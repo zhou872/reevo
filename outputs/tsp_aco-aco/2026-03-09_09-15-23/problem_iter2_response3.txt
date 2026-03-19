@@ -1,0 +1,249 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsification with Density Awareness", "Two-Hop Path Efficiency Ratio", "Cycle-Aware Cluster Penalty", "Ensemble Weighted Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import ConvexHull
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with adaptive parameters
+    and global structure awareness.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Matrix of edge priorities with same shape as distance_matrix
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # Simple fallback for very small instances
+        heuristics = 1 / (distance_matrix + np.eye(n))
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ------------------------------------------------------------
+    # 1. Adaptive parameter selection based on instance properties
+    # ------------------------------------------------------------
+    # Measure instance density using distance statistics
+    upper_tri = distance_matrix[np.triu_indices(n, 1)]
+    distance_std = np.std(upper_tri)
+    distance_mean = np.mean(upper_tri)
+    density_factor = distance_mean / (distance_std + 1e-10)
+    
+    # Adaptive k for nearest neighbors (sqrt(n) adjusted by density)
+    base_k = max(3, int(np.sqrt(n)))
+    k = int(base_k * (1 + 0.5 * np.tanh(density_factor - 1)))  # Adjust based on density
+    
+    # Adaptive weights based on instance size and density
+    if n < 50:
+        weights = {'inverse': 0.4, 'mst': 0.25, 'two_hop': 0.2, 'cycle': 0.15}
+    elif density_factor > 2:  # Dense instances
+        weights = {'inverse': 0.35, 'mst': 0.2, 'two_hop': 0.25, 'cycle': 0.2}
+    else:  # Sparse instances
+        weights = {'inverse': 0.45, 'mst': 0.3, 'two_hop': 0.15, 'cycle': 0.1}
+    
+    # ------------------------------------------------------------
+    # 2. Core heuristic components
+    # ------------------------------------------------------------
+    
+    # 2.1 Sparsified inverse distance with adaptive neighbor selection
+    adjacency_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest_indices = np.argpartition(distances, k)[:k]
+        adjacency_mask[i, nearest_indices] = True
+    
+    # Make symmetric and ensure connectivity
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    
+    # Enhanced inverse distance with rank weighting
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    for i in range(n):
+        mask_i = adjacency_mask[i]
+        if np.any(mask_i):
+            # Get distances to neighbors and sort them
+            neighbor_dists = distance_matrix[i, mask_i]
+            neighbor_indices = np.where(mask_i)[0]
+            sorted_idx = np.argsort(neighbor_dists)
+            
+            # Weight by rank: closer neighbors get higher weight
+            ranks = np.arange(1, len(neighbor_dists) + 1)
+            rank_weights = 1.0 / ranks
+            
+            # Calculate weighted inverse distance
+            for idx, j in enumerate(neighbor_indices[sorted_idx]):
+                if i != j:
+                    inv_dist[i, j] = rank_weights[idx] / (distance_matrix[i, j] + 1e-10)
+    
+    # Normalize
+    inv_dist_max = inv_dist.max()
+    if inv_dist_max > 0:
+        inv_dist = inv_dist / inv_dist_max
+    
+    # 2.2 Minimum Spanning Tree influence
+    mst_matrix = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst_matrix > 0) | (mst_matrix.T > 0)
+    mst_bonus = np.zeros_like(distance_matrix)
+    mst_bonus[mst_mask] = 1.2
+    
+    # Boost edges that connect different MST components when removed
+    # (simulating edge importance in MST)
+    for i in range(n):
+        mst_neighbors = np.where(mst_mask[i])[0]
+        for j in mst_neighbors:
+            if i < j:
+                # Check if edge is critical by comparing with alternative paths
+                alt_distances = []
+                for k in range(n):
+                    if k != i and k != j and mst_mask[i, k] and mst_mask[k, j]:
+                        alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                        alt_distances.append(alt_dist)
+                
+                if alt_distances:
+                    min_alt = min(alt_distances)
+                    direct_dist = distance_matrix[i, j]
+                    if min_alt > direct_dist * 1.5:  # Edge is critical
+                        mst_bonus[i, j] = mst_bonus[j, i] = 1.5
+    
+    # 2.3 Enhanced two-hop path efficiency
+    two_hop_score = np.zeros_like(distance_matrix)
+    
+    # Precompute k-nearest neighbors for efficiency
+    nearest_masks = []
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest_indices = np.argsort(distances)[:k]
+        mask = np.zeros(n, dtype=bool)
+        mask[nearest_indices] = True
+        nearest_masks.append(mask)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Find common neighbors in both nodes' k-nearest sets
+                common = nearest_masks[i] & nearest_masks[j]
+                common_indices = np.where(common)[0]
+                common_indices = common_indices[common_indices != i]
+                common_indices = common_indices[common_indices != j]
+                
+                if len(common_indices) > 0:
+                    # Calculate efficiency ratio: direct vs best two-hop
+                    direct = distance_matrix[i, j]
+                    two_hop_dists = []
+                    for m in common_indices:
+                        two_hop = distance_matrix[i, m] + distance_matrix[m, j]
+                        two_hop_dists.append(two_hop)
+                    
+                    if two_hop_dists:
+                        best_two_hop = min(two_hop_dists)
+                        efficiency = best_two_hop / (direct + 1e-10)
+                        # Non-linear scoring: very efficient edges get bonus
+                        two_hop_score[i, j] = two_hop_score[j, i] = min(3.0, efficiency ** 0.5)
+    
+    # Normalize two-hop scores
+    two_hop_max = two_hop_score.max()
+    if two_hop_max > 0:
+        two_hop_score = two_hop_score / two_hop_max
+    
+    # 2.4 Cycle-aware cluster penalty
+    # Identify potential clusters using distance thresholds
+    cycle_penalty = np.ones_like(distance_matrix)
+    
+    # Dynamic threshold based on distance distribution
+    threshold = np.percentile(upper_tri, 25)  # 25th percentile as close-distance threshold
+    
+    for i in range(n):
+        # Find close neighbors
+        close_mask = distance_matrix[i] < threshold
+        close_mask[i] = False
+        
+        if np.sum(close_mask) >= 2:  # Potential cluster
+            close_indices = np.where(close_mask)[0]
+            
+            # Penalize edges within the cluster that would create short cycles
+            for j in close_indices:
+                if i < j:
+                    # Check for triangle completion
+                    for k in close_indices:
+                        if k != i and k != j:
+                            # If i-j-k forms a very small triangle, penalize i-j
+                            triangle_perimeter = (distance_matrix[i, j] + 
+                                                 distance_matrix[j, k] + 
+                                                 distance_matrix[k, i])
+                            if triangle_perimeter < 3 * threshold:
+                                # Stronger penalty for very tight triangles
+                                penalty = 0.7 if triangle_perimeter < 2 * threshold else 0.85
+                                cycle_penalty[i, j] = cycle_penalty[j, i] = min(
+                                    cycle_penalty[i, j], penalty
+                                )
+    
+    # ------------------------------------------------------------
+    # 3. Ensemble combination with adaptive weighting
+    # ------------------------------------------------------------
+    
+    # Initialize heuristics matrix
+    heuristics = np.zeros_like(distance_matrix)
+    
+    # Combine components with adaptive weights
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Base score from inverse distance
+                score = inv_dist[i, j] * weights['inverse']
+                
+                # Add MST bonus
+                if mst_mask[i, j]:
+                    score += mst_bonus[i, j] * weights['mst']
+                
+                # Apply two-hop efficiency
+                score *= (1.0 + two_hop_score[i, j] * weights['two_hop'])
+                
+                # Apply cycle-aware penalty
+                score *= cycle_penalty[i, j] ** weights['cycle']
+                
+                # Additional factor: balance between exploration and exploitation
+                # based on node degree in the sparsified graph
+                degree_i = np.sum(adjacency_mask[i])
+                degree_j = np.sum(adjacency_mask[j])
+                avg_degree = (degree_i + degree_j) / 2
+                degree_factor = 1.0 + 0.1 * (avg_degree - k) / k
+                score *= degree_factor
+                
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    # ------------------------------------------------------------
+    # 4. Post-processing
+    # ------------------------------------------------------------
+    
+    # Ensure symmetry and no self-loops
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # Apply softmax normalization per node for better probability distribution
+    for i in range(n):
+        row = heuristics[i]
+        if np.any(row > 0):
+            # Softmax with temperature
+            exp_row = np.exp(row / (np.mean(row[row > 0]) + 1e-10))
+            heuristics[i] = exp_row / np.sum(exp_row)
+    
+    # Final normalization to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

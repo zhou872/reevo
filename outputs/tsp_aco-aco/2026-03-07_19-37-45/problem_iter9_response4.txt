@@ -1,0 +1,390 @@
+```json
+{
+    "algorithm_features": ["Multi-Factor Integration with Adaptive Weights", "Simulation-Free Heuristic Design", "Variance-Adaptive Regret Penalization", "Cluster Density Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced deterministic heuristic for TSP edge selection.
+    Returns a matrix of the same shape where higher values indicate more promising edges.
+    Eliminates stochastic simulations for improved robustness and efficiency.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Analyze instance characteristics for adaptive parameter tuning
+    stats = _analyze_instance_v2(distance_matrix)
+    
+    # Step 2: Compute deterministic heuristic factors
+    factors = _compute_deterministic_factors(distance_matrix, stats)
+    
+    # Step 3: Compute adaptive weights based on instance structure
+    weights = _compute_adaptive_weights_v2(stats)
+    
+    # Step 4: Combine factors multiplicatively with adaptive exponents
+    H = _combine_factors(distance_matrix, factors, weights, stats)
+    
+    # Step 5: Post-processing and normalization
+    H = _post_process_heuristics_v2(H, distance_matrix, stats)
+    
+    return H
+
+
+def _analyze_instance_v2(distance_matrix: np.ndarray) -> dict:
+    """Analyze instance characteristics for adaptive parameter tuning."""
+    n = distance_matrix.shape[0]
+    
+    # Extract non-diagonal distances for statistics
+    mask = ~np.eye(n, dtype=bool)
+    distances = distance_matrix[mask]
+    
+    # Compute basic statistics
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv_dist = std_dist / (mean_dist + 1e-8)
+    
+    stats = {
+        'n': n,
+        'mean_dist': mean_dist,
+        'std_dist': std_dist,
+        'cv_dist': cv_dist,
+        'sparsity': _estimate_sparsity_v2(distance_matrix),
+        'cluster_tendency': _estimate_cluster_tendency_v2(distance_matrix),
+        'distances': distances
+    }
+    
+    return stats
+
+
+def _estimate_sparsity_v2(distance_matrix: np.ndarray) -> float:
+    """Estimate structural sparsity of the instance."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return 0.5
+    
+    # Compute distance distribution statistics
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    
+    # Estimate sparsity based on distance distribution shape
+    # More uniform distributions indicate less structure (lower sparsity)
+    q25, q75 = np.percentile(distances, [25, 75])
+    iqr = q75 - q25
+    if iqr == 0:
+        return 0.5
+    
+    # Normalized IQR (higher = more spread = less structure)
+    norm_iqr = iqr / (np.max(distances) - np.min(distances) + 1e-8)
+    
+    # Convert to sparsity score (higher = more structured/sparse)
+    sparsity = 1.0 - norm_iqr
+    
+    return np.clip(sparsity, 0.1, 0.9)
+
+
+def _estimate_cluster_tendency_v2(distance_matrix: np.ndarray) -> float:
+    """Estimate whether points form natural clusters using Hopkins statistic."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return 0.5
+    
+    # Simplified Hopkins statistic calculation
+    m = min(20, n // 2)
+    
+    # Sample m points
+    sample_indices = np.random.choice(n, m, replace=False)
+    
+    # For each sample, find nearest neighbor distance
+    sample_nn_dists = []
+    
+    for idx in sample_indices:
+        dists = distance_matrix[idx].copy()
+        dists[idx] = np.inf
+        sample_nn_dists.append(np.min(dists))
+    
+    # Generate m random distances from the empirical distribution
+    all_dists = distance_matrix[~np.eye(n, dtype=bool)]
+    random_dists = np.random.choice(all_dists, m)
+    
+    # Hopkins statistic
+    sum_sample = np.sum(sample_nn_dists)
+    sum_random = np.sum(random_dists)
+    
+    if sum_sample + sum_random == 0:
+        return 0.5
+    
+    hopkins = sum_random / (sum_sample + sum_random + 1e-8)
+    
+    # Higher hopkins indicates more clustered structure
+    return np.clip(hopkins, 0.1, 0.9)
+
+
+def _compute_deterministic_factors(distance_matrix: np.ndarray, stats: dict) -> dict:
+    """Compute all deterministic heuristic factors."""
+    n = stats['n']
+    
+    factors = {}
+    
+    # 1. Inverse distance (base factor)
+    inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-8)
+    np.fill_diagonal(inv_dist, 0)
+    factors['inv_dist'] = inv_dist
+    
+    # 2. Variance-adaptive regret scores
+    factors['regret'] = _compute_regret_scores_v2(distance_matrix, stats)
+    
+    # 3. Density-based scores
+    factors['density'] = _compute_density_scores_v2(distance_matrix, stats)
+    
+    # 4. MST-based scores
+    factors['mst'] = _compute_mst_scores_v2(distance_matrix)
+    
+    return factors
+
+
+def _compute_regret_scores_v2(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Compute variance-adaptive regret scores.
+    Higher scores for edges without good alternative paths.
+    """
+    n = stats['n']
+    cv = stats['cv_dist']
+    regret = np.ones((n, n))
+    
+    # Adaptive regret penalty based on coefficient of variation
+    # Higher CV (more variation) -> less penalty for regret
+    regret_scale = 1.0 / (1.0 + 2.0 * cv)
+    
+    for i in range(n):
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Sort distances from node i
+        sorted_idx = np.argsort(dists_i)
+        if len(sorted_idx) >= 2:
+            best_dist = dists_i[sorted_idx[0]]
+            
+            for j in range(n):
+                if j == i:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best two-hop alternative (i -> k -> j)
+                best_alternative = np.inf
+                for k in range(n):
+                    if k == i or k == j:
+                        continue
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    if alt_cost < best_alternative:
+                        best_alternative = alt_cost
+                
+                # Regret as ratio of best alternative to direct cost
+                if direct_cost > 0:
+                    regret_ratio = best_alternative / (direct_cost + 1e-8)
+                    # Higher regret ratio means worse alternatives -> higher score
+                    # Apply variance-adaptive scaling
+                    regret_score = np.exp(-regret_scale * (regret_ratio - 1.0))
+                    regret[i, j] = regret_score
+    
+    np.fill_diagonal(regret, 0)
+    return regret
+
+
+def _compute_density_scores_v2(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """Compute density scores favoring edges in sparse regions."""
+    n = stats['n']
+    density_scores = np.ones((n, n))
+    
+    # Estimate local density for each node
+    k = max(2, min(5, n // 10))
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        k_nearest = np.partition(dists, k)[:k]
+        local_density[i] = np.mean(k_nearest)
+    
+    # Normalize densities
+    if np.std(local_density) > 1e-8:
+        local_density = (local_density - np.mean(local_density)) / (np.std(local_density) + 1e-8)
+    
+    # Create density scores: favor connections between sparse areas
+    for i in range(n):
+        for j in range(i+1, n):
+            # Combined density (higher score for connecting two sparse nodes)
+            if local_density[i] > 0 and local_density[j] > 0:
+                density_score = 1.5  # Boost for sparse-sparse connections
+            elif local_density[i] < 0 and local_density[j] < 0:
+                density_score = 0.7  # Penalize dense-dense connections
+            else:
+                density_score = 1.0  # Neutral for mixed connections
+            
+            density_scores[i, j] = density_scores[j, i] = density_score
+    
+    return density_scores
+
+
+def _compute_mst_scores_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute scores based on Minimum Spanning Tree."""
+    n = distance_matrix.shape[0]
+    mst_scores = np.ones((n, n))
+    
+    if n > 2:
+        try:
+            # Compute MST
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_present = (mst + mst.T) > 0
+            
+            # Boost edges in MST
+            mst_scores[mst_present] = 1.5
+            
+            # Additional boost for edges that connect MST components in different ways
+            # Compute degree in MST
+            mst_degree = np.sum(mst_present, axis=1)
+            
+            # Boost leaves (degree 1) connections
+            for i in range(n):
+                if mst_degree[i] == 1:
+                    # Find the MST neighbor
+                    for j in range(n):
+                        if mst_present[i, j]:
+                            mst_scores[i, j] = 2.0
+                            break
+        except:
+            pass
+    
+    np.fill_diagonal(mst_scores, 0)
+    return mst_scores
+
+
+def _compute_adaptive_weights_v2(stats: dict) -> dict:
+    """Dynamically compute factor weights based on instance characteristics."""
+    n = stats['n']
+    cv = stats['cv_dist']
+    sparsity = stats['sparsity']
+    cluster_tendency = stats['cluster_tendency']
+    
+    # Base weights that adapt to instance structure
+    weights = {
+        # Inverse distance: always important, but less so for uniform instances
+        'w_inv': 1.0 + 0.5 * cv,
+        
+        # Regret: more important for instances with moderate variation
+        'w_regret': 0.8 + 0.4 * (1.0 - abs(cv - 0.5)),
+        
+        # Density: more important for clustered instances
+        'w_density': 0.5 + 0.8 * cluster_tendency,
+        
+        # MST: more important for structured/sparse instances
+        'w_mst': 0.3 + 0.6 * sparsity
+    }
+    
+    # Normalize weights to maintain balance
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] = weights[key] / total * 4.0  # Sum to 4
+    
+    return weights
+
+
+def _combine_factors(distance_matrix: np.ndarray, factors: dict, weights: dict, stats: dict) -> np.ndarray:
+    """Combine heuristic factors multiplicatively with adaptive exponents."""
+    n = stats['n']
+    H = np.zeros((n, n))
+    
+    # Build candidate mask for efficiency
+    candidate_mask = _build_candidate_mask_v2(distance_matrix, stats)
+    
+    # Combine factors for candidate edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                combined = (
+                    (factors['inv_dist'][i, j] ** weights['w_inv']) *
+                    (factors['regret'][i, j] ** weights['w_regret']) *
+                    (factors['density'][i, j] ** weights['w_density']) *
+                    (factors['mst'][i, j] ** weights['w_mst'])
+                )
+                H[i, j] = H[j, i] = combined
+    
+    return H
+
+
+def _build_candidate_mask_v2(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """Build mask of candidate edges to consider (for efficiency)."""
+    n = stats['n']
+    
+    # Adaptive candidate list size based on instance structure
+    base_k = min(15, max(5, int(np.log2(n) * 2)))
+    
+    # More candidates for sparse/structured instances
+    k = int(base_k * (1.0 + stats['sparsity']))
+    k = min(k, n - 1)
+    
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Get distances to other nodes
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Select k-nearest neighbors as candidates
+        if k < len(dists):
+            indices = np.argpartition(dists, k)[:k]
+        else:
+            indices = np.arange(n)
+            indices = indices[indices != i]
+        
+        candidate_mask[i, indices] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    
+    return candidate_mask
+
+
+def _post_process_heuristics_v2(H: np.ndarray, distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """Post-process the heuristic matrix."""
+    n = stats['n']
+    
+    # Ensure minimum connectivity (each node connects to at least 2 others)
+    min_edges = min(3, n - 1)
+    for i in range(n):
+        # Count non-zero heuristic values for this node
+        non_zero = np.where(H[i] > 0)[0]
+        if len(non_zero) < min_edges:
+            # Add nearest neighbors
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nearest = np.argsort(dists)[:min_edges]
+            
+            for j in nearest:
+                if H[i, j] == 0:
+                    # Assign base inverse distance score
+                    base_score = 1 / (distance_matrix[i, j] + 1e-8)
+                    H[i, j] = H[j, i] = base_score
+    
+    # Ensure symmetry and zero diagonal
+    H = (H + H.T) / 2.0
+    np.fill_diagonal(H, 0.0)
+    
+    # Apply soft thresholding to sparsify
+    if n > 10:
+        threshold = np.percentile(H[H > 0], 20)  # Keep top 80%
+        H[H < threshold] = 0.0
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    return H
+```

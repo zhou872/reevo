@@ -1,0 +1,354 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Depth", "Distribution-Learned Thresholds", "Multiplicative Ensemble Fusion", "Cluster-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy import stats
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with adaptive regret depth, data-learned thresholds,
+    and balanced complexity for practical performance.
+    
+    Key improvements over v1:
+    1. Adaptive regret depth: Dynamically determines how many alternatives to consider
+       based on instance size and distribution characteristics
+    2. Distribution-learned thresholds: Parameters derived from statistical analysis
+       of the distance distribution rather than fixed values
+    3. Simplified multiplicative fusion: Maintains interpretability while ensuring
+       effective component combination
+    4. Cluster-aware sparsification: Preserves connectivity in dense regions while
+       reducing edges in sparse areas
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # =====================================================================
+    # 1. INSTANCE ANALYSIS FOR ADAPTIVE PARAMETERS
+    # =====================================================================
+    
+    # Analyze distance distribution
+    non_diag = distance_matrix[~np.eye(n, dtype=bool)]
+    dist_mean = np.mean(non_diag)
+    dist_std = np.std(non_diag)
+    dist_skew = stats.skew(non_diag)
+    
+    # Adaptive regret depth: consider more alternatives for skewed distributions
+    # where near neighbors are much better than alternatives
+    regret_depth = max(3, min(n // 4, int(5 + 3 * abs(dist_skew))))
+    
+    # Density parameter: adjust based on instance size and variability
+    k_density = max(3, int(0.1 * n * (1 + 0.5 * dist_std / (dist_mean + 1e-8))))
+    
+    # =====================================================================
+    # 2. ADAPTIVE REGRET-BASED PRIORITIZATION
+    # =====================================================================
+    
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Get sorted distances and indices
+        sorted_indices = np.argsort(distances)
+        sorted_dists = distances[sorted_indices]
+        
+        # Compute regret considering multiple alternatives
+        for rank, j in enumerate(sorted_indices):
+            if i == j:
+                continue
+                
+            edge_dist = distance_matrix[i, j]
+            
+            # Find average of top regret_depth alternatives (excluding current edge)
+            alt_start = 0
+            # Skip if the current edge is among the top regret_depth
+            if rank < regret_depth:
+                alt_start = regret_depth
+            else:
+                alt_start = 0
+                
+            # Get alternative distances
+            alt_dists = []
+            for alt_rank in range(alt_start, min(regret_depth + alt_start, n-1)):
+                if alt_rank != rank:
+                    alt_dists.append(sorted_dists[alt_rank])
+            
+            if alt_dists:
+                avg_alt = np.mean(alt_dists)
+                if edge_dist > 0:
+                    # Normalized regret: how much worse are alternatives
+                    regret = (avg_alt - edge_dist) / edge_dist
+                    # Apply sigmoid to bound the effect
+                    regret_score = 1.0 + 1.2 / (1.0 + np.exp(-2 * regret))
+                    regret_matrix[i, j] = regret_score
+                else:
+                    regret_matrix[i, j] = 1.5
+            else:
+                regret_matrix[i, j] = 1.0
+    
+    # Ensure symmetry by taking maximum
+    regret_matrix = np.maximum(regret_matrix, regret_matrix.T)
+    
+    # =====================================================================
+    # 3. DISTRIBUTION-LEARNED THRESHOLDING
+    # =====================================================================
+    
+    # Learn thresholds from the distance distribution
+    proximity_matrix = np.ones((n, n))
+    
+    # Compute percentile-based thresholds for each node
+    thresholds = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Use statistical measures to determine threshold
+        if len(distances[distances < np.inf]) >= 5:
+            q1 = np.percentile(distances[distances < np.inf], 25)
+            q3 = np.percentile(distances[distances < np.inf], 75)
+            iqr = q3 - q1
+            
+            # Adaptive threshold based on distribution shape
+            if dist_skew > 0.5:  # Right-skewed: be more inclusive
+                thresholds[i] = q3 + 1.8 * iqr
+            elif dist_skew < -0.5:  # Left-skewed: be more restrictive
+                thresholds[i] = q1 + 0.8 * iqr
+            else:  # Normal-ish distribution
+                thresholds[i] = q3 + 1.2 * iqr
+        else:
+            thresholds[i] = np.mean(distances[distances < np.inf]) * 1.5
+    
+    # Apply learned thresholds
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = distance_matrix[i, j]
+            # Use minimum threshold of the two endpoints
+            threshold = min(thresholds[i], thresholds[j])
+            
+            if dist <= threshold:
+                # Bonus that decays with distance
+                proximity_bonus = np.exp(-dist / (threshold + 1e-8))
+                proximity_matrix[i, j] = 1.0 + 0.5 * proximity_bonus
+            else:
+                # Penalty that increases with distance
+                penalty = threshold / (dist + 1e-8)
+                proximity_matrix[i, j] = 0.7 + 0.3 * penalty
+            
+            proximity_matrix[j, i] = proximity_matrix[i, j]
+    
+    # =====================================================================
+    # 4. SIMPLIFIED TWO-STEP LOOKAHEAD
+    # =====================================================================
+    
+    lookahead_matrix = np.ones((n, n))
+    
+    # Precompute nearest neighbors for efficiency
+    nearest_dists = np.zeros((n, 2))
+    nearest_indices = np.zeros((n, 2), dtype=int)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        sorted_idx = np.argsort(distances)
+        nearest_indices[i] = sorted_idx[:2]
+        nearest_dists[i] = distances[sorted_idx[:2]]
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            edge_dist = distance_matrix[i, j]
+            
+            # Find best alternative from i (excluding j)
+            if nearest_indices[i, 0] == j:
+                alt_i_dist = nearest_dists[i, 1]
+            else:
+                alt_i_dist = nearest_dists[i, 0]
+            
+            # Find best alternative from j (excluding i)
+            if nearest_indices[j, 0] == i:
+                alt_j_dist = nearest_dists[j, 1]
+            else:
+                alt_j_dist = nearest_dists[j, 0]
+            
+            # Two-step opportunity cost considering both ends
+            if edge_dist > 0:
+                # Combined opportunity from both perspectives
+                opp_cost_i = max(0, (alt_i_dist - edge_dist) / (alt_i_dist + 1e-8))
+                opp_cost_j = max(0, (alt_j_dist - edge_dist) / (alt_j_dist + 1e-8))
+                combined_opp = (opp_cost_i + opp_cost_j) / 2.0
+                
+                lookahead_matrix[i, j] = 1.0 + 0.3 * combined_opp
+            else:
+                lookahead_matrix[i, j] = 1.5
+    
+    # Symmetrize
+    lookahead_matrix = (lookahead_matrix + lookahead_matrix.T) / 2
+    
+    # =====================================================================
+    # 5. ADAPTIVE DENSITY CLUSTERING
+    # =====================================================================
+    
+    density_matrix = np.ones((n, n))
+    
+    # Compute local densities using adaptive k
+    local_densities = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Get k_density nearest distances
+        if len(distances[distances < np.inf]) > k_density:
+            kth_dist = np.partition(distances, k_density)[k_density]
+            neighbor_dists = distances[distances <= kth_dist]
+        else:
+            neighbor_dists = distances[distances < np.inf]
+        
+        if len(neighbor_dists) > 0:
+            # Use harmonic mean for density (more sensitive to small distances)
+            local_densities[i] = len(neighbor_dists) / (np.sum(1.0 / (neighbor_dists + 1e-8)))
+        else:
+            local_densities[i] = 0
+    
+    # Normalize densities
+    if np.max(local_densities) > 0:
+        local_densities = local_densities / np.max(local_densities)
+    
+    # Apply density-based bonuses
+    density_threshold = np.percentile(local_densities, 50)  # Median as threshold
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Both nodes in dense regions
+            if local_densities[i] > density_threshold and local_densities[j] > density_threshold:
+                # Strong bonus for intra-cluster edges
+                similarity = 1.0 - abs(local_densities[i] - local_densities[j])
+                density_matrix[i, j] = 1.0 + 0.6 * similarity
+            # One node in dense region
+            elif local_densities[i] > density_threshold or local_densities[j] > density_threshold:
+                # Moderate bonus for boundary edges
+                density_matrix[i, j] = 1.0 + 0.2
+            
+            density_matrix[j, i] = density_matrix[i, j]
+    
+    # =====================================================================
+    # 6. STRUCTURAL PRIORITIES
+    # =====================================================================
+    
+    # Minimum Spanning Tree boost
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        # Adaptive MST boost based on instance size
+        mst_boost = np.where(mst_mask, 1.3 - 0.05 * np.log10(n + 1), 1.0)
+    except:
+        mst_boost = np.ones((n, n))
+        mst_mask = np.zeros((n, n), dtype=bool)
+    
+    # =====================================================================
+    # 7. MULTIPLICATIVE ENSEMBLE FUSION
+    # =====================================================================
+    
+    # Base component: inverse distance with instance-adaptive regularization
+    reg_factor = 0.05 * dist_mean * (1 + dist_std / (dist_mean + 1e-8))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg_factor)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Combine all components multiplicatively
+    heuristic = inv_dist * regret_matrix * proximity_matrix * lookahead_matrix * density_matrix * mst_boost
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # =====================================================================
+    # 8. CLUSTER-AWARE SPARSIFICATION
+    # =====================================================================
+    
+    # Determine edges to keep
+    keep_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always keep MST edges
+    keep_mask = keep_mask | mst_mask
+    
+    # Adaptive edge selection based on local density
+    for i in range(n):
+        # Target number of edges: more in dense regions, fewer in sparse
+        if local_densities[i] > density_threshold:
+            target_edges = max(4, int(0.3 * n * (0.8 + 0.4 * local_densities[i])))
+        else:
+            target_edges = max(3, int(0.2 * n))
+        
+        target_edges = min(target_edges, n - 1)
+        
+        # Select top edges by combined heuristic
+        scores = heuristic[i, :].copy()
+        scores[i] = -np.inf
+        
+        if target_edges > 0:
+            threshold_idx = n - target_edges - 1
+            if threshold_idx >= 0:
+                threshold = np.partition(scores, threshold_idx)[threshold_idx]
+                keep_mask[i, scores >= threshold] = True
+    
+    # Ensure symmetry of mask
+    keep_mask = keep_mask | keep_mask.T
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(keep_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        if len(connected) < 2:
+            # Add nearest neighbors
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            
+            sorted_idx = np.argsort(distances)
+            added = 0
+            for j in sorted_idx:
+                if j != i and not keep_mask[i, j]:
+                    keep_mask[i, j] = keep_mask[j, i] = True
+                    added += 1
+                    if len(connected) + added >= 2:
+                        break
+    
+    # Apply sparsification mask
+    heuristic = heuristic * keep_mask
+    
+    # =====================================================================
+    # 9. FINAL NORMALIZATION
+    # =====================================================================
+    
+    # Row-wise normalization to [0,1]
+    for i in range(n):
+        row = heuristic[i, :]
+        if np.sum(row > 0) > 0:
+            row_max = np.max(row)
+            if row_max > 0:
+                heuristic[i, :] = row / row_max
+    
+    # Final symmetry enforcement
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

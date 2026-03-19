@@ -1,0 +1,152 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree", "Christofides-inspired", "Adaptive Sparsification", "Degree Centrality"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with adaptive parameters and
+    Christofides-inspired components for improved edge quality.
+    
+    Parameters:
+    distance_matrix (np.ndarray): Square matrix of distances between nodes.
+    
+    Returns:
+    np.ndarray: Matrix of the same shape with scores indicating edge promise.
+                Unpromising edges are set to zero.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # For very small instances, use simple inverse distance
+        inv_dist = np.zeros_like(distance_matrix, dtype=float)
+        np.divide(1.0, distance_matrix, out=inv_dist, where=distance_matrix != 0)
+        np.fill_diagonal(inv_dist, 0.0)
+        return inv_dist
+    
+    # Step 1: Adaptive parameter tuning based on instance size
+    # Larger instances need more aggressive sparsification
+    alpha = 0.5 + 0.3 * np.exp(-n / 50.0)  # MST boost factor (0.5-0.8)
+    beta = 0.2 + 0.2 * np.exp(-n / 100.0)  # Centrality weight (0.2-0.4)
+    k = max(2, min(8, n // 20))  # Adaptive k-nearest neighbors (2-8)
+    
+    # Step 2: Inverse distance with zero diagonal (base heuristic)
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    np.divide(1.0, distance_matrix, out=inv_dist, where=distance_matrix != 0)
+    np.fill_diagonal(inv_dist, 0.0)
+    
+    # Step 3: Minimum Spanning Tree using efficient sparse implementation
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    if n > 1:
+        # Use scipy's efficient MST implementation (Prim's or Kruskal)
+        mst_csr = minimum_spanning_tree(csr_matrix(distance_matrix))
+        mst_mask = mst_csr.toarray() != 0
+        # Make symmetric (undirected)
+        mst_mask = mst_mask | mst_mask.T
+    
+    # Step 4: Christofides-inspired component - identify odd-degree vertices
+    # In Christofides, odd-degree vertices from MST form a matching set
+    if n > 2 and mst_mask.any():
+        mst_degree = mst_mask.sum(axis=1)  # Degree of each node in MST
+        odd_degree_mask = (mst_degree % 2 == 1)
+        num_odd = odd_degree_mask.sum()
+        
+        if num_odd >= 4:
+            # Boost edges between odd-degree vertices (potential matching edges)
+            odd_vertices = np.where(odd_degree_mask)[0]
+            odd_boost = np.zeros((n, n), dtype=float)
+            
+            # For efficiency, only compute for odd vertices
+            for i in odd_vertices:
+                for j in odd_vertices:
+                    if i < j:  # Upper triangular only
+                        # Boost inversely proportional to edge length
+                        boost_val = 1.0 / (distance_matrix[i, j] + 1e-12)
+                        odd_boost[i, j] = odd_boost[j, i] = boost_val
+            
+            # Normalize odd boost and apply
+            if odd_boost.max() > 0:
+                odd_boost = odd_boost / odd_boost.max()
+    
+    # Step 5: Enhanced node centrality using MST degree and k-NN
+    centrality = np.zeros(n, dtype=float)
+    
+    # Component 1: Degree in MST (normalized)
+    if mst_mask.any():
+        mst_degree = mst_mask.sum(axis=1)
+        if mst_degree.max() > 0:
+            centrality += mst_degree / mst_degree.max()
+    
+    # Component 2: k-nearest neighbor connectivity
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        if n > k:
+            # Get indices of k smallest distances
+            nn_indices = np.argpartition(row, k)[:k]
+            avg_nn_dist = row[nn_indices].mean()
+            centrality[i] += 1.0 / (avg_nn_dist + 1e-12)
+    
+    # Normalize centrality scores
+    if centrality.max() > 0:
+        centrality = centrality / centrality.max()
+    
+    # Step 6: Combine factors with adaptive weights
+    scores = inv_dist.copy()
+    
+    # Apply MST boost
+    scores[mst_mask] *= (1.0 + alpha)
+    
+    # Apply Christofides-inspired boost if available
+    if 'odd_boost' in locals() and odd_boost.max() > 0:
+        # Weight decays with instance size
+        gamma = 0.3 * np.exp(-n / 100.0)
+        scores += gamma * odd_boost * inv_dist
+    
+    # Apply centrality weighting
+    for i in range(n):
+        for j in range(i + 1, n):  # Symmetric optimization
+            if i != j and distance_matrix[i, j] > 0:
+                centrality_factor = 1.0 + beta * (centrality[i] + centrality[j]) / 2.0
+                scores[i, j] *= centrality_factor
+                scores[j, i] = scores[i, j]  # Symmetry
+    
+    # Step 7: Adaptive sparsification with percentile threshold
+    # Use a more aggressive threshold for larger instances
+    if n > 10:
+        off_diag_scores = scores[~np.eye(n, dtype=bool)]
+        if len(off_diag_scores) > 0:
+            # Dynamic percentile based on instance size
+            percentile = 40 + 20 * np.exp(-n / 50.0)  # 40-60th percentile
+            threshold = np.percentile(off_diag_scores, percentile)
+            scores[scores < threshold] = 0.0
+    
+    # Step 8: Ensure minimum connectivity
+    for i in range(n):
+        non_zero_count = np.count_nonzero(scores[i])
+        if non_zero_count < 2:
+            # Add the 2 nearest non-zero edges if missing
+            row = distance_matrix[i].copy()
+            row[i] = np.inf
+            # Skip already non-zero edges
+            non_zero_mask = scores[i] > 0
+            row[non_zero_mask] = np.inf
+            
+            nearest_indices = np.argsort(row)[:2]
+            for j in nearest_indices:
+                if row[j] < np.inf:
+                    scores[i, j] = inv_dist[i, j] * 0.3  # Reduced weight
+                    scores[j, i] = scores[i, j]
+    
+    # Step 9: Final normalization for numerical stability
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    return scores
+```

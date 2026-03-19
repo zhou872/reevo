@@ -1,0 +1,179 @@
+```json
+{
+    "algorithm_features": ["Regret-based Edge Penalization", "Lookahead Spatial Averaging", "Adaptive k-NN Sparsification", "Cluster Density Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection incorporating regret-based penalization
+    and lookahead spatial averaging to anticipate path constraints.
+    
+    Features:
+    1. Regret-based edge penalization: Scores edges based on opportunity cost of omission
+    2. Lookahead spatial averaging: Considers 2-step connectivity patterns
+    3. Adaptive k-nearest neighbor sparsification: Scales with problem size
+    4. Cluster density bonus: Rewards edges within dense local clusters
+    
+    Returns: Heuristic matrix of same shape as input, with higher values indicating
+             more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        # Fallback for trivial instances
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # 1. Base inverse distance matrix (handling zero diagonal)
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    mask_nonzero = distance_matrix > 0
+    inv_dist[mask_nonzero] = 1.0 / distance_matrix[mask_nonzero]
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Adaptive k-nearest neighbor sparsification
+    k = max(2, int(np.sqrt(n)))
+    knn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get k+1 smallest distances (including self)
+        indices = np.argpartition(distance_matrix[i], k+1)[:k+1]
+        # Remove self and keep k nearest
+        indices = indices[indices != i][:k]
+        knn_mask[i, indices] = True
+    
+    # Ensure symmetry (undirected graph)
+    knn_mask = knn_mask | knn_mask.T
+    
+    # 3. Regret-based edge penalization
+    # For each node, compute cost increase if best edge is omitted
+    regret_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        # Get valid neighbor distances
+        neighbor_mask = np.arange(n) != i
+        if not np.any(neighbor_mask):
+            continue
+            
+        dists = distance_matrix[i, neighbor_mask]
+        indices = np.where(neighbor_mask)[0]
+        
+        if len(dists) >= 2:
+            # Find two smallest distances
+            sorted_idx = np.argsort(dists)
+            best_idx = indices[sorted_idx[0]]
+            second_best_idx = indices[sorted_idx[1]]
+            
+            # Regret for omitting best edge
+            regret = dists[sorted_idx[1]] - dists[sorted_idx[0]]
+            
+            # Assign regret scores: higher regret means edge is more critical
+            regret_scores[i, best_idx] = regret
+            regret_scores[i, second_best_idx] = regret * 0.5  # Partial regret
+    
+    # Symmetrize and normalize regret scores
+    regret_scores = np.maximum(regret_scores, regret_scores.T)
+    max_regret = np.max(regret_scores)
+    if max_regret > 0:
+        regret_scores = regret_scores / max_regret
+    
+    # 4. Lookahead spatial averaging
+    # Consider 2-step connectivity patterns
+    lookahead_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if not knn_mask[i, j]:
+                continue
+                
+            # Find common neighbors
+            common_neighbors = np.where(knn_mask[i] & knn_mask[j])[0]
+            common_neighbors = common_neighbors[(common_neighbors != i) & (common_neighbors != j)]
+            
+            if len(common_neighbors) == 0:
+                continue
+            
+            # Average distance of potential 2-step paths through common neighbors
+            two_step_dists = []
+            for k in common_neighbors:
+                if (distance_matrix[i, k] > 0 and distance_matrix[k, j] > 0):
+                    two_step_dists.append(distance_matrix[i, k] + distance_matrix[k, j])
+            
+            if len(two_step_dists) > 0:
+                avg_two_step = np.mean(two_step_dists)
+                # Score favors direct edges significantly shorter than 2-step alternatives
+                if avg_two_step > 0:
+                    lookahead_ratio = avg_two_step / distance_matrix[i, j]
+                    lookahead_scores[i, j] = lookahead_scores[j, i] = np.clip(lookahead_ratio - 1, 0, 3)
+    
+    # Normalize lookahead scores
+    max_lookahead = np.max(lookahead_scores)
+    if max_lookahead > 0:
+        lookahead_scores = lookahead_scores / max_lookahead
+    
+    # 5. Local clustering coefficient bonus
+    clustering_bonus = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        neighbors_i = np.where(knn_mask[i])[0]
+        neighbors_i = neighbors_i[neighbors_i != i]
+        
+        for j in neighbors_i:
+            if j <= i:
+                continue
+                
+            neighbors_j = np.where(knn_mask[j])[0]
+            neighbors_j = neighbors_j[neighbors_j != j]
+            
+            # Count common neighbors
+            common = np.intersect1d(neighbors_i, neighbors_j)
+            common = common[common != i]
+            common = common[common != j]
+            
+            max_possible = min(len(neighbors_i), len(neighbors_j)) - 1
+            if max_possible > 0:
+                clustering = len(common) / max_possible
+                clustering_bonus[i, j] = clustering_bonus[j, i] = clustering
+    
+    # 6. Minimum spanning tree alignment
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = (mst > 0).astype(float) * 0.3
+    
+    # 7. Distance quantile thresholding
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    if len(flat_dists) > 0:
+        threshold = np.quantile(flat_dists, 0.75)
+        dist_mask = distance_matrix <= threshold
+        np.fill_diagonal(dist_mask, False)
+    else:
+        dist_mask = np.ones_like(distance_matrix, dtype=bool)
+        np.fill_diagonal(dist_mask, False)
+    
+    # 8. Combine all factors with weighted composition
+    # Base score emphasizes edges with high regret (critical to include)
+    base_score = inv_dist * (1.0 + regret_scores)
+    
+    # Add bonuses for clustering, MST, and lookahead advantages
+    composite = base_score * (1.0 + 0.4 * clustering_bonus + 0.3 * mst_bonus + 0.3 * lookahead_scores)
+    
+    # Apply sparsification masks
+    final_mask = knn_mask & dist_mask
+    heuristics = composite * final_mask
+    
+    # Ensure symmetry and zero diagonal
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0.0)
+    
+    # Normalize non-zero entries to [0, 1] range
+    non_zero = heuristics[heuristics > 0]
+    if len(non_zero) > 0:
+        max_val = np.max(non_zero)
+        if max_val > 0:
+            heuristics = heuristics / max_val
+    
+    return heuristics
+```

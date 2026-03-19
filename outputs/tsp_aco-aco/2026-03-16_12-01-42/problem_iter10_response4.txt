@@ -1,0 +1,296 @@
+```json
+{
+    "algorithm_features": ["Distance Distribution-Adaptive Weighting", "Harmonic Mean Density Scoring", "Lightweight Multi-Step Path Analysis", "Centrality-Aware Node Penalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with data-adaptive parameter derivation,
+    efficient local exploration, and balanced component fusion.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix (non-negative)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    epsilon = 1e-12
+    
+    # === 1. Derive Global Features for Adaptive Parameters ===
+    # Extract off-diagonal distances for statistical analysis
+    off_diag_mask = ~np.eye(n, dtype=bool)
+    global_distances = distance_matrix[off_diag_mask]
+    
+    # Core global statistics
+    global_mean = np.mean(global_distances)
+    global_std = np.std(global_distances) + epsilon
+    global_cv = global_std / global_mean  # Coefficient of variation
+    
+    # Distance distribution quartiles
+    q25, q50, q75 = np.percentile(global_distances, [25, 50, 75])
+    iqr = q75 - q25 + epsilon
+    
+    # Adaptive neighborhood sizes based on problem characteristics
+    k_base = max(3, min(15, int(np.sqrt(n) * (1.5 if n > 50 else 1.0))))
+    k_regret = max(2, k_base // 2)
+    k_density = k_base
+    k_path = max(2, min(6, int(np.log2(n)) + 1))
+    
+    # === 2. Enhanced Base Distance Component ===
+    # Adaptive distance transformation based on distribution
+    if global_cv > 0.5:
+        # High variability: use power transformation
+        base_heuristics = np.power(1.0 / (distance_matrix + epsilon), 0.9)
+    else:
+        # Low variability: standard inverse
+        base_heuristics = 1.0 / (distance_matrix + epsilon)
+    
+    np.fill_diagonal(base_heuristics, 0)
+    
+    # === 3. Data-Adaptive Regret Analysis ===
+    regret_scores = np.ones_like(distance_matrix)
+    
+    # Adaptive regret threshold based on distance distribution
+    regret_threshold = 0.1 + 0.15 * global_cv
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= k_regret + 1:
+            # Get k_regret + 1 nearest neighbors
+            nearest_idx = np.argpartition(dists, k_regret + 1)[:k_regret + 1]
+            nearest_dists = dists[nearest_idx]
+            
+            # Sort the nearest distances
+            sorted_indices = np.argsort(nearest_dists)
+            sorted_idx = nearest_idx[sorted_indices]
+            sorted_dists = nearest_dists[sorted_indices]
+            
+            # Base regret for each neighbor position
+            for pos, j in enumerate(sorted_idx):
+                if pos == 0:
+                    # Best edge: compare to second best
+                    if k_regret >= 1 and len(sorted_dists) > 1:
+                        regret = (sorted_dists[1] - sorted_dists[0]) / (sorted_dists[0] + epsilon)
+                        regret_scores[i, j] = 1.0 + np.tanh(regret / (regret_threshold + epsilon))
+                else:
+                    # Other edges: compare to best
+                    regret = (sorted_dists[0] - distance_matrix[i, j]) / (distance_matrix[i, j] + epsilon)
+                    # Scale based on position
+                    pos_factor = 1.0 / (pos + 1)
+                    scaled_regret = regret * pos_factor / (regret_threshold + epsilon)
+                    regret_scores[i, j] = 1.0 + 0.4 * np.tanh(scaled_regret)
+    
+    # === 4. Harmonic Mean Density Scoring ===
+    density_scores = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= k_density:
+            # Get k_density nearest neighbors
+            nearest_idx = np.argpartition(dists, k_density)[:k_density]
+            nearest_dists = dists[nearest_idx]
+            
+            # Compute harmonic mean of nearest distances
+            if np.all(nearest_dists > 0):
+                harmonic_mean = k_density / np.sum(1.0 / nearest_dists)
+                
+                # Score edges relative to local density
+                for j in nearest_idx:
+                    if i == j:
+                        continue
+                    
+                    density_ratio = harmonic_mean / (distance_matrix[i, j] + epsilon)
+                    # Non-linear transformation for emphasis
+                    density_scores[i, j] = 1.0 + 0.6 * (1.0 - np.exp(-0.5 * (density_ratio - 1.0)))
+    
+    # === 5. Lightweight Multi-Step Path Analysis ===
+    path_scores = np.ones_like(distance_matrix)
+    
+    if n > 3:
+        for i in range(n):
+            # Get i's nearest neighbors
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            if len(dists_i) >= k_path:
+                neighbors_i = set(np.argpartition(dists_i, k_path)[:k_path])
+                
+                for j in range(n):
+                    if i == j:
+                        continue
+                    
+                    # Get j's nearest neighbors
+                    dists_j = distance_matrix[j].copy()
+                    dists_j[j] = np.inf
+                    if len(dists_j) >= k_path:
+                        neighbors_j = set(np.argpartition(dists_j, k_path)[:k_path])
+                        
+                        # Explore efficient alternative paths
+                        best_alternative = np.inf
+                        
+                        # Two-step paths: i -> k -> j
+                        for k in neighbors_i:
+                            if k != j and k in neighbors_j:
+                                alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                                best_alternative = min(best_alternative, alt_cost)
+                        
+                        # Three-step paths: i -> k -> l -> j (limited exploration)
+                        if best_alternative == np.inf:
+                            for k in neighbors_i:
+                                if k == j:
+                                    continue
+                                for l in neighbors_j:
+                                    if l == i or l == k:
+                                        continue
+                                    alt_cost = (distance_matrix[i, k] + 
+                                               distance_matrix[k, l] + 
+                                               distance_matrix[l, j])
+                                    best_alternative = min(best_alternative, alt_cost)
+                        
+                        if best_alternative < np.inf:
+                            efficiency = distance_matrix[i, j] / (best_alternative + epsilon)
+                            # Boost edges with no efficient alternatives
+                            path_scores[i, j] = 1.0 + 0.7 * np.exp(-max(0, efficiency - 0.8))
+    
+    # === 6. Centrality-Aware Node Penalization ===
+    centrality_penalty = np.ones_like(distance_matrix)
+    
+    # Compute node centrality using k-nearest neighbor appearances
+    centrality = np.zeros(n)
+    k_central = max(3, min(10, n // 4))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if len(dists) >= k_central:
+            nearest = np.argpartition(dists, k_central)[:k_central]
+            centrality[nearest] += 1
+    
+    # Normalize and transform centrality
+    if np.max(centrality) > 0:
+        norm_centrality = centrality / np.max(centrality)
+        # Sigmoid transformation for balanced penalty
+        penalty_strength = 0.3 + 0.3 * global_cv
+        transformed_centrality = 1.0 / (1.0 + np.exp(-5.0 * (norm_centrality - 0.5)))
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    penalty = 1.0 - penalty_strength * transformed_centrality[j]
+                    centrality_penalty[i, j] = max(0.5, penalty)
+    
+    np.fill_diagonal(centrality_penalty, 0)
+    
+    # === 7. Data-Driven Component Weighting ===
+    # Determine weights based on problem characteristics
+    if n <= 15:
+        # Small problems: emphasize distance and regret
+        w_dist = 1.2
+        w_regret = 1.1
+        w_density = 0.9
+        w_path = 0.8
+    else:
+        # Larger problems: dynamic weighting based on distance distribution
+        w_dist = 1.0 - 0.1 * min(1.0, global_cv)
+        w_regret = 1.0 + 0.2 * min(1.0, global_cv)
+        w_density = 0.9 + 0.3 * min(1.0, iqr / q50)
+        w_path = 0.9 + 0.2 * min(1.0, np.log(n) / 5)
+    
+    # Combine components with exponentiation for non-linear emphasis
+    heuristics = (np.power(base_heuristics, w_dist) *
+                  np.power(regret_scores, w_regret) *
+                  np.power(density_scores, w_density) *
+                  np.power(path_scores, w_path) *
+                  centrality_penalty)
+    
+    # === 8. MST Reinforcement ===
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_mask = (mst_dense > 0) | (mst_dense.T > 0)
+            
+            # Adaptive MST boost based on problem size
+            mst_boost = 1.3 + 0.2 * min(1.0, np.log(n) / 5)
+            heuristics[mst_mask] *= mst_boost
+        except:
+            pass
+    
+    # === 9. Adaptive Sparsification ===
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = 0
+        
+        if np.sum(row > 0) > 3:
+            # Determine threshold based on row statistics and global features
+            positive_vals = row[row > 0]
+            
+            # Use dynamic percentile based on problem characteristics
+            if global_cv > 0.3:
+                keep_percentile = max(40, 60 - 10 * global_cv)
+            else:
+                keep_percentile = max(40, 65 - n / 20)
+            
+            threshold = np.percentile(positive_vals, keep_percentile)
+            
+            # Ensure MST edges are kept
+            mst_keep = np.zeros(n, dtype=bool)
+            if n > 2:
+                try:
+                    mst_i = minimum_spanning_tree(distance_matrix).toarray()[i] > 0
+                    mst_keep = mst_i
+                except:
+                    pass
+            
+            # Keep edges above threshold or in MST
+            keep_mask = (row >= threshold) | mst_keep
+            
+            # Ensure minimum connectivity
+            min_keep = min(3, n - 1)
+            if np.sum(keep_mask) < min_keep:
+                top_idx = np.argsort(row)[-min_keep:]
+                keep_mask[top_idx] = True
+            
+            # Soft reduction for edges just below threshold
+            borderline = (row > 0) & ~keep_mask & (row >= 0.8 * threshold)
+            row[borderline] *= 0.4
+            row[~keep_mask & ~borderline] = 0
+            
+            heuristics[i] = row
+    
+    # === 10. Symmetrization and Final Processing ===
+    # Geometric mean for symmetry (preserves zeroes)
+    with np.errstate(invalid='ignore'):
+        symmetric_heuristics = np.sqrt(heuristics * heuristics.T)
+    symmetric_heuristics = np.nan_to_num(symmetric_heuristics, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Final normalization with soft compression
+    max_val = np.max(symmetric_heuristics)
+    if max_val > epsilon:
+        symmetric_heuristics /= max_val
+        # Gentle compression to reduce extreme values
+        symmetric_heuristics = np.power(symmetric_heuristics, 0.95)
+    
+    return symmetric_heuristics
+```

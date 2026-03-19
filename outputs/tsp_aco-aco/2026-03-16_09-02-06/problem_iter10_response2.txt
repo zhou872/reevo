@@ -1,0 +1,191 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret with Local Variance", "Inverse Distance Weighting", "MST Connectivity Core", "Lightweight Two-step Lookahead"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with adaptive regret thresholds and lightweight
+    two-step lookahead, balancing computational efficiency with improved edge discrimination.
+    
+    Key Improvements:
+    1. Adaptive regret thresholds based on local distance variance
+    2. Lightweight two-step lookahead via best neighbor analysis
+    3. Preserved MST connectivity core with dynamic bonus scaling
+    4. Optimized sparsification using local graph characteristics
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores of same shape as input, with higher scores indicating
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Create working copy with safe handling of zeros/infinities
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # === 1. BASE INVERSE DISTANCE WITH ROBUST NORMALIZATION ===
+    # Use median for more robust scaling than mean in presence of outliers
+    median_dist = np.median(dist[dist < np.inf])
+    scaled_dist = dist / (median_dist + 1e-12)
+    inv_dist = 1 / (scaled_dist + 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. ADAPTIVE MST BONUS WITH DYNAMIC SCALING ===
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0).astype(float)
+    
+    # Scale MST bonus by edge quality relative to local alternatives
+    mst_bonus = np.ones_like(dist)
+    for i in range(n):
+        mst_neighbors = np.where(mst_mask[i] > 0)[0]
+        if len(mst_neighbors) > 0:
+            for j in mst_neighbors:
+                # Calculate how much better this edge is than alternatives
+                if i != j:
+                    # Get distances to all other nodes from i
+                    other_dists = dist[i].copy()
+                    other_dists[j] = np.inf
+                    second_best = np.min(other_dists)
+                    
+                    if second_best > 0:
+                        ratio = dist[i, j] / second_best
+                        # Stronger bonus for edges that are clearly optimal
+                        bonus = 1.0 + 0.8 * np.exp(-2.0 * (ratio - 1.0))
+                        mst_bonus[i, j] = min(bonus, 2.0)
+    
+    # === 3. ADAPTIVE REGRET WITH LOCAL VARIANCE AWARENESS ===
+    regret_matrix = np.ones_like(dist)
+    
+    for i in range(n):
+        distances_i = dist[i].copy()
+        valid_dists = distances_i[distances_i < np.inf]
+        
+        if len(valid_dists) >= 2:
+            # Sort distances
+            sorted_dists = np.sort(valid_dists)
+            best, second_best = sorted_dists[0], sorted_dists[1]
+            
+            # Calculate local variance metric
+            local_std = np.std(valid_dists)
+            local_mean = np.mean(valid_dists)
+            local_cv = local_std / (local_mean + 1e-12)
+            
+            # Adaptive threshold: be more selective when distances vary greatly
+            threshold = 0.3 + 0.4 * np.tanh(local_cv)  # Ranges ~0.3-0.7
+            
+            for j in range(n):
+                if i != j and distances_i[j] < np.inf:
+                    if second_best - best > 1e-10:
+                        regret = (distances_i[j] - best) / (second_best - best)
+                        # Apply non-linear penalty that adapts to local variance
+                        if regret > threshold:
+                            penalty = np.exp(-3.0 * (regret - threshold))
+                            regret_matrix[i, j] = penalty
+                        else:
+                            # Small bonus for being near-optimal
+                            regret_matrix[i, j] = 1.0 + 0.2 * (1.0 - regret/threshold)
+                    else:
+                        # All similar distances
+                        regret_matrix[i, j] = 1.0
+    
+    # === 4. LIGHTWEIGHT TWO-STEP LOOKAHEAD ===
+    lookahead_bonus = np.ones_like(dist)
+    
+    if n >= 4:  # Only apply for non-trivial graphs
+        for i in range(n):
+            # Find k nearest neighbors for lookahead (scales with log(n))
+            k = min(max(2, int(np.log2(n))), n-1)
+            neighbors = np.argsort(dist[i])[1:k+1]
+            
+            for j in neighbors:
+                if i != j:
+                    # Look ahead from node j: find best continuation
+                    j_dists = dist[j].copy()
+                    j_dists[i] = np.inf  # Don't go back to i
+                    j_dists[j] = np.inf  # Exclude self
+                    
+                    if np.any(j_dists < np.inf):
+                        best_continuation = np.min(j_dists)
+                        # Bonus if this edge leads to good subsequent options
+                        if best_continuation > 0:
+                            # Ratio of current edge to best continuation
+                            continuation_ratio = dist[i, j] / (best_continuation + 1e-12)
+                            # Favor edges that are proportional to their continuation quality
+                            bonus = 1.0 + 0.3 * np.exp(-continuation_ratio)
+                            lookahead_bonus[i, j] = min(bonus, 1.5)
+    
+    # === 5. COMBINED SCORING WITH ADAPTIVE WEIGHTS ===
+    # Simple linear combination with weights based on graph size
+    size_factor = n / 100.0  # Normalize by reference size
+    
+    # Weights that adapt to problem characteristics
+    w_inv = 0.4 + 0.2 * np.tanh(2.0 - size_factor)  # Base weight
+    w_mst = 0.3  # Consistent MST importance
+    w_regret = 0.5 - 0.2 * np.tanh(size_factor)  # Less emphasis for large graphs
+    w_lookahead = 0.2 * np.tanh(3.0 - size_factor)  # More for small/medium graphs
+    
+    # Normalize weights to sum to 1
+    total = w_inv + w_mst + w_regret + w_lookahead
+    w_inv, w_mst, w_regret, w_lookahead = [w/total for w in [w_inv, w_mst, w_regret, w_lookahead]]
+    
+    scores = (w_inv * inv_dist +
+              w_mst * mst_bonus +
+              w_regret * regret_matrix +
+              w_lookahead * lookahead_bonus)
+    
+    # === 6. ADAPTIVE SPARSIFICATION ===
+    # Determine edges to keep per node based on graph density
+    avg_dist = np.mean(dist[dist < np.inf])
+    density_est = n / (avg_dist + 1e-12)
+    
+    # Base edges to keep: more for dense graphs, fewer for sparse
+    base_k = int(np.sqrt(n) * (1.0 + np.tanh(density_est / 100.0)))
+    k = max(2, min(base_k, n // 2))
+    
+    mask = np.zeros_like(scores, dtype=bool)
+    
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Keep top k edges
+        top_indices = np.argsort(row_scores)[-k:]
+        mask[i, top_indices] = True
+        
+        # Always keep connections to very nearest neighbors (at least 1)
+        if n > 1:
+            nearest = np.argsort(dist[i])[1:min(2, n)]
+            mask[i, nearest] = True
+    
+    # Ensure symmetry and MST inclusion
+    mask = mask | mask.T | (mst_mask > 0)
+    
+    # Apply mask with smooth falloff
+    scores = scores * mask
+    
+    # === 7. FINAL NORMALIZATION ===
+    # Soft normalization preserving relative differences
+    max_score = scores.max()
+    min_score = scores[scores > 0].min() if np.any(scores > 0) else 0
+    
+    if max_score > min_score:
+        scores = (scores - min_score) / (max_score - min_score + 1e-12)
+    
+    np.fill_diagonal(scores, 0)
+    return scores
+```

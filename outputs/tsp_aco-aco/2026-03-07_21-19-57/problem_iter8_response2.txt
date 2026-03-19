@@ -1,0 +1,381 @@
+```json
+{
+    "algorithm_features": ["Probabilistic Two-step Regret", "k-NN Graph Centrality", "Adaptive Component Weighting", "Spectral Cluster Distance"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with probabilistic
+    regret modeling and extended graph centrality measures.
+    
+    Key innovations:
+    1. Probabilistic Two-step Regret: Models edge selection uncertainty using
+       probability distributions over alternative paths with lookahead horizon
+    2. k-NN Graph Centrality: Computes edge importance in both MST and k-nearest
+       neighbor graphs for better structural understanding
+    3. Adaptive Component Weighting: Dynamically adjusts feature importance based
+       on graph topology and problem characteristics
+    4. Spectral Cluster Distance: Uses eigenvector-based clustering to identify
+       natural groups and penalize long inter-cluster edges
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # =====================================================================
+    # 1. PROBABILISTIC TWO-STEP REGRET MINIMIZATION
+    # =====================================================================
+    regret_matrix = np.ones((n, n))
+    median_dist = np.median(distance_matrix[distance_matrix > 0])
+    
+    # Precompute sorted neighbors for efficiency
+    k_neighbors = min(10, n - 1)
+    neighbor_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_neighbors+1]
+    neighbor_distances = np.sort(distance_matrix, axis=1)[:, 1:k_neighbors+1]
+    
+    # Softmax function for probability conversion
+    def softmax(x, temperature=1.0):
+        exp_x = np.exp((x.max() - x) / (temperature + 1e-8))
+        return exp_x / exp_x.sum()
+    
+    for i in range(n):
+        # Get i's neighbor distances and compute selection probabilities
+        i_neighbors = neighbor_indices[i]
+        i_dists = neighbor_distances[i]
+        
+        # Convert distances to probabilities (closer = higher probability)
+        i_probs = softmax(-i_dists, temperature=median_dist * 0.5)
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Check if j is in i's k-nearest neighbors
+            if j not in i_neighbors:
+                # Edge not in immediate consideration - low base score
+                regret_matrix[i, j] = 0.3
+                continue
+            
+            # Find j's position in i's neighbor list
+            j_pos = np.where(i_neighbors == j)[0][0]
+            j_dist = distance_matrix[i, j]
+            
+            # One-step regret: probability-weighted alternative cost
+            alt_mask = i_neighbors != j
+            alt_probs = i_probs[alt_mask] / i_probs[alt_mask].sum()
+            alt_dists = i_dists[alt_mask]
+            one_step_regret = np.sum(alt_probs * (j_dist - alt_dists))
+            
+            # Two-step probabilistic regret
+            two_step_regrets = []
+            for k_idx, k in enumerate(i_neighbors):
+                if k == j:
+                    continue
+                    
+                # Probability of choosing i->k
+                prob_ik = i_probs[k_idx]
+                
+                # Get k's neighbors (excluding i and j)
+                k_neighbor_mask = (neighbor_indices[k] != i) & (neighbor_indices[k] != j)
+                k_candidates = neighbor_indices[k][k_neighbor_mask][:5]
+                
+                if len(k_candidates) == 0:
+                    # No further alternatives
+                    two_step_regret = j_dist - distance_matrix[i, k]
+                else:
+                    # Compute probabilities for k's alternatives
+                    k_dists = distance_matrix[k, k_candidates]
+                    k_probs = softmax(-k_dists, temperature=median_dist * 0.5)
+                    
+                    # Expected two-step cost through k
+                    expected_ik_cost = distance_matrix[i, k] + np.sum(k_probs * k_dists)
+                    two_step_regret = j_dist - expected_ik_cost
+                
+                two_step_regrets.append(prob_ik * max(0, two_step_regret))
+            
+            total_two_step_regret = np.sum(two_step_regrets) if two_step_regrets else 0
+            
+            # Combine one-step and two-step regret
+            combined_regret = 0.6 * one_step_regret + 0.4 * total_two_step_regret
+            
+            # Convert regret to score (higher regret = lower score)
+            norm_regret = combined_regret / (j_dist + 1e-8)
+            regret_matrix[i, j] = 1.0 / (1.0 + 2.0 * norm_regret)
+    
+    # Ensure symmetry
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # =====================================================================
+    # 2. EXTENDED GRAPH CENTRALITY (MST + k-NN GRAPH)
+    # =====================================================================
+    centrality_matrix = np.ones((n, n))
+    
+    # Build MST
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_sym = (mst_array > 0) | (mst_array.T > 0)
+    
+    # Build k-NN graph (undirected)
+    k_nn = min(5, n - 1)
+    knn_graph = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        # Get k nearest neighbors
+        sorted_indices = np.argsort(distance_matrix[i])[1:k_nn+1]
+        knn_graph[i, sorted_indices] = True
+        knn_graph[sorted_indices, i] = True
+    
+    # Compute edge importance in MST (tree betweenness)
+    def compute_tree_betweenness(adj_matrix):
+        n_nodes = adj_matrix.shape[0]
+        betweenness = np.zeros((n_nodes, n_nodes))
+        
+        # For efficiency, compute all-pairs shortest paths in tree using BFS
+        for start in range(n_nodes):
+            # BFS to find all distances from start
+            visited = np.zeros(n_nodes, dtype=bool)
+            parent = np.full(n_nodes, -1, dtype=int)
+            queue = [start]
+            visited[start] = True
+            
+            while queue:
+                current = queue.pop(0)
+                neighbors = np.where(adj_matrix[current])[0]
+                for neighbor in neighbors:
+                    if not visited[neighbor]:
+                        visited[neighbor] = True
+                        parent[neighbor] = current
+                        queue.append(neighbor)
+            
+            # Propagate subtree sizes back
+            subtree_size = np.ones(n_nodes, dtype=int)
+            order = list(reversed(range(n_nodes)))
+            
+            for node in order:
+                if parent[node] != -1:
+                    subtree_size[parent[node]] += subtree_size[node]
+            
+            # Compute betweenness for edges on paths
+            for node in range(n_nodes):
+                if parent[node] != -1:
+                    p = parent[node]
+                    # Number of paths going through this edge
+                    # = size of subtree rooted at node * (n - that size)
+                    b_value = subtree_size[node] * (n_nodes - subtree_size[node])
+                    betweenness[node, p] = b_value
+                    betweenness[p, node] = b_value
+        
+        # Normalize
+        max_b = betweenness.max()
+        if max_b > 0:
+            betweenness = betweenness / max_b
+        
+        return betweenness
+    
+    mst_betweenness = compute_tree_betweenness(mst_sym)
+    
+    # Compute edge importance in k-NN graph (approximate)
+    knn_importance = np.zeros((n, n))
+    
+    # Simple importance measure: edge frequency in k-NN paths
+    for i in range(n):
+        for j in range(i+1, n):
+            if knn_graph[i, j]:
+                # Count how many k-NN paths would be disrupted by removing this edge
+                # Approximate by checking if i and j are in each other's k-NN
+                i_in_j = j in neighbor_indices[i, :k_nn]
+                j_in_i = i in neighbor_indices[j, :k_nn]
+                
+                if i_in_j and j_in_i:
+                    # Mutual nearest neighbors - more important
+                    knn_importance[i, j] = 1.0
+                elif i_in_j or j_in_i:
+                    # One-way nearest neighbor
+                    knn_importance[i, j] = 0.7
+                else:
+                    # Edge in k-NN graph but not in top k for either
+                    knn_importance[i, j] = 0.4
+    
+    # Combine MST and k-NN centrality
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            mst_val = mst_betweenness[i, j] if mst_sym[i, j] else 0.1
+            knn_val = knn_importance[i, j] if knn_graph[i, j] else 0.05
+            
+            # Weighted combination favoring MST for connectivity, k-NN for locality
+            centrality_matrix[i, j] = 1.0 + 0.7 * mst_val + 0.3 * knn_val
+    
+    # =====================================================================
+    # 3. SPECTRAL CLUSTER DISTANCE
+    # =====================================================================
+    cluster_matrix = np.ones((n, n))
+    
+    # Use normalized Laplacian for spectral clustering
+    # Create similarity matrix (inverse distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarity = 1.0 / (distance_matrix + np.eye(n) * 1e-8)
+    np.fill_diagonal(similarity, 0)
+    
+    # Compute normalized Laplacian
+    degree = np.sum(similarity, axis=1)
+    degree_sqrt_inv = 1.0 / np.sqrt(degree + 1e-8)
+    L_norm = np.eye(n) - np.outer(degree_sqrt_inv, degree_sqrt_inv) * similarity
+    
+    # Compute second smallest eigenvector (Fiedler vector)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+        # Sort by eigenvalue
+        idx = np.argsort(eigenvalues)
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+        
+        # Get Fiedler vector (second smallest eigenvalue)
+        fiedler_vector = eigenvectors[:, 1]
+        
+        # Use sign of Fiedler vector for bipartition
+        cluster_assignment = (fiedler_vector > 0).astype(int)
+        
+        # Compute inter-cluster penalty
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                if cluster_assignment[i] != cluster_assignment[j]:
+                    # Inter-cluster edge - penalize based on distance percentile
+                    # Long edges between clusters are especially bad
+                    all_dists = distance_matrix[i]
+                    percentile = np.sum(distance_matrix[i, j] > all_dists) / (n - 1)
+                    penalty = 0.5 + 0.5 * percentile
+                    cluster_matrix[i, j] = 1.0 - 0.3 * penalty
+                else:
+                    # Intra-cluster edge - bonus for short edges
+                    intra_cluster_dists = distance_matrix[i, cluster_assignment == cluster_assignment[i]]
+                    if len(intra_cluster_dists) > 1:
+                        percentile = np.sum(distance_matrix[i, j] > intra_cluster_dists) / (len(intra_cluster_dists) - 1)
+                        bonus = 1.0 - percentile
+                        cluster_matrix[i, j] = 1.0 + 0.2 * bonus
+    except np.linalg.LinAlgError:
+        # Fallback if spectral decomposition fails
+        cluster_matrix = np.ones((n, n))
+    
+    # =====================================================================
+    # 4. ADAPTIVE COMPONENT WEIGHTING
+    # =====================================================================
+    # Analyze problem characteristics for weight adjustment
+    mean_dist = np.mean(distance_matrix[distance_matrix > 0])
+    std_dist = np.std(distance_matrix[distance_matrix > 0])
+    cv_dist = std_dist / (mean_dist + 1e-8)  # Coefficient of variation
+    
+    # Compute graph sparsity in k-NN graph
+    nn_sparsity = np.sum(knn_graph) / (n * (n - 1))
+    
+    # Determine weight profile based on problem characteristics
+    if n < 20:
+        # Small problems: balance all components
+        weights = {'regret': 0.4, 'centrality': 0.3, 'cluster': 0.2, 'proximity': 0.1}
+    elif cv_dist > 1.0:
+        # High variance: emphasize regret and clustering
+        weights = {'regret': 0.5, 'centrality': 0.2, 'cluster': 0.3, 'proximity': 0.0}
+    elif nn_sparsity < 0.1:
+        # Sparse k-NN: emphasize centrality
+        weights = {'regret': 0.3, 'centrality': 0.5, 'cluster': 0.1, 'proximity': 0.1}
+    else:
+        # Default balanced weights
+        weights = {'regret': 0.4, 'centrality': 0.35, 'cluster': 0.15, 'proximity': 0.1}
+    
+    # Proximity component (simple inverse distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        proximity = 1.0 / (distance_matrix + 0.1 * median_dist)
+    np.fill_diagonal(proximity, 0)
+    
+    # Normalize each component to [0, 1] range
+    components = {
+        'regret': regret_matrix,
+        'centrality': centrality_matrix,
+        'cluster': cluster_matrix,
+        'proximity': proximity
+    }
+    
+    normalized_components = {}
+    for key, matrix in components.items():
+        max_val = matrix.max()
+        min_val = matrix.min()
+        if max_val > min_val:
+            normalized_components[key] = (matrix - min_val) / (max_val - min_val)
+        else:
+            normalized_components[key] = matrix
+    
+    # Combine components with adaptive weights
+    heuristic = np.ones((n, n))
+    for key, weight in weights.items():
+        if weight > 0:
+            heuristic *= normalized_components[key] ** weight
+    
+    # Geometric mean normalization
+    total_weight = sum(weights.values())
+    if total_weight > 0:
+        heuristic = np.power(heuristic, 1.0 / total_weight)
+    
+    # =====================================================================
+    # 5. INTELLIGENT EDGE FILTERING
+    # =====================================================================
+    # Start with MST backbone
+    final_mask = mst_sym.copy()
+    
+    # Add edges based on combined score ranking
+    for i in range(n):
+        # Get scores for all potential edges from i
+        scores = heuristic[i, :].copy()
+        scores[i] = -np.inf
+        
+        # Determine number of edges to keep adaptively
+        # Base: keep edges with score above median
+        median_score = np.median(scores[scores > -np.inf])
+        good_edges = scores >= median_score
+        
+        # Ensure at least 2 edges per node for connectivity
+        if np.sum(good_edges) < 2:
+            # Add top 2 scores
+            top_indices = np.argsort(scores)[-2:]
+            good_edges[top_indices] = True
+        
+        # Apply to mask
+        final_mask[i, good_edges] = True
+        final_mask[good_edges, i] = True
+    
+    # Apply mask
+    heuristic = heuristic * final_mask
+    
+    # Final normalization
+    max_val = heuristic.max()
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    # Ensure symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

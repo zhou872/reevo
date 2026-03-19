@@ -1,0 +1,341 @@
+```json
+{
+    "algorithm_features": ["Kernel Bandwidth Optimization", "Adaptive Neighborhood Regret", "Softmax Temperature Scaling", "Hierarchical Graph Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with optimized kernel embeddings,
+    adaptive regret thresholds, and hierarchical graph fusion.
+    
+    Key Innovations:
+    1. Adaptive kernel bandwidth optimization via cross-validation inspired approach
+    2. Dynamic regret computation with penalized alternative paths
+    3. Temperature-scaled softmax with instance-specific annealing
+    4. Hierarchical graph fusion via principal graph components
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. ADAPTIVE INSTANCE ANALYSIS ====================
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    
+    # Compute robust statistics
+    p10, p25, p50, p75, p90 = np.percentile(distances, [10, 25, 50, 75, 90])
+    median_dist = p50
+    iqr_dist = p75 - p25
+    dist_range = p90 - p10
+    
+    # Adaptive scaling factors
+    scale_factor = max(median_dist, 1e-10)
+    complexity_factor = min(1.0, max(0.1, iqr_dist / (scale_factor + 1e-10)))
+    size_factor = min(1.0, np.log10(max(n, 3)) / 2.5)
+    
+    # ==================== 2. OPTIMIZED KERNEL EMBEDDING ====================
+    def compute_optimized_kernel() -> np.ndarray:
+        """Kernel similarity with bandwidth optimization"""
+        # Multiple bandwidth candidates based on distance statistics
+        bandwidth_candidates = [
+            median_dist * 0.5,
+            p25 * 0.8,
+            np.mean([p25, p50]) * 1.2,
+            np.sqrt(p10 * p90)
+        ]
+        
+        # Compute kernel matrices for each bandwidth
+        kernel_matrices = []
+        for bw in bandwidth_candidates:
+            if bw > 1e-10:
+                kernel = np.exp(-distance_matrix**2 / (2 * bw**2))
+                np.fill_diagonal(kernel, 0)
+                kernel_matrices.append(kernel)
+        
+        if not kernel_matrices:
+            return np.zeros_like(distance_matrix)
+        
+        # Select best kernel using spectral gap criterion
+        best_kernel = None
+        best_score = -np.inf
+        
+        for kernel in kernel_matrices:
+            # Compute spectral properties
+            eigvals = np.linalg.eigvalsh(kernel)
+            eigvals = eigvals[eigvals > 1e-10]
+            if len(eigvals) >= 2:
+                # Score based on spectral gap and decay rate
+                eigvals_sorted = np.sort(eigvals)[::-1]
+                spectral_gap = eigvals_sorted[0] / (eigvals_sorted[1] + 1e-10)
+                decay_ratio = eigvals_sorted[1] / (eigvals_sorted[-1] + 1e-10)
+                score = np.log(spectral_gap) - 0.1 * decay_ratio
+                
+                if score > best_score:
+                    best_score = score
+                    best_kernel = kernel
+        
+        if best_kernel is None:
+            best_kernel = kernel_matrices[0]
+        
+        # Compute embedding dimension adaptively
+        eigvals = np.linalg.eigvalsh(best_kernel)
+        eigvals = eigvals[eigvals > 1e-10]
+        effective_dim = min(len(eigvals), max(2, int(np.sqrt(n))))
+        
+        if effective_dim >= 2:
+            # Spectral embedding
+            _, eigvecs = np.linalg.eigh(best_kernel)
+            embedding = eigvecs[:, -effective_dim:]
+            
+            # Compute embedding-based similarity
+            embedding_dist = squareform(pdist(embedding, 'euclidean'))
+            embedding_sim = np.exp(-embedding_dist / (np.median(embedding_dist) + 1e-10))
+            np.fill_diagonal(embedding_sim, 0)
+            
+            # Normalize kernel
+            row_sums = best_kernel.sum(axis=1, keepdims=True)
+            normalized_kernel = best_kernel / (row_sums + 1e-10)
+            
+            # Adaptive blending
+            blend_alpha = 0.2 + 0.6 * complexity_factor
+            kernel_sim = (1 - blend_alpha) * normalized_kernel + blend_alpha * embedding_sim
+        else:
+            kernel_sim = best_kernel / (best_kernel.sum(axis=1, keepdims=True) + 1e-10)
+        
+        return kernel_sim
+    
+    kernel_sim = compute_optimized_kernel()
+    
+    # ==================== 3. PENALIZED REGRET COMPUTATION ====================
+    def compute_penalized_regret() -> np.ndarray:
+        """Regret with penalized alternative paths"""
+        regret_scores = np.ones_like(distance_matrix)
+        
+        if n <= 2:
+            return regret_scores
+        
+        # Adaptive neighborhood size
+        base_neighbors = min(max(3, int(np.sqrt(n))), 10)
+        k_neighbors = min(int(base_neighbors * (1 + 0.5 * complexity_factor)), n - 1)
+        
+        # Precompute neighbors
+        neighbor_indices = []
+        neighbor_dists = []
+        
+        for i in range(n):
+            row_dists = distance_matrix[i].copy()
+            row_dists[i] = np.inf
+            
+            if n > k_neighbors:
+                partition_idx = np.argpartition(row_dists, k_neighbors)[:k_neighbors]
+                sorted_idx = partition_idx[np.argsort(row_dists[partition_idx])]
+                neighbor_indices.append(sorted_idx)
+                neighbor_dists.append(row_dists[sorted_idx])
+            else:
+                valid_mask = np.arange(n) != i
+                indices = np.where(valid_mask)[0]
+                neighbor_indices.append(indices)
+                neighbor_dists.append(row_dists[valid_mask])
+        
+        # Dynamic regret computation
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                best_alternative = np.inf
+                penalty_sum = 0
+                
+                # Consider k-nearest neighbors for alternative paths
+                for k in neighbor_indices[i]:
+                    if k == j:
+                        continue
+                    
+                    # Two-step alternative
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    
+                    # Penalize if alternative is significantly longer than direct
+                    penalty = 0
+                    if alt_cost > direct_cost * 1.5:
+                        penalty = np.tanh((alt_cost - direct_cost) / (direct_cost + 1e-10) - 0.5)
+                    
+                    weighted_alt = alt_cost * (1 + 0.3 * penalty)
+                    
+                    if weighted_alt < best_alternative:
+                        best_alternative = weighted_alt
+                
+                if best_alternative < np.inf:
+                    # Compute penalized regret
+                    regret = max(best_alternative - direct_cost, 1e-10)
+                    
+                    # Adaptive normalization
+                    local_scale = min(neighbor_dists[i][0] if len(neighbor_dists[i]) > 0 else p50, p75)
+                    norm_regret = regret / (local_scale + 1e-10)
+                    
+                    # Non-linear transformation with adaptive sensitivity
+                    sensitivity = 0.6 + 0.6 * complexity_factor
+                    regret_scores[i, j] = 1.0 / (1.0 + norm_regret * sensitivity)
+        
+        # Symmetrize using geometric mean
+        regret_scores = np.sqrt(regret_scores * regret_scores.T)
+        
+        return regret_scores
+    
+    regret_scores = compute_penalized_regret()
+    
+    # ==================== 4. HIERARCHICAL GRAPH FUSION ====================
+    def compute_hierarchical_scores() -> np.ndarray:
+        """Multi-level graph-based scoring"""
+        hierarchical_scores = np.ones_like(distance_matrix)
+        
+        # Level 1: MST-based connectivity
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_mask = (mst + mst.T) > 0
+        
+        # Compute MST edge importance
+        mst_scores = np.zeros_like(distance_matrix)
+        for i in range(n):
+            mst_neighbors = np.where(mst_mask[i])[0]
+            if len(mst_neighbors) > 0:
+                # Average distance to MST neighbors
+                avg_mst_dist = np.mean(distance_matrix[i, mst_neighbors])
+                for j in mst_neighbors:
+                    if i < j:
+                        importance = 1.0 / (1.0 + distance_matrix[i, j] / (avg_mst_dist + 1e-10))
+                        mst_scores[i, j] = mst_scores[j, i] = importance
+        
+        # Level 2: Graph partitioning
+        if n >= 8:
+            # Identify natural clusters via distance threshold
+            cluster_threshold = p50 * 1.5
+            
+            # Intra-cluster edges
+            intra_mask = distance_matrix <= cluster_threshold
+            np.fill_diagonal(intra_mask, False)
+            
+            # Boost intra-cluster edges moderately
+            intra_boost = 0.1 + 0.2 * (1 - complexity_factor)
+            hierarchical_scores[intra_mask] *= (1 + intra_boost)
+            
+            # Identify bridge edges between clusters
+            bridge_boost = 0.05 + 0.15 * complexity_factor
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if distance_matrix[i, j] > cluster_threshold:
+                        # Check if this connects different neighborhoods
+                        i_neighbors = np.where(intra_mask[i])[0]
+                        j_neighbors = np.where(intra_mask[j])[0]
+                        
+                        if len(i_neighbors) > 0 and len(j_neighbors) > 0:
+                            # Measure overlap between neighborhoods
+                            overlap = len(np.intersect1d(i_neighbors, j_neighbors))
+                            if overlap == 0:
+                                # This edge connects disjoint clusters
+                                hierarchical_scores[i, j] *= (1 + bridge_boost)
+                                hierarchical_scores[j, i] = hierarchical_scores[i, j]
+        
+        # Combine levels
+        level_weights = [0.4, 0.6]  # MST, hierarchy
+        if n < 10:
+            level_weights = [0.6, 0.4]
+        
+        hierarchical_scores = level_weights[0] * mst_scores + level_weights[1] * hierarchical_scores
+        
+        return hierarchical_scores
+    
+    hierarchical_scores = compute_hierarchical_scores()
+    
+    # ==================== 5. TEMPERATURE-SCALED FUSION ====================
+    def temperature_scaled_fusion() -> np.ndarray:
+        """Fuse components with adaptive temperature scaling"""
+        # Base distance transformation
+        with np.errstate(divide='ignore', invalid='ignore'):
+            base_scores = np.exp(-distance_matrix / (scale_factor * (0.8 + 0.2 * complexity_factor)))
+        np.fill_diagonal(base_scores, 0)
+        
+        if np.max(base_scores) > 0:
+            base_scores = base_scores / np.max(base_scores)
+        
+        # Adaptive weights based on instance characteristics
+        w_kernel = 0.25 + 0.25 * complexity_factor
+        w_regret = 0.30 + 0.20 * (1 - complexity_factor)
+        w_base = 0.20 + 0.10 * size_factor
+        w_hier = 0.25 + 0.15 * size_factor
+        
+        # Normalize weights
+        total = w_kernel + w_regret + w_base + w_hier
+        w_kernel /= total
+        w_regret /= total
+        w_base /= total
+        w_hier /= total
+        
+        # Weighted product fusion
+        epsilon = 1e-10
+        fused = (
+            (kernel_sim + epsilon) ** w_kernel *
+            (regret_scores + epsilon) ** w_regret *
+            (base_scores + epsilon) ** w_base *
+            (hierarchical_scores + epsilon) ** w_hier
+        )
+        
+        # Adaptive temperature for softmax
+        temperature = 0.05 + 0.25 * (1 - complexity_factor)
+        prob_matrix = np.zeros_like(fused)
+        
+        for i in range(n):
+            row = fused[i].copy()
+            row[i] = -np.inf
+            
+            # Temperature-scaled softmax
+            exp_row = np.exp((row - np.max(row)) / temperature)
+            row_sum = np.sum(exp_row)
+            
+            if row_sum > 0:
+                prob_matrix[i] = exp_row / row_sum
+            prob_matrix[i, i] = 0
+        
+        return prob_matrix
+    
+    fused_scores = temperature_scaled_fusion()
+    
+    # ==================== 6. ADAPTIVE POST-PROCESSING ====================
+    # Symmetrize using geometric mean
+    final_scores = np.sqrt(fused_scores * fused_scores.T)
+    
+    # Ensure MST edges have minimum presence
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    min_mst_score = 0.08 * (1 + size_factor)
+    final_scores[mst_mask] = np.maximum(final_scores[mst_mask], min_mst_score)
+    
+    # Apply sigmoidal compression for better discrimination
+    compression = 2.5 + 1.5 * complexity_factor
+    final_scores = np.tanh(final_scores * compression)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    # Zero diagonal
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

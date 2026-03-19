@@ -1,0 +1,375 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Sampling", "Graph Structure Boosting", "Solution Diversity Injection", "Sparsification with Connectivity Guarantee"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List
+import itertools
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with adaptive regret sampling, efficient graph features,
+    diverse solution injection, and refined sparsification.
+    
+    Core Improvements:
+    1. Adaptive Regret Sampling: Multi-resolution regret with dynamic neighborhood
+    2. Graph Structure Boosting: Fast graph features without expensive embeddings
+    3. Solution Diversity Injection: Multiple constructive heuristics with perturbations
+    4. Sparsification with Connectivity: Guaranteed connectivity with adaptive degree limits
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. CORE COMPONENTS ====================
+    # Base inverse distance (power law adjusted)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix ** 1.2)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Minimum spanning tree (always include)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. ADAPTIVE REGRET SAMPLING ====================
+    def compute_adaptive_regret() -> np.ndarray:
+        """Multi-resolution regret with dynamic neighborhood sizing"""
+        regret_matrix = np.zeros((n, n))
+        
+        if n <= 3:
+            return regret_matrix
+        
+        # Determine optimal neighborhood sizes
+        base_k = min(5, max(2, int(np.log2(n))))
+        k_small = max(2, base_k - 1)
+        k_large = min(n - 1, base_k + 2)
+        
+        for i in range(n):
+            # Sort distances for this node
+            sorted_indices = np.argsort(distance_matrix[i])
+            sorted_indices = sorted_indices[sorted_indices != i]  # Remove self
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct = distance_matrix[i, j]
+                best_alt = np.inf
+                
+                # Small neighborhood (local alternatives)
+                small_neighbors = sorted_indices[:k_small]
+                small_neighbors = small_neighbors[small_neighbors != j]
+                if len(small_neighbors) > 0:
+                    small_alts = distance_matrix[i, small_neighbors] + distance_matrix[small_neighbors, j]
+                    best_alt = min(best_alt, np.min(small_alts))
+                
+                # Large neighborhood (regional alternatives)
+                if n > 10:
+                    large_neighbors = sorted_indices[:k_large]
+                    large_neighbors = large_neighbors[large_neighbors != j]
+                    if len(large_neighbors) > k_small:  # Only if different from small
+                        large_alts = distance_matrix[i, large_neighbors] + distance_matrix[large_neighbors, j]
+                        best_alt = min(best_alt, np.min(large_alts))
+                
+                # Global alternative (random sampling for large n)
+                if n > 20 and best_alt == np.inf:
+                    n_samples = min(10, n - 2)
+                    random_nodes = np.random.choice([x for x in range(n) if x not in [i, j]], 
+                                                   size=n_samples, replace=False)
+                    random_alts = distance_matrix[i, random_nodes] + distance_matrix[random_nodes, j]
+                    best_alt = min(best_alt, np.min(random_alts))
+                
+                # Compute regret
+                if best_alt < np.inf:
+                    regret = max(best_alt - direct, 0)
+                    # Normalize by local scale
+                    local_scale = np.percentile(distance_matrix[i], 25)
+                    if local_scale > 0:
+                        norm_regret = regret / local_scale
+                        regret_matrix[i, j] = 1.0 / (1.0 + norm_regret)
+        
+        # Symmetrize
+        regret_matrix = np.maximum(regret_matrix, regret_matrix.T)
+        return regret_matrix
+    
+    regret_scores = compute_adaptive_regret()
+    
+    # ==================== 3. GRAPH STRUCTURE BOOSTING ====================
+    def compute_graph_features() -> np.ndarray:
+        """Fast graph-theoretic features without neural overhead"""
+        feature_scores = np.ones((n, n))
+        
+        # Edge centrality approximation via triangle counting
+        if n >= 4:
+            # Fast triangle counting for edges
+            for i in range(n):
+                # Get neighbors within median distance
+                median_dist = np.median(distance_matrix[i, distance_matrix[i] > 0])
+                close_neighbors = np.where(distance_matrix[i] <= median_dist)[0]
+                close_neighbors = close_neighbors[close_neighbors != i]
+                
+                for j in range(i + 1, n):
+                    # Check if there are common neighbors
+                    common = np.intersect1d(close_neighbors, 
+                                          np.where(distance_matrix[j] <= median_dist)[0])
+                    common = common[common != j]
+                    
+                    triangle_count = len(common)
+                    # Boost edges that complete many triangles
+                    feature_scores[i, j] += 0.3 * min(triangle_count / 3, 1.0)
+                    feature_scores[j, i] = feature_scores[i, j]
+        
+        # Degree-based boosting
+        degrees = np.sum(distance_matrix < np.percentile(distance_matrix[np.triu_indices(n, 1)], 33), axis=1)
+        norm_degrees = degrees / np.max(degrees) if np.max(degrees) > 0 else np.ones(n)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Boost edges connecting high-degree nodes
+                degree_boost = 0.2 * (norm_degrees[i] + norm_degrees[j]) / 2
+                feature_scores[i, j] += degree_boost
+                feature_scores[j, i] = feature_scores[i, j]
+        
+        return feature_scores
+    
+    graph_scores = compute_graph_features()
+    
+    # ==================== 4. SOLUTION DIVERSITY INJECTION ====================
+    def generate_diverse_solutions() -> List[List[int]]:
+        """Generate diverse initial solutions using multiple heuristics"""
+        solutions = []
+        
+        # Heuristic 1: Nearest neighbor from multiple starts
+        n_starts = min(5, n)
+        starts = np.random.choice(n, size=n_starts, replace=False)
+        
+        for start in starts:
+            tour = [start]
+            current = start
+            
+            while len(tour) < n:
+                remaining = [node for node in range(n) if node not in tour]
+                # Choose next node: 70% nearest, 30% random promising
+                if np.random.random() < 0.7 or len(remaining) == 1:
+                    next_node = min(remaining, key=lambda x: distance_matrix[current, x])
+                else:
+                    # Random among top 3 closest
+                    distances = [distance_matrix[current, node] for node in remaining]
+                    top_k = min(3, len(remaining))
+                    top_indices = np.argsort(distances)[:top_k]
+                    next_node = remaining[np.random.choice(top_indices)]
+                
+                tour.append(next_node)
+                current = next_node
+            
+            tour.append(start)
+            solutions.append(tour)
+        
+        # Heuristic 2: Farthest insertion
+        if n >= 4:
+            start = np.random.randint(0, n)
+            tour = [start]
+            remaining = list(set(range(n)) - {start})
+            
+            while remaining:
+                # Find farthest node from current tour
+                max_dist = -1
+                farthest_node = -1
+                insert_pos = -1
+                
+                for node in remaining:
+                    for pos in range(len(tour)):
+                        i, j = tour[pos], tour[(pos + 1) % len(tour)]
+                        gain = distance_matrix[i, node] + distance_matrix[node, j] - distance_matrix[i, j]
+                        if gain > max_dist:
+                            max_dist = gain
+                            farthest_node = node
+                            insert_pos = pos + 1
+                
+                if farthest_node != -1:
+                    tour.insert(insert_pos, farthest_node)
+                    remaining.remove(farthest_node)
+            
+            tour.append(tour[0])
+            solutions.append(tour)
+        
+        # Heuristic 3: Random with 2-opt improvement
+        if n >= 6:
+            tour = list(range(n))
+            np.random.shuffle(tour)
+            
+            # Fast 2-opt (limited iterations)
+            max_iters = min(100, n * 5)
+            improved = True
+            iters = 0
+            
+            while improved and iters < max_iters:
+                improved = False
+                iters += 1
+                
+                for i in range(n - 1):
+                    for j in range(i + 2, min(i + 6, n)):
+                        a, b, c, d = tour[i], tour[(i + 1) % n], tour[j % n], tour[(j + 1) % n]
+                        current = distance_matrix[a, b] + distance_matrix[c, d]
+                        new = distance_matrix[a, c] + distance_matrix[b, d]
+                        
+                        if new < current:
+                            # Reverse segment
+                            if i < j:
+                                tour[i + 1:j + 1] = reversed(tour[i + 1:j + 1])
+                            else:
+                                segment = tour[i + 1:] + tour[:j + 1]
+                                segment.reverse()
+                                tour[i + 1:] = segment[:n - i - 1]
+                                tour[:j + 1] = segment[n - i - 1:]
+                            improved = True
+            
+            tour.append(tour[0])
+            solutions.append(tour)
+        
+        return solutions
+    
+    # ==================== 5. DYNAMIC EDGE REINFORCEMENT ====================
+    def reinforce_edges(base_scores: np.ndarray) -> np.ndarray:
+        """Boost edges from diverse high-quality solutions"""
+        reinforced = base_scores.copy()
+        
+        # Generate diverse solutions
+        solutions = generate_diverse_solutions()
+        
+        # Count edge appearances
+        edge_counts = np.zeros_like(reinforced)
+        for tour in solutions:
+            for idx in range(len(tour) - 1):
+                i, j = tour[idx], tour[idx + 1]
+                edge_counts[i, j] += 1
+                edge_counts[j, i] += 1
+        
+        # Apply reinforcement if we have multiple solutions
+        if len(solutions) > 1:
+            max_count = np.max(edge_counts)
+            if max_count > 0:
+                # Non-linear reinforcement: stronger for edges appearing in multiple solutions
+                reinforcement = 1.0 + 0.5 * np.sqrt(edge_counts / max_count)
+                reinforced *= reinforcement
+        
+        return reinforced
+    
+    # ==================== 6. WEIGHTED COMBINATION ====================
+    # Simple adaptive weights (could be optimized, but kept efficient)
+    if n <= 10:
+        weights = [0.4, 0.3, 0.3]  # regret, inv_dist, graph
+    elif n <= 50:
+        weights = [0.35, 0.3, 0.35]
+    else:
+        weights = [0.3, 0.25, 0.45]  # More weight to graph features for large instances
+    
+    # Normalize components
+    if np.max(regret_scores) > 0:
+        regret_norm = regret_scores / np.max(regret_scores)
+    else:
+        regret_norm = regret_scores
+    
+    if np.max(inv_dist) > 0:
+        inv_norm = inv_dist / np.max(inv_dist)
+    else:
+        inv_norm = inv_dist
+    
+    if np.max(graph_scores) > 0:
+        graph_norm = graph_scores / np.max(graph_scores)
+    else:
+        graph_norm = graph_scores
+    
+    # Combine
+    combined = (weights[0] * regret_norm + 
+                weights[1] * inv_norm + 
+                weights[2] * graph_norm)
+    
+    # Apply reinforcement from solution sampling
+    reinforced = reinforce_edges(combined)
+    
+    # ==================== 7. REFINED SPARSIFICATION ====================
+    def sparsify_with_connectivity(scores: np.ndarray) -> np.ndarray:
+        """Keep graph connected while focusing on promising edges"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Adaptive degree limit
+        if n <= 10:
+            max_degree = 4
+        elif n <= 30:
+            max_degree = min(5, n // 3)
+        else:
+            max_degree = min(6, n // 4)
+        
+        # Sort candidate edges by score
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j]:
+                    # Adjust score by local connectivity
+                    local_boost = 1.0
+                    # Boost edges that connect to high-degree nodes in current sparsified graph
+                    current_deg_i = np.sum(sparsified[i] > 0)
+                    current_deg_j = np.sum(sparsified[j] > 0)
+                    if current_deg_i < 2 or current_deg_j < 2:
+                        local_boost = 1.2  # Boost for nodes with low current degree
+                    
+                    adjusted_score = scores[i, j] * local_boost
+                    candidates.append((adjusted_score, i, j))
+        
+        # Sort by adjusted score
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Current degrees in sparsified graph
+        current_degrees = np.sum(sparsified > 0, axis=1)
+        
+        # Add edges while respecting degree limits
+        for score, i, j in candidates:
+            if current_degrees[i] < max_degree and current_degrees[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[i, j]
+                current_degrees[i] += 1
+                current_degrees[j] += 1
+        
+        return sparsified
+    
+    sparsified = sparsify_with_connectivity(reinforced)
+    
+    # ==================== 8. FINAL ENHANCEMENT ====================
+    # Ensure symmetry
+    final = (sparsified + sparsified.T) / 2
+    
+    # Apply soft thresholding to emphasize strong edges
+    median_val = np.median(final[final > 0]) if np.any(final > 0) else 0
+    if median_val > 0:
+        # Boost values above median
+        above_median = final > median_val
+        final[above_median] = final[above_median] ** 0.8  # Make high values more prominent
+    
+    # Normalize to [0, 1]
+    max_val = np.max(final)
+    if max_val > 0:
+        final = final / max_val
+    
+    np.fill_diagonal(final, 0)
+    
+    return final
+```

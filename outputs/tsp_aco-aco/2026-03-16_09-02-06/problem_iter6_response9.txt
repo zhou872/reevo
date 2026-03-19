@@ -1,0 +1,259 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Thresholding", "Simulated 2-opt Local Search", "Graph Sparsity-Aware Weighting", "Clustering Density Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges with adaptive regret thresholds,
+    simulated local search lookahead, and machine-learning inspired dynamic weighting.
+    
+    Key Innovations:
+    1. Adaptive Regret Thresholding: Adjusts regret penalty based on graph sparsity
+       and node connectivity patterns
+    2. Simulated 2-opt Local Search: Performs lightweight 2-opt simulations to
+       evaluate edge quality in context of potential tours
+    3. Graph Sparsity-Aware Component Weighting: Dynamically adjusts heuristic
+       component weights based on graph density and structure
+    4. Hierarchical Clustering Density Bonus: Rewards edges that connect
+       well-separated clusters while penalizing intra-cluster edges that are
+       not clearly optimal
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Create working distance matrix with infinity diagonal
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Compute graph sparsity characteristics for adaptive adjustments
+    # Sparsity measure: ratio of average nearest neighbor distance to overall average distance
+    sorted_dists = np.sort(dist, axis=1)
+    avg_nearest = np.mean(sorted_dists[:, 1])  # Skip diagonal (inf)
+    avg_overall = np.mean(dist[dist < np.inf])
+    sparsity = min(1.0, max(0.1, avg_nearest / (avg_overall + 1e-12)))
+    
+    # 2. Hierarchical clustering for cluster-aware scoring
+    cluster_labels = None
+    if n >= 4:
+        # Convert to condensed distance matrix for clustering
+        condensed_dist = squareform(dist, checks=False)
+        Z = linkage(condensed_dist, method='average')
+        # Adaptive clustering threshold based on sparsity
+        cluster_threshold = avg_overall * (0.5 + 0.5 * sparsity)
+        cluster_labels = fcluster(Z, cluster_threshold, criterion='distance')
+    
+    # 3. Base inverse distance scoring with sparsity adjustment
+    # In sparse graphs, give more weight to very short edges
+    inv_power = 1.5 - 0.5 * sparsity  # 1.0 for dense, 1.5 for sparse
+    inv_dist = 1 / (dist + 1e-12) ** inv_power
+    
+    # 4. Adaptive Regret-Based Penalization
+    # For each node, compute regret threshold based on local connectivity
+    regret_penalty = np.ones_like(dist)
+    
+    # Compute alternative cost thresholds per node
+    sorted_dists = np.sort(dist, axis=1)
+    second_best_dists = sorted_dists[:, 1]  # Second smallest distance for each node
+    
+    # Adaptive regret sensitivity based on sparsity
+    # In sparse graphs, regret matters more (steeper penalty)
+    regret_sensitivity = 2.0 - sparsity  # 1.0 for dense, 2.0 for sparse
+    
+    # Compute average distances for normalization
+    row_avgs = np.array([np.mean(row[row < np.inf]) for row in dist])
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Compute regret for both endpoints
+            regret_i = max(0, dist[i, j] - second_best_dists[i])
+            regret_j = max(0, dist[i, j] - second_best_dists[j])
+            
+            # Normalize by local average distances
+            norm_regret_i = regret_i / (row_avgs[i] + 1e-12)
+            norm_regret_j = regret_j / (row_avgs[j] + 1e-12)
+            
+            # Weighted average regret with adaptive sensitivity
+            avg_norm_regret = (norm_regret_i + norm_regret_j) / 2
+            penalty = np.exp(-regret_sensitivity * avg_norm_regret)
+            
+            # Additional cluster-based adjustment
+            if cluster_labels is not None and cluster_labels[i] != cluster_labels[j]:
+                # Edges between clusters: reduce regret penalty
+                penalty = min(1.0, penalty * 1.3)
+            
+            regret_penalty[i, j] = penalty
+            regret_penalty[j, i] = penalty
+    
+    # 5. Simulated 2-opt Local Search Lookahead
+    # Perform lightweight 2-opt simulations for each edge
+    lookahead_scores = np.ones_like(dist)
+    
+    if n >= 4:
+        # Pre-compute nearest neighbors for efficiency
+        k_neighbors = min(5, n - 1)
+        nearest_indices = np.argsort(dist, axis=1)[:, 1:k_neighbors+1]
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Find candidate edges to swap in a 2-opt move
+                best_improvement = 0
+                
+                # Consider k nearest neighbors of i and j as potential swap partners
+                for k in nearest_indices[i]:
+                    if k == j or k == i:
+                        continue
+                    for l in nearest_indices[j]:
+                        if l == i or l == j or l == k:
+                            continue
+                        
+                        # Current edges: (i,j) and (k,l)
+                        # Proposed edges: (i,k) and (j,l)
+                        current_length = dist[i, j] + dist[k, l]
+                        proposed_length = dist[i, k] + dist[j, l]
+                        
+                        improvement = current_length - proposed_length
+                        if improvement > best_improvement:
+                            best_improvement = improvement
+                
+                # Convert improvement to score (normalize by average distance)
+                if best_improvement > 0:
+                    norm_improvement = best_improvement / avg_overall
+                    lookahead_scores[i, j] = 1.0 + min(0.5, norm_improvement)
+                else:
+                    # Small penalty for edges with no local improvement potential
+                    lookahead_scores[i, j] = 0.9
+                
+                lookahead_scores[j, i] = lookahead_scores[i, j]
+    
+    # 6. MST Connectivity Bonus with cluster awareness
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    
+    mst_bonus = np.ones_like(dist)
+    mst_bonus[mst_mask] = 1.5  # Base bonus for MST edges
+    
+    # Additional bonus for MST edges that connect different clusters
+    if cluster_labels is not None:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if mst_mask[i, j] and cluster_labels[i] != cluster_labels[j]:
+                    mst_bonus[i, j] = 2.0
+                    mst_bonus[j, i] = 2.0
+    
+    # 7. Mutual Top-K Prioritization with adaptive K
+    # Adjust K based on graph size and sparsity
+    base_k = int(np.sqrt(n))
+    adaptive_k = max(2, int(base_k * (1.0 + 0.5 * sparsity)))  # Larger K for sparser graphs
+    
+    mutual_priority = np.zeros_like(dist)
+    
+    # Compute mutual priority using inverse distances (higher is better)
+    for i in range(n):
+        row_scores = inv_dist[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Get top-K edges for node i
+        top_k_indices = np.argsort(row_scores)[-adaptive_k:]
+        
+        for j in top_k_indices:
+            # Check if edge is in top-K for j as well
+            col_scores = inv_dist[j].copy()
+            col_scores[j] = -np.inf
+            j_top_k = np.argsort(col_scores)[-adaptive_k:]
+            
+            if i in j_top_k:
+                mutual_priority[i, j] = 1.0
+                mutual_priority[j, i] = 1.0
+    
+    # 8. Dynamic Component Weighting Based on Graph Characteristics
+    # Weights adjust based on graph size and sparsity
+    if n < 20:
+        # Small graphs: emphasize lookahead and MST
+        weights = {
+            'base': 0.3,
+            'regret': 0.8,
+            'lookahead': 1.2,
+            'mst': 1.5,
+            'mutual': 0.4
+        }
+    elif sparsity < 0.3:  # Dense graphs
+        weights = {
+            'base': 0.5,
+            'regret': 1.0,
+            'lookahead': 0.7,
+            'mst': 1.2,
+            'mutual': 0.6
+        }
+    else:  # Sparse graphs
+        weights = {
+            'base': 0.7,
+            'regret': 1.2,
+            'lookahead': 0.9,
+            'mst': 1.0,
+            'mutual': 0.8
+        }
+    
+    # 9. Combine all factors with dynamic weights
+    scores = (
+        inv_dist ** weights['base'] *
+        regret_penalty ** weights['regret'] *
+        lookahead_scores ** weights['lookahead'] *
+        mst_bonus ** weights['mst'] *
+        (1.0 + 0.3 * mutual_priority) ** weights['mutual']
+    )
+    
+    # 10. Adaptive Sparsification with cluster awareness
+    # Determine number of edges to keep per node
+    edges_per_node = max(2, int(np.sqrt(n) * (1.0 + 0.3 * sparsity)))
+    final_mask = np.zeros_like(scores, dtype=bool)
+    
+    # Keep top edges per node
+    for i in range(n):
+        row = scores[i].copy()
+        row[i] = -np.inf
+        top_indices = np.argsort(row)[-edges_per_node:]
+        final_mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    final_mask = final_mask | final_mask.T
+    
+    # Always keep MST edges
+    final_mask = final_mask | mst_mask
+    
+    # Additional rule: keep at least one edge between different clusters
+    if cluster_labels is not None:
+        for cluster_id in np.unique(cluster_labels):
+            cluster_nodes = np.where(cluster_labels == cluster_id)[0]
+            other_clusters = np.where(cluster_labels != cluster_id)[0]
+            
+            if len(cluster_nodes) > 0 and len(other_clusters) > 0:
+                # For each cluster node, keep its best connection to other clusters
+                for node in cluster_nodes:
+                    mask = cluster_labels != cluster_id
+                    available = scores[node] * mask
+                    if np.any(available > 0):
+                        best_other = np.argmax(available)
+                        final_mask[node, best_other] = True
+                        final_mask[best_other, node] = True
+    
+    # Apply final mask
+    scores = scores * final_mask
+    
+    # 11. Normalize scores to [0, 1] range
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

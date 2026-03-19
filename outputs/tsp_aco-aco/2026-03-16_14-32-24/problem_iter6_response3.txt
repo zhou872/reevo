@@ -1,0 +1,283 @@
+```json
+{
+    "algorithm_features": ["Adaptive Parameter Learning", "Clustering-based Density Estimation", "Dynamic Regret Context", "Contextual Rank Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge evaluation with learned parameter adaptation,
+    clustering-based density modeling, and dynamic context awareness.
+    
+    Features:
+    1. Adaptive Parameter Learning: Instance-size and distribution-aware tuning
+    2. Clustering-based Density: Hierarchical clustering for regional identification
+    3. Dynamic Regret Context: Multi-level alternative comparison
+    4. Contextual Rank Weighting: Distribution-adaptive exponential decay
+    
+    Returns: Heuristic matrix of same shape as input, with values in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. INSTANCE CHARACTERIZATION FOR ADAPTIVE PARAMETERS
+    # Compute global statistics for parameter learning
+    flat_dists = safe_dist[safe_dist < np.inf]
+    if len(flat_dists) == 0:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    global_median = np.median(flat_dists)
+    global_std = np.std(flat_dists)
+    density_est = n / (global_median * global_std + eps)  # Rough density estimate
+    
+    # Learned parameters based on instance characteristics
+    candidate_factor = 1.0 + 0.5 * np.tanh(np.log10(n) - 2)  # [1.0, 1.5] range
+    k_candidate = max(4, int(np.log2(n) * 2.0 * candidate_factor))
+    k_candidate = min(k_candidate, n // 3)
+    
+    regret_transition = 0.6 + 0.2 * np.tanh((global_std / (global_median + eps)) - 1.0)
+    
+    # 2. CLUSTERING-BASED DENSITY ESTIMATION
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    if n >= 10:
+        # Hierarchical clustering with adaptive threshold
+        # Use simplified single-linkage clustering on distance matrix
+        cluster_labels = _adaptive_clustering(distance_matrix, global_median)
+        
+        # Compute cluster statistics
+        unique_clusters, cluster_counts = np.unique(cluster_labels, return_counts=True)
+        cluster_density = np.zeros(n)
+        
+        for i in range(n):
+            cluster_idx = cluster_labels[i]
+            same_cluster = cluster_labels == cluster_idx
+            
+            # Local density within cluster
+            if np.sum(same_cluster) > 1:
+                cluster_dists = safe_dist[i, same_cluster]
+                cluster_dists = cluster_dists[cluster_dists < np.inf]
+                if len(cluster_dists) > 0:
+                    # Inverse of average distance within cluster
+                    cluster_density[i] = 1.0 / (np.mean(cluster_dists) + eps)
+        
+        # Normalize cluster densities
+        if np.max(cluster_density) > 0:
+            cluster_density = cluster_density / np.max(cluster_density)
+        
+        # Assign density bonus based on cluster membership and local density
+        for i in range(n):
+            for j in range(i+1, n):
+                if cluster_labels[i] == cluster_labels[j]:
+                    # Same cluster: bonus proportional to geometric mean of densities
+                    geo_density = np.sqrt(cluster_density[i] * cluster_density[j] + eps)
+                    # Scale by cluster size (larger clusters get smaller per-edge bonus)
+                    cluster_size = cluster_counts[cluster_labels[i]]
+                    size_factor = 1.0 / (1.0 + np.log1p(cluster_size))
+                    density_bonus[i, j] = 0.25 * geo_density * size_factor
+                    density_bonus[j, i] = density_bonus[i, j]
+    
+    # 3. DYNAMIC CANDIDATE SELECTION WITH CONNECTIVITY AWARENESS
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    candidate_scores = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Sort distances for this node
+        sorted_indices = np.argsort(safe_dist[i])
+        valid_indices = sorted_indices[sorted_indices != i]
+        
+        if len(valid_indices) == 0:
+            continue
+        
+        distances = safe_dist[i, valid_indices]
+        
+        # 4. DYNAMIC REGRET CONTEXT WITH MULTI-LEVEL ALTERNATIVES
+        regret_levels = []
+        
+        # Level 1: Immediate alternatives (25th percentile)
+        idx_25 = max(1, int(len(distances) * 0.25))
+        regret_levels.append(distances[idx_25])
+        
+        # Level 2: Good alternatives (50th percentile)
+        idx_50 = max(1, int(len(distances) * 0.5))
+        regret_levels.append(distances[idx_50])
+        
+        # Level 3: Acceptable alternatives (75th percentile)
+        idx_75 = max(1, int(len(distances) * 0.75))
+        regret_levels.append(distances[idx_75])
+        
+        best_dist = distances[0]
+        worst_dist = distances[-1]
+        
+        # Calculate regret for each candidate
+        for rank, j in enumerate(valid_indices):
+            edge_dist = safe_dist[i, j]
+            
+            # Determine which regret level applies
+            if edge_dist <= regret_levels[0]:
+                # Near-best edge
+                rel_pos = (edge_dist - best_dist) / (regret_levels[0] - best_dist + eps)
+                regret = 0.05 * (rel_pos ** 1.5)
+            elif edge_dist <= regret_levels[1]:
+                # Good edge
+                rel_pos = (edge_dist - regret_levels[0]) / (regret_levels[1] - regret_levels[0] + eps)
+                regret = 0.1 + 0.1 * rel_pos
+            elif edge_dist <= regret_levels[2]:
+                # Acceptable edge
+                rel_pos = (edge_dist - regret_levels[1]) / (regret_levels[2] - regret_levels[1] + eps)
+                regret = 0.2 + 0.2 * rel_pos
+            else:
+                # Poor edge
+                rel_pos = (edge_dist - regret_levels[2]) / (worst_dist - regret_levels[2] + eps)
+                regret = 0.4 + 0.6 * rel_pos
+            
+            # Apply regret penalty
+            regret_penalty = np.exp(-1.2 * regret)
+            
+            # 5. CONTEXTUAL RANK WEIGHTING
+            # Adaptive decay based on local distance distribution
+            if len(distances) >= 5:
+                local_cv = np.std(distances[:5]) / (np.mean(distances[:5]) + eps)
+                # Decay rate adapts to local variability
+                decay_base = 0.5 + 0.3 * np.tanh(1.0 - local_cv)
+                decay_rate = min(0.85, max(0.3, decay_base))
+            else:
+                decay_rate = 0.6
+            
+            rank_weight = decay_rate ** rank
+            
+            # Base inverse distance with local scaling
+            local_scale = np.median(distances[:min(10, len(distances))])
+            inv_dist = local_scale / (edge_dist + eps)
+            
+            # Combined score for candidate selection
+            candidate_scores[i, j] = inv_dist * rank_weight * regret_penalty
+    
+    # Select top-k candidates per node based on scores
+    for i in range(n):
+        if np.any(candidate_scores[i] > 0):
+            top_k = min(k_candidate, np.sum(candidate_scores[i] > 0))
+            if top_k > 0:
+                top_indices = np.argsort(candidate_scores[i])[-top_k:]
+                candidate_mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 6. COMBINE FACTORS WITH ADAPTIVE WEIGHTS
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Start with candidate scores
+    heuristics_matrix = candidate_scores.copy()
+    
+    # Apply density bonus multiplicatively
+    heuristics_matrix *= (1.0 + density_bonus)
+    
+    # 7. MINIMUM SPANNING TREE REINFORCEMENT
+    if n <= 1000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            # Boost MST edges
+            heuristics_matrix[mst_mask] *= 1.25
+        except:
+            pass
+    
+    # 8. SPARSIFICATION AND CONNECTIVITY PRESERVATION
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure minimum connectivity
+    min_connections = min(3, n-1)
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_indices = np.where(row > 0)[0]
+        
+        if len(nonzero_indices) < min_connections:
+            # Find promising additional connections
+            potential = np.argsort(candidate_scores[i])[::-1]
+            added = 0
+            
+            for idx in potential:
+                if idx == i or idx in nonzero_indices:
+                    continue
+                
+                # Set to average of existing non-zero values
+                if len(nonzero_indices) > 0:
+                    target_val = np.mean(row[nonzero_indices])
+                else:
+                    target_val = np.max(candidate_scores[i]) * 0.2
+                
+                heuristics_matrix[i, idx] = max(heuristics_matrix[i, idx], target_val)
+                heuristics_matrix[idx, i] = max(heuristics_matrix[idx, i], target_val)
+                
+                added += 1
+                if added >= min_connections - len(nonzero_indices):
+                    break
+    
+    # 9. FINAL PROCESSING
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Adaptive normalization
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        # Use percentile-based normalization for robustness
+        non_zero = heuristics_matrix[heuristics_matrix > 0]
+        if len(non_zero) > 10:
+            p95 = np.percentile(non_zero, 95)
+            scale = min(max_val, p95 * 1.2)
+        else:
+            scale = max_val
+        
+        heuristics_matrix = heuristics_matrix / scale
+    
+    heuristics_matrix = np.clip(heuristics_matrix, 0.0, 1.0)
+    
+    return heuristics_matrix
+
+
+def _adaptive_clustering(distance_matrix: np.ndarray, global_median: float) -> np.ndarray:
+    """
+    Perform adaptive hierarchical clustering based on distance matrix.
+    
+    Returns cluster labels for each node.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Simple single-linkage clustering with adaptive threshold
+    # For efficiency, we use a simplified approach
+    threshold = global_median * (0.7 + 0.3 * np.tanh(np.log10(n) - 2))
+    
+    # Initialize each node as its own cluster
+    labels = np.arange(n)
+    
+    # Simplified agglomerative clustering
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] <= threshold:
+                # Merge clusters
+                if labels[i] != labels[j]:
+                    target_label = min(labels[i], labels[j])
+                    source_label = max(labels[i], labels[j])
+                    labels[labels == source_label] = target_label
+    
+    # Renumber clusters consecutively
+    unique_labels = np.unique(labels)
+    label_map = {old: new for new, old in enumerate(unique_labels)}
+    labels = np.array([label_map[l] for l in labels])
+    
+    return labels
+```

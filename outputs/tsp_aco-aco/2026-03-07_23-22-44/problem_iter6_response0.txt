@@ -1,0 +1,234 @@
+```json
+{
+    "algorithm_features": ["Dynamic Regret Thresholding", "Spectral Embedding Global Awareness", "Adaptive Meta-Parameter Tuning", "Geometric Mean Symmetric Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with dynamic regret thresholds, spectral embedding
+    for global topology awareness, and adaptive meta-parameter tuning.
+    
+    Key improvements over v1:
+    1. Dynamic regret thresholds based on distance percentiles
+    2. Spectral embedding for global structure awareness
+    3. Lightweight meta-parameter adaptation
+    4. Geometric mean fusion for symmetric scoring
+    
+    Returns heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ================ 1. Adaptive Meta-Parameter Tuning ================
+    # Analyze distance distribution to set adaptive parameters
+    if n > 2:
+        # Extract upper triangle distances
+        triu_indices = np.triu_indices(n, k=1)
+        distances = distance_matrix[triu_indices]
+        
+        # Compute percentiles for adaptive scaling
+        p10, p50, p90 = np.percentile(distances, [10, 50, 90])
+        dist_range = p90 - p10
+        median_dist = p50
+        
+        # Adaptive scaling factors
+        scale_factor = max(median_dist, 1e-10)
+        decay_factor = 0.2 + 0.3 * np.clip(dist_range / (median_dist + 1e-10), 0.5, 2.0)
+        regret_sensitivity = 0.5 + 0.5 * np.clip(np.log10(n) / 3, 0.3, 1.5)
+    else:
+        scale_factor = 1.0
+        decay_factor = 0.3
+        regret_sensitivity = 1.0
+    
+    # ================ 2. Base Inverse Distance with Stability ================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_scores = 1.0 / (distance_matrix + 1e-10)
+    np.fill_diagonal(base_scores, 0)
+    
+    # ================ 3. Dynamic Bidirectional Regret ================
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    # Precompute nearest neighbors for each node
+    k_neighbors = min(5, n - 1)
+    nearest_dists = np.zeros((n, k_neighbors))
+    nearest_indices = np.zeros((n, k_neighbors), dtype=int)
+    
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        if n > k_neighbors:
+            # Get k nearest neighbors
+            idx_partition = np.argpartition(row_dists, k_neighbors)[:k_neighbors]
+            sorted_idx = idx_partition[np.argsort(row_dists[idx_partition])]
+            nearest_dists[i] = row_dists[sorted_idx]
+            nearest_indices[i] = sorted_idx
+        else:
+            # For small n, use all other nodes
+            valid_mask = np.arange(n) != i
+            nearest_dists[i, :sum(valid_mask)] = row_dists[valid_mask]
+            nearest_indices[i, :sum(valid_mask)] = np.where(valid_mask)[0]
+    
+    # Dynamic regret threshold based on distance percentiles
+    regret_threshold = np.percentile(nearest_dists[nearest_dists > 0], 75) if n > 2 else 1.0
+    
+    for i in range(n):
+        if n > 1:
+            # Minimum distance from i (first nearest neighbor)
+            min_dist_i = nearest_dists[i, 0] if nearest_dists[i, 0] > 0 else 1.0
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best alternative path through nearest neighbors
+                best_alternative = np.inf
+                
+                # Check one-step alternatives (different nearest neighbor)
+                for k_idx in range(k_neighbors):
+                    k = nearest_indices[i, k_idx]
+                    if k == j or k == i:
+                        continue
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    if alt_cost < best_alternative:
+                        best_alternative = alt_cost
+                
+                # Also consider direct nearest neighbor alternative
+                if nearest_indices[i, 0] != j:
+                    one_step_alt = nearest_dists[i, 0] + distance_matrix[nearest_indices[i, 0], j]
+                    best_alternative = min(best_alternative, one_step_alt)
+                
+                # Dynamic regret calculation with threshold
+                if best_alternative < np.inf:
+                    regret = max(best_alternative - direct_cost, 1e-10)
+                    # Normalized regret with dynamic sensitivity
+                    norm_regret = regret / max(min_dist_i, regret_threshold)
+                    # Exponential decay with adaptive sensitivity
+                    regret_matrix[i, j] = np.exp(-regret_sensitivity * norm_regret)
+    
+    # Symmetrize regret matrix using geometric mean
+    regret_symmetric = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # ================ 4. Spectral Embedding for Global Awareness ================
+    if n >= 4:
+        try:
+            # Create affinity matrix for spectral embedding
+            sigma = scale_factor * 0.5
+            affinity = np.exp(-distance_matrix**2 / (2 * sigma**2))
+            np.fill_diagonal(affinity, 0)
+            
+            # Compute degree matrix
+            degree = np.diag(np.sum(affinity, axis=1))
+            degree_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(degree) + 1e-10))
+            
+            # Normalized Laplacian
+            laplacian = np.eye(n) - degree_sqrt_inv @ affinity @ degree_sqrt_inv
+            
+            # Compute eigenvectors (using eigh for symmetric matrix)
+            eigvals, eigvecs = np.linalg.eigh(laplacian)
+            
+            # Sort eigenvalues and get embedding (skip first eigenvector)
+            sorted_idx = np.argsort(eigvals)
+            embedding_dim = min(3, n - 2)
+            embedding = eigvecs[:, sorted_idx[1:1+embedding_dim]]
+            
+            # Compute embedding distances
+            embedding_dist = squareform(pdist(embedding, 'euclidean'))
+            embedding_sim = np.exp(-embedding_dist**2 / (2 * np.median(embedding_dist)**2))
+            np.fill_diagonal(embedding_sim, 0)
+        except:
+            # Fallback if spectral embedding fails
+            embedding_sim = np.ones_like(distance_matrix)
+            np.fill_diagonal(embedding_sim, 0)
+    else:
+        embedding_sim = np.ones_like(distance_matrix)
+        np.fill_diagonal(embedding_sim, 0)
+    
+    # ================ 5. Adaptive Distance Penalty ================
+    distance_penalty = np.exp(-distance_matrix / (decay_factor * scale_factor))
+    np.fill_diagonal(distance_penalty, 0)
+    
+    # ================ 6. Combine Components with Geometric Mean ================
+    # Geometric mean for balanced combination
+    combined_scores = np.power(
+        base_scores * regret_symmetric * embedding_sim * distance_penalty,
+        0.25  # Fourth root for geometric mean of 4 components
+    )
+    
+    # Ensure MST edges are preserved
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    combined_scores[mst_mask] = np.maximum(combined_scores[mst_mask], 1e-6)
+    
+    # ================ 7. Adaptive Candidate Selection ================
+    candidate_scores = np.zeros_like(combined_scores)
+    
+    for i in range(n):
+        row_scores = combined_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Determine adaptive number of candidates
+        if n <= 5:
+            candidate_count = min(3, n - 1)
+        else:
+            # Logarithmic scaling with problem size
+            candidate_count = min(int(2.5 * np.log2(n)), n - 1)
+            candidate_count = max(3, candidate_count)
+        
+        # Always include MST edges
+        mst_edges = mst_mask[i]
+        mst_count = np.sum(mst_edges)
+        
+        if mst_count >= candidate_count:
+            # If MST edges already cover candidates, use them
+            keep_mask = mst_edges
+        else:
+            # Add top non-MST edges to reach candidate_count
+            non_mst_needed = candidate_count - mst_count
+            
+            # Get non-MST scores
+            non_mst_mask = ~mst_edges
+            non_mst_mask[i] = False  # Exclude self
+            non_mst_scores = row_scores.copy()
+            non_mst_scores[~non_mst_mask] = -np.inf
+            
+            if np.any(non_mst_scores > -np.inf) and non_mst_needed > 0:
+                # Select top non-MST edges
+                valid_scores = non_mst_scores[non_mst_scores > -np.inf]
+                if len(valid_scores) >= non_mst_needed:
+                    threshold = np.partition(valid_scores, -non_mst_needed)[-non_mst_needed]
+                else:
+                    threshold = np.min(valid_scores) - 1e-8
+                
+                top_non_mst = non_mst_scores >= threshold
+                keep_mask = mst_edges | top_non_mst
+            else:
+                keep_mask = mst_edges
+        
+        keep_mask[i] = False  # Never include self-edge
+        candidate_scores[i][keep_mask] = combined_scores[i][keep_mask]
+    
+    # ================ 8. Final Symmetrization and Normalization ================
+    # Use maximum to preserve edges selected by either endpoint
+    final_scores = np.maximum(candidate_scores, candidate_scores.T)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    # Apply soft clipping for numerical stability
+    final_scores = np.tanh(final_scores * 2)  # Maps [0,1] to [0,0.96] smoothly
+    
+    return final_scores
+```

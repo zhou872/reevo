@@ -1,0 +1,500 @@
+```json
+{
+    "algorithm_features": ["Distance Inverse Weighting", "Regret-based Multiplicative Scaling", "Two-step Lookahead Evaluation", "Adaptive Structural Bonuses"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import distance_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization heuristic with dynamic weight adaptation,
+    deeper lookahead evaluation, and multiplicative integration of structural bonuses.
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances.
+        
+    Returns:
+        Priority matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Handle trivial cases
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # 1. Base inverse distance component (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = inv_dist.max()
+    if max_val > 0:
+        inv_dist = inv_dist / max_val
+    
+    # 2. Compute instance characteristics for dynamic weight adaptation
+    instance_stats = _compute_instance_statistics(distance_matrix, n)
+    
+    # 3. Compute structural bonuses with instance-adaptive parameters
+    mst_bonus = _compute_mst_bonus(distance_matrix)
+    regret_factor = _compute_adaptive_regret(distance_matrix, instance_stats)
+    lookahead_score = _compute_enhanced_lookahead(distance_matrix, instance_stats)
+    knn_bonus = _compute_adaptive_knn_bonus(distance_matrix, instance_stats)
+    cluster_bonus = _compute_density_aware_bonus(distance_matrix, instance_stats)
+    
+    # 4. Dynamically compute component weights based on instance characteristics
+    weights = _compute_dynamic_weights(instance_stats, n)
+    
+    # 5. Multiplicative integration with dynamically weighted components
+    # Base component (inverse distance) is always included
+    priorities = inv_dist.copy()
+    
+    # Apply multiplicative bonuses with dynamic weights
+    if weights['mst'] > 0:
+        priorities *= (1.0 + weights['mst'] * mst_bonus)
+    
+    if weights['regret'] > 0:
+        priorities *= (1.0 + weights['regret'] * regret_factor)
+    
+    if weights['lookahead'] > 0:
+        priorities *= (1.0 + weights['lookahead'] * lookahead_score)
+    
+    # Apply additive bonuses (weaker influence)
+    if weights['knn'] > 0:
+        priorities += weights['knn'] * knn_bonus
+    
+    if weights['cluster'] > 0:
+        priorities += weights['cluster'] * cluster_bonus
+    
+    # 6. Adaptive sparsification with connectivity guarantee
+    priorities = _adaptive_sparsification(priorities, distance_matrix, instance_stats)
+    
+    # 7. Final normalization and symmetry
+    priorities = (priorities + priorities.T) / 2
+    np.fill_diagonal(priorities, 0)
+    
+    # Normalize to [0, 1] range
+    max_priority = priorities.max()
+    if max_priority > 0:
+        priorities = priorities / max_priority
+    
+    return priorities
+
+
+def _compute_instance_statistics(dist_mat: np.ndarray, n: int) -> dict:
+    """
+    Compute comprehensive statistics about the TSP instance.
+    """
+    stats = {}
+    
+    # Basic size metric
+    stats['n'] = n
+    
+    # Distance distribution statistics
+    upper_tri = dist_mat[np.triu_indices(n, k=1)]
+    stats['mean_dist'] = np.mean(upper_tri)
+    stats['std_dist'] = np.std(upper_tri)
+    stats['cv_dist'] = stats['std_dist'] / (stats['mean_dist'] + 1e-12)  # Coefficient of variation
+    
+    # Percentiles for understanding distance distribution
+    stats['p25'] = np.percentile(upper_tri, 25)
+    stats['p50'] = np.percentile(upper_tri, 50)
+    stats['p75'] = np.percentile(upper_tri, 75)
+    
+    # Spatial spread indicator
+    stats['spread_ratio'] = stats['p75'] / (stats['p25'] + 1e-12)
+    
+    # Neighborhood density indicator
+    # Average number of nodes within 1.5x median distance
+    median_dist = stats['p50']
+    neighborhood_threshold = 1.5 * median_dist
+    neighborhood_counts = np.sum(dist_mat < neighborhood_threshold, axis=1) - 1  # Exclude self
+    stats['avg_neighbors'] = np.mean(neighborhood_counts) / n
+    
+    return stats
+
+
+def _compute_mst_bonus(dist_mat: np.ndarray) -> np.ndarray:
+    """
+    Compute Minimum Spanning Tree bonus with distance weighting.
+    """
+    n = dist_mat.shape[0]
+    if n <= 1:
+        return np.zeros_like(dist_mat)
+    
+    # Compute MST using Prim's algorithm (more efficient than scipy for this purpose)
+    mst_mask = np.zeros_like(dist_mat, dtype=bool)
+    
+    # Initialize
+    in_mst = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    # Start from node 0
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        # Find minimum edge from MST to non-MST
+        u = -1
+        min_val = np.inf
+        for v in range(n):
+            if not in_mst[v] and min_edge[v] < min_val:
+                min_val = min_edge[v]
+                u = v
+        
+        if u == -1:
+            break
+        
+        in_mst[u] = True
+        if parent[u] != -1:
+            mst_mask[u, parent[u]] = True
+            mst_mask[parent[u], u] = True
+        
+        # Update minimum edges
+        for v in range(n):
+            if not in_mst[v] and dist_mat[u, v] < min_edge[v]:
+                min_edge[v] = dist_mat[u, v]
+                parent[v] = u
+    
+    # Convert to weighted bonus (closer edges in MST get higher bonus)
+    mst_bonus = np.zeros_like(dist_mat, dtype=float)
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_mask[i, j]:
+                # Bonus inversely proportional to distance, normalized by median
+                mst_bonus[i, j] = mst_bonus[j, i] = 1.0 / (dist_mat[i, j] + 1e-12)
+    
+    # Normalize
+    max_bonus = mst_bonus.max()
+    if max_bonus > 0:
+        mst_bonus = mst_bonus / max_bonus
+    
+    return mst_bonus
+
+
+def _compute_adaptive_regret(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Compute regret factor with adaptive parameters based on instance characteristics.
+    """
+    n = dist_mat.shape[0]
+    if n < 3:
+        return np.ones_like(dist_mat)
+    
+    # Adaptive k based on instance density
+    if stats['avg_neighbors'] > 0.3:  # Dense instance
+        k = min(5, n//4)
+    else:  # Sparse instance
+        k = min(3, n//6)
+    k = max(2, k)
+    
+    regret_factor = np.ones_like(dist_mat)
+    
+    for i in range(n):
+        # Get distances excluding self
+        row = dist_mat[i].copy()
+        row[i] = np.inf
+        
+        # Find k nearest neighbors
+        if len(row) >= k:
+            sorted_idx = np.argsort(row)[:k]
+            sorted_dists = row[sorted_idx]
+            
+            if len(sorted_dists) >= 2:
+                # Compute base regret (normalized difference from best)
+                base_regret = (sorted_dists[1] - sorted_dists[0]) / (sorted_dists[0] + 1e-12)
+                
+                # Adjust based on distance spread
+                spread_factor = min(2.0, max(0.5, stats['cv_dist']))
+                scaled_regret = base_regret * spread_factor
+                
+                # Assign to edges with exponential decay
+                for rank, j in enumerate(sorted_idx):
+                    if i != j:
+                        decay = np.exp(-rank / 2.0)
+                        regret_val = scaled_regret * decay
+                        regret_factor[i, j] = 1.0 + min(1.0, regret_val)  # Cap at 2.0
+    
+    # Symmetrize by taking maximum
+    regret_factor = np.maximum(regret_factor, regret_factor.T)
+    
+    return regret_factor
+
+
+def _compute_enhanced_lookahead(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Enhanced two-step lookahead evaluation with adaptive depth based on instance size.
+    """
+    n = dist_mat.shape[0]
+    if n < 4:
+        return np.ones_like(dist_mat)
+    
+    lookahead_score = np.ones_like(dist_mat)
+    
+    # Adaptive lookahead depth based on instance size
+    if n <= 20:
+        # Full two-step evaluation for small instances
+        for i in range(n):
+            i_dists = dist_mat[i].copy()
+            i_dists[i] = np.inf
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                # Find best continuation from j (excluding i)
+                j_dists = dist_mat[j].copy()
+                j_dists[i] = j_dists[j] = np.inf
+                
+                if np.any(j_dists < np.inf):
+                    best_continuation = np.min(j_dists)
+                    
+                    # Find best alternative from i (excluding j)
+                    alt_dists = i_dists.copy()
+                    alt_dists[j] = np.inf
+                    
+                    if np.any(alt_dists < np.inf):
+                        best_alt = np.min(alt_dists)
+                        k = np.argmin(alt_dists)
+                        
+                        # Find best continuation from k (excluding i and j)
+                        k_dists = dist_mat[k].copy()
+                        k_dists[i] = k_dists[j] = k_dists[k] = np.inf
+                        
+                        if np.any(k_dists < np.inf):
+                            best_alt_continuation = np.min(k_dists)
+                            
+                            # Score based on path quality ratio
+                            current_path = dist_mat[i, j] + best_continuation
+                            alt_path = best_alt + best_alt_continuation
+                            
+                            if current_path > 0:
+                                ratio = alt_path / current_path
+                                # Convert to multiplicative factor (0.7 to 1.3 range)
+                                lookahead_score[i, j] = 1.3 - 0.6 * min(1.0, ratio)
+    
+    else:
+        # Approximate evaluation for larger instances
+        # Precompute nearest neighbors for efficiency
+        nn_count = min(5, n//10)
+        nearest = np.argsort(dist_mat, axis=1)[:, 1:nn_count+1]
+        
+        for i in range(n):
+            i_nn = nearest[i]
+            
+            for j_idx, j in enumerate(i_nn):
+                if i >= j:
+                    continue
+                
+                # Simplified evaluation using nearest neighbors
+                j_nn = nearest[j]
+                j_nn_filtered = [k for k in j_nn if k != i]
+                
+                if len(j_nn_filtered) > 0:
+                    # Best continuation from j
+                    best_continuation = min(dist_mat[j, k] for k in j_nn_filtered[:3])
+                    
+                    # Best alternative from i (excluding j)
+                    i_alt_nn = [k for k in i_nn if k != j]
+                    if len(i_alt_nn) > 0:
+                        best_alt = min(dist_mat[i, k] for k in i_alt_nn[:2])
+                        k = i_alt_nn[np.argmin([dist_mat[i, k] for k in i_alt_nn[:2]])]
+                        
+                        # Best continuation from k (excluding i and j)
+                        k_nn = nearest[k]
+                        k_nn_filtered = [l for l in k_nn if l not in (i, j, k)]
+                        
+                        if len(k_nn_filtered) > 0:
+                            best_alt_continuation = min(dist_mat[k, l] for l in k_nn_filtered[:2])
+                            
+                            current_path = dist_mat[i, j] + best_continuation
+                            alt_path = best_alt + best_alt_continuation
+                            
+                            if current_path > 0:
+                                ratio = alt_path / current_path
+                                score = 1.3 - 0.6 * min(1.0, ratio)
+                                lookahead_score[i, j] = lookahead_score[j, i] = score
+    
+    return lookahead_score
+
+
+def _compute_adaptive_knn_bonus(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Compute k-nearest neighbors bonus with adaptive k based on instance density.
+    """
+    n = dist_mat.shape[0]
+    bonus = np.zeros_like(dist_mat)
+    
+    # Adaptive k based on instance characteristics
+    if stats['avg_neighbors'] > 0.4:  # Very dense
+        k = min(8, max(3, n//8))
+    elif stats['avg_neighbors'] > 0.2:  # Moderately dense
+        k = min(5, max(2, n//10))
+    else:  # Sparse
+        k = min(3, max(2, n//15))
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        indices = np.argsort(dist_mat[i])[1:k+1]  # Skip self at index 0
+        
+        for rank, j in enumerate(indices):
+            if i != j:
+                # Weight decays with rank
+                weight = (k - rank) / k
+                # Bonus inversely proportional to distance
+                if dist_mat[i, j] > 0:
+                    bonus[i, j] = weight / dist_mat[i, j]
+    
+    # Symmetrize and normalize
+    bonus = (bonus + bonus.T) / 2
+    max_bonus = bonus.max()
+    if max_bonus > 0:
+        bonus = bonus / max_bonus
+    
+    return bonus
+
+
+def _compute_density_aware_bonus(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Compute bonus based on local density, with adaptation to instance characteristics.
+    """
+    n = dist_mat.shape[0]
+    if n <= 3:
+        return np.zeros_like(dist_mat)
+    
+    bonus = np.zeros_like(dist_mat)
+    
+    # Compute local density for each node
+    densities = np.zeros(n)
+    for i in range(n):
+        # Use adaptive neighborhood size based on instance
+        if stats['cv_dist'] > 1.0:  # High variation
+            neighborhood_size = max(3, n//20)
+        else:
+            neighborhood_size = max(2, n//15)
+        
+        # Get distances to nearest neighbors
+        sorted_dists = np.sort(dist_mat[i])[1:neighborhood_size+1]  # Exclude self
+        if len(sorted_dists) > 0:
+            densities[i] = 1.0 / (np.mean(sorted_dists) + 1e-12)
+    
+    # Normalize densities
+    max_density = densities.max()
+    if max_density > 0:
+        densities = densities / max_density
+    
+    # Assign bonus to edges based on endpoint densities
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_mat[i, j] > 0:
+                # Combined density measure
+                density_score = np.sqrt(densities[i] * densities[j])
+                # Bonus: higher density and shorter distance get higher bonus
+                bonus[i, j] = bonus[j, i] = density_score / dist_mat[i, j]
+    
+    # Normalize
+    max_bonus = bonus.max()
+    if max_bonus > 0:
+        bonus = bonus / max_bonus
+    
+    return bonus
+
+
+def _compute_dynamic_weights(stats: dict, n: int) -> dict:
+    """
+    Dynamically compute component weights based on instance characteristics.
+    """
+    weights = {}
+    
+    # Base weights
+    base_weights = {
+        'mst': 0.25,
+        'regret': 0.20,
+        'lookahead': 0.20,
+        'knn': 0.15,
+        'cluster': 0.10
+    }
+    
+    # Adjust based on instance size
+    size_factor = min(1.0, 50.0 / n)  # Decrease influence for larger instances
+    
+    # Adjust based on distance variation
+    cv = stats['cv_dist']
+    if cv > 1.5:
+        # High variation: emphasize lookahead and regret
+        variation_factor = {'mst': 0.8, 'regret': 1.2, 'lookahead': 1.3, 'knn': 0.7, 'cluster': 0.6}
+    elif cv < 0.5:
+        # Low variation: emphasize basic heuristics
+        variation_factor = {'mst': 1.2, 'regret': 0.8, 'lookahead': 0.7, 'knn': 1.1, 'cluster': 1.0}
+    else:
+        variation_factor = {'mst': 1.0, 'regret': 1.0, 'lookahead': 1.0, 'knn': 1.0, 'cluster': 1.0}
+    
+    # Adjust based on spatial spread
+    spread = stats['spread_ratio']
+    if spread > 3.0:
+        # High spread: emphasize MST and regret
+        spread_factor = {'mst': 1.3, 'regret': 1.2, 'lookahead': 0.9, 'knn': 0.8, 'cluster': 0.7}
+    elif spread < 1.5:
+        # Low spread: emphasize clustering and KNN
+        spread_factor = {'mst': 0.9, 'regret': 0.8, 'lookahead': 1.1, 'knn': 1.2, 'cluster': 1.3}
+    else:
+        spread_factor = {'mst': 1.0, 'regret': 1.0, 'lookahead': 1.0, 'knn': 1.0, 'cluster': 1.0}
+    
+    # Combine adjustments
+    for key in base_weights:
+        adjusted = base_weights[key] * size_factor * variation_factor[key] * spread_factor[key]
+        weights[key] = max(0.05, min(0.35, adjusted))  # Keep within reasonable bounds
+    
+    # Normalize to ensure reasonable total influence
+    total = sum(weights.values())
+    if total > 1.0:
+        for key in weights:
+            weights[key] = weights[key] / total
+    
+    return weights
+
+
+def _adaptive_sparsification(priorities: np.ndarray, dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Adaptive sparsification that preserves promising edges while ensuring connectivity.
+    """
+    n = priorities.shape[0]
+    result = priorities.copy()
+    
+    if n <= 10:
+        # Keep more edges for small instances
+        keep_ratio = 0.4
+    elif n <= 50:
+        keep_ratio = 0.25
+    elif n <= 100:
+        keep_ratio = 0.15
+    else:
+        keep_ratio = 0.10
+    
+    # Calculate threshold based on keep_ratio
+    non_zero = result[result > 0]
+    if len(non_zero) > 0:
+        threshold = np.percentile(non_zero, 100 * (1 - keep_ratio))
+        result[result < threshold] = 0
+    
+    # Ensure minimum connectivity: each node connected to at least 2 others
+    for i in range(n):
+        connected = np.where(result[i] > 0)[0]
+        if len(connected) < 2:
+            # Find top candidates by priority
+            candidates = np.argsort(priorities[i])[-3:]  # Top 3
+            for j in candidates:
+                if j != i and result[i, j] == 0:
+                    result[i, j] = priorities[i, j]
+                    result[j, i] = priorities[j, i]
+                    if len(np.where(result[i] > 0)[0]) >= 2:
+                        break
+    
+    return result
+```

@@ -1,0 +1,200 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Bonus", "Regret-based Alternative Penalty", "Dynamic Lookahead Cost Estimation", "Spectral Clustering Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection probability.
+    
+    Enhanced Features:
+    1. Inverse distance weighting (base preference for short edges)
+    2. Minimum spanning tree edges get bonus (MST often contains TSP edges)
+    3. Regret-based penalization: penalizes edges with many good alternatives
+    4. Dynamic lookahead: estimates future path cost using spatial averaging
+    5. Spectral clustering bonus: gives edges within clusters higher preference
+    6. Adaptive sparsification: keeps only promising edges
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions (rows normalized to sum to 1)
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # Trivial cases
+        heuristics = np.ones((n, n)) - np.eye(n)
+        return heuristics / heuristics.sum(axis=1, keepdims=True)
+    
+    # 1. Base inverse distance (handle zero distances)
+    with np.errstate(divide='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-10)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Minimum Spanning Tree bonus
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = (mst + mst.T > 0).astype(float) * 2.0
+    
+    # 3. Regret-based alternative penalty
+    # Penalize edges that have many good alternatives
+    regret_penalty = np.ones((n, n))
+    k_regret = min(5, n // 2)  # Number of alternatives to consider
+    
+    for i in range(n):
+        # Get distances from node i to all others
+        dist_from_i = distance_matrix[i].copy()
+        dist_from_i[i] = np.inf  # Ignore self
+        
+        # Sort to find k nearest neighbors
+        nearest_indices = np.argsort(dist_from_i)[:k_regret]
+        nearest_distances = dist_from_i[nearest_indices]
+        
+        if len(nearest_distances) > 1:
+            # The best alternative distance (second best if j is the best)
+            for j in range(n):
+                if j == i:
+                    continue
+                    
+                # Find where j ranks among nearest neighbors
+                j_rank = np.where(nearest_indices == j)[0]
+                if len(j_rank) == 0:
+                    # j is not in top k, use k-th nearest distance as alternative
+                    alt_dist = nearest_distances[-1]
+                else:
+                    j_rank = j_rank[0]
+                    if j_rank == 0:
+                        # j is the nearest, use second nearest as alternative
+                        alt_dist = nearest_distances[1] if len(nearest_distances) > 1 else nearest_distances[0]
+                    else:
+                        # j is not the nearest, use nearest as alternative
+                        alt_dist = nearest_distances[0]
+                
+                # Regret: how much worse is the alternative compared to edge (i,j)?
+                # Higher regret means edge (i,j) is more critical
+                edge_dist = distance_matrix[i, j]
+                regret = max(0, alt_dist - edge_dist)
+                
+                # Convert regret to penalty factor (edges with high regret get boosted)
+                # Use logistic function to map regret to [0.5, 2.0] range
+                # Scale regret by average distance for normalization
+                avg_dist = np.mean(nearest_distances)
+                scaled_regret = regret / (avg_dist + 1e-10)
+                regret_penalty[i, j] = 1.0 + 1.0 / (1.0 + np.exp(-scaled_regret))
+    
+    # Symmetrize regret penalty
+    regret_penalty = (regret_penalty + regret_penalty.T) / 2
+    np.fill_diagonal(regret_penalty, 1)
+    
+    # 4. Dynamic lookahead cost estimation
+    # Estimate future cost of connecting to a node based on its neighborhood
+    lookahead_factor = np.ones((n, n))
+    
+    for i in range(n):
+        # Find promising next nodes after j
+        for j in range(n):
+            if j == i:
+                continue
+                
+            # Estimate average distance from j to other promising nodes
+            # Consider nodes that are not i or j
+            other_nodes = [k for k in range(n) if k not in [i, j]]
+            
+            if len(other_nodes) == 0:
+                lookahead_factor[i, j] = 1.0
+                continue
+                
+            # Get distances from j to other nodes
+            dist_from_j = distance_matrix[j, other_nodes]
+            
+            # Estimate expected next step cost
+            # Weight by inverse distance (closer nodes more likely)
+            inv_dist_from_j = 1 / (dist_from_j + 1e-10)
+            weights = inv_dist_from_j / inv_dist_from_j.sum()
+            expected_next_cost = np.sum(weights * dist_from_j)
+            
+            # Normalize by average distance for stability
+            avg_dist = np.mean(dist_from_j)
+            lookahead_ratio = expected_next_cost / (avg_dist + 1e-10)
+            
+            # Convert to factor: lower expected future cost is better
+            lookahead_factor[i, j] = 1.0 / (0.5 + 0.5 * lookahead_ratio)
+    
+    # 5. Spectral clustering bonus
+    cluster_bonus = np.ones((n, n))
+    
+    if n >= 4:
+        # Simple spectral clustering approximation
+        # Build adjacency matrix using k-nearest neighbors
+        k_cluster = min(3, n // 4)
+        adjacency = np.zeros((n, n))
+        
+        for i in range(n):
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nearest = np.argsort(distances)[:k_cluster]
+            adjacency[i, nearest] = 1
+            
+        adjacency = np.maximum(adjacency, adjacency.T)  # Symmetrize
+        
+        # Simple connected components as clusters
+        n_components, labels = connected_components(adjacency, directed=False)
+        
+        if n_components > 1:
+            # Give bonus to edges within same cluster
+            for i in range(n):
+                for j in range(i+1, n):
+                    if labels[i] == labels[j]:
+                        # Same cluster: boost intra-cluster edges
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = 1.5
+                    else:
+                        # Different clusters: mild penalty for inter-cluster
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = 0.8
+    
+    # 6. Combine all factors
+    heuristics = inv_dist * (1.0 + 0.4 * mst_bonus) * regret_penalty * lookahead_factor * cluster_bonus
+    
+    # 7. Adaptive sparsification
+    # First, keep only k-nearest neighbors for each node
+    k_sparse = max(3, min(10, n // 5))
+    mask = np.zeros((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest = np.argsort(distances)[:k_sparse]
+        mask[i, nearest] = 1
+        
+    mask = np.maximum(mask, mask.T)  # Symmetrize
+    np.fill_diagonal(mask, 0)
+    
+    heuristics = heuristics * mask
+    
+    # Second, keep only top edges per row
+    for i in range(n):
+        row = heuristics[i]
+        non_zero = row[row > 0]
+        if len(non_zero) > 2:  # Keep at least 2 connections
+            threshold = np.percentile(non_zero, 75)  # Keep top 25%
+            row[row < threshold] = 0
+        heuristics[i] = row
+    
+    # Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # 8. Normalize rows to sum to 1 for probability interpretation
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1  # Avoid division by zero
+    heuristics = heuristics / row_sums
+    
+    return heuristics
+```

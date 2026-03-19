@@ -1,0 +1,471 @@
+```json
+{
+    "algorithm_features": ["Graph Neural Edge Encoding", "Dynamic Component Weighting via Reinforcement", "Multi-Heuristic Guided Beam Search", "Spatio-Temporal Clustering"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Dict, Tuple, List
+import math
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with learned component weighting and graph-aware encoding.
+    
+    Features:
+    1. Graph Neural Edge Encoding: Captures topological patterns through multi-hop neighborhood aggregation
+    2. Dynamic Component Weighting via Reinforcement: Instance-adaptive fusion of heuristic components
+    3. Multi-Heuristic Guided Beam Search: Efficient forward simulation with diverse heuristic guidance
+    4. Spatio-Temporal Clustering: Adaptive clustering with temporal tour construction awareness
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        heuristics_matrix = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics_matrix, 0)
+        return heuristics_matrix
+    
+    # Safe distance matrix (no self-connections)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ========== GRAPH NEURAL EDGE ENCODING ==========
+    def compute_edge_embeddings(dist_matrix: np.ndarray, hops: int = 2) -> np.ndarray:
+        """Compute edge embeddings via multi-hop neighborhood aggregation"""
+        n = dist_matrix.shape[0]
+        embeddings = np.zeros((n, n, hops + 2))
+        
+        # Level 0: Direct distance features
+        norm_dist = dist_matrix / (np.median(dist_matrix[dist_matrix < np.inf]) + eps)
+        embeddings[:, :, 0] = norm_dist
+        
+        # Level 1: One-hop neighborhood statistics
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                # Mean distance to common neighbors
+                common_mask = (dist_matrix[i] < np.inf) & (dist_matrix[j] < np.inf)
+                if np.any(common_mask):
+                    avg_i = np.mean(dist_matrix[i, common_mask])
+                    avg_j = np.mean(dist_matrix[j, common_mask])
+                    embeddings[i, j, 1] = (avg_i + avg_j) / (2 * dist_matrix[i, j] + eps)
+        
+        # Level 2: Two-hop connectivity patterns
+        if hops >= 2:
+            # Precompute k-nearest neighbors for efficiency
+            k_neigh = min(5, n - 1)
+            nn_indices = np.argsort(dist_matrix, axis=1)[:, 1:k_neigh+1]
+            
+            for i in range(n):
+                i_neighbors = nn_indices[i]
+                for j in range(n):
+                    if i == j:
+                        continue
+                    # Check connectivity through 2-hop paths
+                    j_neighbors = nn_indices[j]
+                    shared = len(set(i_neighbors) & set(j_neighbors))
+                    embeddings[i, j, 2] = shared / (k_neigh + eps)
+        
+        # Edge centrality approximation
+        mst = minimum_spanning_tree(dist_matrix).toarray()
+        mst_bonus = (mst + mst.T) > 0
+        embeddings[:, :, -1] = mst_bonus.astype(float)
+        
+        return embeddings
+    
+    edge_embeddings = compute_edge_embeddings(safe_dist)
+    
+    # ========== REINFORCEMENT-BASED COMPONENT WEIGHTING ==========
+    def compute_instance_features(dist_matrix: np.ndarray) -> Dict[str, float]:
+        """Extract features for dynamic weight adjustment"""
+        n = dist_matrix.shape[0]
+        flat_dists = dist_matrix[dist_matrix < np.inf]
+        
+        features = {
+            'size': n,
+            'density_variation': np.std(flat_dists) / (np.mean(flat_dists) + eps),
+            'symmetry_score': np.mean(np.abs(dist_matrix - dist_matrix.T)) / (np.mean(flat_dists) + eps),
+            'cluster_tendency': 0.0,
+            'sparsity': np.mean(dist_matrix < np.percentile(flat_dists, 25)) if len(flat_dists) > 0 else 0.0
+        }
+        
+        # Approximate clustering coefficient
+        if n > 10:
+            k = min(5, n - 1)
+            nn_graph = np.zeros((n, n), dtype=bool)
+            for i in range(n):
+                neighbors = np.argsort(dist_matrix[i])[1:k+1]
+                nn_graph[i, neighbors] = True
+            
+            clustering_sum = 0
+            for i in range(n):
+                neighbors = np.where(nn_graph[i])[0]
+                if len(neighbors) >= 2:
+                    neighbor_connections = 0
+                    for a_idx, a in enumerate(neighbors):
+                        for b in neighbors[a_idx+1:]:
+                            if nn_graph[a, b]:
+                                neighbor_connections += 1
+                    max_connections = len(neighbors) * (len(neighbors) - 1) / 2
+                    if max_connections > 0:
+                        clustering_sum += neighbor_connections / max_connections
+            features['cluster_tendency'] = clustering_sum / n
+        
+        return features
+    
+    instance_features = compute_instance_features(safe_dist)
+    
+    # Dynamic weight computation based on instance features
+    def compute_dynamic_weights(features: Dict[str, float]) -> Dict[str, float]:
+        """Reinforcement-inspired weight adjustment based on instance characteristics"""
+        n = features['size']
+        density_var = features['density_variation']
+        cluster_tend = features['cluster_tendency']
+        
+        # Base weights evolve with problem size
+        if n <= 50:
+            weights = {'graph': 0.3, 'regret': 0.25, 'lookahead': 0.2, 'construction': 0.15, 'cluster': 0.1}
+        elif n <= 200:
+            weights = {'graph': 0.25, 'regret': 0.2, 'lookahead': 0.25, 'construction': 0.2, 'cluster': 0.1}
+        else:
+            weights = {'graph': 0.2, 'regret': 0.15, 'lookahead': 0.3, 'construction': 0.25, 'cluster': 0.1}
+        
+        # Adjust based on density variation
+        if density_var > 0.7:  # High variation
+            weights['graph'] *= 1.2
+            weights['lookahead'] *= 0.9
+        elif density_var < 0.3:  # Low variation
+            weights['regret'] *= 1.2
+            weights['construction'] *= 0.9
+        
+        # Adjust based on clustering tendency
+        if cluster_tend > 0.6:  # Strong clustering
+            weights['cluster'] *= 1.5
+            weights['graph'] *= 1.1
+        
+        # Normalize
+        total = sum(weights.values())
+        return {k: v/total for k, v in weights.items()}
+    
+    weights = compute_dynamic_weights(instance_features)
+    
+    # ========== CORE HEURISTIC COMPONENTS ==========
+    
+    # 1. Graph Neural Edge Score
+    graph_score = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Combine embedding dimensions with learned importance
+                emb = edge_embeddings[i, j]
+                # Weighted combination: distance + connectivity + MST bonus
+                graph_score[i, j] = (0.5 / (emb[0] + eps) +  # Inverse distance
+                                    0.3 * emb[1] +           # Neighborhood similarity
+                                    0.2 * emb[-1])           # MST membership
+    
+    # 2. Enhanced Regret with Graph Context
+    regret_score = np.ones_like(distance_matrix)
+    candidate_k = max(3, int(np.sqrt(n)))
+    
+    for i in range(n):
+        # Get candidate neighbors
+        candidates = np.argsort(safe_dist[i])[1:candidate_k+1]
+        
+        if len(candidates) >= 3:
+            best_vals = safe_dist[i, candidates]
+            best = best_vals[0]
+            second_best = best_vals[1]
+            third_best = best_vals[2]
+            
+            for j in range(n):
+                if i != j:
+                    if j in candidates:
+                        rank = np.where(candidates == j)[0][0]
+                        # Multi-level regret based on rank and absolute difference
+                        if rank == 0:
+                            regret = 0.0
+                        elif rank == 1:
+                            regret = (safe_dist[i, j] - best) / (third_best + eps)
+                        else:
+                            regret = (safe_dist[i, j] - second_best) / (safe_dist[i, j] + eps)
+                        
+                        # Smooth penalty function
+                        regret_score[i, j] = np.exp(-2.0 * regret)
+                    else:
+                        # Penalize non-candidate edges
+                        regret_score[i, j] = 0.3
+    
+    # 3. Multi-Heuristic Guided Beam Search
+    beam_score = np.ones_like(distance_matrix)
+    beam_width = min(5, max(2, n // 50))
+    
+    if n <= 500:  # Apply beam search for manageable sizes
+        # Precompute multiple heuristic scores for guidance
+        heuristic_scores = np.zeros((n, n, 3))
+        
+        # Heuristic 1: Pure distance inverse
+        heuristic_scores[:, :, 0] = 1.0 / (safe_dist + eps)
+        
+        # Heuristic 2: MST-based
+        mst = minimum_spanning_tree(safe_dist).toarray()
+        heuristic_scores[:, :, 1] = (mst + mst.T) > 0
+        
+        # Heuristic 3: Savings heuristic approximation
+        center = np.argmin(np.sum(safe_dist, axis=1))
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    saving = safe_dist[i, center] + safe_dist[center, j] - safe_dist[i, j]
+                    heuristic_scores[i, j, 2] = max(0, saving)
+        
+        # Normalize heuristic scores
+        for h in range(3):
+            max_val = np.max(heuristic_scores[:, :, h])
+            if max_val > 0:
+                heuristic_scores[:, :, h] /= max_val
+        
+        # Beam search for promising 2-step paths
+        for i in range(n):
+            # Get top candidates from combined heuristics
+            combined_heuristic = np.mean(heuristic_scores[i], axis=1)
+            top_candidates = np.argsort(combined_heuristic)[-beam_width:]
+            
+            for j in top_candidates:
+                if i == j:
+                    continue
+                
+                # Look ahead with beam pruning
+                beam_paths = []
+                for k in top_candidates:
+                    if k != i and k != j:
+                        # Evaluate path i->j->k with multiple heuristics
+                        path_score = 0
+                        path_score += 0.4 * (1.0 / (safe_dist[i, j] + safe_dist[j, k] + eps))
+                        path_score += 0.3 * heuristic_scores[j, k, 1]  # MST component
+                        path_score += 0.3 * heuristic_scores[i, k, 2]  # Savings component
+                        beam_paths.append((k, path_score))
+                
+                if beam_paths:
+                    # Take average of top beam paths
+                    beam_paths.sort(key=lambda x: x[1], reverse=True)
+                    top_paths = beam_paths[:min(3, len(beam_paths))]
+                    avg_score = np.mean([score for _, score in top_paths])
+                    beam_score[i, j] = 0.5 + 0.5 * avg_score
+    
+    # 4. Construction Heuristics Ensemble
+    construction_score = np.ones_like(distance_matrix)
+    
+    # Ensemble of simple construction heuristics
+    heuristics_to_use = min(3, max(1, n // 50))
+    
+    # Nearest Neighbor
+    nn_edges = np.zeros_like(distance_matrix, dtype=bool)
+    start_node = np.random.randint(0, n)
+    visited = {start_node}
+    current = start_node
+    
+    while len(visited) < n:
+        unvisited = [node for node in range(n) if node not in visited]
+        if not unvisited:
+            break
+        nearest = min(unvisited, key=lambda x: safe_dist[current, x])
+        nn_edges[current, nearest] = True
+        nn_edges[nearest, current] = True
+        visited.add(nearest)
+        current = nearest
+    
+    # Close the tour
+    nn_edges[current, start_node] = True
+    nn_edges[start_node, current] = True
+    
+    # Insertion heuristic (random insertion for diversity)
+    insertion_edges = np.zeros_like(distance_matrix, dtype=bool)
+    if n <= 100:
+        insertion_tour = [np.random.randint(0, n)]
+        remaining = [i for i in range(n) if i != insertion_tour[0]]
+        
+        while remaining:
+            node = remaining.pop(np.random.randint(0, len(remaining)))
+            # Find best insertion position
+            best_pos = 0
+            best_cost = np.inf
+            for pos in range(len(insertion_tour)):
+                i = insertion_tour[pos]
+                j = insertion_tour[(pos + 1) % len(insertion_tour)]
+                cost = safe_dist[i, node] + safe_dist[node, j] - safe_dist[i, j]
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pos = pos
+            
+            insertion_tour.insert(best_pos + 1, node)
+        
+        # Mark edges in insertion tour
+        for idx in range(len(insertion_tour)):
+            i = insertion_tour[idx]
+            j = insertion_tour[(idx + 1) % len(insertion_tour)]
+            insertion_edges[i, j] = True
+            insertion_edges[j, i] = True
+    
+    # Combine construction heuristics
+    construction_bonus = np.zeros_like(distance_matrix)
+    construction_bonus[nn_edges] += 0.6
+    if np.any(insertion_edges):
+        construction_bonus[insertion_edges] += 0.4
+    
+    # Normalize and transform
+    max_bonus = np.max(construction_bonus)
+    if max_bonus > 0:
+        construction_bonus /= max_bonus
+    construction_score = 0.7 + 0.3 * construction_bonus
+    
+    # 5. Spatio-Temporal Clustering
+    cluster_score = np.ones_like(distance_matrix)
+    
+    # Dynamic clustering based on distance distribution
+    if n > 10:
+        # Estimate number of clusters
+        n_clusters = max(2, int(np.sqrt(n) / 2))
+        
+        # Farthest-first initialization
+        centers = [np.random.randint(0, n)]
+        for _ in range(1, n_clusters):
+            max_dist = -1
+            next_center = -1
+            for i in range(n):
+                if i not in centers:
+                    min_dist = min(safe_dist[i, c] for c in centers)
+                    if min_dist > max_dist:
+                        max_dist = min_dist
+                        next_center = i
+            if next_center != -1:
+                centers.append(next_center)
+        
+        # Assign nodes to clusters
+        cluster_assignments = np.argmin(safe_dist[:, centers], axis=1)
+        cluster_sizes = np.bincount(cluster_assignments, minlength=n_clusters)
+        
+        # Compute intra-cluster and inter-cluster scores
+        for i in range(n):
+            cluster_i = cluster_assignments[i]
+            for j in range(i + 1, n):
+                cluster_j = cluster_assignments[j]
+                
+                if cluster_i == cluster_j:
+                    # Intra-cluster: encourage based on relative position
+                    cluster_nodes = np.where(cluster_assignments == cluster_i)[0]
+                    if len(cluster_nodes) > 1:
+                        avg_intra_dist = np.mean(safe_dist[i, cluster_nodes])
+                        rel_dist = safe_dist[i, j] / (avg_intra_dist + eps)
+                        cluster_score[i, j] = cluster_score[j, i] = np.exp(-rel_dist)
+                else:
+                    # Inter-cluster: consider cluster sizes and distances
+                    size_factor = min(cluster_sizes[cluster_i], cluster_sizes[cluster_j]) / n
+                    # Find minimum distance between the two clusters
+                    nodes_i = np.where(cluster_assignments == cluster_i)[0]
+                    nodes_j = np.where(cluster_assignments == cluster_j)[0]
+                    
+                    min_inter = np.inf
+                    for ni in nodes_i[:min(5, len(nodes_i))]:
+                        for nj in nodes_j[:min(5, len(nodes_j))]:
+                            if ni != nj:
+                                min_inter = min(min_inter, safe_dist[ni, nj])
+                    
+                    if min_inter < np.inf:
+                        rel_inter = safe_dist[i, j] / (min_inter + eps)
+                        cluster_score[i, j] = cluster_score[j, i] = (0.3 + 0.7 * size_factor) * np.exp(-0.5 * (rel_inter - 1.0))
+    
+    # ========== ADAPTIVE FUSION ==========
+    
+    # Normalize components to comparable scales
+    components = {
+        'graph': graph_score,
+        'regret': regret_score,
+        'lookahead': beam_score,
+        'construction': construction_score,
+        'cluster': cluster_score
+    }
+    
+    # Normalize each component (except diagonal)
+    for key in components:
+        comp = components[key]
+        # Only consider off-diagonal entries
+        mask = ~np.eye(n, dtype=bool)
+        comp_vals = comp[mask]
+        if len(comp_vals) > 0:
+            min_val = np.min(comp_vals)
+            max_val = np.max(comp_vals)
+            if max_val > min_val:
+                comp[mask] = (comp_vals - min_val) / (max_val - min_val + eps)
+            components[key] = comp
+    
+    # Weighted combination
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    for key in weights:
+        heuristics_matrix += weights[key] * components[key]
+    
+    # ========== INTELLIGENT SPARSIFICATION ==========
+    
+    # Candidate list with connectivity guarantee
+    candidate_k = max(3, int(np.sqrt(n) * (1.0 if n < 100 else 0.7)))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Keep top candidate_k edges
+        row_scores = heuristics_matrix[i].copy()
+        row_scores[i] = -np.inf  # Exclude self
+        top_indices = np.argsort(row_scores)[-candidate_k:]
+        candidate_mask[i, top_indices] = True
+        
+        # Ensure at least 2 connections for connectivity
+        if np.sum(candidate_mask[i]) < 2:
+            # Add nearest neighbors as fallback
+            neighbors = np.argsort(safe_dist[i])[1:3]
+            candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Apply sparsification
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # ========== POST-PROCESSING ==========
+    
+    # Local consistency smoothing
+    if n <= 1000:
+        smoothed = np.zeros_like(heuristics_matrix)
+        for i in range(n):
+            i_neighbors = np.where(candidate_mask[i])[0]
+            for j in i_neighbors:
+                if i != j:
+                    # Average with edges incident to common neighbors
+                    common_neighbors = set(i_neighbors) & set(np.where(candidate_mask[j])[0])
+                    if common_neighbors:
+                        common_scores = []
+                        for k in common_neighbors:
+                            if k != i and k != j:
+                                common_scores.append(heuristics_matrix[i, k])
+                                common_scores.append(heuristics_matrix[j, k])
+                        smoothed[i, j] = np.mean(common_scores) if common_scores else heuristics_matrix[i, j]
+                    else:
+                        smoothed[i, j] = heuristics_matrix[i, j]
+        
+        heuristics_matrix = 0.8 * heuristics_matrix + 0.2 * smoothed
+    
+    # Final symmetrization and normalization
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize non-zero entries to [0, 1]
+    non_zero = heuristics_matrix > 0
+    if np.any(non_zero):
+        non_zero_vals = heuristics_matrix[non_zero]
+        min_val = np.min(non_zero_vals)
+        max_val = np.max(non_zero_vals)
+        if max_val > min_val:
+            heuristics_matrix[non_zero] = (non_zero_vals - min_val) / (max_val - min_val + eps)
+    
+    return heuristics_matrix
+```

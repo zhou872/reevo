@@ -1,0 +1,432 @@
+```json
+{
+    "algorithm_features": ["Hybrid Component Fusion", "Adaptive Edge Sparsification", "Multi-Source Sampling", "Statistical Instance Tuning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with multi-source sampling, 
+    statistical instance tuning, and improved component fusion.
+    
+    Key improvements:
+    1. Multi-source sampling: Combines tour-based, path-based, and component-based approaches
+    2. Statistical instance tuning: Adapts parameters based on comprehensive instance statistics
+    3. Hybrid component fusion: Dynamically combines multiple promising indicators
+    4. Advanced sparsification: Preserves connectivity while focusing on most promising edges
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. COMPREHENSIVE INSTANCE ANALYSIS =====
+    # Extract upper triangular distances
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # Compute comprehensive statistics
+    dist_stats = {
+        'mean': np.mean(distances),
+        'std': np.std(distances),
+        'cv': np.std(distances) / (np.mean(distances) + 1e-10),
+        'q25': np.percentile(distances, 25),
+        'median': np.median(distances),
+        'q75': np.percentile(distances, 75),
+        'range': np.ptp(distances),
+        'entropy': -np.sum((distances/distances.sum()) * np.log(distances/distances.sum() + 1e-10))
+    }
+    
+    # Instance size adaptation factors
+    log_n = np.log(n + 1)
+    sqrt_n = np.sqrt(n)
+    density_factor = min(1.0, n / 50.0)
+    
+    # ===== 2. MULTI-SOURCE SAMPLING =====
+    def sample_nearest_neighbor_tour() -> np.ndarray:
+        """Generate tour using randomized nearest neighbor."""
+        start = np.random.randint(0, n)
+        tour = [start]
+        visited = set([start])
+        
+        while len(tour) < n:
+            current = tour[-1]
+            # Consider both nearest and top-k neighbors
+            distances_to_current = distance_matrix[current].copy()
+            distances_to_current[list(visited)] = np.inf
+            
+            # Softmax selection from top candidates
+            k = max(3, min(10, n // 5))
+            top_k_indices = np.argpartition(distances_to_current, k)[:k]
+            top_k_dists = distances_to_current[top_k_indices]
+            
+            # Temperature-based selection (lower temperature = more greedy)
+            temperature = max(0.1, 0.5 * (1 - dist_stats['cv']))
+            inv_dists = 1 / (top_k_dists + 1e-10)
+            probs = np.exp(-inv_dists / temperature)
+            probs = probs / probs.sum()
+            
+            next_node = np.random.choice(top_k_indices, p=probs)
+            tour.append(next_node)
+            visited.add(next_node)
+        
+        return np.array(tour)
+    
+    def sample_greedy_tour() -> np.ndarray:
+        """Generate tour using greedy insertion with lookahead."""
+        if n <= 3:
+            return np.random.permutation(n)
+        
+        # Start with random 3-node cycle
+        start_nodes = np.random.choice(n, 3, replace=False)
+        tour = list(start_nodes)
+        tour.append(start_nodes[0])
+        remaining = set(range(n)) - set(tour[:-1])
+        
+        while remaining:
+            best_improvement = -np.inf
+            best_node = None
+            best_position = -1
+            
+            for node in list(remaining):
+                for i in range(len(tour) - 1):
+                    # Compute insertion cost with 1-step lookahead
+                    a, b = tour[i], tour[i + 1]
+                    current_cost = distance_matrix[a, b]
+                    
+                    # Direct insertion
+                    new_cost = distance_matrix[a, node] + distance_matrix[node, b]
+                    direct_improvement = current_cost - new_cost
+                    
+                    # Consider neighborhood effects
+                    neighborhood_bonus = 0
+                    if i > 0:
+                        prev = tour[i - 1]
+                        neighborhood_bonus += 0.1 * (distance_matrix[prev, a] - 
+                                                   min(distance_matrix[prev, node], 
+                                                       distance_matrix[prev, a]))
+                    
+                    total_improvement = direct_improvement + neighborhood_bonus
+                    
+                    if total_improvement > best_improvement:
+                        best_improvement = total_improvement
+                        best_node = node
+                        best_position = i + 1
+            
+            tour.insert(best_position, best_node)
+            remaining.remove(best_node)
+        
+        return np.array(tour[:-1])
+    
+    def sample_random_tour() -> np.ndarray:
+        """Generate random tour with local perturbation."""
+        tour = np.random.permutation(n)
+        
+        # Apply small perturbation
+        if n > 5:
+            for _ in range(max(2, n // 10)):
+                i, j = np.random.choice(n, 2, replace=False)
+                tour[i], tour[j] = tour[j], tour[i]
+        
+        return tour
+    
+    def compute_path_quality(tour: np.ndarray) -> float:
+        """Compute normalized quality of a tour."""
+        total_dist = sum(distance_matrix[tour[i], tour[(i + 1) % n]] for i in range(n))
+        theoretical_min = n * dist_stats['q25']  # Rough estimate
+        return theoretical_min / (total_dist + 1e-10)
+    
+    # Generate diverse solution samples
+    sample_counts = {
+        'nn': max(2, int(5 * density_factor)),
+        'greedy': max(2, int(4 * density_factor)),
+        'random': max(2, int(3 * density_factor))
+    }
+    
+    tours = []
+    tour_weights = []
+    
+    for method, count in sample_counts.items():
+        for _ in range(count):
+            if method == 'nn':
+                tour = sample_nearest_neighbor_tour()
+            elif method == 'greedy':
+                tour = sample_greedy_tour()
+            else:
+                tour = sample_random_tour()
+            
+            tours.append(tour)
+            tour_weights.append(compute_path_quality(tour))
+    
+    # ===== 3. COMPONENT COMPUTATION =====
+    
+    # 3.1 Edge Frequency Component
+    edge_freq = np.zeros((n, n))
+    max_weight = max(tour_weights) + 1e-10
+    
+    for tour, weight in zip(tours, tour_weights):
+        normalized_weight = weight / max_weight
+        for i in range(n):
+            u, v = tour[i], tour[(i + 1) % n]
+            edge_freq[u, v] += normalized_weight
+            edge_freq[v, u] += normalized_weight
+    
+    if edge_freq.max() > 0:
+        edge_freq = edge_freq / edge_freq.max()
+    
+    # 3.2 Path Betweenness Component
+    edge_betweenness = np.zeros((n, n))
+    
+    # Adaptive sampling based on instance characteristics
+    num_paths = min(300, max(50, int(n * (2 + dist_stats['cv']))))
+    
+    for _ in range(num_paths):
+        s, t = np.random.choice(n, 2, replace=False)
+        
+        # Biased random walk with distance and progress considerations
+        current = s
+        visited_count = np.zeros(n)
+        max_visits = max(2, int(sqrt_n * 0.5))
+        
+        path_length = 0
+        while current != t and path_length < 2 * n:
+            # Get candidate next nodes
+            candidates = list(range(n))
+            candidates.remove(current)
+            
+            # Compute scores for candidates
+            scores = []
+            for v in candidates:
+                # Distance component (prefer shorter edges)
+                dist_score = 1 / (distance_matrix[current, v] + 1e-10)
+                
+                # Progress component (prefer nodes closer to target)
+                progress_score = 1 / (distance_matrix[v, t] + 1e-10)
+                
+                # Diversity component (avoid recently visited nodes)
+                visit_penalty = visited_count[v] / max_visits
+                diversity_score = 1 - min(1.0, visit_penalty)
+                
+                # Combined score with adaptive weights
+                score = (0.4 * dist_score + 
+                        0.4 * progress_score + 
+                        0.2 * diversity_score)
+                scores.append(score)
+            
+            scores = np.array(scores)
+            if scores.sum() > 0:
+                probs = scores / scores.sum()
+                next_node = np.random.choice(candidates, p=probs)
+            else:
+                next_node = np.random.choice(candidates)
+            
+            # Update betweenness
+            edge_betweenness[current, next_node] += 1
+            edge_betweenness[next_node, current] += 1
+            
+            # Update visited count
+            visited_count[next_node] += 1
+            current = next_node
+            path_length += 1
+    
+    if edge_betweenness.max() > 0:
+        edge_betweenness = edge_betweenness / edge_betweenness.max()
+    
+    # 3.3 Structural Components
+    # Inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    if inv_dist.max() > 0:
+        inv_dist = inv_dist / inv_dist.max()
+    
+    # MST component (enhanced)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # MST with distance-based weighting
+    mst_scores = np.zeros((n, n))
+    mst_edges = np.where(mst_mask)
+    
+    if len(mst_edges[0]) > 0:
+        mst_dists = distance_matrix[mst_edges]
+        min_mst_dist = mst_dists.min()
+        max_mst_dist = mst_dists.max()
+        
+        if max_mst_dist > min_mst_dist:
+            normalized_dists = (max_mst_dist - mst_dists) / (max_mst_dist - min_mst_dist)
+        else:
+            normalized_dists = np.ones_like(mst_dists)
+        
+        for (u, v), score in zip(zip(*mst_edges), normalized_dists):
+            mst_scores[u, v] = score
+            mst_scores[v, u] = score
+    
+    if mst_scores.max() > 0:
+        mst_scores = mst_scores / mst_scores.max()
+    
+    # 3.4 Neighborhood Component
+    neighborhood_scores = np.zeros((n, n))
+    k_neighbors = max(3, min(10, n // 4))
+    
+    for i in range(n):
+        # Find k nearest neighbors
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        neighbor_indices = np.argpartition(distances_i, k_neighbors)[:k_neighbors]
+        
+        # Score based on shared neighbors
+        for j in neighbor_indices:
+            if i != j:
+                # Common neighbors metric
+                neighbors_i = set(np.argpartition(distance_matrix[i], k_neighbors)[:k_neighbors])
+                neighbors_j = set(np.argpartition(distance_matrix[j], k_neighbors)[:k_neighbors])
+                common = len(neighbors_i.intersection(neighbors_j))
+                
+                # Distance-normalized score
+                dist_ij = distance_matrix[i, j]
+                avg_neighbor_dist = np.mean([distance_matrix[i, k] for k in neighbor_indices])
+                
+                if avg_neighbor_dist > 0:
+                    normalized_dist = dist_ij / avg_neighbor_dist
+                    score = (common / k_neighbors) * (1 / (normalized_dist + 1e-10))
+                    neighborhood_scores[i, j] = score
+    
+    if neighborhood_scores.max() > 0:
+        neighborhood_scores = neighborhood_scores / neighborhood_scores.max()
+    
+    # ===== 4. ADAPTIVE COMPONENT FUSION =====
+    
+    # Compute component statistics for adaptive weighting
+    component_stats = []
+    components = [edge_freq, edge_betweenness, inv_dist, mst_scores, neighborhood_scores]
+    component_names = ['freq', 'between', 'dist', 'mst', 'neigh']
+    
+    for comp in components:
+        triu_vals = comp[triu_indices]
+        stats = {
+            'mean': np.mean(triu_vals),
+            'std': np.std(triu_vals),
+            'cv': np.std(triu_vals) / (np.mean(triu_vals) + 1e-10),
+            'sparsity': np.mean(triu_vals > 0)
+        }
+        component_stats.append(stats)
+    
+    # Dynamic weight computation
+    base_weights = {
+        'freq': 0.25,
+        'between': 0.20,
+        'dist': 0.20,
+        'mst': 0.20,
+        'neigh': 0.15
+    }
+    
+    # Adjust weights based on component quality
+    adjusted_weights = {}
+    for name, base, stats in zip(component_names, base_weights.values(), component_stats):
+        # Reward discriminative components (high std, low sparsity)
+        std_factor = min(2.0, stats['std'] * 3)
+        sparsity_factor = 1.5 - min(1.0, stats['sparsity'])
+        cv_factor = 1.0 + min(1.0, stats['cv'])
+        
+        adjustment = std_factor * sparsity_factor * cv_factor
+        adjusted_weights[name] = base * adjustment
+    
+    # Normalize weights
+    total_weight = sum(adjusted_weights.values())
+    weights = {name: w / total_weight for name, w in adjusted_weights.items()}
+    
+    # Combine components
+    heuristics_matrix = (
+        weights['freq'] * edge_freq +
+        weights['between'] * edge_betweenness +
+        weights['dist'] * inv_dist +
+        weights['mst'] * mst_scores +
+        weights['neigh'] * neighborhood_scores
+    )
+    
+    # ===== 5. INTELLIGENT SPARSIFICATION =====
+    
+    # Adaptive edge retention per node
+    base_edges = max(2, int(1.5 * log_n))
+    adaptive_factor = 1.0 + min(1.0, dist_stats['cv']) * density_factor
+    edges_per_node = min(n - 1, int(base_edges * adaptive_factor))
+    
+    sparsity_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Get scores for this node
+        scores_i = heuristics_matrix[i].copy()
+        scores_i[i] = -np.inf
+        
+        # Keep top edges_per_node connections
+        threshold_idx = n - edges_per_node - 1
+        threshold = np.partition(scores_i, threshold_idx)[threshold_idx]
+        mask_i = scores_i >= threshold
+        
+        # Ensure at least 2 edges for connectivity
+        if mask_i.sum() < 2:
+            top_indices = np.argsort(scores_i)[-2:]
+            mask_i = np.zeros(n, dtype=bool)
+            mask_i[top_indices] = True
+        
+        sparsity_mask[i] = mask_i
+    
+    # Ensure symmetry and preserve MST edges
+    sparsity_mask = sparsity_mask | sparsity_mask.T | mst_mask
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # ===== 6. POST-PROCESSING =====
+    
+    # Ensure symmetry and zero diagonal
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Enhanced normalization
+    non_zero = heuristics_matrix[heuristics_matrix > 0]
+    if len(non_zero) > 1:
+        # Statistical normalization
+        mean_val = np.mean(non_zero)
+        std_val = np.std(non_zero)
+        
+        if std_val > 1e-10:
+            # Z-score normalization with clipping
+            z_scores = (non_zero - mean_val) / std_val
+            # Map to [0,1] range (preserving 1% extremes)
+            min_z, max_z = np.percentile(z_scores, [1, 99])
+            if max_z > min_z:
+                normalized = (z_scores - min_z) / (max_z - min_z)
+                normalized = np.clip(normalized, 0, 1)
+                heuristics_matrix[heuristics_matrix > 0] = normalized
+    
+    # Final smoothing
+    kernel_size = max(1, int(sqrt_n * 0.2))
+    if kernel_size > 1 and n > kernel_size * 2:
+        # Simple local smoothing
+        for i in range(n):
+            neighbors = np.where(heuristics_matrix[i] > 0)[0]
+            if len(neighbors) > 1:
+                avg_neighbor = np.mean([heuristics_matrix[i, j] for j in neighbors])
+                heuristics_matrix[i, neighbors] = 0.7 * heuristics_matrix[i, neighbors] + 0.3 * avg_neighbor
+    
+    # Final symmetry check
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    
+    return heuristics_matrix
+```

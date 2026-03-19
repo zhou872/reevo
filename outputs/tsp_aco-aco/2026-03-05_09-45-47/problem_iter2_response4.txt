@@ -1,0 +1,282 @@
+```json
+{
+    "algorithm_features": ["Landmark MDS Embedding", "Multiplicative Factor Fusion", "Adaptive Graph Sparsification", "Path-Enhanced Boosting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Optional
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with improved spatial embedding and
+    path-based enhancement.
+    
+    Strategy:
+    1. Fast landmark MDS embedding for spatial neighborhood detection
+    2. Multiplicative fusion of multiple edge quality factors
+    3. Greedy path construction to identify promising tour edges
+    4. Adaptive sparsification preserving global connectivity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric n x n matrix of pairwise distances
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        reciprocal = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal, 0)
+        return reciprocal
+    
+    # 1. Base reciprocal weights (avoid division by zero)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    reciprocal_weights = np.nan_to_num(reciprocal_weights, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # 2. Fast spatial embedding using landmark MDS
+    coords = _landmark_mds(distance_matrix)
+    
+    # 3. Spatial neighborhood via KD-tree (adaptive k)
+    k_spatial = max(3, min(n - 1, int(np.log2(n)) + 2))
+    tree = KDTree(coords)
+    spatial_neighbors = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances, indices = tree.query(coords[i], k=k_spatial + 1)
+        # Exclude self if present
+        if indices[0] == i:
+            indices = indices[1:]
+        else:
+            indices = indices[:-1]
+        spatial_neighbors[i, indices] = True
+    
+    # Make symmetric
+    spatial_neighbors = spatial_neighbors | spatial_neighbors.T
+    
+    # 4. Minimum Spanning Tree edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    mst_edges = mst_edges | mst_edges.T  # Undirected
+    
+    # 5. Greedy path construction for tour edges
+    tour_edges = _greedy_tour_edges(distance_matrix)
+    
+    # 6. Local distance statistics
+    m_local = min(5, n - 1)
+    local_avg_dist = np.zeros(n)
+    for i in range(n):
+        sorted_dists = np.sort(distance_matrix[i])
+        local_avg_dist[i] = np.mean(sorted_dists[1:m_local + 1])  # Exclude diagonal
+    
+    # 7. Multiplicative factor fusion
+    heuristic = np.ones_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            base = reciprocal_weights[i, j]
+            
+            # Spatial factor
+            spatial_factor = 2.5 if spatial_neighbors[i, j] else 0.6
+            
+            # MST factor
+            mst_factor = 3.2 if mst_edges[i, j] else 0.7
+            
+            # Tour factor
+            tour_factor = 2.8 if tour_edges[i, j] else 0.8
+            
+            # Local connectivity factor
+            max_local = max(local_avg_dist[i], local_avg_dist[j])
+            if max_local > 0:
+                dist_ratio = distance_matrix[i, j] / max_local
+                local_factor = np.exp(-dist_ratio ** 2)
+            else:
+                local_factor = 1.0
+            
+            # Multiplicative fusion with logarithmic enhancement
+            combined = (base * spatial_factor * mst_factor * 
+                       tour_factor * local_factor)
+            
+            # Additional boost for very promising edges
+            if spatial_neighbors[i, j] and mst_edges[i, j]:
+                combined *= 1.3
+            if tour_edges[i, j]:
+                combined *= 1.4
+            
+            heuristic[i, j] = heuristic[j, i] = combined
+    
+    np.fill_diagonal(heuristic, 0)
+    
+    # 8. Adaptive sparsification with connectivity preservation
+    sparsified = _adaptive_sparsify(heuristic, distance_matrix)
+    
+    # 9. Triangle-based boosting (clustering coefficient)
+    triangle_boost = np.ones_like(sparsified)
+    for i in range(n):
+        neighbors_i = np.where(sparsified[i] > 0)[0]
+        for j in neighbors_i:
+            if j <= i:
+                continue
+            neighbors_j = np.where(sparsified[j] > 0)[0]
+            common = len(set(neighbors_i) & set(neighbors_j))
+            if common > 0:
+                boost = 1 + 0.25 * np.log1p(common)
+                triangle_boost[i, j] = triangle_boost[j, i] = boost
+    
+    final_heuristic = sparsified * triangle_boost
+    
+    # 10. Normalize and ensure symmetry
+    final_heuristic = np.maximum(final_heuristic, final_heuristic.T)
+    max_val = np.max(final_heuristic)
+    if max_val > 0:
+        final_heuristic /= max_val
+    
+    return final_heuristic
+
+def _landmark_mds(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Fast 2D embedding using landmark Multidimensional Scaling.
+    
+    Chooses two farthest points as landmarks and embeds all points
+    in the plane defined by distances to these landmarks.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Find two farthest points
+    max_idx = np.unravel_index(np.argmax(distance_matrix), distance_matrix.shape)
+    a, b = max_idx[0], max_idx[1]
+    
+    d_ab = distance_matrix[a, b]
+    if d_ab == 0:
+        # All points coincident
+        return np.zeros((n, 2))
+    
+    coords = np.zeros((n, 2))
+    
+    for i in range(n):
+        d_ia = distance_matrix[i, a]
+        d_ib = distance_matrix[i, b]
+        
+        # Law of cosines to find projection on AB line
+        x = (d_ia ** 2 + d_ab ** 2 - d_ib ** 2) / (2 * d_ab)
+        
+        # Avoid numerical issues in sqrt
+        y_sq = max(d_ia ** 2 - x ** 2, 0)
+        y = np.sqrt(y_sq)
+        
+        coords[i] = [x, y]
+    
+    return coords
+
+def _greedy_tour_edges(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Construct a greedy TSP tour and return edge matrix.
+    
+    Uses nearest neighbor heuristic from multiple starting points
+    and takes the best tour found.
+    """
+    n = distance_matrix.shape[0]
+    best_tour = None
+    best_length = np.inf
+    
+    # Try multiple starting points (limited to log(n) for efficiency)
+    n_starts = min(max(3, int(np.log2(n))), n)
+    start_indices = np.linspace(0, n - 1, n_starts, dtype=int)
+    
+    for start in start_indices:
+        tour = [start]
+        visited = set(tour)
+        
+        while len(visited) < n:
+            current = tour[-1]
+            # Find nearest unvisited neighbor
+            mask = np.ones(n, dtype=bool)
+            mask[list(visited)] = False
+            if not np.any(mask):
+                break
+                
+            available_dists = distance_matrix[current].copy()
+            available_dists[~mask] = np.inf
+            next_node = np.argmin(available_dists)
+            tour.append(next_node)
+            visited.add(next_node)
+        
+        # Complete the tour
+        tour.append(start)
+        
+        # Calculate tour length
+        length = 0
+        for i in range(len(tour) - 1):
+            length += distance_matrix[tour[i], tour[i + 1]]
+        
+        if length < best_length:
+            best_length = length
+            best_tour = tour
+    
+    # Create edge matrix from best tour
+    edge_matrix = np.zeros((n, n), dtype=bool)
+    if best_tour is not None:
+        for i in range(len(best_tour) - 1):
+            u, v = best_tour[i], best_tour[i + 1]
+            edge_matrix[u, v] = edge_matrix[v, u] = True
+    
+    return edge_matrix
+
+def _adaptive_sparsify(heuristic: np.ndarray, distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Sparsify heuristic matrix while preserving connectivity.
+    
+    For each node, keep top edges based on adaptive threshold,
+    then ensure the graph remains connected via MST backup.
+    """
+    n = heuristic.shape[0]
+    sparsified = np.zeros_like(heuristic)
+    
+    # Determine number of edges to keep per node
+    # Keep more edges for smaller graphs, fewer for larger
+    base_edges = max(3, int(np.log2(n)) * 2)
+    edges_per_node = min(base_edges, n - 1)
+    
+    # Keep top edges for each node
+    for i in range(n):
+        row = heuristic[i].copy()
+        row[i] = -np.inf  # Ignore self
+        
+        # Find threshold for top edges_per_node
+        if edges_per_node < n:
+            # Use partition for efficiency (O(n) vs O(n log n) for full sort)
+            indices = np.argpartition(row, -edges_per_node)[-edges_per_node:]
+            threshold = np.min(row[indices])
+        else:
+            threshold = 0
+        
+        mask = row >= threshold
+        sparsified[i] = heuristic[i] * mask
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Backup: ensure all MST edges are included (critical for connectivity)
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    mst_edges = mst_edges | mst_edges.T
+    
+    # Add MST edges with their original heuristic values
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_edges[i, j]:
+                sparsified[i, j] = max(sparsified[i, j], heuristic[i, j])
+                sparsified[j, i] = sparsified[i, j]
+    
+    return sparsified
+```

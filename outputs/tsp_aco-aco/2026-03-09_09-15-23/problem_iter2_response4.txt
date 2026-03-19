@@ -1,0 +1,174 @@
+```json
+{
+    "algorithm_features": ["Two-Step Lookahead Regret", "Adaptive Component Weighting", "Cycle-Prevention Consistency", "MST-Constrained Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with:
+    1. Two-step lookahead regret considering multi-step implications
+    2. Problem-size adaptive component weighting
+    3. Global tour consistency to prevent suboptimal cycles
+    4. MST-constrained sparsification for computational efficiency
+    
+    Returns a matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle small cases
+    if n <= 2:
+        heuristics = np.ones((n, n))
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Adaptive weights based on problem size
+    if n < 20:
+        w_inv_dist = 0.4
+        w_regret = 0.3
+        w_two_step = 0.2
+        w_consistency = 0.1
+    elif n < 100:
+        w_inv_dist = 0.35
+        w_regret = 0.35
+        w_two_step = 0.2
+        w_consistency = 0.1
+    else:
+        w_inv_dist = 0.3
+        w_regret = 0.4
+        w_two_step = 0.2
+        w_consistency = 0.1
+    
+    # Initialize components
+    inv_dist = np.zeros((n, n))
+    regret = np.zeros((n, n))
+    two_step_regret = np.zeros((n, n))
+    consistency = np.zeros((n, n))
+    
+    # 1. Base inverse distance (with smoothing)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+    
+    # Normalize inverse distance
+    inv_dist_max = np.max(inv_dist)
+    if inv_dist_max > 0:
+        inv_dist = inv_dist / inv_dist_max
+    
+    # 2. One-step nearest neighbor regret
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        sorted_idx = np.argsort(row)
+        nearest_dist = row[sorted_idx[0]]
+        
+        for j in range(n):
+            if i != j:
+                regret[i, j] = nearest_dist / max(distance_matrix[i, j], 1e-10)
+    
+    # Normalize regret
+    regret_max = np.max(regret)
+    if regret_max > 0:
+        regret = regret / regret_max
+    
+    # 3. Two-step lookahead regret (multi-step decision quality)
+    if n >= 3:
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    # Find best two-step alternative path i -> k -> j
+                    best_alternative = np.inf
+                    for k in range(n):
+                        if k != i and k != j:
+                            alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                            if alt_cost < best_alternative:
+                                best_alternative = alt_cost
+                    
+                    if best_alternative < np.inf:
+                        # Regret ratio: how much worse is the alternative?
+                        direct_cost = distance_matrix[i, j]
+                        if direct_cost > 0:
+                            ratio = best_alternative / direct_cost
+                            # Favor edges where direct path is significantly better
+                            two_step_regret[i, j] = np.tanh(ratio - 1)  # Range: [-1, 1], normalize to [0, 1]
+    
+    # Normalize two-step regret to [0, 1]
+    two_step_min = np.min(two_step_regret)
+    two_step_max = np.max(two_step_regret)
+    if two_step_max > two_step_min:
+        two_step_regret = (two_step_regret - two_step_min) / (two_step_max - two_step_min)
+    
+    # 4. Global tour consistency (cycle prevention)
+    if n >= 4:
+        # Identify potential clusters to avoid intra-cluster cycles
+        condensed_dist = squareform(distance_matrix, checks=False)
+        Z = linkage(condensed_dist, method='average')
+        
+        # Create multiple clusterings at different levels
+        clusters_list = []
+        for t in [2, 3, 4]:
+            if t < n:
+                clusters = fcluster(Z, t=t, criterion='maxclust')
+                clusters_list.append(clusters)
+        
+        # Consistency bonus: edges connecting different clusters
+        for i in range(n):
+            for j in range(i + 1, n):
+                if i != j:
+                    # Count how many clusterings separate i and j
+                    separation_score = 0
+                    for clusters in clusters_list:
+                        if clusters[i] != clusters[j]:
+                            separation_score += 1
+                    
+                    consistency[i, j] = separation_score / len(clusters_list)
+                    consistency[j, i] = consistency[i, j]
+    
+    # 5. Combine components with adaptive weights
+    heuristics = (
+        w_inv_dist * inv_dist +
+        w_regret * regret +
+        w_two_step * two_step_regret +
+        w_consistency * consistency
+    )
+    
+    # 6. MST-constrained sparsification
+    # Keep edges that are either in MST or connect to MST nodes
+    if n >= 3:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = mst.toarray() > 0
+        
+        # Expand MST by connecting to nearest neighbors of MST nodes
+        expanded_mask = mst_mask.copy()
+        for i in range(n):
+            # Find MST neighbors
+            mst_neighbors = np.where(mst_mask[i])[0]
+            if len(mst_neighbors) > 0:
+                # Add k-nearest neighbors of each MST neighbor
+                for neighbor in mst_neighbors:
+                    row = distance_matrix[neighbor].copy()
+                    row[neighbor] = np.inf
+                    k = max(2, int(np.sqrt(n)))
+                    nearest_indices = np.argpartition(row, k)[:k]
+                    expanded_mask[neighbor, nearest_indices] = True
+                    expanded_mask[nearest_indices, neighbor] = True
+        
+        # Symmetrize and apply mask
+        expanded_mask = expanded_mask | expanded_mask.T
+        heuristics = heuristics * expanded_mask
+    
+    # 7. Final normalization and diagonal cleanup
+    np.fill_diagonal(heuristics, 0)
+    
+    heuristics_max = np.max(heuristics)
+    if heuristics_max > 0:
+        heuristics = heuristics / heuristics_max
+    
+    return heuristics
+```

@@ -1,0 +1,433 @@
+```json
+{
+    "algorithm_features": ["Instance-Aware Adaptation", "Christofides Components", "Gradient-Based Refinement", "Dynamic Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+from typing import Dict, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with instance-aware adaptation,
+    Christofides algorithm components, gradient-based refinement, and dynamic sparsification.
+    
+    Key Innovations:
+    1. Instance-aware parameter adaptation using statistical profiling
+    2. Christofides algorithm components (MST + minimum weight perfect matching approximation)
+    3. Gradient-based edge refinement using local search principles
+    4. Dynamic sparsification with connectivity preservation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape indicating edge promise (higher = better).
+    """
+    n = distance_matrix.shape[0]
+    
+    # For trivial cases
+    if n <= 2:
+        inv_dist = np.zeros_like(distance_matrix, dtype=float)
+        np.divide(1.0, distance_matrix, out=inv_dist, where=distance_matrix != 0)
+        np.fill_diagonal(inv_dist, 0.0)
+        return inv_dist
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    instance_stats = _analyze_instance(distance_matrix, n)
+    
+    # ===== 2. ADAPTIVE PARAMETER TUNING =====
+    params = _compute_adaptive_params(instance_stats)
+    
+    # ===== 3. BASE HEURISTIC COMPONENTS =====
+    # 3.1 Inverse distance (proximity)
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    np.divide(1.0, distance_matrix, out=inv_dist, where=distance_matrix != 0)
+    np.fill_diagonal(inv_dist, 0.0)
+    
+    # 3.2 MST component
+    mst_component = _compute_mst_component(distance_matrix, n, params)
+    
+    # 3.3 Christofides-inspired matching component
+    christofides_component = _compute_christofides_component(distance_matrix, n, params, mst_component)
+    
+    # 3.4 Gradient-based local search component
+    gradient_component = _compute_gradient_component(distance_matrix, n, params)
+    
+    # ===== 4. WEIGHTED COMBINATION =====
+    heuristics = (
+        params["w_inv_dist"] * inv_dist +
+        params["w_mst"] * mst_component +
+        params["w_christofides"] * christofides_component +
+        params["w_gradient"] * gradient_component
+    )
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # ===== 5. DYNAMIC SPARSIFICATION =====
+    heuristics = _dynamic_sparsification(heuristics, distance_matrix, n, instance_stats, params)
+    
+    # ===== 6. CONNECTIVITY ENFORCEMENT =====
+    heuristics = _enforce_connectivity(heuristics, distance_matrix, n, params)
+    
+    # ===== 7. FINAL PROCESSING =====
+    # Softmax normalization per row for stochastic sampling
+    eps = 1e-10
+    row_max = heuristics.max(axis=1, keepdims=True)
+    row_min = heuristics.min(axis=1, keepdims=True)
+    
+    # Avoid division by zero
+    row_range = row_max - row_min
+    row_range[row_range == 0] = 1
+    
+    # Normalize to [0, 1]
+    normalized = (heuristics - row_min) / row_range
+    
+    # Apply softmax with temperature
+    temperature = params["temperature"]
+    if temperature > 0:
+        exp_scores = np.exp(normalized / temperature)
+        np.fill_diagonal(exp_scores, 0)
+        row_sums = exp_scores.sum(axis=1, keepdims=True) + eps
+        heuristics = exp_scores / row_sums
+    else:
+        # Simple row normalization
+        row_sums = normalized.sum(axis=1, keepdims=True) + eps
+        heuristics = normalized / row_sums
+    
+    return heuristics
+
+
+def _analyze_instance(distance_matrix: np.ndarray, n: int) -> Dict:
+    """Analyze instance characteristics for adaptive tuning."""
+    mask = ~np.eye(n, dtype=bool)
+    distances = distance_matrix[mask]
+    
+    # Basic statistics
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv_dist = std_dist / (mean_dist + 1e-10)  # Coefficient of variation
+    
+    # Distance distribution percentiles
+    percentiles = np.percentile(distances, [10, 25, 50, 75, 90])
+    
+    # Nearest neighbor statistics
+    nearest_dists = []
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        nearest_dists.append(np.min(row))
+    
+    stats = {
+        "n": n,
+        "mean_dist": mean_dist,
+        "std_dist": std_dist,
+        "cv_dist": cv_dist,
+        "p10": percentiles[0],
+        "p25": percentiles[1],
+        "p50": percentiles[2],
+        "p75": percentiles[3],
+        "p90": percentiles[4],
+        "mean_nearest": np.mean(nearest_dists),
+        "std_nearest": np.std(nearest_dists),
+        "skewness": (np.mean(distances) - np.median(distances)) / (std_dist + 1e-10),
+    }
+    
+    return stats
+
+
+def _compute_adaptive_params(stats: Dict) -> Dict:
+    """Compute adaptive parameters based on instance statistics."""
+    n = stats["n"]
+    cv = stats["cv_dist"]
+    skew = stats["skewness"]
+    
+    # Base weights
+    params = {}
+    
+    # Component weights based on instance characteristics
+    if cv > 1.5:  # Highly variable
+        params["w_inv_dist"] = 0.2
+        params["w_mst"] = 0.4
+        params["w_christofides"] = 0.3
+        params["w_gradient"] = 0.1
+    elif cv < 0.5:  # Uniform
+        params["w_inv_dist"] = 0.3
+        params["w_mst"] = 0.2
+        params["w_christofides"] = 0.3
+        params["w_gradient"] = 0.2
+    else:  # Moderate variability
+        params["w_inv_dist"] = 0.25
+        params["w_mst"] = 0.3
+        params["w_christofides"] = 0.25
+        params["w_gradient"] = 0.2
+    
+    # Adjust for problem size
+    size_factor = np.log10(n) / 2
+    params["w_mst"] *= min(1.5, 1 + 0.1 * size_factor)
+    params["w_christofides"] *= min(1.3, 1 + 0.08 * size_factor)
+    
+    # Normalize weights
+    total = sum(params[k] for k in ["w_inv_dist", "w_mst", "w_christofides", "w_gradient"])
+    for key in ["w_inv_dist", "w_mst", "w_christofides", "w_gradient"]:
+        params[key] /= total
+    
+    # Sparsification parameters
+    if n < 50:
+        params["sparsity_percentile"] = 70
+        params["min_edges"] = 3
+    elif n < 200:
+        params["sparsity_percentile"] = 80
+        params["min_edges"] = max(2, int(np.log2(n)))
+    else:
+        params["sparsity_percentile"] = 85
+        params["min_edges"] = max(2, int(np.log2(n) / 2))
+    
+    # Temperature for softmax (controls exploration)
+    params["temperature"] = 0.1 + 0.1 * np.exp(-n / 100)
+    
+    # Gradient refinement parameters
+    params["gradient_steps"] = min(5, max(1, n // 50))
+    params["learning_rate"] = 0.1
+    
+    return params
+
+
+def _compute_mst_component(distance_matrix: np.ndarray, n: int, params: Dict) -> np.ndarray:
+    """Compute MST-based heuristic component."""
+    mst = minimum_spanning_tree(csr_matrix(distance_matrix)).toarray()
+    mst_component = np.zeros_like(distance_matrix)
+    
+    # MST edges get base score
+    mst_mask = mst > 0
+    if mst_mask.any():
+        # Normalize by average MST edge weight
+        mst_edges = distance_matrix[mst_mask]
+        avg_mst_weight = np.mean(mst_edges) + 1e-10
+        mst_component[mst_mask] = avg_mst_weight / (distance_matrix[mst_mask] + 1e-10)
+    
+    # Boost important MST edges (connecting clusters)
+    mst_degrees = (mst > 0).sum(axis=1)
+    if mst_degrees.max() > 1:
+        # Identify articulation points and bridges
+        for i in range(n):
+            if mst_degrees[i] > 1:
+                neighbors = np.where(mst[i] > 0)[0]
+                for j in neighbors:
+                    if mst_degrees[j] > 1:
+                        # Bridge between two high-degree nodes
+                        mst_component[i, j] *= 1.5
+    
+    # Normalize
+    max_val = mst_component.max()
+    if max_val > 0:
+        mst_component /= max_val
+    
+    return mst_component
+
+
+def _compute_christofides_component(distance_matrix: np.ndarray, n: int, 
+                                   params: Dict, mst_component: np.ndarray) -> np.ndarray:
+    """Compute Christofides-inspired component (MST + matching approximation)."""
+    component = np.zeros_like(distance_matrix)
+    
+    if n < 4:
+        return component
+    
+    # 1. Identify odd-degree vertices in MST
+    mst_mask = mst_component > 0
+    mst_degrees = mst_mask.sum(axis=1)
+    odd_vertices = np.where(mst_degrees % 2 == 1)[0]
+    num_odd = len(odd_vertices)
+    
+    if num_odd < 4:
+        return component
+    
+    # 2. Approximate minimum weight perfect matching on odd vertices
+    # For efficiency, use greedy matching
+    odd_subset = odd_vertices[:min(num_odd, 20)]  # Limit for large instances
+    used = np.zeros(len(odd_subset), dtype=bool)
+    
+    for i in range(len(odd_subset)):
+        if not used[i]:
+            # Find closest unused odd vertex
+            best_j = -1
+            best_dist = np.inf
+            for j in range(i + 1, len(odd_subset)):
+                if not used[j]:
+                    dist = distance_matrix[odd_subset[i], odd_subset[j]]
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_j = j
+            
+            if best_j != -1:
+                idx_i, idx_j = odd_subset[i], odd_subset[best_j]
+                # Score inversely proportional to distance
+                component[idx_i, idx_j] = 1.0 / (best_dist + 1e-10)
+                component[idx_j, idx_i] = component[idx_i, idx_j]
+                used[i] = used[best_j] = True
+    
+    # 3. Also consider edges incident to odd vertices (Christofides intuition)
+    for v in odd_vertices[:min(num_odd, 50)]:  # Limit for efficiency
+        # Find k nearest neighbors to this odd vertex
+        row = distance_matrix[v].copy()
+        row[v] = np.inf
+        k = min(5, n // 10)
+        if k > 0:
+            indices = np.argpartition(row, k)[:k]
+            for j in indices:
+                if row[j] < np.inf:
+                    boost = 1.0 / (row[j] + 1e-10)
+                    component[v, j] = max(component[v, j], boost * 0.5)
+                    component[j, v] = component[v, j]
+    
+    # Normalize
+    max_val = component.max()
+    if max_val > 0:
+        component /= max_val
+    
+    return component
+
+
+def _compute_gradient_component(distance_matrix: np.ndarray, n: int, params: Dict) -> np.ndarray:
+    """Compute gradient-based component using local search principles."""
+    component = np.zeros_like(distance_matrix)
+    
+    # Initialize with inverse distance
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    np.divide(1.0, distance_matrix, out=inv_dist, where=distance_matrix != 0)
+    np.fill_diagonal(inv_dist, 0.0)
+    
+    # Apply gradient-style updates (simulating local search improvements)
+    steps = params["gradient_steps"]
+    lr = params["learning_rate"]
+    
+    current = inv_dist.copy()
+    
+    for _ in range(steps):
+        # Compute "gradient" based on 2-opt neighborhood intuition
+        gradient = np.zeros_like(current)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if distance_matrix[i, j] == 0:
+                    continue
+                
+                # Consider alternative paths (2-opt style)
+                alt_gain = 0
+                alt_count = 0
+                
+                # Sample a few alternative connections
+                for k in range(min(5, n)):
+                    if k != i and k != j:
+                        # If we break edge (i,j) and connect i-k, k-j
+                        if (distance_matrix[i, k] > 0 and distance_matrix[k, j] > 0 and
+                            current[i, k] > 0 and current[k, j] > 0):
+                            alt_length = distance_matrix[i, k] + distance_matrix[k, j]
+                            gain = distance_matrix[i, j] - alt_length
+                            if gain > 0:
+                                alt_gain += gain
+                                alt_count += 1
+                
+                if alt_count > 0:
+                    avg_gain = alt_gain / alt_count
+                    # Positive gain means edge (i,j) might be suboptimal
+                    if avg_gain > 0:
+                        gradient[i, j] = -lr * avg_gain * current[i, j]
+                    else:
+                        gradient[i, j] = lr * abs(avg_gain) * (1 - current[i, j])
+                else:
+                    # No alternative found, mildly encourage
+                    gradient[i, j] = lr * 0.1 * (1 - current[i, j])
+                
+                gradient[j, i] = gradient[i, j]
+        
+        # Update current scores
+        current += gradient
+        current = np.clip(current, 0, 1)
+    
+    component = current
+    
+    return component
+
+
+def _dynamic_sparsification(heuristics: np.ndarray, distance_matrix: np.ndarray,
+                           n: int, stats: Dict, params: Dict) -> np.ndarray:
+    """Apply dynamic sparsification while preserving important structure."""
+    result = heuristics.copy()
+    
+    # Adaptive threshold based on instance characteristics
+    if stats["cv_dist"] > 1.5:  # Highly variable
+        percentile = params["sparsity_percentile"] - 10
+    elif stats["cv_dist"] < 0.5:  # Uniform
+        percentile = params["sparsity_percentile"] + 5
+    else:
+        percentile = params["sparsity_percentile"]
+    
+    # Apply percentile threshold
+    off_diag = result[~np.eye(n, dtype=bool)]
+    if len(off_diag) > 0:
+        threshold = np.percentile(off_diag[off_diag > 0], percentile) if np.any(off_diag > 0) else 0
+        result[result < threshold] = 0
+    
+    # Preserve edges with strong structural importance
+    # Identify edges that appear in multiple heuristics
+    structural_edges = np.zeros_like(result, dtype=bool)
+    
+    # MST edges
+    mst = minimum_spanning_tree(csr_matrix(distance_matrix)).toarray()
+    structural_edges |= (mst > 0)
+    
+    # Nearest neighbor edges (for each node)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        k = min(3, n // 10)
+        if k > 0:
+            indices = np.argpartition(row, k)[:k]
+            structural_edges[i, indices] = True
+            structural_edges[indices, i] = True
+    
+    # Ensure structural edges are preserved
+    result[structural_edges] = np.maximum(result[structural_edges], 
+                                         np.percentile(off_diag[off_diag > 0], 50) if np.any(off_diag > 0) else 0.1)
+    
+    return result
+
+
+def _enforce_connectivity(heuristics: np.ndarray, distance_matrix: np.ndarray,
+                         n: int, params: Dict) -> np.ndarray:
+    """Ensure each node has sufficient connectivity."""
+    result = heuristics.copy()
+    min_edges = params["min_edges"]
+    
+    for i in range(n):
+        non_zero = np.count_nonzero(result[i])
+        
+        if non_zero < min_edges:
+            # Add promising missing edges
+            row = distance_matrix[i].copy()
+            row[i] = np.inf
+            
+            # Skip already non-zero edges
+            already_selected = result[i] > 0
+            row[already_selected] = np.inf
+            
+            # Select closest missing edges
+            candidates = np.argsort(row)[:min_edges - non_zero]
+            for j in candidates:
+                if row[j] < np.inf:
+                    # Add with reduced weight
+                    result[i, j] = 1.0 / (row[j] + 1e-10) * 0.3
+                    result[j, i] = result[i, j]
+    
+    return result
+```

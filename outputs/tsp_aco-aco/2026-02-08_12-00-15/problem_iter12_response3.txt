@@ -1,0 +1,205 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristics with advanced feature combination.
+    Incorporates multi-scale nearest neighbor analysis, edge centrality,
+    geometric coherence, and adaptive regularization.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base heuristic: reciprocal with distance transformation
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # Distance transformation to enhance contrast
+    mean_dist = np.mean(safe_dist[safe_dist < np.inf])
+    base_heuristic = np.exp(-safe_dist / (mean_dist + 1e-10))
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. Multi-scale minimum spanning tree analysis
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # MST edge importance based on node degree in MST
+    mst_degrees = np.sum(mst_mask, axis=1)
+    mst_edge_importance = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_mask[i, j]:
+                # Higher bonus for edges connecting high-degree nodes in MST
+                degree_factor = (mst_degrees[i] + mst_degrees[j]) / (2 * np.max(mst_degrees) + 1e-10)
+                mst_edge_importance[i, j] = mst_edge_importance[j, i] = 1.5 + 0.8 * degree_factor
+    
+    # 3. Multi-level nearest neighbor analysis
+    nn_levels = [min(max(2, int(np.log2(n))), 5), 
+                 min(max(3, n//10), 10),
+                 min(max(4, n//5), 15)]
+    
+    nn_heuristic = np.zeros_like(distance_matrix)
+    for k in nn_levels:
+        k = min(k, n-1)
+        for i in range(n):
+            row = safe_dist[i]
+            valid_indices = np.argsort(row)[1:k+1]  # Skip self
+            weights = np.exp(-np.arange(k) / (k/3))
+            weights = weights / np.sum(weights) * k
+            nn_heuristic[i, valid_indices] += weights
+    
+    # Normalize and transform NN heuristic
+    max_nn = nn_heuristic.max()
+    if max_nn > 0:
+        nn_heuristic = nn_heuristic / max_nn
+    nn_bonus = 1.0 + np.tanh(nn_heuristic * 2)  # [1.0, ~1.76]
+    
+    # 4. Edge centrality and structural coherence
+    centrality = np.zeros_like(distance_matrix)
+    
+    # Compute approximate betweenness centrality using sampled paths
+    if n >= 4:
+        sample_size = min(200, n * (n-1) // 2)
+        
+        for _ in range(sample_size):
+            # Sample two distinct nodes
+            i, j = np.random.choice(n, 2, replace=False)
+            
+            # Find shortest path using base heuristic as proxy
+            path_edges = []
+            if base_heuristic[i, j] > np.percentile(base_heuristic, 70):
+                # Direct edge is promising
+                path_edges = [(i, j)]
+            else:
+                # Try 2-hop paths
+                for k in range(n):
+                    if k != i and k != j:
+                        if (base_heuristic[i, k] > np.percentile(base_heuristic, 60) and
+                            base_heuristic[k, j] > np.percentile(base_heuristic, 60)):
+                            path_edges.extend([(i, k), (k, j)])
+                            break
+            
+            # Boost edges on promising paths
+            for a, b in path_edges:
+                centrality[a, b] += 0.1
+    
+    centrality = (centrality + centrality.T) / 2
+    centrality_factor = 1.0 + 0.5 * np.tanh(centrality)
+    
+    # 5. Geometric coherence: triangle quality assessment
+    triangle_quality = np.zeros_like(distance_matrix)
+    
+    if n >= 3:
+        # Assess triangle quality for promising edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if base_heuristic[i, j] > np.percentile(base_heuristic, 50):
+                    # Find best third vertex to form triangle
+                    best_quality = 0
+                    for k in range(n):
+                        if k != i and k != j:
+                            # Triangle inequality satisfaction measure
+                            d_ij = safe_dist[i, j]
+                            d_ik = safe_dist[i, k]
+                            d_jk = safe_dist[j, k]
+                            
+                            # Quality: how well the triangle satisfies geometric constraints
+                            quality = 2 * d_ij / (d_ik + d_jk + 1e-10)
+                            quality = np.exp(-np.abs(np.log(quality)))
+                            best_quality = max(best_quality, quality)
+                    
+                    triangle_quality[i, j] = triangle_quality[j, i] = best_quality
+        
+        triangle_factor = 0.7 + 0.6 * triangle_quality  # [0.7, 1.3]
+    else:
+        triangle_factor = 1.0
+    
+    # 6. Local density adaptation
+    density_factor = np.ones_like(distance_matrix)
+    
+    # Adjust based on local neighborhood density
+    for i in range(n):
+        local_distances = safe_dist[i]
+        median_dist = np.median(local_distances[local_distances < np.inf])
+        
+        for j in range(n):
+            if i != j:
+                # Boost edges to nodes in denser regions
+                if safe_dist[i, j] < median_dist:
+                    density_factor[i, j] = 1.2
+                else:
+                    density_factor[i, j] = 0.9
+    
+    # 7. Combine all factors
+    heuristics = base_heuristic.copy()
+    heuristics[mst_mask] *= mst_edge_importance[mst_mask]
+    heuristics *= nn_bonus
+    heuristics *= centrality_factor
+    heuristics *= triangle_factor
+    heuristics *= density_factor
+    
+    # 8. Adaptive sparsification with structural preservation
+    sparsified = np.zeros_like(heuristics)
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = -np.inf
+        
+        # Determine number of edges to keep adaptively
+        keep_count = max(2, min(8, int(np.sqrt(n)) + 2))
+        
+        # Always keep MST edges
+        mst_indices = np.where(mst_mask[i])[0]
+        
+        # Keep top heuristic edges
+        top_indices = np.argpartition(-row, keep_count)[:keep_count]
+        
+        # Combine and ensure uniqueness
+        keep_indices = np.unique(np.concatenate([mst_indices, top_indices]))
+        keep_indices = keep_indices[keep_indices != i]
+        
+        sparsified[i, keep_indices] = row[keep_indices]
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0.0)
+    
+    # 9. Final refinement and normalization
+    # Smooth the heuristic values
+    if n >= 3:
+        for _ in range(2):  # Two smoothing iterations
+            smoothed = sparsified.copy()
+            for i in range(n):
+                for j in range(i+1, n):
+                    if sparsified[i, j] > 0:
+                        # Average with neighbors' heuristic values
+                        neighbors_i = np.where(sparsified[i] > 0)[0]
+                        neighbors_j = np.where(sparsified[j] > 0)[0]
+                        
+                        if len(neighbors_i) > 0 and len(neighbors_j) > 0:
+                            avg_i = np.mean(sparsified[i, neighbors_i])
+                            avg_j = np.mean(sparsified[j, neighbors_j])
+                            smoothed[i, j] = smoothed[j, i] = 0.7 * sparsified[i, j] + 0.15 * avg_i + 0.15 * avg_j
+            
+            sparsified = smoothed
+    
+    # Normalize to [0, 1]
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    # Apply final non-linear transformation for contrast enhancement
+    sparsified = np.power(sparsified, 0.8)
+    
+    return sparsified
+```

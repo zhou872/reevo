@@ -1,0 +1,358 @@
+```json
+{
+    "algorithm_features": ["Betweenness Centrality Edge Scoring", "Four-Hop Path Integral Regret Analysis", "Adaptive Reinforcement Weighting", "Spectral Embedding Clustering"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import eigsh
+from sklearn.cluster import KMeans
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic function integrating graph centrality, deep path analysis,
+    adaptive reinforcement weighting, and spectral embedding clustering.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ENHANCED SPARSIFICATION WITH CENTRALITY AWARENESS ====================
+    # Compute local density for adaptive sparsification
+    base_k = max(3, int(np.log2(n)))
+    local_densities = np.zeros(n)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest = np.partition(distances, min(base_k, n-1))[:min(base_k, n-1)]
+        local_densities[i] = 1.0 / (np.mean(nearest) + 1e-10)
+    
+    # Normalize densities
+    density_min, density_max = local_densities.min(), local_densities.max()
+    if density_max > density_min:
+        normalized_densities = (local_densities - density_min) / (density_max - density_min)
+    else:
+        normalized_densities = np.ones(n)
+    
+    # Create adaptive sparsification with centrality consideration
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Centrality-aware k: high-density nodes need more connections
+        centrality_factor = 0.6 + 1.4 * normalized_densities[i]  # Range [0.6, 2.0]
+        adaptive_k = min(n-1, int(base_k * centrality_factor))
+        
+        # Get adaptive nearest neighbors
+        nn_indices = np.argpartition(distances, adaptive_k)[:adaptive_k]
+        adjacency_mask[i, nn_indices] = True
+    
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. BETWEENNESS CENTRALITY EDGE SCORING ====================
+    # Compute approximate betweenness centrality using BFS from multiple sources
+    betweenness_scores = np.zeros_like(distance_matrix, dtype=float)
+    n_sources = min(20, max(5, n // 10))  # Adaptive number of sources
+    
+    if n_sources > 0:
+        source_indices = np.random.choice(n, size=n_sources, replace=False)
+        
+        for source in source_indices:
+            # Dijkstra-like propagation for weighted graph
+            dist = np.full(n, np.inf)
+            dist[source] = 0
+            sigma = np.zeros(n)  # Number of shortest paths
+            sigma[source] = 1
+            predecessor_lists = [[] for _ in range(n)]
+            
+            # Priority queue simulation
+            visited = np.zeros(n, dtype=bool)
+            for _ in range(n):
+                # Find unvisited node with minimum distance
+                unvisited = np.where(~visited)[0]
+                if len(unvisited) == 0:
+                    break
+                u = unvisited[np.argmin(dist[unvisited])]
+                visited[u] = True
+                
+                # Update neighbors
+                for v in np.where(adjacency_mask[u])[0]:
+                    if not visited[v]:
+                        alt = dist[u] + distance_matrix[u, v]
+                        if alt < dist[v] - 1e-10:  # New shortest path
+                            dist[v] = alt
+                            sigma[v] = sigma[u]
+                            predecessor_lists[v] = [u]
+                        elif abs(alt - dist[v]) < 1e-10:  # Another shortest path
+                            sigma[v] += sigma[u]
+                            predecessor_lists[v].append(u)
+            
+            # Backward accumulation of betweenness
+            delta = np.zeros(n)
+            order = np.argsort(dist)[::-1]  # Process from furthest to closest
+            
+            for w in order:
+                if w == source:
+                    continue
+                coeff = (1 + delta[w]) / sigma[w]
+                for v in predecessor_lists[w]:
+                    if sigma[v] > 0:
+                        edge_score = sigma[v] * coeff
+                        betweenness_scores[v, w] += edge_score
+                        betweenness_scores[w, v] += edge_score
+                        delta[v] += edge_score
+    
+    # Normalize betweenness scores
+    if betweenness_scores.max() > 0:
+        betweenness_scores = betweenness_scores / betweenness_scores.max()
+    
+    # ==================== 3. FOUR-HOP PATH INTEGRAL REGRET ANALYSIS ====================
+    # Precompute sorted neighbors for efficiency
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    # Multi-hop regret analysis (2, 3, and 4 hops)
+    hop_scores = np.ones_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask_i = adjacency_mask[i]
+        valid_indices_i = np.where(valid_mask_i)[0]
+        
+        for j in valid_indices_i:
+            if i >= j:
+                continue
+            
+            direct_dist = distance_matrix[i, j]
+            if direct_dist < 1e-10:
+                continue
+            
+            # Initialize best distances for each hop count
+            best_distances = [np.inf, np.inf, np.inf]  # 2-hop, 3-hop, 4-hop
+            
+            # 2-hop analysis via common neighbors
+            common_neighbors = np.where(adjacency_mask[i] & adjacency_mask[j])[0]
+            common_neighbors = common_neighbors[(common_neighbors != i) & (common_neighbors != j)]
+            
+            if len(common_neighbors) > 0:
+                two_hop_dists = distance_matrix[i, common_neighbors] + distance_matrix[common_neighbors, j]
+                best_distances[0] = np.min(two_hop_dists)
+            
+            # 3-hop and 4-hop analysis with sampling
+            sample_size = min(15, max(5, n // 20))
+            
+            for _ in range(sample_size):
+                # Sample intermediate nodes
+                candidates = [x for x in range(n) if x not in (i, j)]
+                if not candidates:
+                    break
+                
+                k = np.random.choice(candidates)
+                if not adjacency_mask[i, k]:
+                    continue
+                
+                # 3-hop: i -> k -> l -> j
+                possible_l = np.where(adjacency_mask[k] & adjacency_mask[j])[0]
+                possible_l = possible_l[(possible_l != i) & (possible_l != j) & (possible_l != k)]
+                
+                if len(possible_l) > 0:
+                    for l in possible_l[:2]:  # Check up to 2 options
+                        three_hop = distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                        if three_hop < best_distances[1]:
+                            best_distances[1] = three_hop
+                
+                # 4-hop: i -> k -> l -> m -> j
+                if len(possible_l) > 0:
+                    l = possible_l[0]
+                    possible_m = np.where(adjacency_mask[l] & adjacency_mask[j])[0]
+                    possible_m = possible_m[(possible_m != i) & (possible_m != j) & (possible_m != k) & (possible_m != l)]
+                    
+                    if len(possible_m) > 0:
+                        m = possible_m[0]
+                        four_hop = (distance_matrix[i, k] + distance_matrix[k, l] + 
+                                   distance_matrix[l, m] + distance_matrix[m, j])
+                        if four_hop < best_distances[2]:
+                            best_distances[2] = four_hop
+            
+            # Compute integrated regret score
+            valid_hops = [idx for idx, dist in enumerate(best_distances) if dist < np.inf]
+            
+            if valid_hops:
+                # Weight decays with hop count
+                weights = [0.5, 0.3, 0.2]  # Weights for 2, 3, 4 hops
+                
+                # Compute regret for each valid hop
+                regrets = []
+                for hop_idx in valid_hops:
+                    hop_dist = best_distances[hop_idx]
+                    regret = max(0, (direct_dist - hop_dist) / (direct_dist + 1e-10))
+                    regrets.append(regret)
+                
+                # Weighted average regret
+                weighted_regret = sum(w * r for w, r in zip(weights[:len(valid_hops)], regrets)) / sum(weights[:len(valid_hops)])
+                
+                # Convert to score (higher regret = more promising edge)
+                hop_scores[i, j] = hop_scores[j, i] = 1.0 + 0.6 * weighted_regret
+    
+    # ==================== 4. SPECTRAL EMBEDDING CLUSTERING ====================
+    # Create Laplacian matrix for spectral embedding
+    W = np.zeros_like(distance_matrix)
+    W[adjacency_mask] = 1.0 / (distance_matrix[adjacency_mask] + 1e-10)
+    np.fill_diagonal(W, 0)
+    
+    D = np.diag(W.sum(axis=1))
+    L = D - W  # Unnormalized Laplacian
+    
+    # Compute spectral embedding
+    n_clusters = max(2, min(10, int(np.sqrt(n))))
+    try:
+        # Compute eigenvectors of Laplacian
+        eigvals, eigvecs = eigsh(L, k=n_clusters, sigma=0, which='LM')
+        
+        # Use K-means on eigenvectors
+        if eigvecs.shape[1] > 1:
+            kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+            cluster_labels = kmeans.fit_predict(eigvecs)
+        else:
+            cluster_labels = np.zeros(n, dtype=int)
+    except:
+        # Fallback to connected components
+        sparse_graph = csr_matrix(adjacency_mask.astype(int))
+        _, cluster_labels = connected_components(sparse_graph, directed=False, return_labels=True)
+    
+    # Compute cluster-based scores
+    cluster_scores = np.ones_like(distance_matrix)
+    cluster_sizes = np.bincount(cluster_labels)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                if cluster_labels[i] == cluster_labels[j]:
+                    # Same cluster: boost based on cluster size
+                    cluster_size = cluster_sizes[cluster_labels[i]]
+                    size_factor = 2.0 / (1.0 + np.log1p(cluster_size))
+                    cluster_scores[i, j] = cluster_scores[j, i] = size_factor
+                else:
+                    # Different clusters: penalize based on distance between clusters
+                    cluster_i_nodes = np.where(cluster_labels == cluster_labels[i])[0]
+                    cluster_j_nodes = np.where(cluster_labels == cluster_labels[j])[0]
+                    
+                    # Compute average distance between clusters
+                    cross_distances = distance_matrix[np.ix_(cluster_i_nodes, cluster_j_nodes)]
+                    avg_cross_dist = np.mean(cross_distances)
+                    avg_intra_dist = distance_matrix.mean()
+                    
+                    # Normalize and apply penalty
+                    penalty_factor = 0.3 + 0.7 * np.exp(-avg_cross_dist / (avg_intra_dist + 1e-10))
+                    cluster_scores[i, j] = cluster_scores[j, i] = penalty_factor
+    
+    # ==================== 5. ADAPTIVE REINFORCEMENT WEIGHTING ====================
+    # Dynamically adjust component weights based on problem characteristics
+    component_weights = np.ones(4)  # Inverse distance, multi-hop, cluster, betweenness
+    
+    # Analyze problem statistics
+    avg_distance = distance_matrix.mean()
+    distance_variance = distance_matrix.var()
+    
+    if distance_variance > 0:
+        cv = np.sqrt(distance_variance) / avg_distance
+        
+        # Reinforcement-inspired weighting: favor strategies that work well for this instance
+        # Higher variance -> more emphasis on multi-hop and betweenness
+        component_weights[0] = 1.0  # Inverse distance (stable)
+        component_weights[1] = 0.8 + 0.4 * min(1.0, cv)  # Multi-hop
+        component_weights[2] = 1.2 - 0.4 * min(1.0, cv)  # Clustering
+        component_weights[3] = 0.6 + 0.6 * min(1.0, cv)  # Betweenness
+    
+    # Normalize weights
+    component_weights = component_weights / component_weights.sum()
+    
+    # ==================== 6. INVERSE DISTANCE WITH CENTRALITY ENHANCEMENT ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            valid_indices = np.where(valid_mask)[0]
+            
+            # Enhanced inverse distance with centrality weighting
+            for idx, j in enumerate(valid_indices):
+                dist = valid_dists[idx]
+                
+                # Base inverse distance
+                base_val = 1.0 / (dist + 1e-10)
+                
+                # Enhance by betweenness centrality
+                centrality_boost = 1.0 + 0.5 * betweenness_scores[i, j]
+                
+                # Enhance by local density
+                density_boost = 0.7 + 0.6 * (normalized_densities[i] + normalized_densities[j]) / 2
+                
+                inv_dist[i, j] = base_val * centrality_boost * density_boost
+    
+    # Symmetrize
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    
+    # ==================== 7. COMBINE ALL COMPONENTS ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Weighted combination of all components
+                score = (component_weights[0] * inv_dist[i, j] +
+                        component_weights[1] * hop_scores[i, j] +
+                        component_weights[2] * cluster_scores[i, j] +
+                        component_weights[3] * (1.0 + betweenness_scores[i, j]))
+                
+                # Apply final adjustments
+                # Boost edges in sparse regions
+                density_factor = 0.8 + 0.4 * (normalized_densities[i] + normalized_densities[j]) / 2
+                
+                heuristics[i, j] = heuristics[j, i] = score * density_factor
+    
+    # ==================== 8. CONNECTIVITY ENHANCEMENT ====================
+    # Ensure no node is isolated
+    for i in range(n):
+        row_nonzero = np.where(heuristics[i] > 0)[0]
+        if len(row_nonzero) == 0:
+            # Connect to nearest neighbors
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nn_indices = np.argpartition(distances, min(3, n-1))[:min(3, n-1)]
+            for j in nn_indices:
+                inv_val = 1.0 / (distance_matrix[i, j] + 1e-10)
+                heuristics[i, j] = heuristics[j, i] = max(heuristics[i, j], inv_val)
+    
+    # ==================== 9. FINAL PROCESSING ====================
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-wise normalization with adaptive temperature
+    for i in range(n):
+        row = heuristics[i]
+        row_max = row.max()
+        if row_max > 0:
+            # Adaptive temperature based on local density
+            temp = 0.8 + 0.4 * normalized_densities[i]  # Denser regions -> sharper distribution
+            exp_row = np.exp(row / (row_max * temp + 1e-10))
+            heuristics[i] = exp_row / (exp_row.sum() + 1e-10)
+    
+    # Symmetrize and zero diagonal
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

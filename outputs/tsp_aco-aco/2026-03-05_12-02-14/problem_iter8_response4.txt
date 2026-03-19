@@ -1,0 +1,363 @@
+```json
+{
+    "algorithm_features": ["2-opt Local Search", "Graph Centrality Fusion", "Adaptive Meta-Parameters", "Tour Edge Sampling"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse
+from scipy.sparse import csgraph
+from collections import defaultdict
+import math
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with 2-opt local search integration,
+    graph centrality fusion, adaptive meta-parameters, and improved edge sampling.
+    
+    Key innovations:
+    1. 2-opt local search enhancement on sampled tours
+    2. Multi-scale graph centrality fusion (betweenness + eigenvector)
+    3. Meta-learning for adaptive parameter tuning
+    4. Intelligent edge sampling with tour memory
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, row-normalized for stochastic sampling
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            reciprocal = 1 / distance_matrix
+            reciprocal[np.isinf(reciprocal)] = 0
+            reciprocal = np.nan_to_num(reciprocal, nan=0)
+        np.fill_diagonal(reciprocal, 0)
+        return reciprocal / (reciprocal.sum(axis=1, keepdims=True) + 1e-10)
+    
+    # ===== 1. INITIAL SAMPLING AND ANALYSIS =====
+    # Compute basic statistics for meta-learning
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_stats = {
+        'mean': np.mean(flat_dists),
+        'std': np.std(flat_dists),
+        'cv': np.std(flat_dists) / (np.mean(flat_dists) + 1e-10),
+        'skewness': 0.0
+    }
+    
+    if len(flat_dists) > 0:
+        # Compute skewness
+        mean = dist_stats['mean']
+        std = dist_stats['std']
+        if std > 1e-10:
+            dist_stats['skewness'] = np.mean(((flat_dists - mean) / std) ** 3)
+    
+    # ===== 2. GRAPH CENTRALITY FUSION =====
+    # Create adjacency matrix (using reciprocal distances with threshold)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    inv_dist = np.nan_to_num(inv_dist, nan=0)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Adaptive thresholding for adjacency
+    if n > 100:
+        # For large graphs, keep only top connections
+        threshold = np.percentile(inv_dist[inv_dist > 0], 80)
+        adj_matrix = (inv_dist >= threshold).astype(float) * inv_dist
+    else:
+        adj_matrix = inv_dist.copy()
+    
+    # 2.1 Betweenness centrality approximation (Brandes algorithm for weighted graphs)
+    def approximate_betweenness(adj_mat, samples=None):
+        """Approximate betweenness centrality using random sampling"""
+        n = adj_mat.shape[0]
+        if samples is None:
+            samples = min(50, max(10, n // 20))
+        
+        betweenness = np.zeros(n)
+        
+        # Convert to shortest path distances
+        # Use Floyd-Warshall for moderate n, Dijkstra for large n
+        if n <= 500:
+            # Floyd-Warshall
+            shortest_paths = distance_matrix.copy().astype(float)
+            for k in range(n):
+                for i in range(n):
+                    for j in range(n):
+                        if shortest_paths[i, j] > shortest_paths[i, k] + shortest_paths[k, j]:
+                            shortest_paths[i, j] = shortest_paths[i, k] + shortest_paths[k, j]
+        else:
+            # Use distance matrix as is (assuming it represents shortest paths)
+            shortest_paths = distance_matrix
+        
+        # Sample nodes for approximation
+        sample_nodes = np.random.choice(n, min(samples, n), replace=False)
+        
+        for s in sample_nodes:
+            # Dijkstra-like traversal
+            dist = np.full(n, np.inf)
+            dist[s] = 0
+            sigma = np.zeros(n)
+            sigma[s] = 1
+            visited = np.zeros(n, dtype=bool)
+            
+            # Simple BFS-like traversal (approximation)
+            unvisited = set(range(n))
+            while unvisited:
+                # Find node with minimum distance
+                candidates = [u for u in unvisited if dist[u] < np.inf]
+                if not candidates:
+                    break
+                u = min(candidates, key=lambda x: dist[x])
+                unvisited.remove(u)
+                visited[u] = True
+                
+                for v in range(n):
+                    if v != u and not visited[v]:
+                        if dist[v] > dist[u] + shortest_paths[u, v]:
+                            dist[v] = dist[u] + shortest_paths[u, v]
+                            sigma[v] = sigma[u]
+                        elif abs(dist[v] - (dist[u] + shortest_paths[u, v])) < 1e-10:
+                            sigma[v] += sigma[u]
+        
+        return betweenness / samples if samples > 0 else betweenness
+    
+    betweenness = approximate_betweenness(adj_matrix)
+    
+    # 2.2 Eigenvector centrality (power iteration)
+    def eigenvector_centrality(adj_mat, max_iter=100, tol=1e-6):
+        """Compute eigenvector centrality using power iteration"""
+        n = adj_mat.shape[0]
+        # Normalize adjacency matrix
+        row_sums = adj_mat.sum(axis=1)
+        row_sums[row_sums == 0] = 1
+        norm_adj = adj_mat / row_sums[:, np.newaxis]
+        
+        # Initialize with uniform values
+        x = np.ones(n) / n
+        
+        for _ in range(max_iter):
+            x_new = norm_adj @ x
+            # Normalize
+            norm = np.linalg.norm(x_new)
+            if norm == 0:
+                break
+            x_new = x_new / norm
+            
+            # Check convergence
+            if np.linalg.norm(x_new - x) < tol:
+                break
+            x = x_new
+        
+        return x
+    
+    eigenvector = eigenvector_centrality(adj_matrix)
+    
+    # 2.3 Combine centralities
+    betweenness_norm = betweenness / (betweenness.max() + 1e-10)
+    eigenvector_norm = eigenvector / (eigenvector.max() + 1e-10)
+    
+    # Geometric mean for robust combination
+    node_centrality = np.sqrt(betweenness_norm * eigenvector_norm)
+    centrality_matrix = np.outer(node_centrality, node_centrality)
+    
+    # ===== 3. LOCAL SEARCH ENHANCEMENT WITH 2-OPT =====
+    def two_opt_improvement(tour, dist_matrix):
+        """Improve a tour using 2-opt local search"""
+        n = len(tour)
+        improved = True
+        best_tour = tour.copy()
+        
+        while improved:
+            improved = False
+            best_gain = 0
+            
+            for i in range(n - 1):
+                for j in range(i + 2, n):
+                    # Calculate gain from reversing segment i+1 to j
+                    a, b = best_tour[i], best_tour[(i + 1) % n]
+                    c, d = best_tour[j], best_tour[(j + 1) % n]
+                    
+                    current = dist_matrix[a, b] + dist_matrix[c, d]
+                    new = dist_matrix[a, c] + dist_matrix[b, d]
+                    gain = current - new
+                    
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_i, best_j = i, j
+            
+            if best_gain > 1e-10:
+                # Reverse the segment
+                i, j = best_i, best_j
+                best_tour[i+1:j+1] = best_tour[i+1:j+1][::-1]
+                improved = True
+        
+        return best_tour
+    
+    # Build multiple improved tours
+    n_tours = min(15, max(5, n // 20))
+    tour_edges = defaultdict(float)
+    
+    for _ in range(n_tours):
+        # Start from random node
+        start = np.random.randint(0, n)
+        visited = np.zeros(n, dtype=bool)
+        tour = [start]
+        visited[start] = True
+        
+        # Nearest neighbor construction
+        current = start
+        for _ in range(n - 1):
+            row = distance_matrix[current]
+            row[visited] = np.inf
+            next_node = np.argmin(row)
+            tour.append(next_node)
+            visited[next_node] = True
+            current = next_node
+        
+        # Apply 2-opt improvement
+        if n >= 4:  # 2-opt requires at least 4 nodes
+            improved_tour = two_opt_improvement(tour, distance_matrix)
+        else:
+            improved_tour = tour
+        
+        # Add edges with weights based on position
+        for idx in range(len(improved_tour)):
+            u = improved_tour[idx]
+            v = improved_tour[(idx + 1) % len(improved_tour)]
+            key = (min(u, v), max(u, v))
+            # Give higher weight to edges that appear early in construction
+            tour_edges[key] += 1.0 / (idx + 1)
+    
+    # Create tour boost matrix
+    tour_boost = np.ones((n, n))
+    for (u, v), weight in tour_edges.items():
+        boost = 1.0 + 0.5 * weight / n_tours
+        tour_boost[u, v] = tour_boost[v, u] = boost
+    
+    # ===== 4. META-LEARNING FOR PARAMETER OPTIMIZATION =====
+    # Extract problem features for meta-learning
+    features = {
+        'n': n,
+        'cv': dist_stats['cv'],
+        'skewness': abs(dist_stats['skewness']),
+        'sparsity': (distance_matrix > 0).sum() / (n * n)
+    }
+    
+    # Rule-based meta-learning for parameter tuning
+    if features['cv'] < 0.3:
+        # Uniform distances - emphasize centrality
+        w_rec = 0.3
+        w_cent = 0.5
+        w_tour = 0.2
+    elif features['cv'] > 0.8:
+        # Highly variable distances - emphasize proximity
+        w_rec = 0.6
+        w_cent = 0.2
+        w_tour = 0.2
+    else:
+        # Moderate case
+        w_rec = 0.4
+        w_cent = 0.4
+        w_tour = 0.2
+    
+    # Adjust based on problem size
+    if n < 50:
+        w_tour *= 1.5  # Emphasize tours for small problems
+    elif n > 200:
+        w_rec *= 1.2  # Emphasize proximity for large problems
+    
+    # Normalize weights
+    total = w_rec + w_cent + w_tour
+    w_rec /= total
+    w_cent /= total
+    w_tour /= total
+    
+    # ===== 5. ADAPTIVE COMBINATION =====
+    # Combine components
+    combined = (w_rec * inv_dist +
+                w_cent * centrality_matrix +
+                w_tour * tour_boost)
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    # ===== 6. INTELLIGENT EDGE SAMPLING =====
+    # Determine sparsity level adaptively
+    if n < 30:
+        k_values = np.full(n, n - 1, dtype=int)
+    else:
+        base_k = int(np.sqrt(n) * 1.5)
+        # Adjust k based on distance statistics
+        if features['cv'] > 0.7:
+            base_k = int(base_k * 1.3)  # More edges for variable distances
+        k_values = np.clip(base_k, 5, n - 1)
+        k_values = np.full(n, k_values, dtype=int)
+    
+    # Create sparsified matrix
+    sparsified = np.zeros_like(combined)
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        k = k_values[i]
+        if k < n - 1:
+            # Get top-k edges
+            top_k_idx = np.argpartition(row, -k)[-k:]
+            top_k_vals = row[top_k_idx]
+            
+            # Sort top-k by value
+            sorted_idx = top_k_idx[np.argsort(top_k_vals)[::-1]]
+            
+            # Apply exponential decay with adaptive rate
+            decay_rate = 2.0 + 0.5 * (features['cv'] > 0.5)  # Faster decay for uniform
+            for rank, j in enumerate(sorted_idx):
+                decay = np.exp(-rank / decay_rate)
+                sparsified[i, j] = combined[i, j] * decay
+        else:
+            # Keep all edges with decay
+            all_idx = np.arange(n)
+            all_idx = all_idx[all_idx != i]
+            sorted_idx = all_idx[np.argsort(row[all_idx])[::-1]]
+            
+            for rank, j in enumerate(sorted_idx):
+                decay = np.exp(-rank / 3.0)
+                sparsified[i, j] = combined[i, j] * decay
+    
+    # ===== 7. FINAL PROCESSING =====
+    # Ensure symmetry and non-negativity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    sparsified = np.maximum(sparsified, 0)
+    
+    # Add small exploration noise
+    if n > 10:
+        noise_scale = 0.01 * features['cv']
+        noise = noise_scale * np.abs(np.random.randn(n, n))
+        np.fill_diagonal(noise, 0)
+        sparsified = sparsified + noise
+    
+    # Row normalization for stochastic sampling
+    row_sums = sparsified.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Fallback to reciprocal distances for disconnected rows
+        sparsified[zero_rows] = inv_dist[zero_rows]
+        row_sums[zero_rows] = inv_dist[zero_rows].sum(axis=1, keepdims=True)
+    
+    row_sums[row_sums == 0] = 1
+    normalized = sparsified / row_sums
+    
+    return normalized
+```

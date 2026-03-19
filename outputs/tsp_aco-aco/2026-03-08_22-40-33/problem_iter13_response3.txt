@@ -1,0 +1,162 @@
+```json
+{
+    "algorithm_features": ["Vectorized Reciprocal Proximity", "Two-Hop Regret with Adaptive Neighbors", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization using vectorized
+    operations and two-hop regret analysis.
+    
+    Features:
+    1. Vectorized reciprocal proximity computation
+    2. Two-hop regret using adaptive neighbor sets
+    3. Connectivity-preserving sparsification with mutual K-NN boosting
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix normalized to [0,1], with same shape as input
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. INSTANCE CHARACTERIZATION ===
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    if len(distances) > 0:
+        median_dist = np.median(distances)
+        mean_dist = np.mean(distances)
+        sparsity_ratio = median_dist / (mean_dist + 1e-12)
+        
+        # Adaptive K selection
+        min_k = max(2, n // 8)
+        max_k = min(12, n // 2)
+        k = int(min_k + (max_k - min_k) * (1 - min(sparsity_ratio, 1.5) / 1.5))
+        k = max(min_k, min(max_k, k, n - 1))
+    else:
+        k = min(8, n - 1)
+    
+    # === 2. BASE INVERSE DISTANCE ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        eps = np.percentile(distances, 10) * 0.01 if len(distances) > 0 else 1e-12
+        inv_dist = 1.0 / (distance_matrix + eps * np.eye(n))
+    
+    np.fill_diagonal(inv_dist, 0)
+    max_inv = np.max(inv_dist[~np.eye(n, dtype=bool)], initial=0)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # === 3. VECTORIZED RECIPROCAL PROXIMITY ===
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    positions = np.argsort(sorted_indices, axis=1)  # position matrix: positions[i,j] = rank of j for i
+    
+    # Vectorized reciprocal proximity calculation
+    R = positions
+    mutual_top_k = (R < k) & (R.T < k)
+    one_way_top_k = (R < k) ^ (R.T < k)
+    min_rank = np.minimum(R, R.T)
+    
+    reciprocal_prox = np.ones((n, n))
+    # Mutual top-k edges
+    reciprocal_prox[mutual_top_k] = 1.0 + (2 * k - R[mutual_top_k] - R.T[mutual_top_k]) / (2 * k)
+    # One-way top-k edges
+    reciprocal_prox[one_way_top_k] = 1.0 + (k - min_rank[one_way_top_k]) / (2 * k)
+    np.fill_diagonal(reciprocal_prox, 0)
+    
+    # === 4. TWO-HOP REGRET WITH ADAPTIVE NEIGHBORS ===
+    regret_k = min(k, 20)  # Limit for regret computation efficiency
+    regret = np.ones((n, n))
+    
+    # Get top neighbors for each node (excluding self)
+    top_neighbors = []
+    for i in range(n):
+        neighbor_indices = sorted_indices[i, 1:1+regret_k]
+        top_neighbors.append(neighbor_indices)
+    
+    # Compute two-hop distances via top neighbors
+    two_hop = np.full((n, n), np.inf)
+    for i in range(n):
+        for k_neighbor in top_neighbors[i]:
+            via_k = distance_matrix[i, k_neighbor] + distance_matrix[k_neighbor, :]
+            via_k[k_neighbor] = np.inf  # Avoid using intermediate as destination
+            two_hop[i, :] = np.minimum(two_hop[i, :], via_k)
+    
+    # Consider both directions for union of neighbors
+    two_hop_union = np.minimum(two_hop, two_hop.T)
+    
+    # Compute regret ratios
+    direct_dist = distance_matrix
+    regret_ratio = two_hop_union / (direct_dist + 1e-12)
+    
+    # Transform regret ratio to [0.5, 2.0] range with saturation
+    regret = np.where(
+        regret_ratio > 1.0,
+        1.0 + 0.5 * np.minimum(regret_ratio - 1.0, 2.0),  # Cap at 2.0
+        np.maximum(0.5, regret_ratio)
+    )
+    regret[np.isinf(regret_ratio)] = 1.0
+    
+    # === 5. COMBINE FACTORS ===
+    heuristics_intermediate = inv_dist * reciprocal_prox * regret
+    np.fill_diagonal(heuristics_intermediate, 0)
+    
+    # === 6. MUTUAL K-NN BOOST ===
+    mutual_knn = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        i_top_k = sorted_indices[i, 1:k+1]
+        for neighbor in i_top_k:
+            if i in sorted_indices[neighbor, 1:k+1]:
+                mutual_knn[i, neighbor] = True
+    
+    heuristics_intermediate[mutual_knn] *= 1.5
+    
+    # === 7. CONNECTIVITY-PRESERVING SPARSIFICATION ===
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    heuristics_intermediate[mst_mask] *= 1.3
+    
+    # Per-node adaptive sparsification
+    heuristics_final = heuristics_intermediate.copy()
+    target_edges = min(max(2, k), n - 1)  # Keep at least 2 edges per node
+    
+    for i in range(n):
+        row_values = heuristics_intermediate[i].copy()
+        row_values[i] = -np.inf
+        
+        # Keep top target_edges, plus mutual K-NN and MST edges
+        if np.sum(row_values > 0) > target_edges:
+            threshold = np.partition(row_values, -target_edges)[-target_edges]
+            mask = (row_values >= threshold) | mutual_knn[i] | mst_mask[i]
+        else:
+            mask = (row_values > 0) | mutual_knn[i] | mst_mask[i]
+        
+        heuristics_final[i, ~mask] = 0
+    
+    # Ensure symmetry
+    symmetric_heuristics = np.maximum(heuristics_final, heuristics_final.T)
+    strong_mask = (heuristics_final > 0) | (heuristics_final.T > 0)
+    heuristics = np.where(strong_mask, symmetric_heuristics, 0)
+    
+    # === 8. FINAL NORMALIZATION ===
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = np.max(heuristics[non_zero_mask])
+        if max_val > 0:
+            heuristics = heuristics / max_val
+    
+    np.fill_diagonal(heuristics, 0)
+    return heuristics
+```

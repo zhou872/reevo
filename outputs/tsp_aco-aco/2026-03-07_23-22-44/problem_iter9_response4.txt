@@ -1,0 +1,362 @@
+```json
+{
+    "algorithm_features": ["Approximation Regret Heuristic", "Spectral Partition Edge Affinity", "Multi-Armed Bandit Weight Learning", "Sparse Connectivity Preservation"]
+}
+```
+
+```python
+import numpy as np
+from typing import List, Tuple
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Efficient TSP heuristic combining approximation regret, spectral analysis,
+    adaptive weight learning, and sparse connectivity preservation.
+    
+    Core Innovations:
+    1. Approximation Regret Heuristic: Computes opportunity cost using greedy approximations
+    2. Spectral Partition Edge Affinity: Uses spectral embedding for cluster-sensitive scoring
+    3. Multi-Armed Bandit Weight Learning: Online weight adaptation using Thompson sampling
+    4. Sparse Connectivity Preservation: Retains critical edges while enforcing sparsity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. BASIC COMPONENTS ====================
+    # Inverse distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST for connectivity preservation
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. APPROXIMATION REGRET HEURISTIC ====================
+    def compute_regret_scores() -> np.ndarray:
+        """Fast regret computation using greedy approximations"""
+        regret_scores = np.zeros((n, n))
+        
+        # For each node, compute regret for each incident edge
+        for i in range(n):
+            # Get distances from node i (excluding self)
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            
+            # Sort by distance
+            sorted_idx = np.argsort(dists_i)
+            if len(sorted_idx) < 2:
+                continue
+                
+            # Best and second best distances
+            best_dist = dists_i[sorted_idx[0]]
+            second_best = dists_i[sorted_idx[1]] if len(sorted_idx) > 1 else best_dist
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                    
+                # Simple regret: difference between edge and next best alternative
+                if distance_matrix[i, j] == best_dist:
+                    # This is the best edge for i
+                    regret = second_best - best_dist
+                else:
+                    regret = best_dist - distance_matrix[i, j]
+                
+                # Additional penalty based on node degree approximation
+                degree_i = np.sum(distance_matrix[i] < np.percentile(distance_matrix[i], 30))
+                degree_j = np.sum(distance_matrix[j] < np.percentile(distance_matrix[j], 30))
+                degree_bonus = 1.0 / (1 + np.sqrt(degree_i * degree_j))
+                
+                # Convert to score
+                scale = np.median(distance_matrix[np.triu_indices(n, 1)])
+                regret_scores[i, j] = degree_bonus * np.exp(-max(0, -regret) / (scale + 1e-8))
+        
+        # Symmetrize and smooth
+        regret_scores = (regret_scores + regret_scores.T) / 2
+        
+        # Apply distance-based decay
+        median_dist = np.median(distance_matrix)
+        decay = np.exp(-distance_matrix / (2 * median_dist))
+        regret_scores *= decay
+        
+        return regret_scores
+    
+    regret_scores = compute_regret_scores()
+    
+    # ==================== 3. SPECTRAL PARTITION EDGE AFFINITY ====================
+    def compute_spectral_scores(k_clusters: int = None) -> np.ndarray:
+        """Efficient spectral analysis for edge affinity"""
+        if k_clusters is None:
+            k_clusters = max(2, min(5, int(np.sqrt(n))))
+        
+        # Use normalized Laplacian
+        degree_matrix = np.diag(np.sum(distance_matrix, axis=1))
+        degree_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(degree_matrix) + 1e-8))
+        normalized_laplacian = np.eye(n) - degree_inv_sqrt @ distance_matrix @ degree_inv_sqrt
+        
+        # Compute a few eigenvectors (using SVD for stability)
+        try:
+            # Use randomized SVD for large matrices
+            if n > 100:
+                from scipy.sparse.linalg import svds
+                _, _, vh = svds(normalized_laplacian, k=k_clusters + 1, which='SM')
+                spectral_embedding = vh.T[:, :k_clusters]
+            else:
+                _, eigenvectors = np.linalg.eigh(normalized_laplacian)
+                spectral_embedding = eigenvectors[:, 1:k_clusters + 1]
+        except:
+            # Fallback to simple distance-based clustering
+            return np.ones_like(distance_matrix)
+        
+        # Compute edge scores based on spectral similarity
+        spectral_scores = np.ones((n, n))
+        
+        # Normalize embedding rows
+        row_norms = np.linalg.norm(spectral_embedding, axis=1, keepdims=True)
+        normalized_embedding = spectral_embedding / (row_norms + 1e-8)
+        
+        # Compute cosine similarity matrix
+        similarity = normalized_embedding @ normalized_embedding.T
+        
+        # Combine with distance information
+        dist_scale = np.median(distance_matrix)
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Enhanced similarity score
+                sim_score = 0.5 + 0.5 * similarity[i, j]
+                
+                # Distance attenuation
+                dist_ratio = distance_matrix[i, j] / (dist_scale + 1e-8)
+                attenuation = np.exp(-dist_ratio)
+                
+                spectral_scores[i, j] = sim_score * attenuation
+                spectral_scores[j, i] = spectral_scores[i, j]
+        
+        return spectral_scores
+    
+    spectral_scores = compute_spectral_scores()
+    
+    # ==================== 4. MULTI-ARMED BANDIT WEIGHT LEARNING ====================
+    def bandit_weight_learning(num_rounds: int = 15) -> Tuple[float, float, float]:
+        """Adaptive weight learning using Thompson sampling"""
+        # Initialize component performance beliefs
+        alpha_regret = np.ones(2)  # Beta distribution parameters
+        alpha_inv = np.ones(2)
+        alpha_spectral = np.ones(2)
+        
+        for _ in range(num_rounds):
+            # Sample weights from current beliefs
+            w1 = np.random.beta(alpha_regret[0], alpha_regret[1])
+            w2 = np.random.beta(alpha_inv[0], alpha_inv[1])
+            w3 = np.random.beta(alpha_spectral[0], alpha_spectral[1])
+            
+            # Normalize
+            total = w1 + w2 + w3 + 1e-8
+            w1, w2, w3 = w1 / total, w2 / total, w3 / total
+            
+            # Generate a tour using the current weights
+            tour = generate_weighted_tour(w1, w2, w3)
+            
+            # Evaluate tour quality
+            tour_length = compute_tour_length(tour)
+            
+            # Update beliefs based on component contributions
+            update_beliefs(tour, tour_length, alpha_regret, alpha_inv, alpha_spectral)
+        
+        # Final weights from expected values
+        w_regret = alpha_regret[0] / (alpha_regret[0] + alpha_regret[1])
+        w_inv = alpha_inv[0] / (alpha_inv[0] + alpha_inv[1])
+        w_spectral = alpha_spectral[0] / (alpha_spectral[0] + alpha_spectral[1])
+        
+        # Normalize
+        total = w_regret + w_inv + w_spectral
+        return w_regret / total, w_inv / total, w_spectral / total
+    
+    def generate_weighted_tour(w1: float, w2: float, w3: float) -> List[int]:
+        """Generate tour using weighted heuristic"""
+        # Combine scores
+        combined = w1 * regret_scores + w2 * inv_dist + w3 * spectral_scores
+        
+        # Greedy construction
+        start = np.random.randint(0, n)
+        visited = set([start])
+        tour = [start]
+        current = start
+        
+        while len(visited) < n:
+            # Get scores for current node
+            scores = combined[current].copy()
+            for v in visited:
+                scores[v] = -np.inf
+            
+            # Softmax selection
+            exp_scores = np.exp(scores - np.max(scores))
+            probs = exp_scores / np.sum(exp_scores)
+            next_node = np.random.choice(n, p=probs)
+            
+            tour.append(next_node)
+            visited.add(next_node)
+            current = next_node
+        
+        tour.append(start)  # Close the tour
+        return tour
+    
+    def compute_tour_length(tour: List[int]) -> float:
+        """Compute total tour length"""
+        length = 0
+        for i in range(len(tour) - 1):
+            length += distance_matrix[tour[i], tour[i + 1]]
+        return length
+    
+    def update_beliefs(tour: List[int], tour_length: float,
+                      alpha_regret: np.ndarray, alpha_inv: np.ndarray,
+                      alpha_spectral: np.ndarray) -> None:
+        """Update Beta distribution parameters based on tour performance"""
+        # Compute component contributions
+        regret_contrib = 0
+        inv_contrib = 0
+        spectral_contrib = 0
+        
+        for i in range(len(tour) - 1):
+            u, v = tour[i], tour[i + 1]
+            regret_contrib += regret_scores[u, v]
+            inv_contrib += inv_dist[u, v]
+            spectral_contrib += spectral_scores[u, v]
+        
+        # Normalize contributions
+        total = regret_contrib + inv_contrib + spectral_contrib + 1e-8
+        regret_contrib /= total
+        inv_contrib /= total
+        spectral_contrib /= total
+        
+        # Reward inversely proportional to tour length
+        baseline = np.median(distance_matrix) * n
+        reward = baseline / (tour_length + 1e-8)
+        
+        # Update Beta parameters (success if contribution > average)
+        avg = 1.0 / 3.0
+        if regret_contrib > avg:
+            alpha_regret[0] += reward
+        else:
+            alpha_regret[1] += 1.0
+        
+        if inv_contrib > avg:
+            alpha_inv[0] += reward
+        else:
+            alpha_inv[1] += 1.0
+        
+        if spectral_contrib > avg:
+            alpha_spectral[0] += reward
+        else:
+            alpha_spectral[1] += 1.0
+    
+    # Learn weights
+    w_regret, w_inv, w_spectral = bandit_weight_learning()
+    
+    # ==================== 5. COMPOSITE SCORE & REINFORCEMENT ====================
+    # Weighted combination
+    composite = (
+        w_regret * regret_scores +
+        w_inv * inv_dist +
+        w_spectral * spectral_scores
+    )
+    
+    # Boost MST edges
+    mst_boost = 1.0 + 0.3 * np.log1p(n) / (1 + distance_matrix / np.median(distance_matrix))
+    composite[mst_edges] *= mst_boost
+    
+    # Generate a few high-quality tours for reinforcement
+    best_tour = None
+    best_length = float('inf')
+    
+    for _ in range(min(5, n)):
+        tour = generate_weighted_tour(w_regret, w_inv, w_spectral)
+        length = compute_tour_length(tour)
+        if length < best_length:
+            best_length = length
+            best_tour = tour
+    
+    # Boost edges in best tour
+    if best_tour:
+        tour_boost = np.ones_like(composite)
+        for i in range(len(best_tour) - 1):
+            u, v = best_tour[i], best_tour[i + 1]
+            tour_boost[u, v] = 1.2
+            tour_boost[v, u] = 1.2
+        composite *= tour_boost
+    
+    # ==================== 6. SPARSE CONNECTIVITY PRESERVATION ====================
+    def sparse_preservation(scores: np.ndarray) -> np.ndarray:
+        """Intelligent edge selection with connectivity guarantees"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine target degree per node
+        if n <= 10:
+            target_degree = 4
+        elif n <= 50:
+            target_degree = max(3, n // 10)
+        else:
+            target_degree = max(3, n // 15)
+        
+        # For each node, add top edges not already in MST
+        for i in range(n):
+            # Get candidate edges
+            candidates = []
+            for j in range(n):
+                if i != j and not mst_edges[i, j]:
+                    candidates.append((scores[i, j], j))
+            
+            # Sort by score
+            candidates.sort(reverse=True)
+            
+            # Add top edges up to target degree
+            current_degree = np.sum(sparsified[i] > 0)
+            for score, j in candidates:
+                if current_degree >= target_degree:
+                    break
+                
+                # Check degree constraint for j
+                if np.sum(sparsified[j] > 0) < target_degree:
+                    sparsified[i, j] = score
+                    sparsified[j, i] = score
+                    current_degree += 1
+        
+        return sparsified
+    
+    sparsified = sparse_preservation(composite)
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    # Ensure symmetry
+    final_scores = (sparsified + sparsified.T) / 2
+    
+    # Apply final distance-based smoothing
+    dist_scale = np.percentile(distance_matrix[np.triu_indices(n, 1)], 75)
+    distance_weight = np.exp(-distance_matrix / (dist_scale + 1e-8))
+    final_scores *= distance_weight
+    
+    # Normalize
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

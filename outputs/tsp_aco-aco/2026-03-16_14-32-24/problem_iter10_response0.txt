@@ -1,0 +1,463 @@
+```json
+{
+    "algorithm_features": ["Multi-scale Graph Embedding", "Adaptive Parameter Tuning via Meta-Heuristic", "Embedding-enhanced Regret Estimation", "Component-wise Meta-optimization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import cdist
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with multi-scale graph embeddings, meta-heuristic
+    parameter adaptation, and embedding-enhanced regret estimation for robust
+    performance across diverse TSP instances.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+    
+    n = distance_matrix.shape[0]
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Prepare safe distance matrix
+    dmat = distance_matrix.copy()
+    np.fill_diagonal(dmat, np.inf)
+    eps = 1e-12
+    
+    # ========== MULTI-SCALE GRAPH EMBEDDING ==========
+    def compute_graph_embeddings(dmat, n_scales=3):
+        """Compute multi-scale node embeddings using landmark-based approach."""
+        embeddings = []
+        
+        # Scale 1: Local neighborhood (small-scale)
+        k_local = max(5, min(10, n // 20))
+        local_emb = np.zeros((n, k_local))
+        for i in range(n):
+            neighbors = np.argsort(dmat[i])[:k_local]
+            if len(neighbors) > 0:
+                local_emb[i, :len(neighbors)] = dmat[i, neighbors]
+        if np.max(local_emb) > 0:
+            local_emb = local_emb / (np.max(local_emb) + eps)
+        embeddings.append(local_emb)
+        
+        # Scale 2: Medium-scale landmarks
+        n_landmarks = max(3, min(15, int(np.sqrt(n))))
+        if n_landmarks < n:
+            # Select diverse landmarks using Max-Min strategy
+            landmarks = [np.random.randint(n)]
+            for _ in range(1, n_landmarks):
+                min_dists = np.min(dmat[:, landmarks], axis=1)
+                min_dists[landmarks] = -np.inf
+                landmarks.append(np.argmax(min_dists))
+            
+            landmark_dist = dmat[:, landmarks].copy()
+            if np.max(landmark_dist) > 0:
+                landmark_dist = landmark_dist / (np.max(landmark_dist) + eps)
+            embeddings.append(landmark_dist)
+        
+        # Scale 3: Global structure via Fiedler vector approximation
+        if n <= 200:  # Only for moderate-sized instances
+            try:
+                # Compute degree matrix and normalized Laplacian
+                W = np.exp(-dmat / (np.median(dmat[dmat < np.inf]) + eps))
+                np.fill_diagonal(W, 0)
+                D = np.diag(np.sum(W, axis=1))
+                L = np.eye(n) - np.linalg.inv(D) @ W
+                
+                # Compute second smallest eigenvector (Fiedler vector)
+                eigenvalues, eigenvectors = np.linalg.eigh(L)
+                idx = np.argsort(eigenvalues)
+                fiedler = eigenvectors[:, idx[1]]  # Second smallest eigenvector
+                global_emb = fiedler.reshape(-1, 1)
+                embeddings.append(global_emb)
+            except:
+                pass
+        
+        # Combine all scales
+        if embeddings:
+            combined_emb = np.hstack(embeddings)
+            # Normalize embedding dimensions
+            for dim in range(combined_emb.shape[1]):
+                col = combined_emb[:, dim]
+                if np.std(col) > eps:
+                    combined_emb[:, dim] = (col - np.mean(col)) / (np.std(col) + eps)
+            return combined_emb
+        return None
+    
+    embeddings = compute_graph_embeddings(dmat)
+    
+    # ========== META-HEURISTIC PARAMETER ADAPTATION ==========
+    def meta_optimize_params(dmat, embeddings):
+        """Adapt parameters using simple meta-heuristic optimization."""
+        # Analyze instance characteristics
+        flat_dist = dmat[dmat < np.inf]
+        if len(flat_dist) == 0:
+            return None
+            
+        dist_mean = np.mean(flat_dist)
+        dist_std = np.std(flat_dist)
+        cv = dist_std / (dist_mean + eps)
+        
+        # Base parameters
+        if n < 30:
+            params = {
+                'lookahead_steps': 3,
+                'beam_width': 8,
+                'k_candidate': min(10, n-1),
+                'regret_power': 1.5,
+                'embed_weight': 0.4,
+                'tour_samples': 5
+            }
+        elif n < 100:
+            params = {
+                'lookahead_steps': 2,
+                'beam_width': 6,
+                'k_candidate': min(15, int(np.sqrt(n)*2)),
+                'regret_power': 1.3,
+                'embed_weight': 0.35,
+                'tour_samples': 4
+            }
+        else:
+            params = {
+                'lookahead_steps': 2,
+                'beam_width': 5,
+                'k_candidate': min(20, int(np.sqrt(n)*1.5)),
+                'regret_power': 1.2,
+                'embed_weight': 0.3,
+                'tour_samples': 3
+            }
+        
+        # Adjust based on coefficient of variation
+        if cv < 0.3:  # Uniform distances
+            params['lookahead_steps'] = max(2, params['lookahead_steps'] - 1)
+            params['embed_weight'] *= 0.8
+        elif cv > 0.7:  # Highly varied
+            params['beam_width'] = min(8, params['beam_width'] + 1)
+            params['regret_power'] = min(2.0, params['regret_power'] * 1.2)
+        
+        # Adjust based on embedding quality (if available)
+        if embeddings is not None:
+            # Measure embedding spread
+            embed_std = np.std(embeddings)
+            if embed_std > 0.5:
+                params['embed_weight'] = min(0.5, params['embed_weight'] * 1.2)
+        
+        return params
+    
+    params = meta_optimize_params(dmat, embeddings)
+    if params is None:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== EMBEDDING-ENHANCED REGRET ESTIMATION ==========
+    def compute_embedding_enhanced_regret(dmat, embeddings, params):
+        """Compute regret scores using embedding-guided alternative path search."""
+        n = dmat.shape[0]
+        regret_scores = np.zeros_like(dmat)
+        
+        # Precompute nearest neighbors for efficiency
+        k_neighbors = min(params['k_candidate'] * 2, n - 1)
+        neighbor_indices = np.argsort(dmat, axis=1)[:, 1:k_neighbors + 1]
+        
+        # If embeddings available, compute embedding distances
+        embed_dist = None
+        if embeddings is not None:
+            try:
+                embed_dist = cdist(embeddings, embeddings, 'euclidean')
+                np.fill_diagonal(embed_dist, np.inf)
+            except:
+                embed_dist = None
+        
+        for i in range(n):
+            # Consider candidate edges
+            candidates = neighbor_indices[i, :params['k_candidate']]
+            
+            for j in candidates:
+                if i == j or np.isinf(dmat[i, j]):
+                    continue
+                
+                direct_cost = dmat[i, j]
+                best_alt_cost = np.inf
+                
+                # Beam search for alternative paths
+                beam = [(j, direct_cost, {i, j})]  # (node, total_cost, visited)
+                
+                for step in range(params['lookahead_steps'] - 1):
+                    new_beam = []
+                    
+                    for node, cost, visited in beam:
+                        # Get candidate continuations
+                        cand_nodes = neighbor_indices[node]
+                        
+                        # Filter visited nodes
+                        if step == params['lookahead_steps'] - 2:
+                            # Last step: can return to i
+                            valid_cand = [c for c in cand_nodes 
+                                        if c not in visited or c == i]
+                        else:
+                            valid_cand = [c for c in cand_nodes 
+                                        if c not in visited]
+                        
+                        if not valid_cand:
+                            continue
+                        
+                        # Use embedding distance to guide search if available
+                        if embed_dist is not None and step > 0:
+                            # Sort by combination of distance and embedding similarity to i
+                            cand_costs = []
+                            for c in valid_cand:
+                                dist_cost = dmat[node, c]
+                                if embed_dist is not None:
+                                    # Encourage returning to region near i
+                                    embed_sim = 1.0 / (embed_dist[i, c] + eps)
+                                    combined = dist_cost * 0.7 + embed_sim * 0.3
+                                else:
+                                    combined = dist_cost
+                                cand_costs.append(combined)
+                            
+                            top_k = min(params['beam_width'], len(valid_cand))
+                            top_indices = np.argpartition(cand_costs, top_k)[:top_k]
+                        else:
+                            # Fallback: sort by distance only
+                            cand_dists = dmat[node, valid_cand]
+                            top_k = min(params['beam_width'], len(valid_cand))
+                            top_indices = np.argpartition(cand_dists, top_k)[:top_k]
+                        
+                        for idx in top_indices:
+                            next_node = valid_cand[idx]
+                            new_cost = cost + dmat[node, next_node]
+                            new_visited = visited.copy()
+                            new_visited.add(next_node)
+                            new_beam.append((next_node, new_cost, new_visited))
+                    
+                    if not new_beam:
+                        break
+                    
+                    # Prune beam
+                    new_beam.sort(key=lambda x: x[1])
+                    beam = new_beam[:params['beam_width']]
+                
+                # Calculate enhanced regret
+                if beam:
+                    best_alt_cost = min(beam, key=lambda x: x[1])[1]
+                    if best_alt_cost < np.inf and direct_cost > 0:
+                        regret = max(0, direct_cost - best_alt_cost) / (direct_cost + eps)
+                        # Power transform for non-linear sensitivity
+                        regret_scores[i, j] = 1.0 + np.tanh(regret * params['regret_power'])
+        
+        # Symmetrize and normalize
+        regret_scores = np.maximum(regret_scores, regret_scores.T)
+        max_regret = np.max(regret_scores)
+        if max_regret > 0:
+            regret_scores = regret_scores / max_regret
+        
+        return regret_scores
+    
+    # ========== COMPONENT-WISE META-OPTIMIZATION ==========
+    def optimize_component_weights(dmat, params, embeddings):
+        """Optimize component weights using simple meta-heuristic."""
+        # Generate heuristic tours for evaluation
+        n_tours = params['tour_samples']
+        tour_edges = set()
+        
+        for _ in range(n_tours):
+            start = np.random.randint(n)
+            unvisited = set(range(n))
+            current = start
+            tour = [current]
+            unvisited.remove(current)
+            
+            while unvisited:
+                # Adaptive nearest neighbor
+                candidates = list(unvisited)
+                if len(candidates) == 1:
+                    next_node = candidates[0]
+                else:
+                    dists = dmat[current, candidates]
+                    top_k = min(3, len(candidates))
+                    top_idx = np.argsort(dists)[:top_k]
+                    top_cand = [candidates[i] for i in top_idx]
+                    
+                    # Softmax selection
+                    inv_dists = 1.0 / (dmat[current, top_cand] + eps)
+                    probs = inv_dists / np.sum(inv_dists)
+                    next_node = np.random.choice(top_cand, p=probs)
+                
+                tour.append(next_node)
+                unvisited.remove(next_node)
+                current = next_node
+            
+            # Add tour edges to set
+            for i in range(len(tour)):
+                a, b = tour[i], tour[(i + 1) % len(tour)]
+                tour_edges.add((min(a, b), max(a, b)))
+        
+        # Initialize components
+        base_scores = np.zeros_like(dmat)
+        for i in range(n):
+            sorted_idx = np.argsort(dmat[i])
+            valid = min(params['k_candidate'], n-1)
+            for rank, j in enumerate(sorted_idx[1:valid+1]):
+                if i != j:
+                    base_scores[i, j] = np.exp(-rank / valid)
+        
+        regret_scores = compute_embedding_enhanced_regret(dmat, embeddings, params)
+        
+        # Embedding similarity scores
+        embed_scores = np.zeros_like(dmat)
+        if embeddings is not None:
+            for i in range(n):
+                for j in range(i+1, n):
+                    if dmat[i, j] < np.percentile(dmat[dmat < np.inf], 50):
+                        sim = 1.0 / (np.linalg.norm(embeddings[i] - embeddings[j]) + eps)
+                        embed_scores[i, j] = sim
+            embed_scores = np.maximum(embed_scores, embed_scores.T)
+            max_embed = np.max(embed_scores)
+            if max_embed > 0:
+                embed_scores = embed_scores / max_embed
+        
+        # Structural scores (MST + local density)
+        struct_scores = np.zeros_like(dmat)
+        if n <= 2000:
+            try:
+                mst = minimum_spanning_tree(dmat).toarray()
+                mst_edges = (mst + mst.T) > 0
+                struct_scores += mst_edges * 0.3
+            except:
+                pass
+        
+        # Meta-optimization: try different weight combinations
+        best_score = -np.inf
+        best_weights = None
+        
+        # Sample weight combinations
+        weight_combinations = []
+        for _ in range(20):
+            w = np.random.dirichlet([1, 1, 1, 1])  # 4 components
+            weight_combinations.append(w)
+        
+        # Add some predefined combinations
+        weight_combinations.extend([
+            [0.4, 0.3, 0.2, 0.1],  # Base-heavy
+            [0.2, 0.4, 0.2, 0.2],  # Regret-heavy
+            [0.25, 0.25, 0.4, 0.1],  # Embedding-heavy
+            [0.25, 0.25, 0.25, 0.25]  # Balanced
+        ])
+        
+        for weights in weight_combinations:
+            w_base, w_regret, w_embed, w_struct = weights
+            
+            # Combine components
+            combined = (
+                base_scores * w_base +
+                regret_scores * w_regret +
+                embed_scores * w_embed +
+                struct_scores * w_struct
+            )
+            
+            # Evaluate on tour edges
+            tour_score = 0
+            for i, j in tour_edges:
+                tour_score += combined[i, j]
+            
+            # Add regularization for component usage
+            component_usage = np.array([w_base, w_regret, w_embed, w_struct])
+            diversity_bonus = -np.sum(component_usage * np.log(component_usage + eps))
+            total_score = tour_score + 0.1 * diversity_bonus
+            
+            if total_score > best_score:
+                best_score = total_score
+                best_weights = weights
+        
+        return best_weights, {
+            'base': base_scores,
+            'regret': regret_scores,
+            'embed': embed_scores,
+            'struct': struct_scores
+        }
+    
+    # Run meta-optimization
+    best_weights, components = optimize_component_weights(dmat, params, embeddings)
+    
+    # ========== FINAL COMBINATION AND PROCESSING ==========
+    if best_weights is None:
+        w_base, w_regret, w_embed, w_struct = 0.3, 0.3, 0.2, 0.2
+    else:
+        w_base, w_regret, w_embed, w_struct = best_weights
+    
+    # Combine with optimized weights
+    heuristics_matrix = (
+        components['base'] * w_base +
+        components['regret'] * w_regret +
+        components['embed'] * w_embed +
+        components['struct'] * w_struct
+    )
+    
+    # Intelligent sparsification
+    edges_per_node = max(3, min(params['k_candidate'], int(np.sqrt(n)) + 2))
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        if np.all(scores <= 0):
+            # Fallback to nearest neighbors
+            top_idx = np.argsort(dmat[i])[1:edges_per_node + 1]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Keep top edges
+            top_idx = np.argpartition(scores, -edges_per_node)[-edges_per_node:]
+            candidate_mask[i, top_idx] = True
+    
+    # Ensure symmetry and minimum connectivity
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    for i in range(n):
+        degree = np.sum(candidate_mask[i])
+        if degree < 2:
+            all_neighbors = np.argsort(dmat[i])[1:]
+            needed = 2 - degree
+            added = 0
+            for neighbor in all_neighbors:
+                if not candidate_mask[i, neighbor]:
+                    candidate_mask[i, neighbor] = True
+                    candidate_mask[neighbor, i] = True
+                    added += 1
+                    if added >= needed:
+                        break
+    
+    # Apply sparsification
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Final processing
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # Row-wise normalization
+    row_max = np.max(heuristics_matrix, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    heuristics_matrix = heuristics_matrix / row_max
+    
+    # Global normalization
+    overall_max = np.max(heuristics_matrix)
+    if overall_max > 0:
+        heuristics_matrix = heuristics_matrix / overall_max
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

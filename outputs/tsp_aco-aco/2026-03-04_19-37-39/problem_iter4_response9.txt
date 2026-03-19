@@ -1,0 +1,166 @@
+```json
+{
+    "algorithm_features": ["Candidate Set Filtering", "Adaptive Weight Learning", "Ensemble Heuristics", "Sparsity-Aware Normalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics using candidate set filtering, adaptive weight
+    learning from instance characteristics, and ensemble heuristics with improved
+    sparsity handling. Returns a matrix where higher values indicate more
+    promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Instance characterization for adaptive learning
+    eps = 1e-10
+    dist = np.where(distance_matrix > 0, distance_matrix, eps)
+    
+    # Characterize problem instance
+    flat_dist = dist[np.triu_indices(n, 1)]  # Upper triangle without diagonal
+    dist_mean = np.mean(flat_dist)
+    dist_std = np.std(flat_dist)
+    dist_cv = dist_std / (dist_mean + eps)
+    
+    # Learn adaptive parameters from instance
+    # More candidate edges for uniform distances, fewer for variable
+    candidate_ratio = 0.3 + 0.2 * np.exp(-dist_cv)  # 0.3-0.5
+    nn_factor = 0.25 + 0.15 * (1 - np.exp(-dist_cv))  # 0.25-0.4
+    
+    # Weight adaptation based on instance size and variation
+    w1 = 0.8 - 0.2 * np.tanh(dist_cv)  # Inverse distance weight: 0.6-0.8
+    w2 = 0.6 + 0.3 * np.tanh(10/n)    # Centrality weight: increases with n
+    w3 = 1.2 + 0.3 * np.tanh(dist_cv)  # Candidate weight: 1.2-1.5
+    
+    # 2. Build candidate set using nearest-neighbor strategy
+    k_candidate = max(2, int(n * candidate_ratio))
+    candidate_mask = np.zeros_like(dist, dtype=bool)
+    
+    for i in range(n):
+        # Get k_candidate nearest neighbors (excluding self)
+        neighbors = np.argsort(dist[i])[1:k_candidate+1]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry of candidate set
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # 3. Compute base heuristic components only for candidate edges
+    # Inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / dist
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Centrality component using inverse average distance
+    # Modified to focus on candidate edges only
+    row_sums_candidate = np.sum(dist * candidate_mask, axis=1)
+    row_counts = np.sum(candidate_mask, axis=1)
+    avg_dist = row_sums_candidate / np.maximum(row_counts, 1)
+    centrality = 1 / (avg_dist + eps)
+    centrality = centrality / (np.sum(centrality) + eps)
+    centrality_product = np.outer(centrality, centrality)
+    
+    # Minimum spanning tree component (always computed on full graph)
+    mst = minimum_spanning_tree(dist).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # 4. Ensemble heuristics with learned weights
+    # Base score combines inverse distance and centrality
+    base_score = w1 * inv_dist + w2 * centrality_product
+    
+    # Apply candidate set filtering
+    candidate_score = np.where(candidate_mask, base_score, 0)
+    
+    # Boost for candidate edges (multiplicative)
+    candidate_boost = np.where(candidate_mask, w3, 1.0)
+    candidate_score *= candidate_boost
+    
+    # Strong boost for MST edges (additive)
+    mst_boost = 0.5  # Fixed boost for MST edges
+    candidate_score[mst_mask] += mst_boost
+    
+    # 5. Adaptive sparsification with size-aware thresholds
+    # Keep edges based on instance characteristics
+    sparsity_mask = np.zeros_like(candidate_score, dtype=bool)
+    
+    for i in range(n):
+        row_vals = candidate_score[i].copy()
+        row_vals[i] = -np.inf
+        
+        # Determine number of edges to keep adaptively
+        base_edges = max(3, min(8, int(n * nn_factor)))
+        max_edges = min(15, n // 2)
+        
+        # Sort values and apply percentile-based cutoff
+        sorted_vals = np.sort(row_vals[row_vals > 0])[::-1]
+        if len(sorted_vals) > base_edges:
+            # Use percentile threshold: keep top edges
+            threshold_idx = min(max_edges - 1, len(sorted_vals) - 1)
+            if threshold_idx >= base_edges:
+                # Dynamic threshold: value at max_edges or base_edges, whichever is more restrictive
+                threshold_val = sorted_vals[threshold_idx]
+                if threshold_val > 0:
+                    keep_mask = row_vals >= threshold_val
+                    keep_mask[i] = False
+                    sparsity_mask[i] = keep_mask
+                else:
+                    # Fallback: keep base_edges
+                    top_indices = np.argsort(row_vals)[-base_edges:]
+                    sparsity_mask[i, top_indices] = True
+            else:
+                # Keep all positive values (should be at least base_edges)
+                keep_mask = row_vals > 0
+                keep_mask[i] = False
+                sparsity_mask[i] = keep_mask
+        else:
+            # Keep all candidate edges for this node
+            sparsity_mask[i] = candidate_mask[i]
+            sparsity_mask[i, i] = False
+    
+    # Ensure symmetry and minimum connectivity of 2 per node
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Force MST edges to be included
+    sparsity_mask = sparsity_mask | mst_mask
+    
+    # Connectivity check: ensure each node has at least 2 connections
+    connections = np.sum(sparsity_mask, axis=1)
+    for i in range(n):
+        if connections[i] < 2:
+            # Add nearest neighbors not already in mask
+            neighbors = np.argsort(dist[i])[1:3]
+            for j in neighbors:
+                if j != i and not sparsity_mask[i, j]:
+                    sparsity_mask[i, j] = True
+                    sparsity_mask[j, i] = True
+    
+    # 6. Apply sparsification and normalize
+    heuristics_matrix = candidate_score * sparsity_mask
+    
+    # Row-wise softmax normalization for better probability interpretation
+    for i in range(n):
+        row = heuristics_matrix[i]
+        max_val = np.max(row)
+        if max_val > 0:
+            # Shift and scale for numerical stability
+            exp_row = np.exp((row - max_val) * 2)
+            heuristics_matrix[i] = exp_row / (np.sum(exp_row) + eps)
+    
+    # Ensure symmetry by taking maximum of both directions
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Global normalization to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

@@ -1,0 +1,307 @@
+```json
+{
+    "algorithm_features": ["Monte Carlo Multi-step Lookahead", "Adaptive Threshold Learning via Gradient Bandits", "Spectral Clustering Edge Weighting", "Dynamic Sparsification with Connectivity Guarantees"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges with:
+    1. Monte Carlo multi-step lookahead with intelligent path sampling
+    2. Adaptive threshold learning using gradient-based multi-armed bandits
+    3. Spectral clustering with eigenvector-based edge partitioning
+    4. Dynamic sparsification with provable connectivity guarantees
+    
+    The function returns a matrix of edge scores where higher values indicate
+    more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n == 0:
+        return np.array([])
+    
+    # Create working copy with safe numerical handling
+    dist = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(dist, np.inf)
+    
+    # === 1. BASE INVERSE DISTANCE WITH ADAPTIVE SMOOTHING ===
+    median_dist = np.median(dist[dist < np.inf])
+    inv_dist = 1.0 / (dist + 0.01 * median_dist)
+    
+    # === 2. SPECTRAL CLUSTERING FOR STRUCTURAL AWARENESS ===
+    cluster_bonus = np.ones_like(dist)
+    
+    if n >= 4:  # Need sufficient nodes for meaningful clustering
+        try:
+            # Normalized Laplacian for better spectral properties
+            degree_matrix = np.diag(np.sum(dist, axis=1))
+            laplacian = degree_matrix - dist
+            
+            # Use small diagonal regularization for stability
+            regularized_laplacian = laplacian + 1e-8 * np.eye(n)
+            
+            # Compute Fiedler vector (second smallest eigenvector)
+            eigvals, eigvecs = eigh(regularized_laplacian)
+            fiedler = eigvecs[:, 1]  # Second eigenvector
+            
+            # Partition nodes based on Fiedler vector sign
+            cluster_labels = (fiedler > 0).astype(int)
+            
+            # Compute cluster-aware bonuses
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if cluster_labels[i] == cluster_labels[j]:
+                        # Intra-cluster: bonus inversely proportional to cluster density
+                        cluster_size = np.sum(cluster_labels == cluster_labels[i])
+                        density_factor = cluster_size / n
+                        # Higher bonus for sparse clusters
+                        intra_bonus = 1.2 + 0.5 * (1 - density_factor)
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = intra_bonus
+                    else:
+                        # Inter-cluster: bonus based on relative distance to cluster centers
+                        cluster_i_nodes = np.where(cluster_labels == cluster_labels[i])[0]
+                        cluster_j_nodes = np.where(cluster_labels == cluster_labels[j])[0]
+                        
+                        avg_dist_i = np.mean(dist[i, cluster_i_nodes])
+                        avg_dist_j = np.mean(dist[j, cluster_j_nodes])
+                        cross_avg = np.mean(dist[cluster_i_nodes][:, cluster_j_nodes])
+                        
+                        # Bonus for edges that are shorter than cluster separations
+                        if dist[i, j] < 0.5 * (avg_dist_i + avg_dist_j):
+                            inter_bonus = 1.3 + 0.4 * (cross_avg / (dist[i, j] + 1e-10))
+                        else:
+                            inter_bonus = 0.8
+                        
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = inter_bonus
+        except:
+            # Fallback to MST-based clustering if spectral fails
+            mst = minimum_spanning_tree(dist)
+            mst_array = mst.toarray()
+            # Use the longest MST edge as cluster separator
+            if n > 1:
+                mst_edges = np.argwhere(mst_array > 0)
+                if len(mst_edges) > 0:
+                    longest_idx = np.argmax([mst_array[i, j] for i, j in mst_edges])
+                    sep_i, sep_j = mst_edges[longest_idx]
+                    # Simple two-cluster split
+                    for i in range(n):
+                        if dist[i, sep_i] < dist[i, sep_j]:
+                            cluster_labels[i] = 0
+                        else:
+                            cluster_labels[i] = 1
+                    # Apply simple cluster bonuses
+                    for i in range(n):
+                        for j in range(i + 1, n):
+                            if cluster_labels[i] == cluster_labels[j]:
+                                cluster_bonus[i, j] = cluster_bonus[j, i] = 1.1
+                            else:
+                                cluster_bonus[i, j] = cluster_bonus[j, i] = 1.0
+    
+    # === 3. MONTE CARLO MULTI-STEP LOOKAHEAD ===
+    lookahead_scores = np.ones_like(dist)
+    
+    if n >= 3:
+        # Precompute nearest neighbors for efficiency
+        k_lookahead = min(5, n - 1)
+        nearest_indices = np.argsort(dist, axis=1)[:, 1:k_lookahead + 1]
+        nearest_distances = np.take_along_axis(dist, nearest_indices, axis=1)
+        
+        # Monte Carlo parameters
+        mc_samples = min(20, n - 2)
+        depth = 3  # Look 3 steps ahead
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                sampled_costs = []
+                for _ in range(mc_samples):
+                    # Start Monte Carlo walk from j
+                    current = j
+                    prev = i
+                    total_lookahead_cost = 0
+                    
+                    for step in range(depth):
+                        # Get feasible next nodes (exclude previous node and visited)
+                        feasible_mask = np.ones(n, dtype=bool)
+                        feasible_mask[[prev, current]] = False
+                        
+                        if np.sum(feasible_mask) == 0:
+                            break
+                        
+                        # Sample next node with probability inversely proportional to distance
+                        feasible_dists = dist[current, feasible_mask]
+                        if np.sum(feasible_dists) > 0:
+                            probs = 1.0 / (feasible_dists + 1e-10)
+                            probs = probs / np.sum(probs)
+                            
+                            # Roulette wheel selection
+                            next_idx = np.random.choice(
+                                np.where(feasible_mask)[0],
+                                p=probs
+                            )
+                            total_lookahead_cost += dist[current, next_idx]
+                            
+                            # Update for next step
+                            prev, current = current, next_idx
+                        else:
+                            break
+                    
+                    sampled_costs.append(total_lookahead_cost)
+                
+                if sampled_costs:
+                    avg_cost = np.mean(sampled_costs)
+                    # Normalize by expected cost per step
+                    expected_per_step = median_dist * depth
+                    lookahead_scores[i, j] = np.exp(-avg_cost / expected_per_step)
+    
+    # === 4. ADAPTIVE THRESHOLD LEARNING ===
+    # Simulate gradient bandit for threshold selection
+    # We maintain two candidate thresholds and update based on simulated performance
+    
+    # Candidate thresholds (percentiles)
+    thresholds = [0.2, 0.4, 0.6]
+    threshold_probs = np.ones(3) / 3  # Initial uniform distribution
+    learning_rate = 0.1
+    
+    # Base scores before thresholding
+    base_scores = inv_dist * cluster_bonus * lookahead_scores
+    
+    # Simple regret estimation for each threshold
+    for t_idx, threshold in enumerate(thresholds):
+        # Simulate sparsification with this threshold
+        temp_mask = np.zeros_like(base_scores, dtype=bool)
+        for i in range(n):
+            row = base_scores[i].copy()
+            row[i] = -np.inf
+            k_keep = max(1, int(threshold * (n - 1)))
+            if k_keep < len(row):
+                threshold_val = np.partition(row, -k_keep)[-k_keep]
+                temp_mask[i] = row >= threshold_val
+        
+        # Symmetrize
+        temp_mask = temp_mask | temp_mask.T
+        
+        # Estimate regret: how many "good" MST edges are preserved?
+        mst = minimum_spanning_tree(dist)
+        mst_edges = (mst.toarray() > 0)
+        preserved_mst = np.sum(mst_edges & temp_mask)
+        total_mst = np.sum(mst_edges)
+        
+        if total_mst > 0:
+            mst_preservation = preserved_mst / total_mst
+            # Also consider edge score preservation
+            edge_score_preserved = np.mean(base_scores[temp_mask])
+            edge_score_total = np.mean(base_scores[~np.eye(n, dtype=bool)])
+            
+            # Combined reward
+            reward = 0.7 * mst_preservation + 0.3 * (edge_score_preserved / (edge_score_total + 1e-10))
+            
+            # Update probabilities using softmax gradient
+            threshold_probs[t_idx] *= np.exp(learning_rate * reward)
+    
+    # Normalize probabilities
+    threshold_probs = threshold_probs / np.sum(threshold_probs)
+    
+    # Select threshold (expected value)
+    selected_threshold = np.dot(threshold_probs, thresholds)
+    
+    # === 5. DYNAMIC SPARSIFICATION WITH CONNECTIVITY GUARANTEES ===
+    # Phase 1: Adaptive degree-based sparsification
+    # Target degree grows logarithmically with n
+    target_degree = min(max(3, int(np.log2(n + 1))), n - 1)
+    
+    degree_mask = np.zeros_like(base_scores, dtype=bool)
+    for i in range(n):
+        row = base_scores[i].copy()
+        row[i] = -np.inf
+        
+        if n > target_degree:
+            # Keep top target_degree edges
+            threshold_idx = np.argpartition(row, -target_degree)[-target_degree]
+            threshold = row[threshold_idx]
+            degree_mask[i] = row >= threshold
+        else:
+            degree_mask[i, :] = True
+            degree_mask[i, i] = False
+    
+    # Symmetrize
+    degree_mask = degree_mask | degree_mask.T
+    
+    # Phase 2: Threshold-based sparsification using learned threshold
+    threshold_mask = np.zeros_like(base_scores, dtype=bool)
+    global_scores = base_scores[np.triu_indices(n, k=1)]
+    if len(global_scores) > 0:
+        threshold_val = np.percentile(global_scores, 100 * (1 - selected_threshold))
+        threshold_mask = base_scores >= threshold_val
+    
+    # Phase 3: Connectivity preservation
+    # Ensure at least 2 edges per node for Hamiltonian path feasibility
+    connectivity_mask = np.zeros_like(base_scores, dtype=bool)
+    
+    for i in range(n):
+        # Combine existing masks
+        candidate_edges = (degree_mask[i] | threshold_mask[i])
+        candidate_edges[i] = False
+        
+        if np.sum(candidate_edges) < 2:
+            # Need to add more edges for this node
+            row_scores = base_scores[i].copy()
+            row_scores[i] = -np.inf
+            row_scores[~candidate_edges] = -np.inf
+            
+            # Add best missing edges to reach at least 2
+            needed = 2 - np.sum(candidate_edges)
+            if needed > 0:
+                for _ in range(int(needed)):
+                    if np.max(row_scores) > -np.inf:
+                        best_j = np.argmax(row_scores)
+                        candidate_edges[best_j] = True
+                        row_scores[best_j] = -np.inf
+        
+        connectivity_mask[i] = candidate_edges
+    
+    # Symmetrize connectivity mask
+    connectivity_mask = connectivity_mask | connectivity_mask.T
+    
+    # Final mask: union of all strategies plus MST guarantee
+    mst = minimum_spanning_tree(dist)
+    mst_edges = (mst.toarray() > 0)
+    
+    final_mask = degree_mask | threshold_mask | connectivity_mask | mst_edges
+    
+    # Apply sparsification
+    scores = base_scores * final_mask
+    
+    # === 6. ROBUST NORMALIZATION ===
+    # Use quantile-based normalization to handle outliers
+    non_zero_scores = scores[scores > 0]
+    
+    if len(non_zero_scores) > 0:
+        q25 = np.percentile(non_zero_scores, 25)
+        q75 = np.percentile(non_zero_scores, 75)
+        
+        if q75 > q25:
+            # Robust scaling using interquartile range
+            iqr = q75 - q25
+            scores[scores > 0] = (scores[scores > 0] - q25) / iqr
+            # Clip to [0, 1] and apply softmax-style transformation
+            scores = np.clip(scores, 0, 3) / 3  # Normalize to [0, 1]
+        else:
+            # Fallback to min-max
+            min_val = np.min(non_zero_scores)
+            max_val = np.max(non_zero_scores)
+            if max_val > min_val:
+                scores[scores > 0] = (scores[scores > 0] - min_val) / (max_val - min_val)
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

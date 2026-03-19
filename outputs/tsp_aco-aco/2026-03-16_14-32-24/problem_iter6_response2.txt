@@ -1,0 +1,332 @@
+```json
+{
+    "algorithm_features": ["Multi-Eigenvector Spectral Clustering", "Reinforcement Learning-inspired Adaptive Weighting", "Community-Aware Edge Scoring", "Hierarchical Density Estimation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with community detection, multi-eigenvector analysis,
+    reinforcement learning-inspired weight adaptation, and hierarchical clustering.
+    
+    Key innovations:
+    1. Multi-eigenvector spectral clustering for community detection
+    2. Reinforcement learning-inspired Q-value weight updates
+    3. Community-aware edge scoring with inter/intra-cluster bonuses
+    4. Hierarchical density estimation across multiple scales
+    5. Adaptive weight balancing based on solution structure
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. INSTANCE ANALYSIS & PARAMETER INITIALIZATION
+    # ------------------------------------------------------------
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + eps)
+    
+    # Adaptive parameter initialization
+    if n < 20:
+        k_candidate = min(n - 1, 6)
+        n_clusters = max(2, n // 4)
+    elif dist_cv < 0.3:
+        k_candidate = max(4, int(np.sqrt(n)))
+        n_clusters = max(2, int(np.sqrt(n)))
+    else:
+        k_candidate = max(5, int(n ** 0.4))
+        n_clusters = max(3, int(n ** 0.3))
+    
+    # ------------------------------------------------------------
+    # 2. MULTI-EIGENVECTOR SPECTRAL CLUSTERING
+    # ------------------------------------------------------------
+    try:
+        # Construct normalized Laplacian
+        W = np.exp(-safe_dist / (dist_mean + eps))
+        np.fill_diagonal(W, 0)
+        
+        D = np.diag(np.sum(W, axis=1))
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + eps))
+        L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+        
+        # Compute multiple eigenvectors
+        n_eigenvectors = min(10, n)
+        eigvals, eigvecs = np.linalg.eigh(L_norm)
+        
+        # Use multiple eigenvectors for richer representation
+        spectral_features = eigvecs[:, :n_eigenvectors]
+        
+        # Perform k-means clustering on spectral features
+        # Simple k-means implementation
+        np.random.seed(42)
+        centroids = spectral_features[np.random.choice(n, n_clusters, replace=False)]
+        
+        for _ in range(10):  # Fixed number of iterations
+            # Assign clusters
+            distances_to_centroids = np.sqrt(((spectral_features[:, np.newaxis] - centroids) ** 2).sum(axis=2))
+            cluster_assignments = np.argmin(distances_to_centroids, axis=1)
+            
+            # Update centroids
+            new_centroids = np.array([spectral_features[cluster_assignments == k].mean(axis=0) 
+                                     for k in range(n_clusters)])
+            
+            if np.allclose(centroids, new_centroids, atol=1e-6):
+                break
+            centroids = new_centroids
+        
+        # Spectral score based on multi-dimensional distance
+        spectral_distances = squareform(pdist(spectral_features, 'euclidean'))
+        spectral_score = np.exp(-spectral_distances / np.median(spectral_distances + eps))
+        
+    except:
+        # Fallback: use hierarchical clustering
+        try:
+            Z = linkage(safe_dist[np.triu_indices(n, k=1)], 'ward')
+            cluster_assignments = fcluster(Z, n_clusters, criterion='maxclust')
+            
+            # Create connectivity matrix based on clusters
+            cluster_mask = np.zeros((n, n))
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if cluster_assignments[i] == cluster_assignments[j]:
+                        cluster_mask[i, j] = cluster_mask[j, i] = 1
+            
+            spectral_score = 0.5 + 0.5 * cluster_mask
+            
+        except:
+            spectral_score = np.ones_like(distance_matrix)
+            cluster_assignments = np.ones(n, dtype=int)
+    
+    # ------------------------------------------------------------
+    # 3. HIERARCHICAL DENSITY ESTIMATION
+    # ------------------------------------------------------------
+    density_scores = np.zeros_like(distance_matrix)
+    
+    # Multi-scale bandwidths
+    bandwidths = [dist_mean * 0.25, dist_mean * 0.5, dist_mean, dist_mean * 2.0]
+    
+    for bw in bandwidths:
+        if bw > eps:
+            # Gaussian kernel
+            kernel_matrix = np.exp(-0.5 * (safe_dist / bw) ** 2)
+            np.fill_diagonal(kernel_matrix, 0)
+            
+            # Local density estimation
+            for i in range(n):
+                row_sum = np.sum(kernel_matrix[i])
+                if row_sum > eps:
+                    for j in range(i + 1, n):
+                        # Joint probability density
+                        joint_density = kernel_matrix[i, j] * np.sqrt(
+                            np.sum(kernel_matrix[i]) * np.sum(kernel_matrix[j])
+                        )
+                        density_scores[i, j] += joint_density / len(bandwidths)
+                        density_scores[j, i] = density_scores[i, j]
+    
+    # Normalize density scores
+    max_density = np.max(density_scores)
+    if max_density > eps:
+        density_scores = density_scores / max_density
+    
+    # ------------------------------------------------------------
+    # 4. COMMUNITY-AWARE EDGE SCORING
+    # ------------------------------------------------------------
+    community_scores = np.zeros_like(distance_matrix)
+    cluster_sizes = np.bincount(cluster_assignments)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cluster_assignments[i] == cluster_assignments[j]:
+                # Intra-cluster: favor connections within small clusters
+                cluster_size = cluster_sizes[cluster_assignments[i]]
+                size_factor = 2.0 / (cluster_size + 1)
+                community_scores[i, j] = size_factor
+            else:
+                # Inter-cluster: strategic connections between clusters
+                # Favor connections between large clusters
+                size_i = cluster_sizes[cluster_assignments[i]]
+                size_j = cluster_sizes[cluster_assignments[j]]
+                inter_factor = 0.5 * (size_i + size_j) / n
+                community_scores[i, j] = inter_factor
+            community_scores[j, i] = community_scores[i, j]
+    
+    # ------------------------------------------------------------
+    # 5. REINFORCEMENT LEARNING-INSPIRED WEIGHT ADAPTATION
+    # ------------------------------------------------------------
+    # Initialize Q-values for different heuristic components
+    component_q_values = {
+        'spectral': 1.0,
+        'inverse': 1.0,
+        'regret': 1.0,
+        'density': 1.0,
+        'community': 1.0
+    }
+    
+    # Compute component performances
+    inv_dist = 1.0 / safe_dist
+    np.fill_diagonal(inv_dist, 0)
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # Regret-based scores
+    regret_scores = np.ones_like(distance_matrix)
+    for i in range(n):
+        dists = safe_dist[i][safe_dist[i] < np.inf]
+        if len(dists) >= 3:
+            sorted_dists = np.sort(dists)
+            if len(sorted_dists) >= 2:
+                second_best = sorted_dists[1]
+                for j in range(n):
+                    if i != j:
+                        regret = (safe_dist[i, j] - second_best) / (dist_mean + eps)
+                        regret_scores[i, j] = np.exp(-max(0, regret))
+    
+    # Update Q-values based on component consistency
+    component_variances = {
+        'spectral': np.std(spectral_score[triu_indices]),
+        'inverse': np.std(inv_dist[triu_indices]),
+        'regret': np.std(regret_scores[triu_indices]),
+        'density': np.std(density_scores[triu_indices]),
+        'community': np.std(community_scores[triu_indices])
+    }
+    
+    total_variance = sum(component_variances.values()) + eps
+    for key in component_q_values:
+        # Components with lower variance get higher weights (more reliable)
+        reliability = 1.0 - (component_variances[key] / total_variance)
+        component_q_values[key] = 0.8 * component_q_values[key] + 0.2 * reliability
+    
+    # Normalize Q-values to get weights
+    q_total = sum(component_q_values.values())
+    weights = {k: v / q_total for k, v in component_q_values.items()}
+    
+    # ------------------------------------------------------------
+    # 6. CANDIDATE EDGE SELECTION WITH COMMUNITY AWARENESS
+    # ------------------------------------------------------------
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Select candidates within clusters
+    for cluster_id in np.unique(cluster_assignments):
+        cluster_nodes = np.where(cluster_assignments == cluster_id)[0]
+        if len(cluster_nodes) > 1:
+            for i in cluster_nodes:
+                # Select top k within cluster
+                within_cluster_dist = safe_dist[i, cluster_nodes].copy()
+                within_cluster_dist[within_cluster_dist == 0] = np.inf
+                
+                k_within = min(k_candidate // 2, len(cluster_nodes) - 1)
+                if k_within > 0:
+                    top_within = np.argsort(within_cluster_dist)[:k_within]
+                    candidate_mask[i, cluster_nodes[top_within]] = True
+    
+    # Select candidates between clusters
+    for i in range(n):
+        # Find best connections to other clusters
+        other_clusters = np.unique(cluster_assignments[cluster_assignments != cluster_assignments[i]])
+        
+        for cluster_id in other_clusters:
+            cluster_nodes = np.where(cluster_assignments == cluster_id)[0]
+            if len(cluster_nodes) > 0:
+                # Select best connection to this cluster
+                best_in_cluster = cluster_nodes[np.argmin(safe_dist[i, cluster_nodes])]
+                candidate_mask[i, best_in_cluster] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # ------------------------------------------------------------
+    # 7. COMPOSITE SCORING WITH ADAPTIVE WEIGHTS
+    # ------------------------------------------------------------
+    heuristics = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if candidate_mask[i, j]:
+                # Combine all components
+                score = (
+                    weights['spectral'] * spectral_score[i, j] +
+                    weights['inverse'] * inv_dist[i, j] +
+                    weights['regret'] * regret_scores[i, j] +
+                    weights['density'] * density_scores[i, j] +
+                    weights['community'] * community_scores[i, j]
+                )
+                
+                # Apply MST bonus if edge is in minimum spanning tree
+                try:
+                    mst = minimum_spanning_tree(distance_matrix).toarray()
+                    if mst[i, j] > 0 or mst[j, i] > 0:
+                        score *= 1.3
+                except:
+                    pass
+                
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    # ------------------------------------------------------------
+    # 8. STRUCTURAL REFINEMENT
+    # ------------------------------------------------------------
+    # Ensure each cluster has at least one high-scoring connection to other clusters
+    unique_clusters = np.unique(cluster_assignments)
+    if len(unique_clusters) > 1:
+        for c1 in unique_clusters:
+            for c2 in unique_clusters:
+                if c1 < c2:
+                    nodes1 = np.where(cluster_assignments == c1)[0]
+                    nodes2 = np.where(cluster_assignments == c2)[0]
+                    
+                    # Find best inter-cluster connection
+                    best_score = -1
+                    best_pair = (nodes1[0], nodes2[0])
+                    
+                    for i in nodes1:
+                        for j in nodes2:
+                            current_score = heuristics[i, j]
+                            if current_score > best_score:
+                                best_score = current_score
+                                best_pair = (i, j)
+                    
+                    # Boost the best connection
+                    if best_score > 0:
+                        i, j = best_pair
+                        heuristics[i, j] = heuristics[j, i] = best_score * 1.5
+    
+    # Apply softmax normalization with temperature scaling
+    temperature = max(0.1, np.std(heuristics[heuristics > 0]))
+    if temperature > eps:
+        for i in range(n):
+            row = heuristics[i]
+            if np.sum(row) > 0:
+                exp_row = np.exp(row / temperature)
+                row_sum = np.sum(exp_row)
+                if row_sum > eps:
+                    heuristics[i] = exp_row / row_sum
+    
+    # Final cleanup
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

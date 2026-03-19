@@ -1,0 +1,166 @@
+```json
+{
+    "algorithm_features": ["Adaptive Logarithmic Sparsification", "Rank-Weighted Inverse Distance Scoring", "Dynamic Two-Hop Regret Penalty", "Exponential Penalty Scaling"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with improved computational
+    efficiency and more sophisticated regret-based penalty mechanisms.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Adaptive Logarithmic Sparsification ====================
+    # Use logarithmic scaling to retain promising edges
+    k = max(3, int(np.log2(n)))
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Pre-compute k nearest neighbors for all nodes
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        nn_indices = sorted_indices[i, 1:k+1]
+        adjacency_mask[i, nn_indices] = True
+        
+        # Ensure reciprocal connections for stability
+        for j in nn_indices:
+            j_nn = sorted_indices[j, 1:k+1]
+            if i in j_nn:
+                adjacency_mask[j, i] = True
+    
+    # Ensure symmetry and no self-loops
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Rank-Weighted Inverse Distance Scoring ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Get distances to neighbors
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Compute rank-based weights with exponential decay
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            # Exponential weighting: closer ranks get much higher weights
+            weights = np.exp(-0.5 * (ranks - 1))
+            weights = weights / np.sum(weights)
+            
+            # Compute inverse distances with smoothing
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            
+            # Normalize by number of neighbors to prevent dominance
+            neighbor_factor = 1.0 / np.sqrt(np.sum(valid_mask))
+            inv_dist[i, valid_mask] = inv_vals * weights * neighbor_factor
+    
+    # Symmetrize by taking geometric mean
+    inv_dist_sym = np.sqrt(np.maximum(inv_dist * inv_dist.T, 1e-16))
+    
+    # ==================== 3. Dynamic Two-Hop Regret Penalty ====================
+    two_hop_penalty = np.ones_like(distance_matrix)
+    
+    # Pre-compute top neighbors for two-hop analysis
+    check_limit = max(4, int(np.sqrt(n)))
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        valid_indices = np.where(valid_mask)[0]
+        
+        for j in valid_indices:
+            if i >= j:
+                continue
+                
+            direct_dist = distance_matrix[i, j]
+            if direct_dist < 1e-10:
+                continue
+            
+            # Get top neighbors of i and j (excluding each other)
+            i_neighbors = [x for x in sorted_indices[i, 1:check_limit+1] if x != j]
+            j_neighbors = [x for x in sorted_indices[j, 1:check_limit+1] if x != i]
+            
+            # Combine and deduplicate
+            candidate_nodes = np.unique(np.concatenate([i_neighbors, j_neighbors]))
+            
+            # Remove i and j if present
+            candidate_nodes = candidate_nodes[(candidate_nodes != i) & (candidate_nodes != j)]
+            
+            if len(candidate_nodes) > 0:
+                # Compute all two-hop paths
+                two_hop_dists = distance_matrix[i, candidate_nodes] + distance_matrix[candidate_nodes, j]
+                min_two_hop = np.min(two_hop_dists) if len(two_hop_dists) > 0 else np.inf
+                
+                if min_two_hop < np.inf:
+                    # Compute regret: positive when direct is better, negative when worse
+                    regret = (direct_dist - min_two_hop) / direct_dist
+                    
+                    # Apply exponential penalty scaling based on regret
+                    # High regret (direct much better) → low penalty
+                    # Low regret (two-hop almost as good) → high penalty
+                    if regret > 0:
+                        # Direct is better, apply mild penalty
+                        penalty = np.exp(-2.0 * regret)
+                    else:
+                        # Two-hop is better, apply strong penalty
+                        penalty = 0.2 + 0.8 * np.exp(3.0 * regret)
+                    
+                    # Additional scaling by inverse distance to prioritize shorter edges
+                    dist_factor = 1.0 / (1.0 + direct_dist / np.mean(distance_matrix))
+                    penalty *= (0.3 + 0.7 * dist_factor)
+                    
+                    two_hop_penalty[i, j] = two_hop_penalty[j, i] = penalty
+    
+    # ==================== 4. Combined Scoring ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Vectorized combination for efficiency
+    mask_indices = np.where(adjacency_mask)
+    i_indices, j_indices = mask_indices
+    mask_i_j = i_indices < j_indices  # Upper triangle
+    
+    # Apply scoring only to upper triangle
+    for i, j in zip(i_indices[mask_i_j], j_indices[mask_i_j]):
+        base_score = inv_dist_sym[i, j]
+        penalty = two_hop_penalty[i, j]
+        
+        # Combine with multiplicative penalty and add small constant
+        combined_score = base_score * penalty + 1e-8
+        
+        heuristics[i, j] = heuristics[j, i] = combined_score
+    
+    # ==================== 5. Final Normalization ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Symmetrize final matrix with geometric mean
+    heuristics_sym = np.sqrt(np.maximum(heuristics * heuristics.T, 1e-16))
+    np.fill_diagonal(heuristics_sym, 0)
+    
+    # Final row normalization
+    row_sums = heuristics_sym.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics_sym = heuristics_sym / row_sums
+    
+    return heuristics_sym
+```

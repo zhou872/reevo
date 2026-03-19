@@ -1,0 +1,470 @@
+```json
+{
+    "algorithm_features": ["Multi-Stage Sampling", "Memory-Augmented Learning", "Approximate Lin-Kernighan", "Parallel Processing"]
+}
+```
+
+```python
+import numpy as np
+import hashlib
+import math
+from scipy import sparse
+from scipy.sparse import csgraph
+import multiprocessing as mp
+from functools import partial
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with multi-stage stochastic sampling,
+    incremental memory updates, approximate Lin-Kernighan heuristics, and parallel
+    processing for extreme-scale instances.
+    
+    Key innovations:
+    1. Multi-stage sampling with adaptive intensity
+    2. Incremental memory updates with exponential decay
+    3. Approximate Lin-Kernighan via restricted k-opt moves
+    4. Parallel processing for large instances
+    5. Hierarchical sampling for massive graphs
+    
+    Parameters:
+    distance_matrix (np.ndarray): Square matrix of distances between nodes.
+    
+    Returns:
+    np.ndarray: Matrix of the same shape with scores indicating edge promise.
+    """
+    n = distance_matrix.shape[0]
+    
+    # ==================== MEMORY MANAGEMENT ====================
+    # Initialize memory as function attribute with incremental update capability
+    if not hasattr(heuristics_v2, "memory_cache"):
+        heuristics_v2.memory_cache = {}  # key -> (heuristic_matrix, access_count, last_used)
+        heuristics_v2.access_counter = 0
+    
+    # Create robust instance signature using hierarchical sampling
+    def create_instance_signature(matrix, n_samples=1000):
+        """Create a compact signature for memory lookup."""
+        rng = np.random.RandomState(42)
+        signature_parts = []
+        
+        # Sample distances at multiple scales
+        for scale in [1.0, 0.1, 0.01]:
+            sample_size = min(n_samples, n * n)
+            if sample_size > 0:
+                # Sample with bias toward shorter distances (more informative)
+                flat_dists = matrix.flatten()
+                weights = 1.0 / (flat_dists + 1e-10)
+                weights[weights > 1e10] = 0
+                if weights.sum() > 0:
+                    weights = weights / weights.sum()
+                    indices = rng.choice(len(flat_dists), size=min(sample_size, len(flat_dists)), 
+                                        replace=False, p=weights)
+                    samples = flat_dists[indices]
+                    # Compute robust statistics
+                    stats = np.percentile(samples, [10, 25, 50, 75, 90])
+                    signature_parts.append(stats.tobytes())
+        
+        # Add size and basic stats
+        signature_parts.append(str(n).encode())
+        if n > 0:
+            triu_dists = matrix[np.triu_indices(n, 1)]
+            if len(triu_dists) > 0:
+                signature_parts.append(str(np.mean(triu_dists)).encode())
+                signature_parts.append(str(np.std(triu_dists)).encode())
+        
+        # Create hash
+        combined = b''.join(signature_parts)
+        return hashlib.md5(combined).hexdigest()[:16]
+    
+    instance_key = create_instance_signature(distance_matrix)
+    current_access = heuristics_v2.access_counter
+    heuristics_v2.access_counter += 1
+    
+    # Check memory and compute blending factor
+    if instance_key in heuristics_v2.memory_cache:
+        cached_heuristic, cached_count, cached_access = heuristics_v2.memory_cache[instance_key]
+        # Exponential decay based on time since last access
+        time_decay = np.exp(-0.1 * (current_access - cached_access))
+        # Usage-based confidence
+        usage_confidence = 1.0 - np.exp(-cached_count / 10.0)
+        blend_old = min(0.3, 0.1 + 0.2 * usage_confidence * time_decay)
+        # Update access info
+        heuristics_v2.memory_cache[instance_key] = (cached_heuristic, cached_count + 1, current_access)
+    else:
+        blend_old = 0.0
+    
+    blend_new = 1.0 - blend_old
+    
+    # Handle trivial cases
+    if n <= 2:
+        heuristic = np.zeros_like(distance_matrix, dtype=np.float64)
+        if n == 2:
+            heuristic[0, 1] = heuristic[1, 0] = 1.0
+        # Store in memory
+        heuristics_v2.memory_cache[instance_key] = (heuristic, 1, current_access)
+        return heuristic
+    
+    # ==================== INSTANCE ANALYSIS ====================
+    # Compute instance statistics efficiently
+    triu_dists = distance_matrix[np.triu_indices(n, 1)]
+    dist_mean = np.mean(triu_dists) if len(triu_dists) > 0 else 1.0
+    dist_std = np.std(triu_dists) if len(triu_dists) > 0 else 0.0
+    dist_cv = dist_std / dist_mean if dist_mean > 0 else 1.0
+    
+    # Estimate graph sparsity and structure
+    density_est = min(1.0, (np.count_nonzero(distance_matrix) - n) / (n * (n - 1) + 1e-10))
+    
+    # ==================== BASE COMPONENTS ====================
+    # 1. Reciprocal distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1.0 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # Scale based on distance distribution
+    if dist_cv > 1.5:
+        reciprocal = np.power(reciprocal, 0.8)  # Reduce emphasis on very close nodes
+    
+    # 2. Efficient centrality using random walk with restarts
+    def compute_centrality(distance_matrix, n_iter=20, damping=0.85):
+        """Compute centrality using random walk with restarts."""
+        n = distance_matrix.shape[0]
+        
+        # Create transition matrix with Gaussian similarity
+        sigma = np.median(distance_matrix[distance_matrix > 0]) if np.any(distance_matrix > 0) else 1.0
+        similarity = np.exp(-distance_matrix ** 2 / (2 * sigma ** 2))
+        np.fill_diagonal(similarity, 0)
+        
+        # Normalize rows
+        row_sums = similarity.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        transition = similarity / row_sums
+        
+        # Random walk with restarts
+        centrality = np.ones(n) / n
+        restart = np.ones(n) / n
+        
+        for _ in range(n_iter):
+            centrality = damping * (transition.T @ centrality) + (1 - damping) * restart
+        
+        # Normalize
+        if centrality.max() > 0:
+            centrality = centrality / centrality.max()
+        
+        return centrality
+    
+    centrality = compute_centrality(distance_matrix)
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # 3. MST with Christofides-inspired enhancements
+    try:
+        # Compute MST
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_dense = mst.toarray()
+        mst_mask = (mst_dense > 0).astype(float)
+        
+        # Identify odd-degree vertices
+        mst_degree = mst_mask.sum(axis=1)
+        odd_vertices = np.where(mst_degree % 2 == 1)[0]
+        
+        # Create matching component
+        matching_component = np.zeros_like(distance_matrix)
+        if len(odd_vertices) > 0:
+            # Simplified greedy matching
+            matched = np.zeros(len(odd_vertices), dtype=bool)
+            for idx, i in enumerate(odd_vertices):
+                if not matched[idx]:
+                    # Find closest unmatched odd vertex
+                    min_dist = np.inf
+                    best_j = -1
+                    best_j_idx = -1
+                    for jdx, j in enumerate(odd_vertices):
+                        if jdx > idx and not matched[jdx]:
+                            dist = distance_matrix[i, j]
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_j = j
+                                best_j_idx = jdx
+                    
+                    if best_j != -1:
+                        weight = reciprocal[i, best_j] * 0.3
+                        matching_component[i, best_j] = weight
+                        matching_component[best_j, i] = weight
+                        matched[idx] = matched[best_j_idx] = True
+        
+        # MST component with degree-based weighting
+        mst_component = mst_mask.copy()
+        for i in range(n):
+            for j in range(i + 1, n):
+                if mst_mask[i, j]:
+                    # Boost edges connecting high-degree vertices
+                    degree_factor = (mst_degree[i] * mst_degree[j]) ** 0.25
+                    mst_component[i, j] = mst_component[j, i] = 0.5 + 0.5 * degree_factor
+        
+    except Exception as e:
+        mst_component = np.zeros_like(distance_matrix)
+        matching_component = np.zeros_like(distance_matrix)
+    
+    # ==================== ADVANCED SAMPLING WITH PARALLEL PROCESSING ====================
+    def approximate_lin_kernighan(tour, dist_matrix, max_iter=50, max_depth=3):
+        """Approximate Lin-Kernighan with restricted k-opt moves."""
+        n = len(tour)
+        best_tour = tour.copy()
+        best_length = np.sum(dist_matrix[tour, np.roll(tour, -1)])
+        
+        for _ in range(max_iter):
+            improved = False
+            
+            for i in range(n):
+                # Random starting edge
+                a1 = tour[i]
+                a2 = tour[(i + 1) % n]
+                
+                # Try to find improving sequence
+                current_gain = 0
+                sequence = []
+                
+                for depth in range(1, max_depth + 1):
+                    # Random candidate for breaking next edge
+                    j = np.random.randint(n)
+                    b1 = tour[j]
+                    b2 = tour[(j + 1) % n]
+                    
+                    # Calculate gain for this move
+                    gain = dist_matrix[a1, a2] + dist_matrix[b1, b2] - \
+                           dist_matrix[a1, b1] - dist_matrix[b2, a2]
+                    
+                    if gain > 0 or (depth == 1 and gain > -0.1 * dist_matrix[a1, a2]):
+                        current_gain += gain
+                        sequence.append((i, j))
+                        
+                        # Update endpoints for next iteration
+                        a1, a2 = b2, tour[(j + 1) % n]
+                    else:
+                        break
+                
+                if current_gain > 0 and len(sequence) > 0:
+                    # Apply the sequence of moves
+                    temp_tour = best_tour.copy()
+                    for i_idx, j_idx in sequence:
+                        # Reverse segment between i+1 and j
+                        start = (i_idx + 1) % n
+                        end = j_idx % n
+                        if start != end:
+                            if start < end:
+                                temp_tour[start:end + 1] = temp_tour[start:end + 1][::-1]
+                            else:
+                                segment = list(temp_tour[start:]) + list(temp_tour[:end + 1])
+                                segment = segment[::-1]
+                                temp_tour[start:] = segment[:n - start]
+                                temp_tour[:end + 1] = segment[n - start:]
+                    
+                    # Check improvement
+                    new_length = np.sum(dist_matrix[temp_tour, np.roll(temp_tour, -1)])
+                    if new_length < best_length:
+                        best_tour = temp_tour
+                        best_length = new_length
+                        improved = True
+                        break
+            
+            if not improved:
+                break
+        
+        return best_tour, best_length
+    
+    def sample_and_improve_batch(batch_size, start_seed, distance_matrix, n):
+        """Sample and improve a batch of tours."""
+        np.random.seed(start_seed)
+        batch_edges = np.zeros((n, n), dtype=np.float64)
+        
+        for _ in range(batch_size):
+            # Generate random tour
+            tour = np.random.permutation(n)
+            
+            # Apply approximate Lin-Kernighan
+            improved_tour, tour_length = approximate_lin_kernighan(
+                tour, distance_matrix, 
+                max_iter=min(20, n // 10),
+                max_depth=min(3, int(np.log2(n)))
+            )
+            
+            # Weight edges by tour quality
+            weight = 1.0 / (tour_length + 1e-10)
+            for i in range(n):
+                a, b = improved_tour[i], improved_tour[(i + 1) % n]
+                batch_edges[a, b] += weight
+                batch_edges[b, a] += weight
+        
+        return batch_edges
+    
+    # Determine sampling strategy based on instance size
+    if n <= 100:
+        n_tours = 200
+        use_parallel = False
+    elif n <= 1000:
+        n_tours = 100
+        use_parallel = (mp.cpu_count() > 1)
+    else:
+        # Hierarchical sampling for massive instances
+        n_tours = 50
+        use_parallel = (mp.cpu_count() > 1) and (n > 5000)
+    
+    # Perform sampling
+    local_search_component = np.zeros_like(distance_matrix, dtype=np.float64)
+    
+    if use_parallel and n_tours > 0:
+        # Parallel processing for large instances
+        n_workers = min(mp.cpu_count(), 8)
+        batch_size = max(1, n_tours // n_workers)
+        
+        with mp.Pool(processes=n_workers) as pool:
+            seeds = np.random.randint(0, 2**31, size=n_workers)
+            func = partial(sample_and_improve_batch, batch_size, distance_matrix=distance_matrix, n=n)
+            results = pool.starmap(func, [(seed,) for seed in seeds])
+            
+            for batch_edges in results:
+                local_search_component += batch_edges
+    elif n_tours > 0:
+        # Sequential processing
+        local_search_component = sample_and_improve_batch(
+            n_tours, 42, distance_matrix, n
+        )
+    
+    # Normalize local search component
+    if local_search_component.max() > 0:
+        local_search_component = local_search_component / local_search_component.max()
+    
+    # ==================== ADAPTIVE COMBINATION ====================
+    # Dynamic weighting based on instance characteristics
+    if n < 50:
+        base_weights = [0.35, 0.25, 0.20, 0.10, 0.10]  # reciprocal, centrality, MST, matching, local
+    elif n < 200:
+        base_weights = [0.30, 0.20, 0.25, 0.15, 0.10]
+    elif n < 1000:
+        base_weights = [0.25, 0.15, 0.30, 0.15, 0.15]
+    else:
+        base_weights = [0.20, 0.10, 0.35, 0.15, 0.20]
+    
+    # Adjust based on distance characteristics
+    if dist_cv > 1.0:
+        base_weights[0] *= 1.1  # Emphasize reciprocal
+        base_weights[2] *= 0.9  # Reduce MST weight
+    
+    if density_est < 0.1:
+        base_weights[3] *= 1.2  # Emphasize matching for sparse graphs
+    
+    # Normalize weights
+    weight_sum = sum(base_weights)
+    weights = [w / weight_sum for w in base_weights]
+    
+    # Combine components
+    combined = (
+        weights[0] * reciprocal +
+        weights[1] * centrality_matrix +
+        weights[2] * mst_component +
+        weights[3] * matching_component +
+        weights[4] * local_search_component
+    )
+    
+    # ==================== MEMORY-AUGMENTED REFINEMENT ====================
+    if blend_old > 0:
+        # Blend with cached version
+        cached_heuristic = heuristics_v2.memory_cache[instance_key][0]
+        combined = blend_new * combined + blend_old * cached_heuristic
+    
+    # ==================== ADAPTIVE SPARSIFICATION ====================
+    sparsified = np.zeros_like(combined)
+    
+    # Determine sparsity level adaptively
+    if n < 100:
+        base_k = max(3, min(15, n // 3))
+    elif n < 1000:
+        base_k = max(3, int(5 + np.sqrt(n)))
+    else:
+        base_k = max(3, int(3 + np.log2(n) * 2))
+    
+    rng = np.random.RandomState(42)
+    
+    for i in range(n):
+        # Adaptive k per node based on centrality
+        node_k = int(base_k * (0.8 + 0.4 * centrality[i]))
+        node_k = max(2, min(n - 1, node_k))
+        
+        # Select top edges with stochastic perturbation
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Add small noise for diversity
+        noise = rng.randn(n) * 0.05 * (1.0 - centrality[i])
+        row_noisy = row * (1.0 + noise)
+        
+        if node_k < n - 1:
+            # Get top node_k edges
+            threshold = np.partition(row_noisy, -node_k)[-node_k]
+            mask = row_noisy >= threshold
+        else:
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+        
+        # Apply exponential decay based on rank
+        masked_indices = np.where(mask)[0]
+        masked_values = row_noisy[masked_indices]
+        sorted_indices = masked_indices[np.argsort(masked_values)[::-1]]
+        
+        for rank, j in enumerate(sorted_indices[:node_k]):
+            decay = np.exp(-rank / max(1.0, node_k / 4.0))
+            
+            # Boost if in MST or matching
+            boost = 1.0
+            if mst_component[i, j] > 0:
+                boost *= 1.3
+            if matching_component[i, j] > 0:
+                boost *= 1.2
+            
+            sparsified[i, j] = combined[i, j] * decay * boost
+    
+    # ==================== FINAL PROCESSING ====================
+    # Ensure symmetry
+    symmetric = 0.6 * sparsified + 0.4 * sparsified.T
+    
+    # Add small random noise for exploration
+    if n > 10:
+        noise = rng.randn(n, n) * 0.02
+        noise = np.triu(noise) + np.triu(noise, 1).T
+        np.fill_diagonal(noise, 0)
+        symmetric = symmetric * (1.0 + noise)
+    
+    # Ensure non-negativity and zero diagonal
+    symmetric = np.maximum(symmetric, 0)
+    np.fill_diagonal(symmetric, 0)
+    
+    # Normalize
+    max_val = symmetric.max()
+    if max_val > 0:
+        symmetric = symmetric / max_val
+    
+    # ==================== MEMORY UPDATE ====================
+    # Update memory with exponential moving average if exists
+    if instance_key in heuristics_v2.memory_cache:
+        old_heuristic, old_count, _ = heuristics_v2.memory_cache[instance_key]
+        alpha = 1.0 / (old_count + 1.0)  # Decreasing learning rate
+        symmetric = (1.0 - alpha) * old_heuristic + alpha * symmetric
+    
+    # Store in memory
+    heuristics_v2.memory_cache[instance_key] = (symmetric, 
+                                              heuristics_v2.memory_cache.get(instance_key, (None, 0, 0))[1] + 1,
+                                              current_access)
+    
+    # Limit memory size
+    max_memory = 100
+    if len(heuristics_v2.memory_cache) > max_memory:
+        # Remove least recently used entries
+        items = list(heuristics_v2.memory_cache.items())
+        items.sort(key=lambda x: x[1][2])  # Sort by last access
+        for key, _ in items[:-max_memory]:
+            del heuristics_v2.memory_cache[key]
+    
+    return symmetric
+```

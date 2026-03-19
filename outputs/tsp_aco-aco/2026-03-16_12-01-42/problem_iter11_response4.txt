@@ -1,0 +1,257 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret Analysis", "Adaptive Exponential Fusion", "Centrality-guided Sparsification", "Size-aware Component Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization with multi-step regret analysis,
+    adaptive exponential fusion, and size-aware component weighting.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix with non-negative entries
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Compute coefficient of variation for adaptive weights ===
+    if n > 1:
+        # Get upper triangular distances (excluding diagonal)
+        triu_indices = np.triu_indices(n, k=1)
+        distances_flat = distance_matrix[triu_indices]
+        if len(distances_flat) > 0:
+            cv = np.std(distances_flat) / (np.mean(distances_flat) + epsilon)
+        else:
+            cv = 0.5
+        # Constrain CV to reasonable range
+        cv = np.clip(cv, 0.1, 2.0)
+    else:
+        cv = 0.5
+    
+    # === 2. Size-adaptive component weights ===
+    # Base weights that adapt to problem size
+    if n < 30:
+        # Small instances: emphasize regret analysis
+        w_inv = 0.7 + 0.3 * (1 - cv)
+        w_regret = 1.2 + 0.3 * cv
+        w_spatial = 0.8 + 0.2 * (1 - cv)
+    elif n < 100:
+        # Medium instances: balanced approach
+        w_inv = 0.9 + 0.2 * (1 - cv)
+        w_regret = 1.0 + 0.2 * cv
+        w_spatial = 0.9 + 0.1 * (1 - cv)
+    else:
+        # Large instances: emphasize inverse distance and spatial info
+        w_inv = 1.1 + 0.3 * (1 - cv)
+        w_regret = 0.8 + 0.2 * cv
+        w_spatial = 1.1 + 0.2 * (1 - cv)
+    
+    # === 3. Base inverse distance component ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distances for stable exponentiation
+    inv_dist_max = np.max(inv_dist)
+    if inv_dist_max > epsilon:
+        inv_dist_norm = inv_dist / inv_dist_max
+    else:
+        inv_dist_norm = inv_dist
+    
+    # === 4. Multi-step regret analysis with exponential decay ===
+    regret_scores = np.ones_like(distance_matrix)
+    
+    if n > 2:
+        # Precompute nearest neighbors for efficient lookahead
+        k_neighbors = min(8, max(3, int(np.sqrt(n))))
+        neighbor_indices = np.zeros((n, k_neighbors), dtype=int)
+        neighbor_distances = np.zeros((n, k_neighbors))
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Get k nearest neighbors
+            idx = np.argpartition(dists, k_neighbors)[:k_neighbors]
+            neighbor_indices[i] = idx
+            neighbor_distances[i] = dists[idx]
+        
+        # Compute regret for each edge
+        for i in range(n):
+            for j in range(i + 1, n):
+                d_ij = distance_matrix[i, j]
+                if d_ij <= epsilon:
+                    continue
+                
+                # Get nearest neighbors for i and j (excluding each other)
+                neighbors_i = [k for k in neighbor_indices[i] if k != j]
+                neighbors_j = [k for k in neighbor_indices[j] if k != i]
+                
+                # Multi-step regret analysis
+                regrets = []
+                
+                # 1-step alternatives (direct competitors)
+                alt_costs_1step = []
+                for k in neighbors_i:
+                    if k != j:
+                        # Find alternative path i->k->?
+                        alt_costs_1step.append(distance_matrix[i, k])
+                
+                # 2-step lookahead alternatives
+                alt_costs_2step = []
+                for k in neighbors_i:
+                    if k != j:
+                        # Path i->k->j
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        alt_costs_2step.append(alt_cost)
+                        
+                        # Additional 2-step via j's neighbors
+                        for l in neighbors_j:
+                            if l != i and l != k:
+                                alt_cost2 = distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                                alt_costs_2step.append(alt_cost2)
+                
+                if alt_costs_1step:
+                    best_1step = np.min(alt_costs_1step)
+                    regret_1step = (best_1step - d_ij) / (d_ij + epsilon)
+                    regrets.append(regret_1step)
+                
+                if alt_costs_2step:
+                    best_2step = np.min(alt_costs_2step)
+                    regret_2step = (best_2step - d_ij) / (d_ij + epsilon)
+                    regrets.append(0.7 * regret_2step)  # Decay for 2-step
+                
+                if regrets:
+                    # Combine regrets with exponential decay
+                    total_regret = np.sum(regrets) / len(regrets)
+                    # Transform to score (higher regret -> higher penalty -> lower score)
+                    # Using sigmoid-like transformation
+                    regret_score = 2.0 / (1.0 + np.exp(0.5 * total_regret)) - 0.5
+                    regret_scores[i, j] = regret_scores[j, i] = np.clip(regret_score, 0.5, 1.5)
+    
+    # === 5. Spatial scoring with cluster density awareness ===
+    spatial_scores = np.ones_like(distance_matrix)
+    
+    if n > 2:
+        # Compute local spatial statistics
+        local_density = np.zeros(n)
+        for i in range(n):
+            mask = np.arange(n) != i
+            if np.any(mask):
+                distances = distance_matrix[i, mask]
+                # Use quartile-based density measure
+                q1 = np.percentile(distances, 25)
+                q3 = np.percentile(distances, 75)
+                local_density[i] = q3 - q1  # Interquartile range as density measure
+        
+        # Compute spatial scores
+        mean_density = np.mean(local_density) + epsilon
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Edge between dense regions should be penalized unless very short
+                density_factor = (local_density[i] + local_density[j]) / (2 * mean_density)
+                # Spatial score favors edges in sparse regions and short edges
+                spatial_score = np.exp(-0.3 * density_factor * distance_matrix[i, j] / mean_density)
+                spatial_scores[i, j] = spatial_scores[j, i] = np.clip(spatial_score, 0.7, 1.3)
+    
+    # === 6. Exponential multiplicative fusion ===
+    # Apply component weights via exponentiation
+    heuristics = (
+        np.power(inv_dist_norm, w_inv) *
+        np.power(regret_scores, w_regret) *
+        np.power(spatial_scores, w_spatial)
+    )
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 7. MST reinforcement ===
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_present = (mst_dense > 0) | (mst_dense.T > 0)
+            
+            # Boost MST edges based on their strength in the heuristic
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if mst_present[i, j]:
+                        current_val = heuristics[i, j]
+                        # Boost proportionally to current value (stronger edges get more boost)
+                        boost = 1.0 + 0.3 * (current_val / (np.max(heuristics) + epsilon))
+                        heuristics[i, j] = heuristics[j, i] = current_val * boost
+        except:
+            pass
+    
+    # === 8. Adaptive sparsification ===
+    # Compute node importance for guided sparsification
+    if n > 2:
+        node_importance = np.zeros(n)
+        for i in range(n):
+            # Importance based on heuristic strength of incident edges
+            row = heuristics[i].copy()
+            row[i] = 0
+            if np.any(row > 0):
+                node_importance[i] = np.mean(row[row > 0])
+        
+        if np.max(node_importance) > epsilon:
+            node_importance = node_importance / np.max(node_importance)
+    
+        for i in range(n):
+            row = heuristics[i].copy()
+            
+            # Adaptive sparsity threshold based on node importance
+            if node_importance[i] > 0.7:
+                keep_top = max(4, min(12, n // 3))
+            elif node_importance[i] > 0.3:
+                keep_top = max(3, min(8, n // 4))
+            else:
+                keep_top = max(2, min(5, n // 5))
+            
+            keep_top = min(keep_top, n - 1)
+            
+            if keep_top > 0 and np.any(row > 0):
+                # Keep top edges
+                threshold = np.partition(row, -keep_top)[-keep_top]
+                keep_mask = row >= threshold
+                
+                # Preserve MST edges
+                if n > 2 and 'mst_present' in locals():
+                    keep_mask = keep_mask | mst_present[i]
+                
+                # Apply soft thresholding
+                mask_strength = np.zeros_like(row)
+                non_zero = row > 0
+                if np.any(non_zero):
+                    row_nonzero = row[non_zero]
+                    threshold_nonzero = np.partition(row_nonzero, -keep_top)[-keep_top] if len(row_nonzero) > keep_top else np.min(row_nonzero)
+                    mask_strength[non_zero] = np.clip((row[non_zero] - threshold_nonzero) / 
+                                                     (np.max(row[non_zero]) - threshold_nonzero + epsilon), 0, 1)
+                
+                row = row * mask_strength
+                row[~keep_mask] = 0
+                heuristics[i] = row
+    
+    # === 9. Final processing ===
+    # Symmetrize (take maximum of both directions)
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize and apply final transformation
+    max_val = np.max(heuristics)
+    if max_val > epsilon:
+        heuristics = heuristics / max_val
+        # Gentle compression to enhance contrast without extreme values
+        heuristics = np.power(heuristics, 0.9)
+    
+    return heuristics
+```

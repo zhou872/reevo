@@ -1,0 +1,184 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Regret", "Nearest Neighbor Sparsification", "Symmetry-Constrained Scoring", "Cluster-Aware Normalization"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple, List
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection probability estimation.
+    
+    Combines multiple strategies:
+    1. Two-step lookahead regret analysis
+    2. Sparsification based on local and global promise thresholds
+    3. Symmetry constraints enforcement
+    4. Cluster-aware normalization
+    
+    Args:
+        distance_matrix: n x n symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape, with unpromising edges set to zero
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Handle potential zero distances (same node)
+    eps = 1e-10
+    D = distance_matrix.copy()
+    np.fill_diagonal(D, np.inf)  # Ignore self-loops
+    
+    # 1. Two-step lookahead regret analysis
+    # For each edge (i,j), compute the regret of not choosing the best alternative
+    regret_matrix = np.zeros_like(D)
+    
+    # Pre-compute nearest neighbors for each node
+    k = min(10, n - 1)  # Number of nearest neighbors to consider
+    nearest_indices = np.argsort(D, axis=1)[:, 1:k+1]  # Exclude self
+    
+    for i in range(n):
+        # Get distances from i to all other nodes
+        dist_i = D[i, :].copy()
+        dist_i[i] = np.inf  # Ignore self
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Find best alternative connections for i and j
+            # Filter out j from i's alternatives and i from j's alternatives
+            alt_i = [idx for idx in nearest_indices[i] if idx != j]
+            alt_j = [idx for idx in nearest_indices[j] if idx != i]
+            
+            if alt_i and alt_j:
+                # Best alternative distances
+                best_alt_i = dist_i[alt_i[0]]
+                best_alt_j = D[j, alt_j[0]]
+                
+                # Two-step regret: cost of connecting i->alt_i + j->alt_j vs i->j
+                regret = (best_alt_i + best_alt_j) - D[i, j]
+                regret_matrix[i, j] = max(regret, 0)  # Only positive regret is interesting
+    
+    # 2. Cluster-aware normalization
+    # Identify natural clusters in the data using average linkage
+    if n >= 4:
+        try:
+            # Compute condensed distance matrix for clustering
+            condensed_dist = pdist(D, metric='euclidean') if n > 1 else np.array([])
+            cluster_density = np.zeros(n)
+            
+            # Simple density estimation: inverse of average distance to k nearest neighbors
+            for i in range(n):
+                if len(nearest_indices[i]) > 0:
+                    avg_neighbor_dist = np.mean(D[i, nearest_indices[i][:min(3, len(nearest_indices[i]))]])
+                    cluster_density[i] = 1.0 / (avg_neighbor_dist + eps)
+            
+            # Normalize density scores
+            if np.max(cluster_density) > 0:
+                cluster_density = cluster_density / np.max(cluster_density)
+        except:
+            cluster_density = np.ones(n)
+    else:
+        cluster_density = np.ones(n)
+    
+    # 3. Combine factors with weighted scoring
+    # Base heuristic: inverse distance (closer is better)
+    base_heuristic = 1.0 / (D + eps)
+    
+    # Enhanced scoring combining multiple factors
+    enhanced_heuristic = np.zeros_like(D)
+    
+    for i in range(n):
+        for j in range(i + 1, n):  # Upper triangular only (symmetric matrix)
+            if D[i, j] == np.inf:
+                continue
+                
+            # Factor 1: Inverse distance (normalized)
+            inv_dist_score = base_heuristic[i, j]
+            
+            # Factor 2: Regret score (normalized)
+            if np.max(regret_matrix) > 0:
+                regret_score = regret_matrix[i, j] / (np.max(regret_matrix) + eps)
+            else:
+                regret_score = 0
+            
+            # Factor 3: Cluster connection bonus
+            # Edges connecting dense clusters get bonus
+            cluster_bonus = cluster_density[i] * cluster_density[j]
+            
+            # Factor 4: Local vs global balance
+            # Ratio of edge length to average edge length from i and j
+            avg_edge_i = np.mean(D[i, nearest_indices[i][:min(5, len(nearest_indices[i]))]])
+            avg_edge_j = np.mean(D[j, nearest_indices[j][:min(5, len(nearest_indices[j]))]])
+            length_ratio = D[i, j] / (0.5 * (avg_edge_i + avg_edge_j) + eps)
+            length_score = np.exp(-0.5 * (length_ratio - 1) ** 2)  # Gaussian around 1
+            
+            # Combined score with weights
+            combined_score = (
+                0.4 * inv_dist_score +
+                0.3 * regret_score +
+                0.2 * cluster_bonus +
+                0.1 * length_score
+            )
+            
+            enhanced_heuristic[i, j] = combined_score
+            enhanced_heuristic[j, i] = combined_score  # Symmetric
+    
+    # 4. Sparsification: Keep only the most promising edges
+    # Strategy: Keep edges that are in top percentile OR connect to nodes with few good options
+    sparsified = enhanced_heuristic.copy()
+    
+    # Calculate connection need per node
+    connection_scores = np.zeros(n)
+    for i in range(n):
+        # Consider top m edges for each node
+        m = min(5, n - 1)
+        node_edges = enhanced_heuristic[i, :].copy()
+        node_edges[i] = 0  # Ignore diagonal
+        if len(node_edges) > m:
+            top_m_threshold = np.sort(node_edges)[-m]
+            connection_scores[i] = np.sum(node_edges >= top_m_threshold)
+    
+    # Adaptive sparsification threshold
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                sparsified[i, j] = 0
+                continue
+                
+            # Determine if edge should be kept
+            should_keep = False
+            
+            # Keep if in top p% globally
+            global_threshold = np.percentile(enhanced_heuristic[enhanced_heuristic > 0], 70)
+            if enhanced_heuristic[i, j] > global_threshold:
+                should_keep = True
+            
+            # Keep if either node has few good connections
+            local_threshold_i = np.percentile(enhanced_heuristic[i, :][enhanced_heuristic[i, :] > 0], 60)
+            local_threshold_j = np.percentile(enhanced_heuristic[j, :][enhanced_heuristic[j, :] > 0], 60)
+            
+            if (enhanced_heuristic[i, j] > local_threshold_i and connection_scores[i] < 3) or \
+               (enhanced_heuristic[i, j] > local_threshold_j and connection_scores[j] < 3):
+                should_keep = True
+            
+            # Keep if it's a very strong edge (top 10%)
+            strong_threshold = np.percentile(enhanced_heuristic[enhanced_heuristic > 0], 90)
+            if enhanced_heuristic[i, j] > strong_threshold:
+                should_keep = True
+            
+            if not should_keep:
+                sparsified[i, j] = 0
+    
+    # 5. Ensure symmetry and zero diagonal
+    np.fill_diagonal(sparsified, 0)
+    sparsified = np.maximum(sparsified, sparsified.T)  # Ensure symmetry
+    
+    return sparsified
+```

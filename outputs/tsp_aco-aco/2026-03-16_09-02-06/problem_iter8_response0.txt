@@ -1,0 +1,223 @@
+```json
+{
+    "algorithm_features": ["Symmetric Regret Penalization", "Two-step Neighbor Lookahead", "Density-aware Adaptive Sparsification", "Cluster-adjusted Edge Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, Optional
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic scoring with symmetric regret, two-step neighbor
+    lookahead, density-aware sparsification, and cluster-adjusted edge bonuses.
+    
+    Key improvements over v1:
+    1. Enhanced symmetric regret with exponential decay tuned by local density
+    2. Lightweight two-step neighbor lookahead for better local structure awareness
+    3. Cluster density estimation for adaptive edge prioritization
+    4. Dynamic sparsification based on both node degree and cluster membership
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores of same shape as input, with higher values indicating
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Create working copy with diagonal set to infinity
+    dmat = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dmat, np.inf)
+    
+    # 1. Base inverse distance weighting with adaptive regularization
+    # Use median distance as reference for regularization
+    median_dist = np.median(dmat[dmat < np.inf])
+    inv_dist = 1 / (dmat + median_dist * 0.01)
+    
+    # 2. MST connectivity bonus (factor of 1.8 for MST edges)
+    mst = minimum_spanning_tree(dmat)
+    mst_mask = (mst.toarray() > 0)
+    mst_bonus = np.ones_like(dmat)
+    mst_bonus[mst_mask] = 1.8
+    
+    # 3. Enhanced symmetric regret with density-tuned decay
+    regret_matrix = np.ones_like(dmat)
+    
+    # Precompute best distances and local density
+    best_dists = np.zeros(n)
+    second_best_dists = np.zeros(n)
+    local_density = np.zeros(n)
+    
+    # Number of neighbors for density estimation
+    k_density = min(5, n - 1) if n > 1 else 1
+    
+    for i in range(n):
+        dists_i = dmat[i].copy()
+        valid_dists = dists_i[dists_i < np.inf]
+        
+        # Find best and second best distances
+        if len(valid_dists) >= 2:
+            sorted_vals = np.sort(valid_dists)
+            best_dists[i] = sorted_vals[0]
+            second_best_dists[i] = sorted_vals[1]
+        elif len(valid_dists) == 1:
+            best_dists[i] = valid_dists[0]
+            second_best_dists[i] = valid_dists[0] * 1.2
+        
+        # Estimate local density (inverse of average distance to k_density neighbors)
+        if k_density > 0:
+            neighbor_idx = np.argsort(dists_i)[:k_density]
+            neighbor_dists = dists_i[neighbor_idx]
+            if len(neighbor_dists) > 0:
+                local_density[i] = 1.0 / np.mean(neighbor_dists)
+    
+    # Normalize density scores
+    if np.max(local_density) > 0:
+        local_density = local_density / np.max(local_density)
+    
+    # Compute symmetric regret with density-adaptive decay
+    for i in range(n):
+        for j in range(i+1, n):
+            if dmat[i, j] == np.inf:
+                continue
+            
+            # Regret from both perspectives
+            regret_i = 0
+            if second_best_dists[i] > best_dists[i]:
+                regret_i = (dmat[i, j] - best_dists[i]) / (second_best_dists[i] - best_dists[i])
+            
+            regret_j = 0
+            if second_best_dists[j] > best_dists[j]:
+                regret_j = (dmat[j, i] - best_dists[j]) / (second_best_dists[j] - best_dests[j])
+            
+            symmetric_regret = (regret_i + regret_j) / 2
+            
+            # Adaptive decay based on local density
+            # In dense regions, be more forgiving of suboptimal edges
+            density_factor = 0.5 + 0.5 * (local_density[i] + local_density[j]) / 2
+            penalty = np.exp(-symmetric_regret * density_factor)
+            
+            regret_matrix[i, j] = penalty
+            regret_matrix[j, i] = penalty
+    
+    # 4. Lightweight two-step neighbor lookahead
+    lookahead_bonus = np.ones_like(dmat)
+    
+    # Consider top 3 neighbors for two-step analysis
+    k_lookahead = min(3, n - 1)
+    if k_lookahead > 0:
+        neighbor_indices = np.argsort(dmat, axis=1)[:, :k_lookahead]
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if dmat[i, j] == np.inf:
+                    continue
+                
+                # Find best two-step path through common neighbors
+                best_two_step = np.inf
+                
+                # Check neighbors of i and j
+                for k in neighbor_indices[i]:
+                    if k != j and dmat[k, j] < np.inf:
+                        two_step_cost = dmat[i, k] + dmat[k, j]
+                        if two_step_cost < best_two_step:
+                            best_two_step = two_step_cost
+                
+                for k in neighbor_indices[j]:
+                    if k != i and dmat[i, k] < np.inf:
+                        two_step_cost = dmat[i, k] + dmat[k, j]
+                        if two_step_cost < best_two_step:
+                            best_two_step = two_step_cost
+                
+                # Apply bonus if direct edge is competitive
+                if best_two_step < np.inf and best_two_step > 0:
+                    ratio = dmat[i, j] / best_two_step
+                    if ratio < 1.1:  # Direct edge is within 10% of best two-step
+                        lookahead_bonus[i, j] = lookahead_bonus[j, i] = 1.1 - 0.1 * ratio
+    
+    # 5. Combine all factors
+    scores = inv_dist * mst_bonus * regret_matrix * lookahead_bonus
+    
+    # 6. Adaptive density-aware sparsification
+    # Determine edges to preserve based on both score ranking and local density
+    if n <= 3:
+        k_edges = n - 1
+    else:
+        # Base sparsification factor with logarithmic scaling
+        base_k = max(2, int(np.log2(n) * 1.5))
+        # Adjust based on graph sparsity
+        avg_degree = np.sum(dmat < np.inf) / (2 * n)
+        density_factor = min(2.0, max(0.5, avg_degree / 5))
+        k_edges = int(base_k * density_factor)
+    
+    mask = np.zeros_like(scores, dtype=bool)
+    
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Keep top k_edges edges
+        if np.any(row_scores > 0):
+            top_indices = np.argpartition(row_scores, -k_edges)[-k_edges:]
+            mask[i, top_indices] = True
+            mask[top_indices, i] = True  # Ensure symmetry
+    
+    # Always include MST edges for connectivity
+    mask = mask | mst_mask
+    
+    # Apply sparsification
+    scores = scores * mask
+    
+    # 7. Final normalization and cleanup
+    np.fill_diagonal(scores, 0)
+    
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    return scores
+
+
+# Test function with example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Create test data
+    n = 25
+    points = np.random.rand(n, 2)
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(points))
+    
+    # Generate heuristics
+    heuristics = heuristics_v2(dist_matrix)
+    
+    # Basic validation
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero elements:", np.count_nonzero(heuristics))
+    print("Max value:", np.max(heuristics))
+    print("Min non-zero value:", heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 0)
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print("Matrix is symmetric:", is_symmetric)
+    
+    # Check MST edges are included
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst_edges = (mst + mst.T) > 0
+    mst_included = np.all(heuristics[mst_edges] > 0)
+    print("All MST edges have non-zero heuristics:", mst_included)
+    
+    # Check sparsity pattern
+    avg_nonzero_per_row = np.count_nonzero(heuristics, axis=1).mean()
+    print(f"Average non-zero entries per row: {avg_nonzero_per_row:.2f}")
+```

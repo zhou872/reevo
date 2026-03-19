@@ -1,0 +1,372 @@
+```json
+{
+    "algorithm_features": ["Multi-Scale Features", "Adaptive Ensemble", "Efficient Hierarchical Clustering", "Structure-Aware Boosting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import fcluster, linkage
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Efficient multi-scale heuristic for TSP edge selection with hierarchical clustering,
+    adaptive ensemble weighting, and structure-aware boosting.
+    
+    Features:
+    1. Multi-scale instance characterization with lightweight statistics
+    2. Efficient hierarchical clustering with adaptive depth control
+    3. Adaptive ensemble of heuristics weighted by instance hardness
+    4. Structure-aware edge boosting with scalable implementation
+    5. Memory-efficient operations with early sparsification
+    
+    Returns:
+        Edge promise matrix with values in [0, 1], same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+            max_val = np.max(result)
+            if max_val > 0:
+                result = result / max_val
+            return result
+    
+    # Phase 1: Lightweight multi-scale instance characterization
+    instance_features = _compute_lightweight_features(distance_matrix, n)
+    
+    # Phase 2: Efficient hierarchical community detection
+    communities = _efficient_hierarchical_clustering(distance_matrix, n, instance_features)
+    
+    # Phase 3: Adaptive ensemble of heuristics
+    heuristic_layers = _adaptive_heuristic_ensemble(distance_matrix, n, instance_features, communities)
+    
+    # Phase 4: Instance-aware fusion with early sparsification
+    combined = _instance_aware_fusion(heuristic_layers, instance_features, distance_matrix, n)
+    
+    # Phase 5: Structure-aware boosting with scalable implementation
+    boosted = _scalable_structure_boosting(combined, communities, n, instance_features)
+    
+    # Final normalization
+    np.fill_diagonal(boosted, 0)
+    max_val = np.max(boosted)
+    if max_val > 0:
+        boosted = boosted / max_val
+    
+    return boosted
+
+
+def _compute_lightweight_features(distance_matrix: np.ndarray, n: int) -> dict:
+    """Compute lightweight instance features for adaptive control."""
+    features = {}
+    
+    # Global statistics (efficient calculation)
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    features['global_mean'] = np.mean(distances)
+    features['global_std'] = np.std(distances)
+    
+    # Local statistics at two scales only
+    scales = [min(5, n-1), min(10, n-1)]
+    local_vars = []
+    for k in scales:
+        if k > 0:
+            # Vectorized local distance calculation
+            dists_sorted = np.partition(distance_matrix, k, axis=1)[:, :k+1]
+            local_vars.append(np.var(dists_sorted[:, 1:]))  # Exclude diagonal/self
+    
+    features['local_variability'] = np.mean(local_vars) if local_vars else 0
+    
+    # MST-based features (only if n <= 10000 for efficiency)
+    if n <= 10000:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_dists = mst.data[mst.data > 0]
+        if len(mst_dists) > 0:
+            features['mst_mean'] = np.mean(mst_dists)
+            features['mst_cv'] = np.std(mst_dists) / (features['mst_mean'] + 1e-12)
+        else:
+            features['mst_mean'] = features['global_mean']
+            features['mst_cv'] = 0.1
+    else:
+        # Approximation for very large instances
+        features['mst_mean'] = features['global_mean'] * 0.8
+        features['mst_cv'] = 0.15
+    
+    # Instance hardness estimate (simplified but effective)
+    features['hardness'] = min(1.0, features['global_std'] / (features['global_mean'] + 1e-12) + 
+                                 features['local_variability'] / (features['global_mean'] + 1e-12))
+    
+    return features
+
+
+def _efficient_hierarchical_clustering(distance_matrix: np.ndarray, n: int, 
+                                      features: dict) -> dict:
+    """Efficient hierarchical clustering with adaptive depth."""
+    communities = {}
+    
+    if n <= 10:
+        communities['level_0'] = np.ones((n, n), dtype=bool)
+        return communities
+    
+    # Convert to condensed form for efficient clustering
+    if n <= 10000:
+        try:
+            condensed_dist = squareform(distance_matrix)
+            Z = linkage(condensed_dist, method='average', optimal_ordering=True)
+            
+            # Adaptive number of levels based on instance size and hardness
+            max_levels = min(3, int(np.log2(n)) + 1)
+            hardness = features['hardness']
+            
+            for level in range(max_levels):
+                # Adaptive cluster count based on level and hardness
+                base_clusters = max(2, int(n / (2 ** (level + 1))))
+                hardness_factor = 1 + 0.5 * hardness
+                n_clusters = max(2, int(base_clusters * hardness_factor))
+                
+                labels = fcluster(Z, n_clusters, criterion='maxclust')
+                
+                # Create boolean community matrix efficiently
+                comm_matrix = labels[:, None] == labels[None, :]
+                np.fill_diagonal(comm_matrix, False)
+                communities[f'level_{level}'] = comm_matrix
+                
+        except Exception:
+            # Fallback: distance-based approximate clustering
+            pass
+    
+    # Fallback or supplemental: fast distance-based clustering for large instances
+    if not communities:
+        # Use simple threshold-based clustering
+        median_dist = np.median(distance_matrix[triu_indices])
+        threshold = median_dist * (1 + 0.5 * features['hardness'])
+        comm_matrix = distance_matrix < threshold
+        np.fill_diagonal(comm_matrix, False)
+        communities['level_0'] = comm_matrix
+    
+    return communities
+
+
+def _adaptive_heuristic_ensemble(distance_matrix: np.ndarray, n: int,
+                                features: dict, communities: dict) -> dict:
+    """Generate adaptive ensemble of heuristics based on instance features."""
+    ensemble = {}
+    
+    # 1. Distance-based heuristic (always included)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal, 0)
+    
+    # Adaptive exponent based on hardness
+    hardness = features['hardness']
+    exponent = 0.7 + 0.6 * hardness  # Range: 0.7-1.3
+    reciprocal = np.power(reciprocal + 1e-12, exponent)
+    ensemble['distance'] = reciprocal / (np.max(reciprocal) + 1e-12)
+    
+    # 2. MST-based heuristic (only for moderate sizes or hard instances)
+    if n <= 5000 or hardness > 0.5:
+        mst_heuristic = _efficient_mst_heuristic(distance_matrix, n, features)
+        ensemble['mst'] = mst_heuristic
+    
+    # 3. Community-based heuristic (if communities available)
+    if communities:
+        comm_heuristic = _community_based_heuristic(distance_matrix, n, features, communities)
+        ensemble['community'] = comm_heuristic
+    
+    # 4. Neighborhood-based heuristic (lightweight)
+    neighborhood_heuristic = _neighborhood_heuristic(distance_matrix, n, features)
+    ensemble['neighborhood'] = neighborhood_heuristic
+    
+    return ensemble
+
+
+def _efficient_mst_heuristic(distance_matrix: np.ndarray, n: int, 
+                            features: dict) -> np.ndarray:
+    """Efficient MST-based heuristic with local enhancement."""
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    # Make symmetric and boost MST edges
+    mst_promising = mst_edges + mst_edges.T
+    
+    # Enhance with local connections based on hardness
+    k_local = min(max(3, int(5 * features['hardness'])), n-1)
+    
+    for i in range(n):
+        if n > 1000 and i % 100 == 0:  # Sample for very large instances
+            continue
+            
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        local_indices = np.argpartition(dists, k_local)[:k_local]
+        
+        for j in local_indices:
+            if mst_promising[i, j] == 0:
+                # Weight based on relative distance rank
+                rank = np.where(np.argsort(dists) == j)[0][0] / k_local
+                mst_promising[i, j] = 0.5 * (1 - 0.3 * rank)
+    
+    return mst_promising / (np.max(mst_promising) + 1e-12)
+
+
+def _community_based_heuristic(distance_matrix: np.ndarray, n: int,
+                              features: dict, communities: dict) -> np.ndarray:
+    """Community-based heuristic combining multiple hierarchical levels."""
+    comm_heuristic = np.zeros((n, n))
+    
+    for level, comm_matrix in communities.items():
+        level_num = int(level.split('_')[1]) if '_' in level else 0
+        weight = 1.0 / (1 + level_num)  # Decreasing weight for higher levels
+        
+        # Apply distance decay within communities
+        if isinstance(comm_matrix, np.ndarray):
+            if comm_matrix.dtype == bool:
+                # Boolean matrix: convert to float and apply distance decay
+                median_dist = np.median(distance_matrix[triu_indices])
+                dist_factor = np.exp(-distance_matrix**2 / (2 * (median_dist**2)))
+                comm_heuristic += weight * (comm_matrix.astype(float) * dist_factor)
+            else:
+                comm_heuristic += weight * comm_matrix
+    
+    if np.max(comm_heuristic) > 0:
+        comm_heuristic = comm_heuristic / np.max(comm_heuristic)
+    
+    return comm_heuristic
+
+
+def _neighborhood_heuristic(distance_matrix: np.ndarray, n: int,
+                           features: dict) -> np.ndarray:
+    """Efficient neighborhood-based heuristic using multi-scale approach."""
+    heuristic = np.zeros((n, n))
+    
+    # Use two scales for balance of local and global
+    scales = [max(3, int(np.log2(n)) + 1), max(5, int(np.sqrt(n)))]
+    
+    for k in scales:
+        if k >= n:
+            continue
+            
+        # Vectorized k-nearest neighbors
+        for i in range(n):
+            if n > 5000 and i % 10 != 0:  # Stride for very large instances
+                continue
+                
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            indices = np.argpartition(dists, k)[:k]
+            
+            # Weight based on rank within neighbors
+            sorted_indices = indices[np.argsort(dists[indices])]
+            for rank, j in enumerate(sorted_indices):
+                heuristic[i, j] += 1.0 / (1 + 0.5 * rank + 0.5 * np.log1p(k))
+    
+    # Symmetrize and normalize
+    heuristic = (heuristic + heuristic.T) / 2
+    if np.max(heuristic) > 0:
+        heuristic = heuristic / np.max(heuristic)
+    
+    return heuristic
+
+
+def _instance_aware_fusion(heuristic_layers: dict, features: dict,
+                          distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Fuse heuristic layers with instance-aware weighting and early sparsification."""
+    hardness = features['hardness']
+    
+    # Adaptive weights based on instance hardness
+    if hardness > 0.7:  # Hard instances
+        weights = {'distance': 0.3, 'mst': 0.6, 'community': 0.8, 'neighborhood': 0.4}
+    elif hardness > 0.3:  # Medium instances
+        weights = {'distance': 0.5, 'mst': 0.5, 'community': 0.6, 'neighborhood': 0.5}
+    else:  # Easy instances
+        weights = {'distance': 0.8, 'mst': 0.3, 'community': 0.4, 'neighborhood': 0.6}
+    
+    # Initialize combined matrix
+    combined = np.zeros((n, n))
+    
+    # Weighted combination of available heuristics
+    for name, heuristic in heuristic_layers.items():
+        if name in weights:
+            combined += weights[name] * heuristic
+    
+    # Early sparsification for efficiency
+    if n > 50:
+        sparsified = np.zeros_like(combined)
+        keep_per_node = max(5, min(20, int(n * (0.1 + 0.05 * hardness))))
+        
+        for i in range(n):
+            row = combined[i].copy()
+            row[i] = -np.inf
+            
+            if np.any(row > 0):
+                top_indices = np.argpartition(-row, keep_per_node)[:keep_per_node]
+                sparsified[i, top_indices] = combined[i, top_indices]
+        
+        combined = np.maximum(sparsified, sparsified.T)
+    
+    return combined
+
+
+def _scalable_structure_boosting(heuristics_matrix: np.ndarray, 
+                                 communities: dict, n: int,
+                                 features: dict) -> np.ndarray:
+    """Scalable structure-aware edge boosting."""
+    if n < 4:
+        return heuristics_matrix
+    
+    boosted = heuristics_matrix.copy()
+    hardness = features['hardness']
+    
+    # Determine appropriate method based on instance size
+    if n <= 500:
+        # Exact triangle counting for small instances
+        threshold = np.percentile(heuristics_matrix[heuristics_matrix > 0], 50)
+        binary = (heuristics_matrix > threshold).astype(float)
+        
+        # Efficient triangle counting via matrix multiplication
+        common_neighbors = binary @ binary.T
+        
+        # Apply triangle boost
+        for i in range(n):
+            for j in range(i+1, n):
+                if heuristics_matrix[i, j] > 0:
+                    common = common_neighbors[i, j]
+                    if common > 0:
+                        # Boost based on triangle count and hardness
+                        boost = 1 + 0.2 * min(np.sqrt(common), 3) * (1 + 0.5 * hardness)
+                        boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    elif n <= 5000:
+        # Approximate triangle boosting for medium instances
+        sample_size = min(200, n // 10)
+        if sample_size > 0:
+            sampled_nodes = np.random.choice(n, sample_size, replace=False)
+            
+            for i in sampled_nodes:
+                neighbors_i = np.where(heuristics_matrix[i] > 0)[0]
+                for j in neighbors_i:
+                    if j <= i or j not in sampled_nodes:
+                        continue
+                    neighbors_j = np.where(heuristics_matrix[j] > 0)[0]
+                    common = len(np.intersect1d(neighbors_i, neighbors_j))
+                    if common > 0:
+                        boost = 1 + 0.15 * common
+                        boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    # For very large instances (n > 5000), skip triangle boosting for efficiency
+    # but apply community-based boosting if available
+    if communities and n > 500:
+        for level, comm_matrix in communities.items():
+            if isinstance(comm_matrix, np.ndarray):
+                level_num = int(level.split('_')[1]) if '_' in level else 0
+                boost_factor = 1 + 0.1 / (1 + level_num)
+                boosted[comm_matrix] *= boost_factor
+    
+    return boosted
+```

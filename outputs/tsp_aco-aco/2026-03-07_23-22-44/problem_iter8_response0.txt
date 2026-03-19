@@ -1,0 +1,341 @@
+```json
+{
+    "algorithm_features": ["Multi-Step Lookahead Regret", "Spectral Graph Embedding", "Adaptive Geometric Fusion", "Topology-Aware Candidate Selection"]
+}
+```
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform, pdist
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with multi-step lookahead regret, spectral graph 
+    embeddings, adaptive fusion, and topology-aware candidate selection.
+    
+    Core Innovations:
+    1. Multi-Step Lookahead Regret: Consider 2-step and 3-step alternative paths
+    2. Dual Spectral Embeddings: Leverage both Laplacian and adjacency eigenvectors
+    3. Adaptive Fusion Weights: Learn weights from problem characteristics
+    4. Topology-Aware Selection: Balance local and global connectivity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. ADAPTIVE PARAMETER TUNING ====================
+    # Analyze distance distribution for adaptive parameter setting
+    if n > 2:
+        triu_indices = np.triu_indices(n, 1)
+        distances = distance_matrix[triu_indices]
+        
+        p10, p50, p90 = np.percentile(distances, [10, 50, 90])
+        dist_range = p90 - p10
+        median_dist = max(p50, 1e-10)
+        
+        # Dynamic parameters based on problem characteristics
+        decay_base = 0.2 + 0.3 * np.clip(dist_range / median_dist, 0.5, 2.0)
+        regret_weight = 0.4 + 0.3 * np.clip(np.log10(n) / 2, 0.2, 1.0)
+        lookahead_depth = min(3, int(np.log2(n)) + 1)
+    else:
+        decay_base = 0.3
+        regret_weight = 0.6
+        lookahead_depth = 1
+    
+    # ==================== 2. BASE COMPONENTS ====================
+    # Inverse distance with stability
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_scores = 1.0 / (distance_matrix + 1e-10)
+    np.fill_diagonal(base_scores, 0)
+    
+    # Minimum spanning tree for connectivity guarantee
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # ==================== 3. MULTI-STEP LOOKAHEAD REGRET ====================
+    def compute_multi_step_regret() -> np.ndarray:
+        """Compute regret considering alternative paths of varying lengths"""
+        regret_matrix = np.ones_like(distance_matrix)
+        
+        # Precompute nearest neighbors for efficient lookahead
+        k_neighbors = min(max(5, int(np.log2(n) * 2)), n - 1)
+        nearest_indices = np.zeros((n, k_neighbors), dtype=int)
+        
+        for i in range(n):
+            row_dists = distance_matrix[i].copy()
+            row_dists[i] = np.inf
+            if n > k_neighbors:
+                idx_partition = np.argpartition(row_dists, k_neighbors)[:k_neighbors]
+                sorted_idx = idx_partition[np.argsort(row_dists[idx_partition])]
+                nearest_indices[i] = sorted_idx
+            else:
+                valid_mask = np.arange(n) != i
+                nearest_indices[i, :sum(valid_mask)] = np.where(valid_mask)[0]
+        
+        # Adaptive regret threshold
+        all_dists = distance_matrix[np.triu_indices(n, 1)]
+        regret_threshold = np.percentile(all_dists, 60) if len(all_dists) > 0 else 1.0
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                best_alternative = np.inf
+                
+                # 1-step lookahead (i -> k -> j)
+                for k_idx in range(k_neighbors):
+                    k = nearest_indices[i, k_idx]
+                    if k == j or k == i:
+                        continue
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alternative = min(best_alternative, alt_cost)
+                
+                # 2-step lookahead (i -> k -> l -> j) for larger problems
+                if lookahead_depth >= 2 and n >= 8:
+                    for k_idx in range(min(4, k_neighbors)):
+                        k = nearest_indices[i, k_idx]
+                        if k == j or k == i:
+                            continue
+                        for l_idx in range(min(4, k_neighbors)):
+                            l = nearest_indices[j, l_idx]
+                            if l == i or l == j or l == k:
+                                continue
+                            alt_cost = (distance_matrix[i, k] + 
+                                       distance_matrix[k, l] + 
+                                       distance_matrix[l, j])
+                            best_alternative = min(best_alternative, alt_cost)
+                
+                # 3-step lookahead (i -> k -> l -> m -> j) for very large problems
+                if lookahead_depth >= 3 and n >= 15:
+                    # Simplified: use two intermediate nodes from nearest neighbors
+                    for k in nearest_indices[i, :2]:
+                        if k == j or k == i:
+                            continue
+                        for l in nearest_indices[k, :2]:
+                            if l in [i, j, k]:
+                                continue
+                            for m in nearest_indices[j, :2]:
+                                if m in [i, j, k, l]:
+                                    continue
+                                alt_cost = (distance_matrix[i, k] + 
+                                           distance_matrix[k, l] + 
+                                           distance_matrix[l, m] + 
+                                           distance_matrix[m, j])
+                                best_alternative = min(best_alternative, alt_cost)
+                
+                # Calculate normalized regret
+                if best_alternative < np.inf:
+                    regret = max(best_alternative - direct_cost, 1e-10)
+                    norm_regret = regret / max(regret_threshold, direct_cost)
+                    # Exponential decay with adaptive sensitivity
+                    regret_matrix[i, j] = np.exp(-regret_weight * norm_regret)
+        
+        # Symmetrize using geometric mean
+        return np.sqrt(regret_matrix * regret_matrix.T)
+    
+    regret_scores = compute_multi_step_regret()
+    
+    # ==================== 4. DUAL SPECTRAL EMBEDDINGS ====================
+    def compute_spectral_features() -> np.ndarray:
+        """Compute graph embeddings from both Laplacian and adjacency matrices"""
+        if n < 4:
+            return np.ones_like(distance_matrix)
+        
+        try:
+            # 4.1 Laplacian embedding (global structure)
+            sigma_lap = np.median(distance_matrix) * 0.3
+            affinity = np.exp(-distance_matrix**2 / (2 * sigma_lap**2))
+            np.fill_diagonal(affinity, 0)
+            
+            degree = np.diag(np.sum(affinity, axis=1))
+            degree_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(degree) + 1e-10))
+            laplacian = np.eye(n) - degree_sqrt_inv @ affinity @ degree_sqrt_inv
+            
+            eigvals_lap, eigvecs_lap = np.linalg.eigh(laplacian)
+            sorted_idx = np.argsort(eigvals_lap)
+            dim_lap = min(3, n - 2)
+            emb_lap = eigvecs_lap[:, sorted_idx[1:1+dim_lap]]
+            
+            # 4.2 Adjacency embedding (local connectivity)
+            # Normalize distance matrix for adjacency
+            dist_norm = distance_matrix / np.max(distance_matrix)
+            adj_embed_dim = min(2, n - 1)
+            
+            # Use top eigenvectors of distance-based similarity
+            similarity = np.exp(-dist_norm / 0.3)
+            np.fill_diagonal(similarity, 0)
+            
+            # Compute leading eigenvectors
+            eigvals_adj, eigvecs_adj = np.linalg.eigh(similarity)
+            sorted_idx_adj = np.argsort(eigvals_adj)[::-1]  # Descending for largest
+            emb_adj = eigvecs_adj[:, sorted_idx_adj[:adj_embed_dim]]
+            
+            # Combine embeddings
+            if dim_lap > 0 and adj_embed_dim > 0:
+                combined_emb = np.hstack([emb_lap, emb_adj])
+            elif dim_lap > 0:
+                combined_emb = emb_lap
+            else:
+                combined_emb = emb_adj
+            
+            # Compute embedding similarity
+            if combined_emb.shape[1] > 0:
+                emb_dist = squareform(pdist(combined_emb, 'euclidean'))
+                emb_similarity = np.exp(-emb_dist**2 / (2 * np.median(emb_dist)**2))
+                np.fill_diagonal(emb_similarity, 0)
+                return emb_similarity
+            
+        except np.linalg.LinAlgError:
+            pass
+        
+        return np.ones_like(distance_matrix)
+    
+    spectral_scores = compute_spectral_features()
+    np.fill_diagonal(spectral_scores, 0)
+    
+    # ==================== 5. ADAPTIVE FUSION WEIGHTS ====================
+    # Learn weights from problem characteristics
+    if n > 3:
+        # Analyze component statistics
+        base_flat = base_scores[np.triu_indices(n, 1)]
+        regret_flat = regret_scores[np.triu_indices(n, 1)]
+        spectral_flat = spectral_scores[np.triu_indices(n, 1)]
+        
+        # Normalize each component to [0,1] range
+        def safe_normalize(arr):
+            arr_min, arr_max = np.min(arr), np.max(arr)
+            if arr_max - arr_min > 1e-10:
+                return (arr - arr_min) / (arr_max - arr_min)
+            return np.zeros_like(arr)
+        
+        base_norm = safe_normalize(base_flat)
+        regret_norm = safe_normalize(regret_flat)
+        spectral_norm = safe_normalize(spectral_flat)
+        
+        # Compute component entropy (diversity measure)
+        def entropy(arr):
+            hist, _ = np.histogram(arr, bins=min(20, len(arr)), density=True)
+            hist = hist[hist > 0]
+            return -np.sum(hist * np.log(hist))
+        
+        e_base = entropy(base_norm) if len(base_norm) > 0 else 1.0
+        e_regret = entropy(regret_norm) if len(regret_norm) > 0 else 1.0
+        e_spectral = entropy(spectral_norm) if len(spectral_norm) > 0 else 1.0
+        
+        # Adaptive weights based on entropy and problem size
+        total_entropy = e_base + e_regret + e_spectral
+        w_base = 0.2 + 0.2 * (e_base / total_entropy)
+        w_regret = 0.4 + 0.3 * (e_regret / total_entropy)
+        w_spectral = 0.2 + 0.2 * (e_spectral / total_entropy)
+        
+        # Normalize weights
+        weight_sum = w_base + w_regret + w_spectral
+        w_base /= weight_sum
+        w_regret /= weight_sum
+        w_spectral /= weight_sum
+    else:
+        w_base, w_regret, w_spectral = 0.3, 0.5, 0.2
+    
+    # ==================== 6. WEIGHTED FUSION ====================
+    # Apply adaptive distance penalty
+    distance_penalty = np.exp(-distance_matrix / (decay_base * np.median(distance_matrix)))
+    np.fill_diagonal(distance_penalty, 0)
+    
+    # Weighted geometric mean fusion
+    combined_scores = np.power(
+        np.clip(base_scores, 0, None) ** w_base *
+        np.clip(regret_scores, 0, None) ** w_regret *
+        np.clip(spectral_scores, 0, None) ** w_spectral *
+        np.clip(distance_penalty, 0, None) ** 0.1,
+        1.0 / (w_base + w_regret + w_spectral + 0.1)
+    )
+    
+    # Boost MST edges
+    combined_scores[mst_mask] *= 1.5
+    
+    # ==================== 7. TOPOLOGY-AWARE CANDIDATE SELECTION ====================
+    def topology_aware_selection(scores: np.ndarray) -> np.ndarray:
+        """Select promising edges considering both local and global connectivity"""
+        candidate_scores = np.zeros_like(scores)
+        
+        # Determine candidate count per node
+        if n <= 5:
+            candidate_count = min(3, n - 1)
+        else:
+            # Adaptive candidate count based on problem size and density
+            density_factor = np.sum(mst_mask) / (n * (n - 1))
+            base_candidates = int(2.5 * np.log2(n))
+            candidate_count = min(
+                max(base_candidates, int(3 + 2 * n * density_factor)),
+                n - 1
+            )
+        
+        for i in range(n):
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            
+            # Separate MST and non-MST edges
+            mst_edges_i = mst_mask[i]
+            mst_count = np.sum(mst_edges_i)
+            
+            if mst_count >= candidate_count:
+                # Use only MST edges if they already provide enough connectivity
+                keep_mask = mst_edges_i
+            else:
+                # Combine MST edges with top non-MST edges
+                non_mst_needed = candidate_count - mst_count
+                non_mst_mask = ~mst_edges_i
+                non_mst_mask[i] = False
+                
+                if non_mst_needed > 0 and np.any(non_mst_mask):
+                    non_mst_scores = row_scores.copy()
+                    non_mst_scores[~non_mst_mask] = -np.inf
+                    
+                    valid_scores = non_mst_scores[non_mst_scores > -np.inf]
+                    if len(valid_scores) >= non_mst_needed:
+                        threshold = np.partition(valid_scores, -non_mst_needed)[-non_mst_needed]
+                        top_non_mst = non_mst_scores >= threshold
+                        keep_mask = mst_edges_i | top_non_mst
+                    else:
+                        keep_mask = mst_edges_i | non_mst_mask
+                else:
+                    keep_mask = mst_edges_i
+            
+            keep_mask[i] = False
+            candidate_scores[i][keep_mask] = scores[i][keep_mask]
+        
+        return candidate_scores
+    
+    selected_scores = topology_aware_selection(combined_scores)
+    
+    # ==================== 8. FINAL PROCESSING ====================
+    # Symmetrize using maximum (preserve edges selected by either endpoint)
+    final_scores = np.maximum(selected_scores, selected_scores.T)
+    
+    # Ensure MST edges are always included
+    final_scores[mst_mask] = np.maximum(final_scores[mst_mask], 1e-8)
+    
+    # Normalize to [0, 1]
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    # Apply smooth saturation for numerical stability
+    final_scores = np.tanh(final_scores * 1.5)
+    
+    return final_scores
+```

@@ -1,0 +1,194 @@
+```json
+{
+    "algorithm_features": ["Multiplicative Factor Fusion", "Normalized Regret Penalization", "Mutual Connectivity Boosting", "Adaptive Dynamic Sparsification"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristics with multiplicative fusion and 
+    normalized regret penalization for improved edge differentiation.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance normalization ===
+    # Use squared inverse for stronger distance sensitivity
+    inv_dist = 1 / (distance_matrix**2 + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Enhanced normalized regret penalization ===
+    # Compute normalized regret as (second_nearest - first_nearest) / first_nearest
+    regret_factor = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances from node i to all others
+        dist_i = distance_matrix[i].copy()
+        dist_i[i] = np.inf
+        
+        # Find two smallest distances (nearest and second nearest)
+        smallest_indices = np.argpartition(dist_i, 2)[:2]
+        d1, d2 = dist_i[smallest_indices[0]], dist_i[smallest_indices[1]]
+        
+        # For each edge from i, compute regret factor
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            # Determine alternative distance (nearest distance not through j)
+            if j == smallest_indices[0]:
+                # If j is the nearest, use second nearest as alternative
+                d_alt = d2
+            else:
+                d_alt = d1
+                
+            # Normalized regret calculation
+            if d_ij > epsilon:
+                regret = max(0, (d_alt - d_ij) / d_ij)
+                # Boost edges with high normalized regret
+                regret_factor[i, j] = 1.0 + 1.5 * np.tanh(regret)
+            else:
+                regret_factor[i, j] = 1.0
+    
+    # === 3. Mutual connectivity scoring ===
+    # Emphasize edges where both endpoints have good mutual connectivity
+    k_connect = min(5, n - 1)
+    connectivity_scores = np.zeros_like(distance_matrix)
+    
+    # Pre-compute node connectivity profiles
+    node_profile = np.zeros((n, k_connect))
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        # Get k_connect nearest neighbors
+        nearest_indices = np.argpartition(dists, k_connect)[:k_connect]
+        # Compute harmonic mean of nearest distances as connectivity score
+        harmonic_mean = k_connect / np.sum(1 / (dists[nearest_indices] + epsilon))
+        node_profile[i] = harmonic_mean
+        
+        # Assign preliminary connectivity scores
+        for idx in nearest_indices:
+            connectivity_scores[i, idx] = harmonic_mean
+    
+    # Combine connectivity profiles multiplicatively
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if connectivity_scores[i, j] > 0 and connectivity_scores[j, i] > 0:
+                # Geometric mean of mutual connectivity scores
+                connectivity_scores[i, j] = np.sqrt(connectivity_scores[i, j] * connectivity_scores[j, i])
+            elif connectivity_scores[i, j] > 0:
+                connectivity_scores[i, j] = connectivity_scores[i, j]
+            else:
+                connectivity_scores[i, j] = 0.5 * (node_profile[i] + node_profile[j]).mean()
+    
+    # Normalize connectivity scores
+    if np.max(connectivity_scores) > 0:
+        connectivity_scores = connectivity_scores / np.max(connectivity_scores)
+    
+    # === 4. Degree awareness with popularity damping ===
+    degree_dampener = np.ones_like(distance_matrix)
+    k_nn = min(8, n - 1)
+    
+    # Count how many times each node appears in k-nearest neighbor lists
+    nn_counts = np.zeros(n)
+    nn_lists = []
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest = np.argpartition(dists, k_nn)[:k_nn]
+        nn_lists.append(nearest)
+        nn_counts[nearest] += 1
+    
+    # Apply damping: penalize edges to overly popular nodes
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            popularity = nn_counts[j]
+            damping = 1.0 / (1.0 + 0.3 * popularity / k_nn)
+            degree_dampener[i, j] = damping
+    
+    # === 5. Multiplicative factor fusion ===
+    # Combine all factors multiplicatively for enhanced differentiation
+    heuristics = inv_dist.copy()
+    heuristics *= regret_factor
+    heuristics *= (1.0 + 0.8 * connectivity_scores)  # Additive boost for connectivity
+    heuristics *= degree_dampener
+    
+    # === 6. Dynamic adaptive sparsification ===
+    # Keep only the most promising edges, with dynamic threshold per node
+    adaptive_k = max(3, min(15, int(np.sqrt(n) * 1.5)))
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        
+        if adaptive_k < n - 1:
+            # Sort values to determine threshold
+            sorted_values = np.sort(row)
+            threshold_value = sorted_values[-adaptive_k]
+            
+            # Apply threshold, but always keep mutual k-nearest neighbors
+            keep_mask = row >= threshold_value
+            
+            # Also keep mutual nearest neighbors from connectivity analysis
+            for j in nn_lists[i]:
+                if j != i:
+                    # Check if this edge is also in j's k-nearest
+                    if i in nn_lists[j]:
+                        keep_mask[j] = True
+            
+            # Ensure at least adaptive_k edges are kept
+            if np.sum(keep_mask) < adaptive_k:
+                # Add the next best edges
+                additional_indices = np.argsort(row)[-adaptive_k:]
+                keep_mask[additional_indices] = True
+            
+            # Apply mask
+            row[~keep_mask] = 0
+            heuristics[i] = row
+    
+    # === 7. Symmetrization with geometric mean ===
+    # Combine symmetric entries using geometric mean (preserves multiplicative properties)
+    symmetric_heuristics = np.zeros_like(heuristics)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if heuristics[i, j] > 0 and heuristics[j, i] > 0:
+                symmetric_heuristics[i, j] = np.sqrt(heuristics[i, j] * heuristics[j, i])
+            else:
+                symmetric_heuristics[i, j] = max(heuristics[i, j], heuristics[j, i])
+    
+    # === 8. Final normalization and cleanup ===
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Ensure non-negativity and normalize to [0, 1]
+    symmetric_heuristics = np.maximum(symmetric_heuristics, 0)
+    max_val = np.max(symmetric_heuristics)
+    if max_val > epsilon:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    # Apply mild smoothing to reduce extreme values
+    symmetric_heuristics = np.sqrt(symmetric_heuristics)  # Square root smoothing
+    
+    return symmetric_heuristics
+```

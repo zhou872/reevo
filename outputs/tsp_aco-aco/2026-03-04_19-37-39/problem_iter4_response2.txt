@@ -1,0 +1,198 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "Betweenness Centrality", "Online Sparsification", "Multi-Factor Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with adaptive weight tuning, betweenness centrality,
+    and online sparsification optimization.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes.
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. INSTANCE ANALYSIS FOR ADAPTIVE TUNING =====
+    # Analyze distance matrix properties to adjust strategy weights
+    distances = distance_matrix[np.triu_indices(n, k=1)]
+    cv = np.std(distances) / (np.mean(distances) + 1e-10)  # Coefficient of variation
+    density_factor = min(1.0, n / 100)  # Scale with problem size
+    
+    # Adaptive weights based on instance characteristics
+    w_inv_dist = 0.6 + 0.3 * min(1.0, cv)  # Higher CV → stronger distance dependence
+    w_centrality = 0.3 + 0.2 * (1 - min(1.0, cv))  # Lower CV → stronger centrality
+    w_mst = 1.2 + 0.8 * density_factor  # Scale MST importance with size
+    
+    # ===== 2. ADVANCED CENTRALITY MEASURES =====
+    # Compute betweenness centrality approximation via random sampling
+    betweenness = np.zeros(n)
+    sample_size = min(20, max(5, n // 10))  # Adaptive sampling
+    
+    # Faster betweenness approximation using Floyd-Warshall and path counting
+    # We'll approximate by counting how often nodes appear in shortest paths
+    # between random pairs
+    for _ in range(sample_size):
+        # Random source-target pairs
+        src, tgt = np.random.choice(n, 2, replace=False)
+        
+        # Simple shortest path approximation using nearest neighbor chain
+        path = [src]
+        current = src
+        visited = set([src])
+        
+        while current != tgt and len(visited) < n:
+            # Find nearest unvisited node to current
+            mask = np.ones(n, dtype=bool)
+            mask[list(visited)] = False
+            if not mask.any():
+                break
+                
+            nearest = np.argmin(np.where(mask, distance_matrix[current], np.inf))
+            path.append(nearest)
+            visited.add(nearest)
+            current = nearest
+        
+        # Update betweenness for nodes in path
+        for node in set(path[1:-1]):  # Exclude endpoints
+            betweenness[node] += 1
+    
+    # Normalize betweenness
+    betweenness = betweenness / (sample_size + 1e-10)
+    betweenness = (betweenness - betweenness.min()) / (betweenness.max() - betweenness.min() + 1e-10)
+    
+    # Also compute closeness centrality (inverse average distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    row_sums = np.sum(distance_matrix, axis=1) - np.diag(distance_matrix)
+    closeness = (n - 1) / (row_sums + 1e-10)
+    closeness = closeness / (closeness.sum() + 1e-10)
+    
+    # Combine centrality measures
+    centrality = 0.6 * betweenness + 0.4 * closeness
+    centrality = centrality / (centrality.sum() + 1e-10)
+    
+    # Edge potential using combined centrality
+    edge_potential = np.outer(centrality, centrality)
+    
+    # ===== 3. ADAPTIVE NEAREST NEIGHBORS =====
+    # Dynamic k based on instance characteristics
+    k_base = max(2, min(8, n // 3))
+    k = int(k_base * (1 + 0.5 * min(1.0, cv)))  # Higher CV → more neighbors
+    
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        nn_indices = np.argsort(distance_matrix[i])[1:k+1]
+        nn_mask[i, nn_indices] = True
+    nn_mask = nn_mask | nn_mask.T  # Symmetrize
+    
+    # ===== 4. ENHANCED MST COMPONENT =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Compute MST edge importance (inverse of edge weight in MST)
+    mst_weights = np.zeros_like(distance_matrix)
+    mst_edges = np.where(mst_mask)
+    if len(mst_edges[0]) > 0:
+        mst_vals = 1 / (distance_matrix[mst_edges] + 1e-10)
+        mst_weights[mst_edges] = mst_vals
+        mst_weights = (mst_weights - mst_weights.min()) / (mst_weights.max() - mst_weights.min() + 1e-10)
+    
+    # ===== 5. MULTI-FACTOR FUSION WITH ADAPTIVE WEIGHTS =====
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base: distance component with centrality modulation
+    heuristics_matrix = w_inv_dist * inv_dist * (1 + w_centrality * edge_potential)
+    
+    # Boost nearest neighbors with centrality-aware scaling
+    nn_boost = 1.3 + 0.3 * edge_potential[nn_mask]
+    heuristics_matrix[nn_mask] *= nn_boost
+    
+    # Enhanced MST boost with weight importance
+    heuristics_matrix[mst_mask] *= (w_mst + mst_weights[mst_mask])
+    
+    # Add betweenness-based component for global connectivity
+    heuristics_matrix += 0.2 * edge_potential * (1 + betweenness.reshape(-1, 1) + betweenness.reshape(1, -1))
+    
+    # ===== 6. ONLINE SPARSIFICATION OPTIMIZATION =====
+    # Adaptive thresholds based on score distribution
+    positive_scores = heuristics_matrix[heuristics_matrix > 0]
+    
+    if len(positive_scores) > 0:
+        # Dynamic percentile-based thresholding
+        score_std = np.std(positive_scores)
+        score_mean = np.mean(positive_scores)
+        
+        if score_std > 0:
+            # More aggressive sparsification for high-variance scores
+            z_scores = (positive_scores - score_mean) / score_std
+            keep_ratio = 0.5 + 0.3 * np.tanh(-score_std / score_mean)  # Adaptive ratio
+            threshold = np.percentile(positive_scores, 100 * (1 - keep_ratio))
+        else:
+            threshold = np.percentile(positive_scores, 30)
+        
+        # Initial sparsification mask
+        sparsity_mask = heuristics_matrix > threshold
+        
+        # Ensure MST edges are always kept
+        sparsity_mask = sparsity_mask | mst_mask
+        
+        # Adaptive connectivity guarantee
+        min_connections = max(2, int(np.log2(n + 1)))  # Logarithmic growth
+        
+        for i in range(n):
+            connected = np.sum(sparsity_mask[i])
+            if connected < min_connections:
+                # Add top missing edges
+                missing = min_connections - connected
+                candidates = np.argsort(heuristics_matrix[i])[::-1]
+                added = 0
+                
+                for cand in candidates:
+                    if cand != i and not sparsity_mask[i, cand]:
+                        sparsity_mask[i, cand] = True
+                        sparsity_mask[cand, i] = True
+                        added += 1
+                        if added >= missing:
+                            break
+    else:
+        sparsity_mask = np.ones_like(heuristics_matrix, dtype=bool)
+        np.fill_diagonal(sparsity_mask, False)
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # ===== 7. FINAL NORMALIZATION WITH ROBUST SCALING =====
+    max_val = np.max(heuristics_matrix)
+    min_val = np.min(heuristics_matrix[heuristics_matrix > 0])
+    
+    if max_val > min_val:
+        # Robust min-max scaling
+        heuristics_matrix = (heuristics_matrix - min_val) / (max_val - min_val + 1e-10)
+    elif max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # Ensure symmetry (numerical stability)
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    
+    return heuristics_matrix
+```

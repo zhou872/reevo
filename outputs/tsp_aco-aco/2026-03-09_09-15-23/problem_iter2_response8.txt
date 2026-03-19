@@ -1,0 +1,244 @@
+```json
+{
+    "algorithm_features": ["Sparsified Inverse Distance", "Regret-based Edge Penalty", "Spatial Lookahead Scoring", "Degree-Constrained Clustering"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic matrix combining graph-theoretic principles with
+    regret-based penalties and spatial lookahead for edge promise evaluation.
+    
+    Features:
+    1. Sparsified inverse distance with degree-normalization
+    2. Regret-based penalty for edges with poor alternatives
+    3. Spatial lookahead scoring beyond two-hop neighborhoods
+    4. Degree-constrained clustering with isolation awareness
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) / (distance_matrix + np.eye(n))
+    
+    # Initialize heuristic matrix
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Adaptive neighborhood size
+    k_base = max(2, int(np.sqrt(n)))
+    
+    # ---- 1. SPARSIFIED NEAREST-NEIGHBOR BASE ----
+    adjacency_mask = np.zeros_like(distance_matrix, dtype=bool)
+    inv_dist = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Dynamic k based on local density
+        local_distances = distance_matrix[i].copy()
+        local_distances[i] = np.inf
+        k_i = min(k_base, n // 3)  # Cap k at 1/3 of nodes
+        
+        nearest_indices = np.argpartition(local_distances, k_i)[:k_i]
+        adjacency_mask[i, nearest_indices] = True
+        
+        # Inverse distance weighted by relative rank
+        sorted_dists = np.sort(local_distances[nearest_indices])
+        rank_weights = 1.0 / (1 + np.arange(len(sorted_dists)))
+        
+        for idx, j in enumerate(nearest_indices):
+            rank = np.where(sorted_dists == local_distances[j])[0][0]
+            inv_dist[i, j] = rank_weights[rank] / (distance_matrix[i, j] + 1e-10)
+    
+    # Symmetrize adjacency and inv_dist
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    inv_dist = (inv_dist + inv_dist.T) / 2
+    
+    # Normalize by node degree competition
+    node_degrees = adjacency_mask.sum(axis=1, keepdims=True)
+    inv_dist = inv_dist / (node_degrees + node_degrees.T + 1e-10)
+    
+    # ---- 2. REGRET-BASED PENALTY ----
+    # For each node, compute regret of using second-best vs best connection
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances to neighbors in adjacency mask
+        neighbor_mask = adjacency_mask[i].copy()
+        neighbor_mask[i] = False
+        if not neighbor_mask.any():
+            continue
+            
+        neighbor_dists = distance_matrix[i, neighbor_mask]
+        if len(neighbor_dists) >= 2:
+            # Sort distances to get best and second-best
+            sorted_dists = np.sort(neighbor_dists)
+            min1, min2 = sorted_dists[:2]
+            regret_value = min2 - min1
+            
+            # Find which edges get the penalty (non-optimal edges)
+            for j in range(n):
+                if adjacency_mask[i, j] and i != j:
+                    # Penalize edges that aren't the best connection
+                    if np.isclose(distance_matrix[i, j], min1):
+                        # Best edge gets no penalty
+                        regret_penalty = 0.0
+                    else:
+                        # Non-best edges get penalty proportional to regret
+                        regret_penalty = regret_value / (distance_matrix[i, j] + 1e-10)
+                    
+                    # Apply penalty (negative weight)
+                    regret_matrix[i, j] = -regret_penalty
+    
+    # Symmetrize regret matrix
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # ---- 3. SPATIAL LOOKAHEAD SCORING ----
+    # Evaluate edges by considering 2-hop and 3-hop alternative paths
+    lookahead_scores = np.zeros_like(distance_matrix)
+    
+    # Sample-based lookahead for efficiency
+    lookahead_samples = min(5, n // 3)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not adjacency_mask[i, j]:
+                continue
+            
+            direct_dist = distance_matrix[i, j]
+            alternative_costs = []
+            
+            # Sample k random intermediate nodes for 2-hop paths
+            candidates = np.random.choice([x for x in range(n) if x not in [i, j]], 
+                                         min(lookahead_samples, n-2), replace=False)
+            
+            for k in candidates:
+                if adjacency_mask[i, k] and adjacency_mask[k, j]:
+                    # 2-hop path cost
+                    alt_cost_2hop = distance_matrix[i, k] + distance_matrix[k, j]
+                    alternative_costs.append(alt_cost_2hop)
+                    
+                    # Try to find 3-hop paths through k and another node
+                    if lookahead_samples > 1:
+                        candidates2 = np.random.choice(
+                            [x for x in range(n) if x not in [i, j, k]],
+                            min(lookahead_samples-1, n-3), replace=False
+                        )
+                        for l in candidates2:
+                            if adjacency_mask[k, l] and adjacency_mask[l, j]:
+                                alt_cost_3hop = (distance_matrix[i, k] + 
+                                                distance_matrix[k, l] + 
+                                                distance_matrix[l, j])
+                                alternative_costs.append(alt_cost_3hop)
+            
+            if alternative_costs:
+                # Score based on how much better direct edge is vs alternatives
+                min_alt_cost = np.min(alternative_costs)
+                if min_alt_cost > 0:
+                    lookahead_ratio = direct_dist / min_alt_cost
+                    # Convert to score where lower ratio (better direct edge) gives higher score
+                    lookahead_scores[i, j] = lookahead_scores[j, i] = 1.0 / (lookahead_ratio + 0.1)
+    
+    # Normalize lookahead scores
+    max_lookahead = lookahead_scores.max()
+    if max_lookahead > 0:
+        lookahead_scores = lookahead_scores / max_lookahead
+    
+    # ---- 4. DEGREE-CONSTRAINED CLUSTERING WITH ISOLATION AWARENESS ----
+    # Identify natural clusters using distance threshold
+    avg_distance = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    cluster_threshold = avg_distance * 0.7
+    
+    # Compute node isolation scores
+    node_isolation = np.zeros(n)
+    for i in range(n):
+        neighbor_dists = distance_matrix[i, adjacency_mask[i]]
+        if len(neighbor_dists) > 0:
+            node_isolation[i] = np.mean(neighbor_dists)
+    
+    # Normalize isolation scores
+    max_isolation = node_isolation.max()
+    if max_isolation > 0:
+        node_isolation = node_isolation / max_isolation
+    
+    # Cluster connectivity bonus
+    cluster_bonus = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Edges within clusters get bonus
+                if distance_matrix[i, j] < cluster_threshold:
+                    # Bonus inversely proportional to isolation (connects dense regions)
+                    density_factor = 2.0 - (node_isolation[i] + node_isolation[j])
+                    cluster_bonus[i, j] = cluster_bonus[j, i] = 0.3 * density_factor
+                else:
+                    # Penalize long edges unless connecting isolated nodes
+                    if node_isolation[i] > 0.7 or node_isolation[j] > 0.7:
+                        # Connect isolated nodes even with longer edges
+                        isolation_bonus = (node_isolation[i] + node_isolation[j]) / 2
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = 0.2 * isolation_bonus
+    
+    # ---- 5. COMBINE ALL FACTORS WITH ADAPTIVE WEIGHTS ----
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Base score from normalized inverse distance
+                score = inv_dist[i, j]
+                
+                # Apply regret penalty (reduces score for edges with good alternatives)
+                regret_factor = 1.0 + regret_matrix[i, j]
+                score *= max(0.1, regret_factor)  # Don't let regret dominate completely
+                
+                # Apply spatial lookahead bonus
+                score *= (1.0 + 0.4 * lookahead_scores[i, j])
+                
+                # Apply cluster connectivity bonus
+                score *= (1.0 + cluster_bonus[i, j])
+                
+                # Apply isolation adjustment (boost edges between isolated nodes)
+                isolation_factor = 1.0 + 0.3 * (node_isolation[i] + node_isolation[j])
+                score *= isolation_factor
+                
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    # ---- 6. ENSURE MINIMUM CONNECTIVITY ----
+    # Add minimum spanning tree edges to guarantee connectivity
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Prim's algorithm for MST
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    min_edge = distance_matrix[0].copy()
+    min_edge[0] = np.inf
+    closest = np.full(n, 0, dtype=int)
+    
+    for _ in range(n - 1):
+        # Find minimum edge from visited to unvisited
+        u = np.argmin(min_edge)
+        v = closest[u]
+        mst_mask[v, u] = mst_mask[u, v] = True
+        visited[u] = True
+        
+        # Update min_edge for unvisited nodes
+        for w in range(n):
+            if not visited[w] and distance_matrix[u, w] < min_edge[w]:
+                min_edge[w] = distance_matrix[u, w]
+                closest[w] = u
+    
+    # Boost MST edges that aren't already highly scored
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_mask[i, j] and heuristics[i, j] < 0.5:
+                heuristics[i, j] = heuristics[j, i] = 0.5
+    
+    # ---- 7. FINAL PROCESSING ----
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

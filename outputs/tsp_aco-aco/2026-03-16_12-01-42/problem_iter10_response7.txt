@@ -1,0 +1,294 @@
+```json
+{
+    "algorithm_features": ["Density-Adaptive Regret Scaling", "Two-Step Lookahead Efficiency", "Mutual Neighbor Boosting", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with adaptive component weighting,
+    improved path efficiency scoring, and dynamic connectivity preservation.
+    
+    Core improvements over v1:
+    1. Meta-heuristic weight adjustment based on instance characteristics
+    2. Enhanced two-step lookahead with path competition analysis
+    3. Adaptive density estimation with variance-aware scaling
+    4. Connectivity preservation with regret-based prioritization
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix with non-negative entries
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    epsilon = 1e-12
+    
+    # === 1. INSTANCE CHARACTERIZATION FOR META-HEURISTIC WEIGHTS ===
+    # Analyze distance distribution for adaptive weight adjustment
+    triu_indices = np.triu_indices(n, 1)
+    distances_flat = distance_matrix[triu_indices]
+    
+    mean_dist = np.mean(distances_flat)
+    std_dist = np.std(distances_flat)
+    cv_dist = std_dist / (mean_dist + epsilon)  # Coefficient of variation
+    
+    # Instance type classification factors
+    uniformity = 1.0 / (1.0 + 2.0 * cv_dist)  # Higher for more uniform instances
+    clustering_tendency = np.exp(-std_dist / (mean_dist + epsilon))
+    
+    # === 2. ADAPTIVE DENSITY ESTIMATION WITH VARIANCE-AWARE SCALING ===
+    # Use robust density estimation that considers local variance
+    dist_with_inf = distance_matrix.copy()
+    np.fill_diagonal(dist_with_inf, np.inf)
+    
+    # Dynamic k based on instance characteristics and size
+    base_k = max(3, int(np.sqrt(n) * (1.0 + 0.5 * clustering_tendency)))
+    k_density = min(base_k, n - 1)
+    
+    density = np.zeros(n)
+    density_variance = np.zeros(n)
+    
+    for i in range(n):
+        # Get k nearest distances
+        nearest_dists = np.partition(dist_with_inf[i], k_density)[:k_density]
+        density[i] = np.mean(nearest_dists)
+        density_variance[i] = np.var(nearest_dists)
+    
+    # Normalize with variance stabilization
+    max_density = np.max(density) + epsilon
+    density_norm = density / max_density
+    
+    # Variance-aware density scaling
+    var_norm = density_variance / (np.max(density_variance) + epsilon)
+    density_scale = 1.0 + (1.0 - density_norm) * (1.0 + 0.5 * var_norm)
+    
+    # === 3. ENHANCED TWO-STEP LOOKAHEAD WITH PATH COMPETITION ===
+    # More sophisticated efficiency analysis
+    efficiency_factor = np.ones_like(distance_matrix)
+    
+    # Adaptive lookahead depth based on instance characteristics
+    L = min(max(3, int(np.log2(n + 1)) * 2), n - 2)
+    if L > 0:
+        # Precompute sorted indices for efficient lookahead
+        sorted_indices = np.argsort(dist_with_inf, axis=1)[:, :L+5]  # Extra for robustness
+        
+        # Precompute nearest neighbor lists
+        nearest_indices = sorted_indices[:, :L]
+        
+        # Compute efficiency scores with path competition
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                d_ij = distance_matrix[i, j]
+                
+                # Check alternative paths through neighbors of i and j
+                best_alternative = np.inf
+                
+                # Direct competitors: nodes that are close to both i and j
+                for k in nearest_indices[i]:
+                    if k != j and k != i:
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternative = min(best_alternative, alt_cost)
+                
+                for k in nearest_indices[j]:
+                    if k != i and k != j:
+                        alt_cost = distance_matrix[j, k] + distance_matrix[k, i]
+                        best_alternative = min(best_alternative, alt_cost)
+                
+                if best_alternative < np.inf:
+                    # Enhanced efficiency ratio with saturation
+                    efficiency_ratio = d_ij / (best_alternative + epsilon)
+                    
+                    # Non-linear scoring function
+                    if efficiency_ratio < 0.95:
+                        # Strong penalty for inefficient edges
+                        penalty = 1.0 - np.exp(-3.0 * (0.95 - efficiency_ratio))
+                        efficiency_factor[i, j] = 1.0 - 0.8 * penalty
+                    elif efficiency_ratio > 1.05:
+                        # Diminishing returns for very efficient edges
+                        bonus = 1.0 - np.exp(-2.0 * (efficiency_ratio - 1.05))
+                        efficiency_factor[i, j] = 1.0 + 0.3 * bonus
+                    else:
+                        # Neutral zone
+                        efficiency_factor[i, j] = 1.0
+    
+    # === 4. DENSITY-ADAPTIVE REGRET SCALING WITH MUTUALITY ANALYSIS ===
+    regret_matrix = np.ones_like(distance_matrix)
+    mutual_boost = np.ones_like(distance_matrix)
+    
+    # Adaptive mutual neighbor detection
+    k_mutual = max(3, int(np.sqrt(n) * (1.0 + 0.3 * uniformity)))
+    
+    # Find k-nearest neighbors for each node
+    nn_indices = np.zeros((n, k_mutual), dtype=int)
+    for i in range(n):
+        dist_i = dist_with_inf[i].copy()
+        nearest = np.argpartition(dist_i, k_mutual)[:k_mutual]
+        nn_indices[i, :] = nearest
+    
+    for i in range(n):
+        dist_i = distance_matrix[i].copy()
+        dist_i[i] = np.inf
+        
+        # Find two smallest distances
+        sorted_idx = np.argsort(dist_i)[:2]
+        d1, d2 = dist_i[sorted_idx[0]], dist_i[sorted_idx[1]]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            # Find the best alternative to j
+            if j == sorted_idx[0]:
+                best_alternative = d2
+            else:
+                best_alternative = d1
+            
+            if d_ij > epsilon:
+                # Enhanced regret calculation with density scaling
+                base_regret = (best_alternative - d_ij) / d_ij
+                scaled_regret = base_regret * density_scale[i]
+                
+                # Sigmoid transformation with instance-adaptive steepness
+                sigmoid_steepness = 2.0 + 3.0 * uniformity
+                regret_factor = 1.0 + 2.0 / (1.0 + np.exp(-sigmoid_steepness * scaled_regret)) - 1.0
+                regret_matrix[i, j] = np.clip(regret_factor, 0.4, 3.0)
+            
+            # Enhanced mutual neighbor boosting
+            if np.any(nn_indices[i] == j):
+                # Check if mutual
+                if np.any(nn_indices[j] == i):
+                    closeness = 1.0 / (d_ij + epsilon)
+                    # Density-weighted mutual boost
+                    density_factor = 1.0 + 0.5 * (1.0 - density_norm[i]) * (1.0 - density_norm[j])
+                    boost_strength = 0.6 + 0.4 * clustering_tendency
+                    mutual_boost[i, j] = 1.0 + boost_strength * closeness * density_factor
+    
+    # === 5. META-HEURISTIC COMPONENT WEIGHTING ===
+    # Adjust component influence based on instance characteristics
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Dynamic component exponents based on instance analysis
+    w_inv = 1.0  # Base inverse distance
+    w_regret = 0.8 + 0.4 * uniformity  # Higher for uniform instances
+    w_efficiency = 1.2 - 0.4 * clustering_tendency  # Higher for clustered instances
+    w_mutual = 0.9 + 0.3 * clustering_tendency  # Higher for clustered instances
+    
+    # Normalize to maintain scale
+    weight_sum = w_inv + w_regret + w_efficiency + w_mutual
+    w_inv /= weight_sum
+    w_regret /= weight_sum
+    w_efficiency /= weight_sum
+    w_mutual /= weight_sum
+    
+    # Combine components with meta-heuristic weights
+    heuristics = inv_dist ** w_inv
+    heuristics *= regret_matrix ** w_regret
+    heuristics *= efficiency_factor ** w_efficiency
+    heuristics *= mutual_boost ** w_mutual
+    
+    # === 6. CONNECTIVITY-PRESERVING SPARSIFICATION ===
+    # Enhanced importance scoring with multiple factors
+    importance = heuristics.copy()
+    
+    # Add regret-based importance boost
+    regret_importance = 0.5 * (regret_matrix - 1.0)
+    importance *= (1.0 + regret_importance)
+    
+    # Add efficiency-based importance
+    efficiency_importance = np.clip(efficiency_factor - 1.0, -0.3, 0.3)
+    importance *= (1.0 + 0.5 * efficiency_importance)
+    
+    # MST connectivity preservation
+    if n > 2:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_dense = mst.toarray()
+        mst_mask = (mst_dense > 0) | (mst_dense.T > 0)
+        
+        # Boost MST edges based on their local importance
+        mst_boost = 1.0 + 0.5 * (importance[mst_mask] / (np.max(importance) + epsilon))
+        importance[mst_mask] = np.maximum(importance[mst_mask], mst_boost * np.median(importance[mst_mask]))
+    
+    # Adaptive sparsification
+    base_k = max(3, min(12, n // 3))
+    
+    for i in range(n):
+        row_importance = importance[i].copy()
+        
+        # Always keep mutual neighbors
+        keep_mask = np.zeros(n, dtype=bool)
+        for j in nn_indices[i]:
+            if i != j and np.any(nn_indices[j] == i):
+                keep_mask[j] = True
+        
+        # Keep MST edges for connectivity
+        if n > 2:
+            keep_mask = keep_mask | mst_mask[i]
+        
+        # Dynamic edge retention based on density and instance characteristics
+        adaptive_k = int(base_k * (1.0 + 0.8 * density_norm[i] - 0.3 * uniformity))
+        adaptive_k = min(max(2, adaptive_k), n - 1)
+        
+        if adaptive_k > 0:
+            # Select top edges by importance, considering mutual agreement
+            non_kept = np.where(~keep_mask)[0]
+            non_kept = non_kept[non_kept != i]  # Exclude self
+            
+            if len(non_kept) > 0:
+                # Score with symmetry consideration
+                symmetry_score = np.minimum(row_importance[non_kept], importance[non_kept, i])
+                symmetry_score /= (np.maximum(row_importance[non_kept], importance[non_kept, i]) + epsilon)
+                
+                combined_score = row_importance[non_kept] * (1.0 + 0.3 * symmetry_score)
+                
+                top_k = min(adaptive_k, len(non_kept))
+                top_indices = non_kept[np.argsort(combined_score)[-top_k:]]
+                keep_mask[top_indices] = True
+        
+        # Ensure minimum connectivity
+        if np.sum(keep_mask) < 2:
+            top2_idx = np.argsort(heuristics[i])[-2:]
+            keep_mask[top2_idx] = True
+        
+        keep_mask[i] = False  # Ensure self is never included
+        heuristics[i, ~keep_mask] = 0
+    
+    # === 7. ROBUST SYMMETRIZATION AND NORMALIZATION ===
+    # Geometric mean symmetrization preserving zeros
+    heuristics_sym = np.sqrt(heuristics * heuristics.T + epsilon)
+    np.fill_diagonal(heuristics_sym, 0)
+    
+    # Ensure non-negativity and normalize
+    heuristics_sym = np.maximum(heuristics_sym, 0)
+    row_sums = heuristics_sym.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics_sym = heuristics_sym / row_sums
+    
+    # Apply mild smoothing for stability
+    smoothing_factor = 0.02 + 0.03 * uniformity
+    uniform_value = 1.0 / (n - 1) if n > 1 else 1.0
+    heuristics_sym = (1.0 - smoothing_factor) * heuristics_sym + smoothing_factor * uniform_value
+    np.fill_diagonal(heuristics_sym, 0)
+    
+    return heuristics_sym
+```

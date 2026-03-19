@@ -1,0 +1,355 @@
+```json
+{
+    "algorithm_features": ["Probabilistic Edge Sampling", "Vectorized Sparsification", "Iterative Tour Refinement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+from collections import defaultdict, deque
+import warnings
+
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection with stochastic sampling,
+    vectorized adaptive sparsification, and iterative tour refinement.
+    
+    Key improvements over v1:
+    1. Probabilistic edge sampling instead of deterministic selection
+    2. Vectorized sparsification with entropy-based temperature
+    3. Memory-efficient edge tracking
+    4. Balanced component weighting via instance analysis
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Core Structural Components ==========
+    
+    # 1A. Minimum Spanning Tree (MST) edges
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_mask = mst_array > 0
+    
+    # 1B. Christofides-like matching on odd-degree vertices
+    degrees = (mst_array > 0).sum(axis=1)
+    odd_vertices = np.where(degrees % 2 == 1)[0]
+    
+    matching_boost = np.zeros_like(distance_matrix)
+    if len(odd_vertices) > 0:
+        # Greedy probabilistic matching
+        odd_distances = distance_matrix[np.ix_(odd_vertices, odd_vertices)]
+        np.fill_diagonal(odd_distances, np.inf)
+        
+        # Softmin for probabilistic selection
+        temperature = np.percentile(odd_distances[odd_distances < np.inf], 25)
+        with np.errstate(over='ignore'):
+            weights = np.exp(-odd_distances / max(temperature, 1e-10))
+        weights[np.diag_indices_from(weights)] = 0
+        
+        # Probabilistic matching with sampling
+        matched = set()
+        for _ in range(len(odd_vertices) // 2):
+            available = [i for i in range(len(odd_vertices)) if odd_vertices[i] not in matched]
+            if len(available) < 2:
+                break
+            
+            # Sample edges probabilistically
+            probs = weights[np.ix_(available, available)]
+            probs = probs / probs.sum()
+            
+            # Sample without replacement approximation
+            flat_probs = probs.flatten()
+            idx = np.random.choice(len(flat_probs), p=flat_probs)
+            i_idx, j_idx = np.unravel_index(idx, probs.shape)
+            i, j = available[i_idx], available[j_idx]
+            
+            if odd_vertices[i] not in matched and odd_vertices[j] not in matched:
+                u, v = odd_vertices[i], odd_vertices[j]
+                matching_boost[u, v] = matching_boost[v, u] = 1.0 / distance_matrix[u, v]
+                matched.update([u, v])
+    
+    # ========== Phase 2: Stochastic Tour Sampling ==========
+    
+    # Memory for edge frequencies across sampled tours
+    edge_freq = defaultdict(float)
+    edge_quality = defaultdict(float)
+    
+    def sample_tour() -> list:
+        """Sample a tour using probabilistic nearest neighbor."""
+        tour = []
+        unvisited = set(range(n))
+        current = np.random.randint(n)
+        
+        while unvisited:
+            tour.append(current)
+            unvisited.remove(current)
+            
+            if not unvisited:
+                break
+            
+            # Probabilistic neighbor selection
+            distances = distance_matrix[current].copy()
+            distances[list(unvisited)] += np.random.randn(len(unvisited)) * 0.01 * distances[list(unvisited)].std()
+            mask = np.ones(n, dtype=bool)
+            mask[list(unvisited)] = False
+            distances[mask] = np.inf
+            
+            # Softmax selection
+            if len(unvisited) > 1:
+                inv_dist = 1 / distances
+                inv_dist[~np.isfinite(inv_dist)] = 0
+                probs = inv_dist ** 2  # Square to emphasize closer nodes
+                probs = probs / probs.sum()
+                current = np.random.choice(n, p=probs)
+            else:
+                current = list(unvisited)[0]
+        
+        return tour
+    
+    def two_opt_fast(tour: list, iterations: int = 50) -> list:
+        """Fast 2-opt local search with limited iterations."""
+        tour = tour.copy()
+        improved = True
+        it = 0
+        
+        while improved and it < iterations:
+            improved = False
+            for i in range(n):
+                for j in range(i + 2, min(i + 20, n)):  # Limit search window
+                    if j == n - 1 and i == 0:
+                        continue
+                    
+                    a, b = tour[i], tour[(i + 1) % n]
+                    c, d = tour[j], tour[(j + 1) % n]
+                    
+                    current = distance_matrix[a, b] + distance_matrix[c, d]
+                    new = distance_matrix[a, c] + distance_matrix[b, d]
+                    
+                    if new < current - 1e-10:
+                        # Reverse segment
+                        tour[i + 1:j + 1] = tour[i + 1:j + 1][::-1]
+                        improved = True
+                        break
+                if improved:
+                    break
+            it += 1
+        
+        return tour
+    
+    # Sample and improve multiple tours
+    num_samples = min(20, max(5, n // 10))
+    best_length = np.inf
+    
+    for _ in range(num_samples):
+        tour = sample_tour()
+        improved_tour = two_opt_fast(tour)
+        
+        # Calculate tour length
+        tour_length = sum(distance_matrix[improved_tour[i], improved_tour[(i + 1) % n]] 
+                         for i in range(n))
+        
+        # Update best
+        if tour_length < best_length:
+            best_length = tour_length
+        
+        # Update edge statistics
+        weight = 1.0 / (tour_length + 1e-10)
+        for i in range(n):
+            u, v = improved_tour[i], improved_tour[(i + 1) % n]
+            key = (min(u, v), max(u, v))
+            edge_freq[key] += 1.0
+            edge_quality[key] += weight
+    
+    # Convert to matrices
+    freq_matrix = np.zeros_like(distance_matrix)
+    quality_matrix = np.zeros_like(distance_matrix)
+    
+    for (u, v), freq in edge_freq.items():
+        freq_matrix[u, v] = freq_matrix[v, u] = freq
+        quality_matrix[u, v] = quality_matrix[v, u] = edge_quality[(u, v)]
+    
+    # Normalize frequency matrix
+    if freq_matrix.max() > 0:
+        freq_matrix = freq_matrix / freq_matrix.max()
+    
+    # Normalize quality matrix
+    if quality_matrix.max() > 0:
+        quality_matrix = quality_matrix / quality_matrix.max()
+    
+    # Combine frequency and quality
+    memory_matrix = 0.3 * freq_matrix + 0.7 * quality_matrix
+    
+    # ========== Phase 3: Instance Analysis & Weight Learning ==========
+    
+    # Analyze distance distribution
+    triu_distances = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = triu_distances.mean()
+    dist_std = triu_distances.std()
+    dist_cv = dist_std / (dist_mean + 1e-10)
+    
+    # Determine component weights based on instance characteristics
+    if dist_cv < 0.2:  # Very uniform
+        weights = {'mst': 0.4, 'matching': 0.3, 'memory': 0.2, 'reciprocal': 0.1}
+    elif dist_cv > 0.8:  # Highly variable
+        weights = {'memory': 0.5, 'mst': 0.2, 'matching': 0.2, 'reciprocal': 0.1}
+    else:  # Mixed
+        weights = {'mst': 0.3, 'memory': 0.3, 'matching': 0.2, 'reciprocal': 0.2}
+    
+    # Adjust for problem size
+    if n > 100:
+        weights['memory'] = min(0.6, weights['memory'] * 1.2)
+        weights['mst'] = max(0.1, weights['mst'] * 0.8)
+    
+    # ========== Phase 4: Component Combination ==========
+    
+    # MST component (binary with distance weighting)
+    mst_component = np.zeros_like(distance_matrix)
+    mst_component[mst_mask] = 1.0 / (distance_matrix[mst_mask] + 1e-10)
+    
+    # Reciprocal baseline
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    # Normalize components (except matching which is already scaled)
+    components = {
+        'mst': mst_component,
+        'matching': matching_boost,
+        'memory': memory_matrix,
+        'reciprocal': reciprocal
+    }
+    
+    # Normalize each to [0, 1] range
+    for key in components:
+        if components[key].max() > 0:
+            components[key] = components[key] / components[key].max()
+    
+    # Combine weighted components
+    heuristic = np.zeros_like(distance_matrix)
+    for key, weight in weights.items():
+        heuristic += weight * components[key]
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    # ========== Phase 5: Vectorized Adaptive Sparsification ==========
+    
+    # Determine sparsity level
+    if n < 50:
+        base_k = n - 1
+    elif n < 200:
+        base_k = int(3 * np.sqrt(n))
+    else:
+        base_k = int(2 * np.sqrt(n))
+    
+    # Adjust based on distance distribution entropy
+    entropy = -np.sum(triu_distances / triu_distances.sum() * 
+                     np.log(triu_distances / triu_distances.sum() + 1e-10))
+    norm_entropy = entropy / np.log(n * (n - 1) / 2)
+    
+    # Temperature for softmax in sparsification
+    temperature = 0.1 + 0.4 * norm_entropy
+    
+    # Create preservation mask
+    preserve_mask = np.zeros_like(heuristic, dtype=bool)
+    
+    # Preserve MST edges
+    preserve_mask[mst_mask] = True
+    
+    # Preserve top memory edges
+    if memory_matrix.max() > 0:
+        memory_threshold = np.percentile(memory_matrix[memory_matrix > 0], 75)
+        preserve_mask[memory_matrix > memory_threshold] = True
+    
+    # Vectorized row-wise sparsification
+    sparsified = np.zeros_like(heuristic)
+    
+    for i in range(n):
+        row = heuristic[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Always preserve edges in the mask
+        sparsified[i, preserve_mask[i]] = row[preserve_mask[i]]
+        
+        # For non-preserved edges, apply probabilistic selection
+        candidate_mask = ~preserve_mask[i] & (np.arange(n) != i)
+        candidates = np.where(candidate_mask)[0]
+        
+        if len(candidates) == 0:
+            continue
+        
+        candidate_vals = row[candidates]
+        
+        # Apply softmax with temperature
+        if temperature > 0:
+            exp_vals = np.exp(candidate_vals / temperature)
+            probs = exp_vals / exp_vals.sum()
+        else:
+            # Deterministic selection for zero temperature
+            probs = np.zeros_like(candidate_vals)
+            probs[np.argmax(candidate_vals)] = 1.0
+        
+        # Determine how many edges to keep for this node
+        already_preserved = preserve_mask[i].sum()
+        k_i = min(base_k, n - 1)
+        to_select = max(0, k_i - already_preserved)
+        
+        if to_select > 0:
+            # Sample edges probabilistically
+            if len(candidates) <= to_select:
+                selected = candidates
+            else:
+                # Weighted sampling without replacement approximation
+                # (using repeated sampling with probability adjustment)
+                selected = []
+                probs_copy = probs.copy()
+                
+                for _ in range(to_select):
+                    if probs_copy.sum() == 0:
+                        break
+                    probs_copy = probs_copy / probs_copy.sum()
+                    idx = np.random.choice(len(candidates), p=probs_copy)
+                    selected.append(candidates[idx])
+                    probs_copy[idx] = 0
+                
+                selected = np.array(selected)
+            
+            # Apply exponential decay by rank
+            selected_vals = row[selected]
+            sorted_indices = np.argsort(-selected_vals)
+            
+            for rank, idx in enumerate(sorted_indices):
+                j = selected[idx]
+                decay = np.exp(-rank / 3.0)
+                sparsified[i, j] = selected_vals[idx] * decay
+    
+    # Ensure symmetry and final processing
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # Final normalization
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

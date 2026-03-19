@@ -1,0 +1,215 @@
+```json
+{
+    "algorithm_features": ["Inverse Distance Weighting", "Minimum Spanning Tree Edge Priority", "Neighbor Density Bonus", "Asymmetry Correction"]
+}
+```
+
+```python
+import numpy as np
+from typing import Optional
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  mst_weight: float = 2.0,
+                  neighbor_weight: float = 1.5,
+                  density_power: float = 0.5,
+                  sparsity_threshold: Optional[float] = None) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection combining multiple factors.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        mst_weight: Multiplier for edges in Minimum Spanning Tree
+        neighbor_weight: Multiplier for edges to nearest neighbors
+        density_power: Power for density-based normalization (0.5 = sqrt)
+        sparsity_threshold: Relative threshold for zeroing edges (None = auto)
+    
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Base inverse distance (with epsilon to avoid division by zero)
+    epsilon = 1e-10
+    base_heuristic = 1.0 / (distance_matrix + epsilon)
+    
+    # 1. Minimum Spanning Tree detection using Prim's algorithm
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # 2. Nearest neighbor boosting
+    neighbor_mask = _compute_neighbor_mask(distance_matrix, k=max(2, n//10))
+    
+    # 3. Local density normalization
+    density_factors = _compute_density_factors(distance_matrix, power=density_power)
+    
+    # 4. Asymmetry correction (for potentially asymmetric TSP)
+    asymmetry_correction = _compute_asymmetry_correction(distance_matrix)
+    
+    # Combine all factors
+    heuristic = base_heuristic.copy()
+    
+    # Apply MST boosting
+    heuristic[mst_mask] *= mst_weight
+    
+    # Apply neighbor boosting
+    heuristic[neighbor_mask] *= neighbor_weight
+    
+    # Apply density normalization
+    heuristic *= density_factors
+    
+    # Apply asymmetry correction
+    heuristic *= asymmetry_correction
+    
+    # Sparsify: set less promising edges to zero
+    if sparsity_threshold is None:
+        # Auto-threshold: keep top 2n edges plus MST edges
+        threshold = np.partition(heuristic.flatten(), -2*n)[-2*n]
+    else:
+        # User-defined relative threshold
+        threshold = sparsity_threshold * np.max(heuristic)
+    
+    # Always keep MST edges and diagonal
+    keep_mask = (heuristic >= threshold) | mst_mask
+    heuristic[~keep_mask] = 0.0
+    
+    return heuristic
+
+
+def _compute_mst_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute mask for edges in Minimum Spanning Tree using Prim's algorithm."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    if n <= 1:
+        return mst_mask
+    
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    for _ in range(n - 1):
+        # Find minimum edge from visited to unvisited nodes
+        min_dist = np.inf
+        u = v = -1
+        
+        # Vectorized search for performance
+        visited_indices = np.where(visited)[0]
+        unvisited_indices = np.where(~visited)[0]
+        
+        if len(visited_indices) == 0 or len(unvisited_indices) == 0:
+            break
+        
+        # Create cross product of visited and unvisited nodes
+        for i in visited_indices:
+            for j in unvisited_indices:
+                if distance_matrix[i, j] < min_dist:
+                    min_dist = distance_matrix[i, j]
+                    u, v = i, j
+        
+        if u >= 0 and v >= 0:
+            mst_mask[u, v] = True
+            mst_mask[v, u] = True  # Undirected MST
+            visited[v] = True
+    
+    return mst_mask
+
+
+def _compute_neighbor_mask(distance_matrix: np.ndarray, k: int = 3) -> np.ndarray:
+    """
+    Compute mask for edges to k-nearest neighbors.
+    
+    For each node, marks edges to its k closest neighbors (excluding self).
+    """
+    n = distance_matrix.shape[0]
+    neighbor_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Adjust k for small graphs
+    k = min(k, n - 1)
+    
+    if k <= 0:
+        return neighbor_mask
+    
+    for i in range(n):
+        # Get indices of k+1 smallest distances (including self at position 0)
+        indices = np.argpartition(distance_matrix[i], k+1)[:k+1]
+        
+        # Remove self from neighbors
+        neighbors = indices[indices != i][:k]
+        
+        # Mark edges to these neighbors
+        neighbor_mask[i, neighbors] = True
+        
+        # For undirected TSP, mark symmetric edges
+        for j in neighbors:
+            neighbor_mask[j, i] = True
+    
+    return neighbor_mask
+
+
+def _compute_density_factors(distance_matrix: np.ndarray, power: float = 0.5) -> np.ndarray:
+    """
+    Compute density-based normalization factors.
+    
+    Nodes in dense regions get their outgoing edges down-weighted,
+    nodes in sparse regions get their outgoing edges up-weighted.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # Compute local density for each node (inverse of average distance to neighbors)
+    # Exclude self and use nearest 30% of nodes for density estimation
+    k = max(2, int(0.3 * n))
+    
+    densities = np.zeros(n)
+    for i in range(n):
+        # Get distances to all other nodes
+        distances = np.delete(distance_matrix[i], i)
+        
+        # Take average of k smallest distances
+        k_smallest = np.partition(distances, k)[:k]
+        densities[i] = 1.0 / (np.mean(k_smallest) + 1e-10)
+    
+    # Normalize densities
+    density_mean = np.mean(densities)
+    if density_mean > 0:
+        densities = densities / density_mean
+    
+    # Create normalization matrix
+    # Edge from i to j is normalized by geometric mean of densities
+    density_factors = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                geo_mean = np.sqrt(densities[i] * densities[j])
+                density_factors[i, j] = geo_mean ** (-power)
+    
+    return density_factors
+
+
+def _compute_asymmetry_correction(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute correction factor for asymmetric TSP.
+    
+    For symmetric TSP, returns matrix of ones.
+    For asymmetric TSP, boosts edges where forward+backward average is small.
+    """
+    n = distance_matrix.shape[0]
+    correction = np.ones_like(distance_matrix)
+    
+    # Detect asymmetry
+    asymmetry = np.max(np.abs(distance_matrix - distance_matrix.T))
+    if asymmetry < 1e-10:  # Symmetric case
+        return correction
+    
+    # For asymmetric TSP, prefer edges with small average of forward+backward
+    avg_distance = (distance_matrix + distance_matrix.T) / 2.0
+    min_avg = np.min(avg_distance[avg_distance > 0])
+    max_avg = np.max(avg_distance)
+    
+    if max_avg > min_avg:
+        # Normalize to [0.8, 1.2] range
+        normalized = 0.8 + 0.4 * (max_avg - avg_distance) / (max_avg - min_avg)
+        correction = np.where(avg_distance > 0, normalized, 1.0)
+    
+    return correction
+```

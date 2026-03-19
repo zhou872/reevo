@@ -1,0 +1,182 @@
+```json
+{
+    "algorithm_features": ["Regret-based 2-step Lookahead", "Multiplicative Fusion with Exponent Weights", "Size-Adaptive Component Prioritization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    TSP edge prioritization with regret-based lookahead and adaptive component fusion.
+    
+    Combines inverse distance, regret-based scores, and spatial density with
+    exponent weights that adapt to problem size and graph variation.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix with non-negative entries
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance component ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Regret-based lookahead scores (2-step) ===
+    regret_scores = np.ones_like(distance_matrix)
+    
+    if n > 2:
+        # Precompute nearest neighbors for each node
+        k_neighbors = min(10, n - 1)  # Fixed lookahead horizon
+        neighbor_indices = np.zeros((n, k_neighbors), dtype=int)
+        neighbor_distances = np.zeros((n, k_neighbors))
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Get k nearest neighbors
+            idx = np.argpartition(dists, k_neighbors)[:k_neighbors]
+            neighbor_indices[i] = idx
+            neighbor_distances[i] = dists[idx]
+        
+        # Compute regret scores for each edge
+        for i in range(n):
+            for j in range(i + 1, n):
+                d_ij = distance_matrix[i, j]
+                if d_ij <= epsilon:
+                    continue
+                
+                # Find best 2-step alternative i->k->j
+                best_alternative = np.inf
+                
+                # Check neighbors of i and j for intermediate nodes
+                candidates = set()
+                candidates.update(neighbor_indices[i])
+                candidates.update(neighbor_indices[j])
+                candidates.discard(i)
+                candidates.discard(j)
+                
+                for k in candidates:
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    if alt_cost < best_alternative:
+                        best_alternative = alt_cost
+                
+                if best_alternative < np.inf:
+                    # Compute regret and transform to score
+                    regret = (best_alternative - d_ij) / (d_ij + epsilon)
+                    # Exponential decay: exp(-|regret|) with sign preservation
+                    if regret >= 0:
+                        regret_score = 1.0 + np.tanh(regret)  # Positive: 1-2
+                    else:
+                        regret_score = np.exp(regret)  # Negative: 0-1
+                    regret_scores[i, j] = regret_scores[j, i] = regret_score
+    
+    # === 3. Spatial density scores ===
+    density_scores = np.ones_like(distance_matrix)
+    
+    if n > 2:
+        # Compute local density using nearest neighbors
+        local_density = np.zeros(n)
+        k_density = min(5, n - 1)
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Take average of k nearest distances as density measure
+            k_smallest = np.partition(dists, k_density)[:k_density]
+            local_density[i] = np.mean(k_smallest)
+        
+        mean_density = np.mean(local_density) + epsilon
+        
+        # Compute density-aware scores
+        for i in range(n):
+            for j in range(i + 1, n):
+                density_factor = 0.5 * (local_density[i] + local_density[j]) / mean_density
+                density_score = np.exp(-density_factor)  # Higher for denser areas
+                density_scores[i, j] = density_scores[j, i] = 0.5 + 0.5 * density_score
+    
+    # === 4. Compute adaptive component weights ===
+    # Size-based adjustments
+    if n <= 10:
+        size_factor = 0.7  # Small instances: balance all components
+    elif n <= 50:
+        size_factor = 1.0  # Medium instances
+    else:
+        size_factor = 1.3  # Large instances: emphasize simpler components
+    
+    # Graph variation analysis
+    upper_tri = distance_matrix[np.triu_indices(n, 1)]
+    if len(upper_tri) > 0:
+        coef_var = np.std(upper_tri) / (np.mean(upper_tri) + epsilon)
+        variation_factor = np.tanh(coef_var)  # Map to [0, 1)
+    else:
+        variation_factor = 0.5
+    
+    # Dynamic exponent weights
+    w_inv = 1.0 * size_factor
+    w_regret = (1.5 - 0.5 * variation_factor) * size_factor
+    w_spatial = (0.8 + 0.2 * variation_factor) * size_factor
+    
+    # === 5. Multiplicative fusion with exponent weights ===
+    # Apply exponentiation to each component
+    inv_component = np.power(inv_dist + epsilon, w_inv)
+    regret_component = np.power(regret_scores + epsilon, w_regret)
+    spatial_component = np.power(density_scores + epsilon, w_spatial)
+    
+    # Fuse components multiplicatively
+    heuristics = inv_component * regret_component * spatial_component
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 6. MST reinforcement ===
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_mask = (mst_dense > 0) | (mst_dense.T > 0)
+            
+            # Boost MST edges
+            heuristics[mst_mask] *= 1.5
+        except:
+            pass
+    
+    # === 7. Adaptive sparsification ===
+    if n > 10:  # Only sparsify for larger instances
+        sparsified = np.zeros_like(heuristics)
+        
+        for i in range(n):
+            row = heuristics[i].copy()
+            row[i] = -np.inf  # Ignore diagonal
+            
+            # Keep top-k edges, adaptive to problem size
+            k_keep = max(3, min(10, int(np.sqrt(n))))
+            if k_keep < n - 1:
+                threshold = np.partition(row, -k_keep)[-k_keep]
+                keep_mask = row >= threshold
+                sparsified[i] = heuristics[i] * keep_mask
+            else:
+                sparsified[i] = heuristics[i]
+        
+        heuristics = sparsified
+    
+    # === 8. Final processing ===
+    # Symmetrize and normalize
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    max_val = np.max(heuristics)
+    if max_val > epsilon:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

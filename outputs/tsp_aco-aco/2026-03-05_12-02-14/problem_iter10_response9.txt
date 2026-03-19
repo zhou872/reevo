@@ -1,0 +1,725 @@
+```json
+{
+    "algorithm_features": ["Ensemble Sampling", "Adaptive Weight Learning", "2-opt Local Refinement", "Hierarchical Partitioning"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial
+from collections import defaultdict
+import heapq
+from typing import List, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge sampling with ensemble methods and hierarchical optimization.
+    
+    Key Innovations:
+    1. Ensemble sampling using multiple construction heuristics with adaptive combination
+    2. Online weight optimization via simulated annealing of heuristic components
+    3. 2-opt local refinement to improve edge frequency statistics
+    4. Hierarchical graph partitioning for large-scale instances
+    
+    Returns: Row-normalized matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic[np.isnan(heuristic)] = 0
+        np.fill_diagonal(heuristic, 0)
+        row_sums = heuristic.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return heuristic / row_sums
+    
+    # ===== 1. ENSEMBLE HEURISTIC COMPONENTS =====
+    
+    # 1.1 Reciprocal distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # 1.2 Multiple centrality measures ensemble
+    centrality_ensemble = np.zeros((n, n))
+    
+    # Harmonic centrality
+    harmonic_centrality = np.zeros(n)
+    for i in range(n):
+        mask = np.arange(n) != i
+        harmonic_centrality[i] = np.sum(1 / np.maximum(distance_matrix[i, mask], 1e-10))
+    
+    # Betweenness approximation via random walks
+    betweenness_approx = approximate_betweenness(distance_matrix, n_samples=min(50, n))
+    
+    # Combine centrality measures
+    if harmonic_centrality.max() > 0:
+        harmonic_centrality = harmonic_centrality / harmonic_centrality.max()
+    if betweenness_approx.max() > 0:
+        betweenness_approx = betweenness_approx / betweenness_approx.max()
+    
+    centrality_matrix = np.sqrt(np.outer(harmonic_centrality, harmonic_centrality)) * 0.7 + \
+                       np.outer(betweenness_approx, betweenness_approx) * 0.3
+    
+    # 1.3 Enhanced MST component with Christofides refinement
+    mst_component = compute_enhanced_mst_component(distance_matrix)
+    
+    # 1.4 Nearest neighbor ensemble with multiple starting points
+    nn_ensemble = compute_nn_ensemble(distance_matrix, n_runs=min(20, n))
+    
+    # 1.5 2-opt refined edge frequencies
+    opt_edges = compute_2opt_refined_edges(distance_matrix, n_tours=min(30, max(5, n//10)))
+    
+    # ===== 2. ONLINE WEIGHT OPTIMIZATION =====
+    
+    # Instance characteristics
+    flat_dists = distance_matrix[~np.eye(n, dtype=bool)]
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / max(dist_mean, 1e-10)
+    
+    # Initialize weights with simulated annealing
+    weights = optimize_weights_online(
+        [reciprocal, centrality_matrix, mst_component, nn_ensemble, opt_edges],
+        distance_matrix,
+        n_eval=min(100, n*5)
+    )
+    
+    # ===== 3. HIERARCHICAL PROCESSING FOR LARGE INSTANCES =====
+    
+    if n > 200:
+        # Use hierarchical clustering for large instances
+        result = hierarchical_heuristics(
+            distance_matrix, 
+            weights,
+            [reciprocal, centrality_matrix, mst_component, nn_ensemble, opt_edges]
+        )
+    else:
+        # Direct combination for smaller instances
+        combined = (
+            weights[0] * reciprocal +
+            weights[1] * centrality_matrix +
+            weights[2] * mst_component +
+            weights[3] * nn_ensemble +
+            weights[4] * opt_edges
+        )
+        
+        # Ensure symmetry and zero diagonal
+        combined = (combined + combined.T) / 2
+        np.fill_diagonal(combined, 0)
+        
+        # Adaptive sparsification
+        result = adaptive_sparsification(combined, distance_matrix, dist_cv, n)
+    
+    # ===== 4. POST-PROCESSING =====
+    
+    # Add diversity preservation
+    result = add_diversity_preservation(result, distance_matrix, n)
+    
+    # Final normalization
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Fallback to reciprocal for isolated rows
+        fallback = reciprocal[zero_rows]
+        row_sums[zero_rows] = fallback.sum(axis=1, keepdims=True)
+        result[zero_rows] = fallback
+    
+    row_sums[row_sums == 0] = 1
+    result = result / row_sums
+    
+    return result
+
+
+def approximate_betweenness(distance_matrix: np.ndarray, n_samples: int) -> np.ndarray:
+    """Approximate betweenness centrality using random shortest paths."""
+    n = distance_matrix.shape[0]
+    betweenness = np.zeros(n)
+    
+    for _ in range(n_samples):
+        s, t = np.random.choice(n, 2, replace=False)
+        # Find shortest path using Dijkstra's algorithm
+        path = dijkstra_shortest_path(s, t, distance_matrix)
+        if path:
+            for node in path[1:-1]:  # Exclude endpoints
+                betweenness[node] += 1
+    
+    return betweenness / max(betweenness.max(), 1)
+
+
+def dijkstra_shortest_path(s: int, t: int, dist_matrix: np.ndarray) -> List[int]:
+    """Dijkstra's algorithm for shortest path."""
+    n = dist_matrix.shape[0]
+    INF = float('inf')
+    dist = [INF] * n
+    prev = [-1] * n
+    dist[s] = 0
+    heap = [(0, s)]
+    
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d > dist[u]:
+            continue
+        if u == t:
+            break
+        for v in range(n):
+            if v != u:
+                new_dist = d + dist_matrix[u, v]
+                if new_dist < dist[v]:
+                    dist[v] = new_dist
+                    prev[v] = u
+                    heapq.heappush(heap, (new_dist, v))
+    
+    # Reconstruct path
+    if dist[t] == INF:
+        return []
+    
+    path = []
+    curr = t
+    while curr != -1:
+        path.append(curr)
+        curr = prev[curr]
+    return path[::-1]
+
+
+def compute_enhanced_mst_component(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute MST component with Christofides enhancements."""
+    n = distance_matrix.shape[0]
+    mst_component = np.zeros((n, n))
+    
+    try:
+        # Get minimum spanning tree
+        mst = sparse.csgraph.minimum_spanning_tree(distance_matrix)
+        mst_dense = mst.toarray()
+        mst_mask = mst_dense > 0
+        
+        # Christofides enhancements
+        degrees = mst_mask.sum(axis=1)
+        odd_vertices = np.where(degrees % 2 == 1)[0]
+        
+        if len(odd_vertices) > 0:
+            # Minimum weight perfect matching approximation
+            matching_edges = greedy_perfect_matching(odd_vertices, distance_matrix)
+            for i, j in matching_edges:
+                mst_component[i, j] = 0.7
+                mst_component[j, i] = 0.7
+        
+        # Boost MST edges with distance weighting
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    # Weight by inverse distance within MST
+                    weight = 1.0 / max(distance_matrix[i, j], 1e-10)
+                    mst_component[i, j] = mst_component[j, i] = min(1.0, weight * 0.5)
+        
+        # Add small connectivity bonus for nodes with low degree
+        for i in range(n):
+            if degrees[i] == 1:  # Leaf nodes
+                for j in range(n):
+                    if i != j:
+                        mst_component[i, j] = max(mst_component[i, j], 0.1)
+        
+    except Exception:
+        mst_component = np.ones((n, n)) * 0.1
+        np.fill_diagonal(mst_component, 0)
+    
+    return mst_component / max(mst_component.max(), 1)
+
+
+def greedy_perfect_matching(vertices: np.ndarray, dist_matrix: np.ndarray) -> List[Tuple[int, int]]:
+    """Greedy algorithm for minimum weight perfect matching."""
+    n_vertices = len(vertices)
+    edges = []
+    used = set()
+    
+    # Create all possible edges between odd vertices
+    all_edges = []
+    for i in range(n_vertices):
+        for j in range(i+1, n_vertices):
+            u, v = vertices[i], vertices[j]
+            all_edges.append((dist_matrix[u, v], u, v))
+    
+    # Sort by distance
+    all_edges.sort()
+    
+    # Greedy selection
+    matching = []
+    for d, u, v in all_edges:
+        if u not in used and v not in used:
+            matching.append((u, v))
+            used.add(u)
+            used.add(v)
+    
+    return matching
+
+
+def compute_nn_ensemble(distance_matrix: np.ndarray, n_runs: int) -> np.ndarray:
+    """Compute nearest neighbor ensemble with multiple starting points."""
+    n = distance_matrix.shape[0]
+    nn_matrix = np.zeros((n, n))
+    
+    k_nn = min(max(3, int(np.sqrt(n))), 10)
+    
+    for run in range(n_runs):
+        start_node = np.random.randint(n)
+        tour = nearest_neighbor_tour(start_node, distance_matrix, k_nn)
+        
+        # Record edges in tour with exponential decay by position
+        for pos, (i, j) in enumerate(zip(tour, tour[1:] + [tour[0]])):
+            decay = np.exp(-pos / (n/2))
+            nn_matrix[i, j] += decay
+            nn_matrix[j, i] += decay
+    
+    # Normalize and apply adaptive threshold
+    if nn_matrix.max() > 0:
+        nn_matrix = nn_matrix / nn_matrix.max()
+    
+    # Keep only top edges per node
+    threshold = np.percentile(nn_matrix[np.nonzero(nn_matrix)], 70) if np.any(nn_matrix > 0) else 0
+    nn_matrix[nn_matrix < threshold] = 0
+    
+    return nn_matrix
+
+
+def nearest_neighbor_tour(start: int, dist_matrix: np.ndarray, k: int) -> List[int]:
+    """Construct tour using k-nearest neighbor heuristic."""
+    n = dist_matrix.shape[0]
+    unvisited = set(range(n))
+    tour = [start]
+    unvisited.remove(start)
+    
+    current = start
+    while unvisited:
+        # Get distances to unvisited nodes
+        candidates = list(unvisited)
+        if len(candidates) <= k:
+            nearest = min(candidates, key=lambda x: dist_matrix[current, x])
+        else:
+            # Consider only k nearest
+            distances = [(dist_matrix[current, x], x) for x in candidates]
+            distances.sort()
+            nearest = distances[np.random.randint(0, min(k, len(distances)))][1]
+        
+        tour.append(nearest)
+        unvisited.remove(nearest)
+        current = nearest
+    
+    return tour
+
+
+def compute_2opt_refined_edges(distance_matrix: np.ndarray, n_tours: int) -> np.ndarray:
+    """Generate edges from 2-opt refined tours."""
+    n = distance_matrix.shape[0]
+    edge_freq = np.zeros((n, n))
+    
+    for _ in range(n_tours):
+        # Generate initial tour
+        if np.random.random() < 0.5:
+            tour = list(np.random.permutation(n))
+        else:
+            tour = nearest_neighbor_tour(np.random.randint(n), distance_matrix, 5)
+        
+        # Apply 2-opt local search
+        improved_tour = two_opt_local_search(tour, distance_matrix, max_iter=100)
+        
+        # Record edges with frequency weighted by tour quality
+        tour_length = calculate_tour_length(improved_tour, distance_matrix)
+        weight = 1.0 / max(tour_length, 1e-10)
+        
+        for i, j in zip(improved_tour, improved_tour[1:] + [improved_tour[0]]):
+            edge_freq[i, j] += weight
+            edge_freq[j, i] += weight
+    
+    # Normalize and apply softmax per row
+    if edge_freq.max() > 0:
+        edge_freq = edge_freq / edge_freq.max()
+    
+    return edge_freq
+
+
+def two_opt_local_search(tour: List[int], dist_matrix: np.ndarray, max_iter: int) -> List[int]:
+    """Apply 2-opt local search to improve tour."""
+    n = len(tour)
+    best_tour = tour[:]
+    best_length = calculate_tour_length(tour, dist_matrix)
+    
+    improved = True
+    iterations = 0
+    
+    while improved and iterations < max_iter:
+        improved = False
+        for i in range(n-2):
+            for j in range(i+2, n):
+                if j == n-1 and i == 0:
+                    continue
+                
+                # Try 2-opt swap
+                new_tour = best_tour[:]
+                new_tour[i+1:j+1] = reversed(new_tour[i+1:j+1])
+                new_length = calculate_tour_length(new_tour, dist_matrix)
+                
+                if new_length < best_length:
+                    best_tour = new_tour
+                    best_length = new_length
+                    improved = True
+                    break
+            if improved:
+                break
+        iterations += 1
+    
+    return best_tour
+
+
+def calculate_tour_length(tour: List[int], dist_matrix: np.ndarray) -> float:
+    """Calculate total length of a tour."""
+    n = len(tour)
+    length = 0
+    for i in range(n):
+        j = (i + 1) % n
+        length += dist_matrix[tour[i], tour[j]]
+    return length
+
+
+def optimize_weights_online(components: List[np.ndarray], 
+                           dist_matrix: np.ndarray, 
+                           n_eval: int) -> np.ndarray:
+    """Optimize component weights using simulated annealing."""
+    n_components = len(components)
+    n = dist_matrix.shape[0]
+    
+    # Initial weights based on instance characteristics
+    flat_dists = dist_matrix[~np.eye(n, dtype=bool)]
+    dist_cv = np.std(flat_dists) / max(np.mean(flat_dists), 1e-10)
+    
+    if n < 50:
+        weights = np.array([0.25, 0.15, 0.25, 0.15, 0.2])
+    elif n < 200:
+        weights = np.array([0.2, 0.2, 0.2, 0.15, 0.25])
+    else:
+        weights = np.array([0.15, 0.25, 0.2, 0.1, 0.3])
+    
+    # Adjust based on distance variability
+    if dist_cv > 1.0:
+        weights[0] *= 1.2  # Emphasize reciprocal
+        weights[4] *= 0.8  # Reduce 2-opt
+    elif dist_cv < 0.3:
+        weights[1] *= 1.2  # Emphasize centrality
+    
+    # Normalize
+    weights = weights / weights.sum()
+    
+    # Simple simulated annealing for weight refinement
+    best_weights = weights.copy()
+    best_score = evaluate_weights(weights, components, dist_matrix)
+    
+    T = 1.0  # Initial temperature
+    cooling_rate = 0.95
+    
+    for _ in range(n_eval):
+        # Generate neighbor
+        neighbor = weights.copy()
+        idx1, idx2 = np.random.choice(n_components, 2, replace=False)
+        delta = np.random.uniform(-0.1, 0.1)
+        neighbor[idx1] += delta
+        neighbor[idx2] -= delta
+        neighbor = np.clip(neighbor, 0.05, 0.5)
+        neighbor = neighbor / neighbor.sum()
+        
+        # Evaluate
+        score = evaluate_weights(neighbor, components, dist_matrix)
+        
+        # Accept with probability
+        if score > best_score or np.random.random() < np.exp((score - best_score) / T):
+            weights = neighbor
+            if score > best_score:
+                best_weights = neighbor.copy()
+                best_score = score
+        
+        # Cool down
+        T *= cooling_rate
+    
+    return best_weights
+
+
+def evaluate_weights(weights: np.ndarray, components: List[np.ndarray], 
+                    dist_matrix: np.ndarray) -> float:
+    """Evaluate weight combination by generating and testing tours."""
+    n = dist_matrix.shape[0]
+    combined = np.zeros((n, n))
+    
+    for w, comp in zip(weights, components):
+        combined += w * comp
+    
+    # Generate a few tours using the combined heuristic
+    scores = []
+    for _ in range(5):
+        tour = construct_tour_from_heuristic(combined, dist_matrix)
+        if tour:
+            score = 1.0 / calculate_tour_length(tour, dist_matrix)
+            scores.append(score)
+    
+    return np.mean(scores) if scores else 0
+
+
+def construct_tour_from_heuristic(heuristic: np.ndarray, 
+                                 dist_matrix: np.ndarray) -> List[int]:
+    """Construct tour using heuristic as edge probabilities."""
+    n = heuristic.shape[0]
+    if n == 0:
+        return []
+    
+    # Convert heuristic to probabilities with exploration
+    probs = heuristic.copy()
+    probs = probs + 0.01  # Exploration factor
+    np.fill_diagonal(probs, 0)
+    
+    # Normalize rows
+    row_sums = probs.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    probs = probs / row_sums
+    
+    # Construct tour using randomized greedy
+    start = np.random.randint(n)
+    tour = [start]
+    visited = set([start])
+    
+    current = start
+    while len(visited) < n:
+        # Get probabilities for unvisited nodes
+        mask = np.ones(n, dtype=bool)
+        mask[list(visited)] = False
+        mask[current] = True  # Don't include self
+        
+        available = np.where(mask)[0]
+        if len(available) == 0:
+            break
+        
+        # Select next node based on probabilities
+        probs_available = probs[current, available]
+        if probs_available.sum() == 0:
+            next_node = np.random.choice(available)
+        else:
+            probs_available = probs_available / probs_available.sum()
+            next_node = np.random.choice(available, p=probs_available)
+        
+        tour.append(next_node)
+        visited.add(next_node)
+        current = next_node
+    
+    return tour if len(tour) == n else []
+
+
+def hierarchical_heuristics(dist_matrix: np.ndarray, weights: np.ndarray,
+                           components: List[np.ndarray]) -> np.ndarray:
+    """Hierarchical processing for large instances."""
+    n = dist_matrix.shape[0)
+    
+    # Partition into clusters
+    n_clusters = max(2, min(10, n // 50))
+    clusters = partition_graph(dist_matrix, n_clusters)
+    
+    # Initialize result matrix
+    result = np.zeros((n, n))
+    
+    # Process intra-cluster edges
+    for cluster in clusters:
+        if len(cluster) > 1:
+            # Get submatrix for cluster
+            indices = np.array(cluster)
+            sub_dist = dist_matrix[np.ix_(indices, indices)]
+            
+            # Get corresponding components
+            sub_components = []
+            for comp in components:
+                sub_comp = comp[np.ix_(indices, indices)]
+                sub_components.append(sub_comp)
+            
+            # Combine for this cluster
+            sub_combined = np.zeros((len(cluster), len(cluster)))
+            for w, sub_comp in zip(weights, sub_components):
+                sub_combined += w * sub_comp
+            
+            # Map back to original indices
+            for i, idx_i in enumerate(indices):
+                for j, idx_j in enumerate(indices):
+                    if i != j:
+                        result[idx_i, idx_j] = sub_combined[i, j]
+    
+    # Process inter-cluster edges
+    result = add_inter_cluster_edges(result, clusters, dist_matrix, weights, components)
+    
+    return result
+
+
+def partition_graph(dist_matrix: np.ndarray, n_clusters: int) -> List[List[int]]:
+    """Partition graph into clusters using spectral clustering approximation."""
+    n = dist_matrix.shape[0)
+    
+    if n_clusters == 1:
+        return [list(range(n))]
+    
+    # Use farthest point sampling for initial centroids
+    centroids = [np.random.randint(n)]
+    for _ in range(1, n_clusters):
+        distances = np.min(dist_matrix[:, centroids], axis=1)
+        next_centroid = np.argmax(distances)
+        centroids.append(next_centroid)
+    
+    # Assign nodes to nearest centroid
+    clusters = [[] for _ in range(n_clusters)]
+    for i in range(n):
+        if i in centroids:
+            clusters[centroids.index(i)].append(i)
+        else:
+            closest = np.argmin(dist_matrix[i, centroids])
+            clusters[closest].append(i)
+    
+    # Balance clusters
+    clusters = balance_clusters(clusters, n)
+    
+    return clusters
+
+
+def balance_clusters(clusters: List[List[int]], n: int) -> List[List[int]]:
+    """Balance cluster sizes."""
+    target_size = n // len(clusters)
+    
+    # Identify overfull and underfull clusters
+    overfull = []
+    underfull = []
+    
+    for i, cluster in enumerate(clusters):
+        if len(cluster) > target_size * 1.2:
+            overfull.append(i)
+        elif len(cluster) < target_size * 0.8:
+            underfull.append(i)
+    
+    # Transfer nodes from overfull to underfull clusters
+    for over_idx in overfull:
+        while len(clusters[over_idx]) > target_size and underfull:
+            node = clusters[over_idx].pop()
+            under_idx = underfull[0]
+            clusters[under_idx].append(node)
+            
+            if len(clusters[under_idx]) >= target_size * 0.8:
+                underfull.pop(0)
+    
+    return clusters
+
+
+def add_inter_cluster_edges(result: np.ndarray, clusters: List[List[int]],
+                           dist_matrix: np.ndarray, weights: np.ndarray,
+                           components: List[np.ndarray]) -> np.ndarray:
+    """Add edges between clusters with reduced resolution."""
+    n = dist_matrix.shape[0]
+    
+    # For each pair of clusters
+    for i in range(len(clusters)):
+        for j in range(i+1, len(clusters)):
+            cluster_i = clusters[i]
+            cluster_j = clusters[j]
+            
+            # Sample representative nodes from each cluster
+            n_reps = min(5, len(cluster_i), len(cluster_j))
+            reps_i = np.random.choice(cluster_i, n_reps, replace=False)
+            reps_j = np.random.choice(cluster_j, n_reps, replace=False)
+            
+            # Connect representative nodes
+            for idx_i in reps_i:
+                for idx_j in reps_j:
+                    # Simple heuristic for inter-cluster edges
+                    inter_heuristic = 0
+                    for w, comp in zip(weights, components):
+                        inter_heuristic += w * comp[idx_i, idx_j]
+                    
+                    result[idx_i, idx_j] = max(result[idx_i, idx_j], inter_heuristic * 0.7)
+                    result[idx_j, idx_i] = max(result[idx_j, idx_i], inter_heuristic * 0.7)
+    
+    return result
+
+
+def adaptive_sparsification(matrix: np.ndarray, dist_matrix: np.ndarray,
+                           dist_cv: float, n: int) -> np.ndarray:
+    """Adaptive sparsification with instance-aware edge selection."""
+    sparsified = np.zeros_like(matrix)
+    
+    # Determine edges per node adaptively
+    if n < 50:
+        k_keep = min(15, n - 1)
+    elif n < 200:
+        k_keep = min(12, n - 1)
+    elif n < 500:
+        k_keep = min(10, n - 1)
+    else:
+        k_keep = min(8, n - 1)
+    
+    # Adjust based on distance variability
+    if dist_cv > 1.5:
+        k_keep = min(k_keep + 3, n - 1)
+    
+    # Keep top edges with exponential decay
+    for i in range(n):
+        row = matrix[i].copy()
+        row[i] = -np.inf
+        
+        if k_keep < n - 1:
+            threshold = np.partition(row, -k_keep)[-k_keep]
+            indices = np.where(row >= threshold)[0]
+        else:
+            indices = np.arange(n)
+            indices = indices[indices != i]
+        
+        if len(indices) > 0:
+            # Sort and apply decay
+            values = row[indices]
+            sorted_idx = indices[np.argsort(values)[::-1]]
+            
+            for rank, j in enumerate(sorted_idx[:k_keep]):
+                decay = np.exp(-rank / 2.5)
+                sparsified[i, j] = matrix[i, j] * decay
+    
+    # Ensure symmetry
+    result = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(result, 0)
+    
+    return result
+
+
+def add_diversity_preservation(matrix: np.ndarray, dist_matrix: np.ndarray,
+                              n: int) -> np.ndarray:
+    """Add diversity preservation mechanisms."""
+    result = matrix.copy()
+    
+    # Ensure connectivity for nodes with low outgoing probability
+    row_sums = result.sum(axis=1)
+    low_connectivity = row_sums < np.percentile(row_sums, 10)
+    
+    if np.any(low_connectivity):
+        for i in np.where(low_connectivity)[0]:
+            # Add connections to k nearest neighbors
+            distances = dist_matrix[i].copy()
+            distances[i] = np.inf
+            k = min(5, n - 1)
+            nearest = np.argpartition(distances, k)[:k]
+            
+            for j in nearest:
+                if result[i, j] == 0:
+                    result[i, j] = 0.1
+                    result[j, i] = 0.1
+    
+    # Add small random exploration for diversity
+    exploration = np.random.rand(n, n) * 0.02
+    exploration = (exploration + exploration.T) / 2
+    np.fill_diagonal(exploration, 0)
+    
+    result = result + exploration
+    result = np.maximum(result, 0)
+    
+    return result
+```

@@ -1,0 +1,237 @@
+```json
+{
+    "algorithm_features": ["Dynamic Regret Thresholding", "Approximate 2-opt Gain Estimation", "Density-Adaptive Sparsification", "Hierarchical Cluster Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with dynamic regret thresholds and 2-opt potential estimation.
+    
+    Key innovations:
+    1. Dynamic regret thresholds based on graph density and distance distribution
+    2. Approximate 2-opt gain estimation without requiring a full tour
+    3. Hierarchical cluster preservation for inter-cluster connectivity
+    4. Adaptive sparsification balancing connectivity and selectivity
+    
+    Returns priority matrix with higher values indicating more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base inverse distance with safe handling
+    dist = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(dist, np.inf)
+    inv_dist = 1.0 / (dist + 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Graph density analysis for adaptive parameters
+    # Compute coefficient of variation of distances as density indicator
+    upper_dist = dist[np.triu_indices(n, k=1)]
+    mean_dist = np.mean(upper_dist)
+    std_dist = np.std(upper_dist)
+    cv_dist = std_dist / (mean_dist + 1e-10)  # Coefficient of variation
+    
+    # Density-aware parameters
+    density_factor = np.clip(cv_dist, 0.1, 2.0)  # Higher CV = sparser graph
+    reg_param = 0.7 + 0.3 * np.exp(-density_factor)  # Regret sensitivity
+    
+    # 3. Minimum Spanning Tree base connectivity
+    mst = minimum_spanning_tree(dist)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    mst_bonus = 1.0 + 0.8 * mst_edges  # MST edges get 1.8x bonus
+    
+    # 4. Enhanced regret calculation with dynamic thresholds
+    regret_scores = np.ones_like(dist, dtype=np.float64)
+    
+    # Precompute nearest neighbors for efficiency
+    k_neighbors = min(15, n - 1)
+    sorted_indices = np.argsort(dist, axis=1)
+    sorted_dists = np.take_along_axis(dist, sorted_indices, axis=1)
+    
+    # Two-level regret: direct vs best 2-step alternative
+    for i in range(n):
+        # Get nearest neighbors for node i (excluding self)
+        i_neighbors = sorted_indices[i, 1:k_neighbors+1]
+        i_dists = sorted_dists[i, 1:k_neighbors+1]
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Find best two-step alternative i->k->j
+            best_alternative = np.inf
+            
+            # Consider k from i's and j's nearest neighbors
+            j_neighbors = sorted_indices[j, 1:k_neighbors+1]
+            
+            # Combine candidate k's
+            candidate_ks = np.unique(np.concatenate([i_neighbors, j_neighbors]))
+            candidate_ks = candidate_ks[candidate_ks != i]
+            candidate_ks = candidate_ks[candidate_ks != j]
+            
+            if len(candidate_ks) > 0:
+                # Vectorized computation of alternative paths
+                alt_paths = dist[i, candidate_ks] + dist[candidate_ks, j]
+                best_alternative = np.min(alt_paths) if len(alt_paths) > 0 else np.inf
+            
+            # Dynamic regret calculation
+            direct_dist = dist[i, j]
+            if best_alternative < np.inf and direct_dist > 0:
+                regret_ratio = best_alternative / direct_dist
+                # Dynamic transformation based on density
+                regret_scores[i, j] = 1.0 + reg_param * (regret_ratio - 1.0)
+                regret_scores[i, j] = np.clip(regret_scores[i, j], 0.5, 2.5)
+            else:
+                regret_scores[i, j] = 1.0
+    
+    # 5. Approximate 2-opt gain estimation
+    # Estimate potential improvement if edge were part of a 2-opt move
+    opt_potential = np.ones_like(dist, dtype=np.float64)
+    
+    if n >= 4:
+        # For each edge (i,j), find best candidate edges (k,l) for 2-opt exchange
+        # We approximate by considering promising candidates based on edge lengths
+        for i in range(n):
+            # Get promising candidate nodes for i (nearest and farthest)
+            i_candidates = sorted_indices[i, 1:min(10, n-1)]
+            
+            for j in range(i+1, n):
+                if i == j:
+                    continue
+                
+                # Find promising k candidates (connected to i)
+                k_candidates = i_candidates[i_candidates != j]
+                if len(k_candidates) == 0:
+                    continue
+                
+                # For each k, find promising l candidates (connected to j)
+                # We use j's nearest neighbors as potential l's
+                l_candidates = sorted_indices[j, 1:min(10, n-1)]
+                l_candidates = l_candidates[l_candidates != i]
+                
+                if len(k_candidates) == 0 or len(l_candidates) == 0:
+                    continue
+                
+                # Compute approximate 2-opt gain
+                best_gain = 0.0
+                
+                # Sample promising combinations
+                for k in k_candidates[:5]:  # Limit to top 5 k candidates
+                    for l in l_candidates[:5]:  # Limit to top 5 l candidates
+                        if k != l and k != j and l != i:
+                            current_edges = dist[i, j] + dist[k, l]
+                            new_edges = dist[i, k] + dist[j, l]
+                            gain = current_edges - new_edges
+                            
+                            if gain > best_gain:
+                                best_gain = gain
+                
+                # Transform gain to multiplicative factor
+                if best_gain > 0:
+                    # Normalize gain by average edge length
+                    normalized_gain = best_gain / (mean_dist + 1e-10)
+                    opt_potential[i, j] = 1.0 + 0.3 * np.tanh(normalized_gain)
+                    opt_potential[j, i] = opt_potential[i, j]
+    
+    # 6. Hierarchical clustering for inter-cluster connectivity preservation
+    cluster_bonus = np.ones_like(dist, dtype=np.float64)
+    
+    if n >= 8:
+        # Perform hierarchical clustering
+        condensed_dist = squareform(dist, checks=False)
+        Z = linkage(condensed_dist, method='average')
+        
+        # Create two levels of clustering
+        cluster_levels = []
+        for threshold in [0.3, 0.6, 0.9]:
+            clusters = fcluster(Z, t=threshold * np.max(Z[:, 2]), criterion='distance')
+            cluster_levels.append(clusters)
+        
+        # Boost edges connecting different clusters at various levels
+        for level_idx, clusters in enumerate(cluster_levels):
+            cluster_weight = 0.4 * (level_idx + 1) / len(cluster_levels)
+            
+            for i in range(n):
+                for j in range(i+1, n):
+                    if clusters[i] != clusters[j]:
+                        # Edge connects different clusters
+                        boost = 1.0 + cluster_weight
+                        cluster_bonus[i, j] = max(cluster_bonus[i, j], boost)
+                        cluster_bonus[j, i] = cluster_bonus[i, j]
+    
+    # 7. Combined scoring
+    scores = inv_dist * mst_bonus * regret_scores * opt_potential * cluster_bonus
+    
+    # 8. Adaptive sparsification with density-aware thresholds
+    # Determine number of edges to keep per node
+    base_edges = max(2, int(np.log2(n)) + 1)
+    # Adjust based on density: keep more edges in sparse graphs
+    density_adjusted_edges = int(base_edges * (1.0 + 0.5 * density_factor))
+    k_keep = min(n-1, max(3, density_adjusted_edges))
+    
+    mask = mst_edges.copy()  # Always keep MST edges
+    
+    # Keep top edges per node
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        if k_keep < len(row_scores):
+            top_k_idx = np.argpartition(row_scores, -k_keep)[-k_keep:]
+            for idx in top_k_idx:
+                mask[i, idx] = 1
+                mask[idx, i] = 1
+    
+    # Ensure at least 2 edges per node for connectivity
+    for i in range(n):
+        if np.sum(mask[i]) < 2:
+            # Add best remaining edges
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            row_scores[mask[i] > 0] = -np.inf
+            if np.any(row_scores > -np.inf):
+                best_idx = np.argmax(row_scores)
+                mask[i, best_idx] = 1
+                mask[best_idx, i] = 1
+    
+    scores = scores * mask
+    
+    # 9. Final refinement and normalization
+    # Smooth the scores using neighborhood averaging
+    if n >= 4:
+        smoothed = scores.copy()
+        for i in range(n):
+            for j in range(n):
+                if i != j and mask[i, j] > 0:
+                    # Average with neighbors' scores for similar edges
+                    neighbor_weight = 0.2
+                    i_neighbors = np.where(mask[i] > 0)[0]
+                    j_neighbors = np.where(mask[j] > 0)[0]
+                    
+                    if len(i_neighbors) > 0 and len(j_neighbors) > 0:
+                        i_avg = np.mean(scores[i, i_neighbors]) if len(i_neighbors) > 0 else scores[i, j]
+                        j_avg = np.mean(scores[j_neighbors, j]) if len(j_neighbors) > 0 else scores[i, j]
+                        smoothed[i, j] = (1 - neighbor_weight) * scores[i, j] + \
+                                        neighbor_weight * 0.5 * (i_avg + j_avg)
+        
+        scores = smoothed
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(scores)
+    if max_score > 0:
+        scores = scores / max_score
+    
+    # Ensure symmetry and zero diagonal
+    scores = (scores + scores.T) / 2.0
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

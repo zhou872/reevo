@@ -1,0 +1,212 @@
+```json
+{
+    "algorithm_features": ["MST Edge Bonus", "Dynamic Sparsity Adaptation", "Two-Hop Path Competition", "Degree-Aware Reciprocity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with MST-based lookahead
+    and adaptive sparsity control.
+    
+    Features:
+    1. MST Edge Bonus: Edges appearing in the minimum spanning tree receive priority
+    2. Dynamic Sparsity Adaptation: Instance-specific connectivity based on distance distribution
+    3. Two-Hop Path Competition: Continuous penalty based on alternative path quality
+    4. Degree-Aware Reciprocity: Balanced weighting accounting for node connectivity
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Dynamic Sparsity Adaptation ====================
+    # Base connectivity adapts to instance characteristics
+    instance_coefficient = np.std(distance_matrix) / (np.mean(distance_matrix) + 1e-10)
+    k_base = max(3, int(np.log2(n) * (1 + 0.5 * np.tanh(instance_coefficient - 1))))
+    
+    # Compute adaptive connectivity per node based on local distance distribution
+    k_values = np.zeros(n, dtype=int)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        # Use quartile ratio to detect local density variations
+        sorted_dists = np.partition(dists, min(k_base * 2, n-1))[:min(k_base * 2, n-1)]
+        q1 = np.percentile(sorted_dists, 25)
+        q3 = np.percentile(sorted_dists, 75)
+        density_factor = q3 / (q1 + 1e-10) if q1 > 0 else 1.0
+        # Higher density variation -> more neighbors considered
+        k_values[i] = min(n-1, int(k_base * (0.8 + 0.4 * np.tanh(density_factor - 1))))
+    
+    # Build initial sparse adjacency with reciprocal preference
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        k_i = k_values[i]
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nn_indices = np.argpartition(dists, k_i)[:k_i]
+        adjacency_mask[i, nn_indices] = True
+        
+        # Enhanced reciprocity: prioritize edges where both endpoints rank each other highly
+        for j in nn_indices:
+            k_j = k_values[j]
+            if k_j > 0:
+                j_dists = distance_matrix[j].copy()
+                j_dists[j] = np.inf
+                j_nn = np.argpartition(j_dists, min(k_j, n-2))[:min(k_j, n-2)]
+                if i in j_nn:
+                    adjacency_mask[j, i] = True
+    
+    # ==================== 2. MST-Based Lookahead ====================
+    # Compute minimum spanning tree and give bonus to MST edges
+    mst_bonus = np.ones_like(distance_matrix)
+    try:
+        # Convert to sparse MST representation
+        mst_matrix = minimum_spanning_tree(distance_matrix)
+        mst_edges = (mst_matrix.toarray() != 0) | (mst_matrix.toarray().T != 0)
+        
+        # Strong bonus for MST edges (foundation of good tours)
+        mst_bonus[mst_edges] = 2.0
+        
+        # Ensure MST edges are in adjacency mask
+        adjacency_mask = adjacency_mask | mst_edges
+    except Exception:
+        # Fallback if MST computation fails
+        pass
+    
+    # Final symmetry and self-loop removal
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 3. Reciprocal Rank with Degree Balance ====================
+    edge_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            valid_indices = np.where(valid_mask)[0]
+            
+            # Sort by distance and assign rank-based weights
+            sorted_idx = np.argsort(valid_dists)
+            sorted_indices = valid_indices[sorted_idx]
+            ranks = np.arange(1, len(sorted_indices) + 1)
+            
+            # Exponential rank decay: 1/(rank^1.5) provides stronger preference for top ranks
+            weights = 1.0 / (ranks ** 1.5)
+            weights = weights / np.sum(weights)
+            
+            # Inverse distance with logarithmic compression to reduce extreme values
+            inv_dists = 1.0 / (valid_dists[sorted_idx] + 1e-10)
+            log_inv_dists = np.log1p(inv_dists)  # log(1 + x) for numerical stability
+            
+            # Degree normalization: sqrt(product of degrees) balances hub influence
+            deg_i = np.sum(adjacency_mask[i])
+            for idx, j in enumerate(sorted_indices):
+                deg_j = np.sum(adjacency_mask[j])
+                degree_factor = 1.0 / np.sqrt(deg_i * deg_j) if deg_i > 0 and deg_j > 0 else 1.0
+                edge_scores[i, j] = log_inv_dists[idx] * weights[idx] * degree_factor
+    
+    # Symmetrize using geometric mean
+    edge_scores = np.sqrt(np.maximum(edge_scores * edge_scores.T, 0))
+    np.fill_diagonal(edge_scores, 0)
+    
+    # ==================== 4. Continuous Two-Hop Competition ====================
+    two_hop_adjustment = np.ones_like(distance_matrix)
+    
+    # Precompute sorted neighbors for efficient alternative path checking
+    sorted_neighbors = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if adjacency_mask[i, j]:
+                direct_cost = distance_matrix[i, j]
+                if direct_cost < 1e-10:
+                    continue
+                
+                # Examine limited candidate intermediate nodes
+                check_limit = min(max(4, int(np.sqrt(n))), n-2)
+                candidates_i = sorted_neighbors[i, 1:check_limit+1]
+                candidates_j = sorted_neighbors[j, 1:check_limit+1]
+                candidates = np.unique(np.concatenate([candidates_i, candidates_j]))
+                candidates = candidates[(candidates != i) & (candidates != j)]
+                
+                if len(candidates) > 0:
+                    # Find best two-hop alternative
+                    two_hop_costs = distance_matrix[i, candidates] + distance_matrix[candidates, j]
+                    best_two_hop = np.min(two_hop_costs) if len(two_hop_costs) > 0 else np.inf
+                    
+                    if best_two_hop < np.inf:
+                        # Continuous adjustment using logistic function
+                        ratio = best_two_hop / direct_cost
+                        # Sigmoid centered at 1.0, with steepness 4.0
+                        adjustment = 1.0 / (1.0 + np.exp(-4.0 * (ratio - 1.0)))
+                        two_hop_adjustment[i, j] = two_hop_adjustment[j, i] = adjustment
+    
+    # ==================== 5. Edge Stability via Local Consistency ====================
+    stable_mask = adjacency_mask.copy()
+    
+    for i in range(n):
+        if np.sum(adjacency_mask[i]) >= 4:
+            local_edges = distance_matrix[i, adjacency_mask[i]]
+            median_dist = np.median(local_edges)
+            mad = np.median(np.abs(local_edges - median_dist))  # Median Absolute Deviation
+            
+            if mad > 0:
+                # Mark edges significantly longer than local median
+                z_scores = (local_edges - median_dist) / (mad + 1e-10)
+                unstable_threshold = 2.5  # More conservative than IQR
+                
+                neighbor_indices = np.where(adjacency_mask[i])[0]
+                for idx, j in enumerate(neighbor_indices):
+                    if z_scores[idx] > unstable_threshold:
+                        stable_mask[i, j] = stable_mask[j, i] = False
+    
+    # ==================== 6. Combine Components with MST Bonus ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Combine scores with MST bonus
+    combined_mask = stable_mask & (distance_matrix > 0)
+    heuristics[combined_mask] = (
+        edge_scores[combined_mask] * 
+        two_hop_adjustment[combined_mask] * 
+        mst_bonus[combined_mask]
+    )
+    
+    # Ensure connectivity for isolated nodes
+    for i in range(n):
+        if heuristics[i].sum() == 0:
+            # Connect to nearest neighbors with basic inverse distance
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nn_indices = np.argsort(dists)[:min(3, n-1)]
+            for j in nn_indices:
+                inv_val = 1.0 / (distance_matrix[i, j] + 1e-10)
+                heuristics[i, j] = heuristics[j, i] = max(heuristics[i, j], inv_val)
+    
+    # ==================== 7. Final Normalization ====================
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row normalization with Laplace smoothing
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Symmetrize using arithmetic mean
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

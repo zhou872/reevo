@@ -1,0 +1,377 @@
+```json
+{
+    "algorithm_features": ["Adaptive Meta-Weighting", "Spectral Embedding Similarity", "Multi-scale Regret Analysis", "Solution-aware Edge Pruning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.linalg import eigsh
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with meta-adaptive components,
+    approximate spectral methods for large instances, and solution-aware refinement.
+    
+    Key innovations:
+    1. Meta-learning-inspired parameter adaptation based on instance characteristics
+    2. Approximate spectral embedding using Nyström method for large graphs
+    3. Multi-scale regret analysis with adaptive lookahead depth
+    4. Solution-aware edge pruning based on local improvement potential
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric n x n matrix of distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges for inclusion in optimal tours.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    
+    # ===== 1. INSTANCE CHARACTERIZATION FOR META-ADAPTATION =====
+    # Compute comprehensive instance features for adaptive parameter tuning
+    triu_idx = np.triu_indices(n, k=1)
+    dist_flat = distance_matrix[triu_idx]
+    
+    dist_mean = np.mean(dist_flat)
+    dist_std = np.std(dist_flat)
+    cv = dist_std / (dist_mean + epsilon)  # Coefficient of variation
+    
+    # Skewness for distribution shape characterization
+    if dist_std > epsilon:
+        skewness = np.mean(((dist_flat - dist_mean) / dist_std) ** 3)
+    else:
+        skewness = 0
+    
+    # Spatial density via nearest neighbor analysis
+    if n > 10:
+        sorted_dists = np.sort(distance_matrix, axis=1)[:, 1:min(6, n)]
+        density = 1.0 / (np.mean(sorted_dists) + epsilon)
+    else:
+        density = 1.0
+    
+    # ===== 2. META-ADAPTIVE PARAMETER SCHEDULING =====
+    # Dynamically adjust algorithm parameters based on instance features
+    def compute_adaptive_params(n, cv, skewness, density):
+        """Compute adaptive parameters based on instance characteristics."""
+        
+        # Base parameters with instance-aware adjustments
+        size_factor = np.log(n + 1) / np.log(100)  # Normalized by n=100
+        
+        # Regret analysis depth: deeper for uniform, shallower for skewed
+        regret_depth = max(2, min(5, int(4 - 2 * abs(skewness) + 0.5 * (1 - cv))))
+        
+        # Spectral embedding dimension: higher for clear structure
+        spectral_dim = max(2, min(8, int(3 + 2 * (1 - cv) * min(1.0, density))))
+        
+        # Sparsification aggressiveness: more aggressive for larger instances
+        keep_ratio_base = max(0.1, min(0.4, 0.25 - 0.05 * size_factor + 0.1 * cv))
+        
+        # Component weights adaptive to instance type
+        if cv < 0.3:  # Uniform instances
+            weights = {
+                'inverse': 1.0,
+                'regret': 0.8,
+                'centrality': 0.6,
+                'spectral': 0.4,
+                'structural': 0.7
+            }
+        elif cv < 0.7:  # Moderate variation
+            weights = {
+                'inverse': 0.9,
+                'regret': 1.0,
+                'centrality': 0.8,
+                'spectral': 0.7,
+                'structural': 0.9
+            }
+        else:  # High variation / clustered
+            weights = {
+                'inverse': 0.7,
+                'regret': 0.9,
+                'centrality': 1.0,
+                'spectral': 1.0,
+                'structural': 0.8
+            }
+        
+        # Adjust weights for very small/large instances
+        if n < 20:
+            weights['spectral'] *= 0.5
+            weights['regret'] *= 1.2
+        
+        return {
+            'regret_depth': regret_depth,
+            'spectral_dim': spectral_dim,
+            'keep_ratio': keep_ratio_base,
+            'weights': weights
+        }
+    
+    params = compute_adaptive_params(n, cv, skewness, density)
+    
+    # ===== 3. BASE INVERSE DISTANCE COMPONENT =====
+    inv_dist = 1.0 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ===== 4. MULTI-SCALE REGRET ANALYSIS =====
+    # Adaptive regret computation with multiple lookahead depths
+    regret_penalty = np.ones_like(distance_matrix)
+    
+    # Prepare sorted distances for efficient access
+    dist_with_inf = distance_matrix.copy()
+    np.fill_diagonal(dist_with_inf, np.inf)
+    
+    # Compute regrets at multiple depths
+    max_depth = min(params['regret_depth'], n - 1)
+    k_neighbors = min(max_depth + 2, n - 1)
+    
+    if k_neighbors > 0:
+        sorted_indices = np.argsort(dist_with_inf, axis=1)[:, :k_neighbors]
+        sorted_values = np.take_along_axis(dist_with_inf, sorted_indices, axis=1)
+        
+        # Compute best distances at each depth
+        best_dists = sorted_values[:, 0]
+        
+        # Multi-scale regret calculation
+        regret_components = []
+        
+        for depth in range(1, max_depth + 1):
+            if depth < sorted_values.shape[1]:
+                ref_dists = sorted_values[:, depth]
+            else:
+                ref_dists = sorted_values[:, -1]
+            
+            # Compute regret at this depth
+            spread = np.maximum(epsilon, ref_dists - best_dists)
+            
+            regret_i = dist_with_inf - best_dists[:, np.newaxis]
+            penalty_i = 1.0 / (1.0 + regret_i / spread[:, np.newaxis])
+            
+            regret_j = dist_with_inf - best_dists[np.newaxis, :]
+            penalty_j = 1.0 / (1.0 + regret_j / spread[np.newaxis, :])
+            
+            # Symmetric penalty at this depth
+            depth_penalty = np.sqrt(penalty_i * penalty_j)
+            regret_components.append(depth_penalty)
+        
+        # Combine multi-scale regrets with depth-dependent weights
+        if regret_components:
+            # Exponential decay of weights with depth
+            depth_weights = np.exp(-0.5 * np.arange(len(regret_components)))
+            depth_weights /= depth_weights.sum()
+            
+            # Weighted geometric mean
+            log_sum = np.zeros_like(regret_components[0])
+            for w, comp in zip(depth_weights, regret_components):
+                log_sum += w * np.log(comp + epsilon)
+            regret_penalty = np.exp(log_sum)
+    
+    np.fill_diagonal(regret_penalty, 0)
+    
+    # ===== 5. HARMONIC CENTRALITY BALANCING =====
+    harmonic_centrality = np.sum(1.0 / (distance_matrix + epsilon), axis=1) - 1.0/epsilon
+    centrality_norm = (harmonic_centrality - np.min(harmonic_centrality)) / \
+                     (np.max(harmonic_centrality) - np.min(harmonic_centrality) + epsilon)
+    
+    # Penalty matrix: discourage edges between high-centrality nodes
+    centrality_penalty = 1.0 - 0.4 * np.sqrt(np.outer(centrality_norm, centrality_norm))
+    np.fill_diagonal(centrality_penalty, 0)
+    
+    # ===== 6. ADAPTIVE SPECTRAL EMBEDDING =====
+    spectral_penalty = np.ones_like(distance_matrix)
+    
+    if n >= 5 and params['spectral_dim'] >= 2:
+        try:
+            # Adaptive bandwidth for similarity matrix
+            sigma = np.percentile(dist_flat, 25)  # Use 25th percentile for local structure
+            
+            if n <= 500:
+                # Exact spectral decomposition for small/medium instances
+                similarity = np.exp(-distance_matrix ** 2 / (2 * sigma ** 2))
+                np.fill_diagonal(similarity, 0)
+                
+                D = np.diag(np.sum(similarity, axis=1))
+                D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + epsilon))
+                L = np.eye(n) - D_inv_sqrt @ similarity @ D_inv_sqrt
+                
+                # Compute eigenvectors
+                eigvals, eigvecs = eigh(L)
+                k_dim = min(params['spectral_dim'] + 1, n)
+                embedding = eigvecs[:, 1:k_dim]
+                
+            else:
+                # Nyström approximation for large instances
+                m = min(200, n // 2)  # Landmark size
+                landmark_idx = np.random.choice(n, m, replace=False)
+                W = distance_matrix[np.ix_(landmark_idx, landmark_idx)]
+                A = distance_matrix[:, landmark_idx]
+                
+                # Construct approximate similarity matrices
+                W_sim = np.exp(-W ** 2 / (2 * sigma ** 2))
+                A_sim = np.exp(-A ** 2 / (2 * sigma ** 2))
+                
+                # Nyström approximation of eigenvectors
+                U, S, _ = np.linalg.svd(W_sim)
+                S_inv_sqrt = np.diag(1.0 / np.sqrt(S[:params['spectral_dim']] + epsilon))
+                embedding = A_sim @ U[:, :params['spectral_dim']] @ S_inv_sqrt
+            
+            # Normalize embedding and compute cosine similarities
+            embedding_norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+            normalized_embedding = embedding / (embedding_norms + epsilon)
+            
+            spectral_similarity = normalized_embedding @ normalized_embedding.T
+            spectral_similarity = np.clip(spectral_similarity, 0, 1)  # Keep only positive similarities
+            
+            # Adaptive spectral penalty based on instance type
+            if cv < 0.4:  # Uniform: weaker spectral penalty
+                spectral_strength = 0.3
+            else:  # Clustered: stronger spectral penalty
+                spectral_strength = 0.7
+            
+            spectral_penalty = (1.0 - spectral_strength) + spectral_strength * spectral_similarity
+            
+        except Exception:
+            # Fallback to centrality-based penalty if spectral computation fails
+            spectral_penalty = 1.0 - 0.3 * centrality_penalty
+    
+    np.fill_diagonal(spectral_penalty, 0)
+    
+    # ===== 7. STRUCTURAL ENHANCEMENTS =====
+    # Minimum Spanning Tree bonus
+    mst_boost = np.zeros_like(distance_matrix)
+    if n > 1:
+        try:
+            mst_sparse = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst_sparse.toarray()
+            mst_present = (mst_dense > 0) | (mst_dense.T > 0)
+            mst_boost[mst_present] = 1.4  # Strong bonus for MST edges
+        except Exception:
+            pass
+    
+    # Mutual nearest neighbors bonus
+    mnn_boost = np.zeros_like(distance_matrix)
+    if n > 5:
+        # Adaptive k for mutual nearest neighbors
+        k_mnn = max(3, min(15, int(np.sqrt(n) * (1 + 0.5 * cv))))
+        
+        if k_mnn < n:
+            # Find k-nearest neighbors for each node
+            nn_indices = np.argpartition(dist_with_inf, k_mnn, axis=1)[:, :k_mnn]
+            nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+            
+            rows = np.repeat(np.arange(n), k_mnn)
+            cols = nn_indices.ravel()
+            nn_mask[rows, cols] = True
+            
+            # Mutual nearest neighbors (symmetric)
+            mutual_nn = nn_mask & nn_mask.T
+            mnn_boost[mutual_nn] = 1.2
+    
+    # ===== 8. SOLUTION-AWARE EDGE PRUNING =====
+    # Initial combination with adaptive weights
+    w = params['weights']
+    
+    # Multiplicative combination of core components
+    base_score = (
+        inv_dist ** w['inverse'] *
+        regret_penalty ** w['regret'] *
+        centrality_penalty ** w['centrality'] *
+        spectral_penalty ** w['spectral']
+    )
+    
+    # Add structural bonuses with adaptive weight
+    structural_score = base_score * (1.0 + w['structural'] * (mst_boost + mnn_boost))
+    
+    # Initial sparsification: keep top edges per node
+    heuristics = structural_score.copy()
+    np.fill_diagonal(heuristics, 0)
+    
+    # Adaptive number of edges to keep per node
+    base_keep = max(3, int(params['keep_ratio'] * n))
+    adaptive_keep = min(base_keep, n - 1)
+    
+    if adaptive_keep < n - 1:
+        # Keep top adaptive_keep edges for each node
+        for i in range(n):
+            row = heuristics[i].copy()
+            row[i] = -np.inf  # Exclude self
+            
+            if adaptive_keep < n - 1:
+                threshold_idx = n - adaptive_keep - 1
+                threshold = np.partition(row, threshold_idx)[threshold_idx]
+                row[row < threshold] = 0
+                
+                # Ensure at least 2 connections
+                if np.count_nonzero(row) < 2:
+                    top2_idx = np.argpartition(row, -2)[-2:]
+                    row[:] = 0
+                    row[top2_idx] = heuristics[i, top2_idx]
+            
+            heuristics[i] = row
+    
+    # ===== 9. LOCAL IMPROVEMENT POTENTIAL ASSESSMENT =====
+    # Estimate potential for 2-opt improvements
+    if n >= 10:
+        improvement_potential = np.zeros_like(heuristics)
+        
+        # For each edge (i,j), estimate if removing it could lead to improvement
+        for i in range(n):
+            # Find candidate edges that could replace (i,j) in a 2-opt move
+            for j in range(i+1, n):
+                if heuristics[i, j] > 0:
+                    # Estimate best alternative connection for i
+                    i_alt = np.argmax(heuristics[i])
+                    if i_alt == j:
+                        i_alt = np.argsort(heuristics[i])[-2]
+                    
+                    # Estimate best alternative connection for j
+                    j_alt = np.argmax(heuristics[j])
+                    if j_alt == i:
+                        j_alt = np.argsort(heuristics[j])[-2]
+                    
+                    # Estimate improvement from hypothetical 2-opt
+                    current_cost = distance_matrix[i, j] + distance_matrix[i_alt, j_alt]
+                    new_cost = distance_matrix[i, i_alt] + distance_matrix[j, j_alt]
+                    
+                    if new_cost < current_cost:
+                        improvement = (current_cost - new_cost) / (current_cost + epsilon)
+                        improvement_potential[i, j] = improvement_potential[j, i] = improvement
+        
+        # Boost edges with high improvement potential
+        if np.max(improvement_potential) > 0:
+            improvement_norm = improvement_potential / (np.max(improvement_potential) + epsilon)
+            heuristics *= (1.0 + 0.3 * improvement_norm)
+    
+    # ===== 10. FINAL REFINEMENT AND NORMALIZATION =====
+    # Symmetrize
+    heuristics = np.sqrt(heuristics * heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Remove very weak edges (bottom 15%)
+    non_zero_mask = heuristics > 0
+    if np.sum(non_zero_mask) > 10:
+        non_zero_vals = heuristics[non_zero_mask]
+        threshold = np.percentile(non_zero_vals, 15)
+        heuristics[heuristics < threshold] = 0
+    
+    # Row-wise normalization for probability interpretation
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    valid_rows = row_sums > epsilon
+    heuristics[valid_rows] /= row_sums[valid_rows]
+    heuristics[~valid_rows] = 1.0 / (n - 1)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Final smoothing
+    heuristics = 0.9 * heuristics + 0.1 * (1.0 / (n - 1))
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

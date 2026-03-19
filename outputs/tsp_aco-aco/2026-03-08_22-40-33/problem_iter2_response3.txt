@@ -1,0 +1,279 @@
+```json
+{
+    "algorithm_features": ["Adaptive MST Connectivity Bonus", "Density-Aware Regret Penalization", "K-NN Lookahead Heuristic", "Hybrid Edge Sparsification"]
+}
+```
+```python
+import numpy as np
+from typing import Optional, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray,
+                  base_regret: float = 1.5,
+                  mst_bonus_base: float = 2.0,
+                  k_nn: int = 3,
+                  temperature: float = 0.1,
+                  adaptive_sparsity: bool = True) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with adaptive components.
+    
+    Incorporates:
+    1. Adaptive MST bonus based on graph density
+    2. Density-aware regret penalization
+    3. K-nearest neighbor lookahead heuristic
+    4. Hybrid sparsification with simulated annealing threshold
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        base_regret: Base factor for regret-based penalty
+        mst_bonus_base: Base multiplicative bonus for MST edges
+        k_nn: Number of nearest neighbors to consider for lookahead
+        temperature: Controls smoothness of sparsification threshold
+        adaptive_sparsity: Whether to use density-adaptive sparsification
+    
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # 1. Base inverse distance with regularization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Compute graph density metric
+    density_metric = compute_graph_density(distance_matrix)
+    
+    # 3. Compute Minimum Spanning Tree with adaptive bonus
+    mst_mask, mst_bonus = compute_adaptive_mst(distance_matrix, density_metric, mst_bonus_base)
+    
+    # 4. K-NN lookahead heuristic
+    knn_scores = compute_knn_lookahead(distance_matrix, k_nn)
+    
+    # 5. Density-aware regret penalty
+    regret_matrix = compute_density_aware_regret(distance_matrix, density_metric, base_regret)
+    
+    # 6. Combine factors with adaptive weights
+    w_inv = 0.4 + 0.2 * (1 - density_metric)  # Higher weight for sparse graphs
+    w_knn = 0.3 + 0.2 * density_metric        # Higher weight for dense graphs
+    w_reg = 0.3                               # Fixed weight for regret
+    
+    combined = (w_inv * inv_dist + 
+                w_knn * knn_scores + 
+                w_reg * regret_matrix)
+    
+    # Apply MST bonus
+    combined[mst_mask] *= mst_bonus
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    # 7. Hybrid sparsification
+    if adaptive_sparsity:
+        combined = hybrid_sparsification(combined, mst_mask, density_metric, temperature)
+    
+    # 8. Normalize to [0,1]
+    max_val = np.max(combined)
+    if max_val > 0:
+        combined = combined / max_val
+    
+    return combined
+
+
+def compute_graph_density(distance_matrix: np.ndarray) -> float:
+    """Compute normalized graph density metric based on distance distribution."""
+    n = distance_matrix.shape[0]
+    
+    # Exclude diagonal and compute statistics
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    if len(distances) == 0:
+        return 0.5
+    
+    # Use coefficient of variation as density metric
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv = std_dist / (mean_dist + 1e-12)
+    
+    # Normalize to [0,1], lower CV = more uniform = denser
+    density = 1 - min(cv, 2.0) / 2.0  # Cap CV at 2.0 for stability
+    return np.clip(density, 0.1, 0.9)
+
+
+def compute_adaptive_mst(distance_matrix: np.ndarray, 
+                         density: float, 
+                         base_bonus: float) -> Tuple[np.ndarray, float]:
+    """Compute MST with adaptive bonus based on graph density."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    # Prim's algorithm
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    for _ in range(n):
+        u = -1
+        min_val = np.inf
+        for i in range(n):
+            if not visited[i] and min_edge[i] < min_val:
+                min_val = min_edge[i]
+                u = i
+        
+        if u == -1:
+            break
+            
+        visited[u] = True
+        
+        if parent[u] != -1:
+            mst_mask[u, parent[u]] = True
+            mst_mask[parent[u], u] = True
+        
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    # Adaptive bonus: higher for sparse graphs where MST is more critical
+    adaptive_bonus = base_bonus + (1 - density) * 0.5
+    
+    return mst_mask, adaptive_bonus
+
+
+def compute_knn_lookahead(distance_matrix: np.ndarray, k: int) -> np.ndarray:
+    """Compute k-nearest neighbor lookahead scores."""
+    n = distance_matrix.shape[0]
+    scores = np.zeros((n, n))
+    
+    # For each node, find k nearest neighbors
+    knn_distances = np.zeros((n, n))
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf  # Exclude self
+        knn_indices = np.argsort(dists)[:k]
+        if len(knn_indices) > 0:
+            knn_distances[i, knn_indices] = 1 / (dists[knn_indices] + 1e-12)
+    
+    # Symmetric score based on mutual proximity in k-NN sets
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] > 0:
+                # Mutual k-NN bonus
+                mutual_score = (knn_distances[i, j] + knn_distances[j, i]) / 2
+                
+                # Lookahead: consider paths i->k->j where k is in both k-NN sets
+                common_neighbors = np.where((knn_distances[i] > 0) & (knn_distances[j] > 0))[0]
+                if len(common_neighbors) > 0:
+                    path_scores = []
+                    for k_node in common_neighbors:
+                        if k_node != i and k_node != j:
+                            path_length = distance_matrix[i, k_node] + distance_matrix[k_node, j]
+                            path_scores.append(1 / (path_length + 1e-12))
+                    
+                    if path_scores:
+                        lookahead_bonus = np.mean(path_scores)
+                        mutual_score *= (1 + 0.3 * lookahead_bonus / (mutual_score + 1e-12))
+                
+                scores[i, j] = scores[j, i] = mutual_score
+    
+    return scores
+
+
+def compute_density_aware_regret(distance_matrix: np.ndarray, 
+                                 density: float, 
+                                 base_regret: float) -> np.ndarray:
+    """Compute regret penalty that adapts to graph density."""
+    n = distance_matrix.shape[0]
+    regret = np.ones((n, n))
+    
+    # Adaptive regret factor: stronger penalty for dense graphs
+    adaptive_regret = base_regret * (1 + 0.5 * density)
+    
+    for i in range(n):
+        # Get distances to all other nodes
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        other_indices = np.where(mask)[0]
+        
+        if len(other_indices) < 2:
+            continue
+            
+        dists = distance_matrix[i, other_indices]
+        sorted_idx = np.argsort(dists)
+        sorted_indices = other_indices[sorted_idx]
+        
+        # Compute penalties based on rank
+        best_dist = dists[sorted_idx[0]]
+        
+        for rank, j in enumerate(sorted_indices):
+            if rank == 0:
+                regret[i, j] = 1.0  # Best edge
+            else:
+                # Normalized distance ratio
+                dist_ratio = distance_matrix[i, j] / (best_dist + 1e-12)
+                
+                # Adaptive penalty: stronger for close alternatives in dense graphs
+                if density > 0.7 and rank < 5:  # In dense graphs, penalize close alternatives more
+                    penalty_factor = adaptive_regret * (1 + 0.5 * density)
+                else:
+                    penalty_factor = adaptive_regret
+                
+                # Exponential decay with rank and distance ratio
+                rank_penalty = np.exp(-rank / 3.0)
+                ratio_penalty = 1 / (1 + penalty_factor * (dist_ratio - 1))
+                
+                regret[i, j] = rank_penalty * ratio_penalty
+    
+    # Symmetrize
+    regret = np.sqrt(regret * regret.T)
+    
+    return regret
+
+
+def hybrid_sparsification(heuristics: np.ndarray, 
+                          mst_mask: np.ndarray, 
+                          density: float, 
+                          temperature: float) -> np.ndarray:
+    """Apply hybrid sparsification combining percentile and simulated annealing thresholds."""
+    n = heuristics.shape[0]
+    result = heuristics.copy()
+    
+    # Non-MST edges
+    non_mst_mask = ~mst_mask
+    np.fill_diagonal(non_mst_mask, False)
+    
+    non_mst_values = result[non_mst_mask]
+    if len(non_mst_values) == 0:
+        return result
+    
+    # Adaptive threshold based on density
+    if density > 0.7:  # Dense graph: more aggressive sparsification
+        base_percentile = 70
+        sa_threshold = np.percentile(non_mst_values, 60)
+    else:  # Sparse graph: conservative sparsification
+        base_percentile = 50
+        sa_threshold = np.percentile(non_mst_values, 40)
+    
+    # Simulated annealing inspired threshold adjustment
+    percentile_threshold = np.percentile(non_mst_values, base_percentile)
+    
+    # Combine thresholds with temperature smoothing
+    combined_threshold = (percentile_threshold + sa_threshold) / 2
+    
+    # Apply temperature-based softening
+    if temperature > 0:
+        # Soft threshold using sigmoid
+        soft_mask = non_mst_mask & (result < combined_threshold)
+        t_values = result[soft_mask]
+        if len(t_values) > 0:
+            # Sigmoid scaling based on distance from threshold
+            scaled = (t_values - combined_threshold) / (temperature + 1e-12)
+            soft_penalty = 1 / (1 + np.exp(-scaled))
+            result[soft_mask] = t_values * soft_penalty
+    else:
+        # Hard threshold
+        zero_mask = non_mst_mask & (result < combined_threshold)
+        result[zero_mask] = 0
+    
+    return result
+```

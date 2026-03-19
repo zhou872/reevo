@@ -1,0 +1,289 @@
+```json
+{
+    "algorithm_features": ["Graph Embedding", "Adaptive Weights", "Learning from Structure", "Top-K Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import cdist
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with graph embedding and structural learning.
+    
+    Key improvements:
+    1. Spectral graph embedding for global structure capture
+    2. Adaptive component weighting based on instance learning
+    3. Edge importance scoring from multiple perspectives
+    4. Efficient top-k sparsification with connectivity preservation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== 1. INSTANCE ANALYSIS & PARAMETER LEARNING ==========
+    # Analyze distance distribution for adaptive parameter tuning
+    distances_flat = distance_matrix[~np.eye(n, dtype=bool)].flatten()
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / dist_mean if dist_mean > 0 else 0
+    
+    # Compute sparsity pattern characteristics
+    nnz_ratio = np.sum(distance_matrix > 0) / (n * n)
+    
+    # Determine instance type and set adaptive parameters
+    if cv < 0.2:
+        # Uniform distances - emphasize global structure
+        embedding_weight = 0.35
+        local_weight = 0.25
+        mst_weight = 0.40
+        mst_boost = 1.8
+    elif cv < 0.8:
+        # Moderately varying - balanced approach
+        embedding_weight = 0.40
+        local_weight = 0.35
+        mst_weight = 0.25
+        mst_boost = 2.2
+    else:
+        # Highly clustered - emphasize local connections
+        embedding_weight = 0.30
+        local_weight = 0.45
+        mst_weight = 0.25
+        mst_boost = 2.5
+    
+    # Adjust for problem size
+    size_factor = min(1.0, n / 200.0)
+    if n < 20:
+        embedding_weight *= 0.8
+        local_weight *= 1.2
+    elif n > 100:
+        embedding_weight *= 1.2
+        local_weight *= 0.9
+    
+    # Normalize weights
+    total_weight = embedding_weight + local_weight + mst_weight
+    embedding_weight /= total_weight
+    local_weight /= total_weight
+    mst_weight /= total_weight
+    
+    # ========== 2. GRAPH EMBEDDING FOR GLOBAL STRUCTURE ==========
+    # Compute low-dimensional embedding using spectral methods
+    embedding_score = np.zeros_like(distance_matrix)
+    
+    if n > 2:
+        try:
+            # Normalize distances for embedding
+            eps = 1e-10
+            scaled_dist = distance_matrix / (np.max(distance_matrix) + eps)
+            
+            # Compute affinity matrix using Gaussian kernel
+            sigma = np.median(scaled_dist[scaled_dist > 0])
+            affinity = np.exp(-scaled_dist**2 / (2 * sigma**2 + eps))
+            np.fill_diagonal(affinity, 0)
+            
+            # Degree matrix
+            D = np.diag(np.sum(affinity, axis=1))
+            
+            # Compute normalized Laplacian eigenvectors (spectral embedding)
+            L = D - affinity
+            D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + eps))
+            L_norm = D_inv_sqrt @ L @ D_inv_sqrt
+            
+            # Compute eigenvectors (k = min(10, n-1))
+            k = min(10, n-1)
+            eigvals, eigvecs = np.linalg.eigh(L_norm)
+            
+            # Sort eigenvectors by eigenvalues (ascending)
+            sorted_idx = np.argsort(eigvals)
+            eigvecs = eigvecs[:, sorted_idx]
+            
+            # Skip first eigenvector (constant) and take next k
+            embedding = eigvecs[:, 1:min(k+1, n)]
+            
+            # Compute edge scores based on embedding similarity
+            if embedding.shape[1] > 0:
+                # Normalize embedding vectors
+                embedding_norm = embedding / (np.linalg.norm(embedding, axis=1, keepdims=True) + eps)
+                
+                # Cosine similarity in embedding space
+                embedding_sim = embedding_norm @ embedding_norm.T
+                
+                # Apply nonlinear transformation
+                embedding_score = np.exp(3 * (embedding_sim - 1))
+                np.fill_diagonal(embedding_score, 0)
+                
+        except np.linalg.LinAlgError:
+            # Fallback to distance-based similarity if eigendecomposition fails
+            embedding_score = np.exp(-distance_matrix / (dist_mean + eps))
+            np.fill_diagonal(embedding_score, 0)
+    
+    # ========== 3. LOCAL STRUCTURE COMPONENTS ==========
+    # Inverse distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + np.eye(n) * eps)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Adaptive k-nearest neighbors
+    k_local = max(2, min(8, n // 3))
+    local_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k_local)[:k_local]
+        local_mask[i, nn_indices] = True
+    
+    # Make symmetric and enhance mutual connections
+    local_mask = local_mask | local_mask.T
+    
+    # Local edge score combining distance and neighborhood
+    local_score = inv_dist.copy()
+    
+    # Boost edges within local neighborhoods
+    if cv > 0.5:  # For clustered instances
+        for i in range(n):
+            local_neighbors = np.where(local_mask[i])[0]
+            if len(local_neighbors) > 0:
+                # Compute local density factor
+                local_dists = distance_matrix[i, local_neighbors]
+                density = 1.0 / (np.mean(local_dists) + eps)
+                local_score[i, local_neighbors] *= (1.0 + 0.5 * np.tanh(density / dist_mean))
+    
+    # ========== 4. MINIMUM SPANNING TREE ==========
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Compute edge importance in MST
+    mst_score = np.zeros_like(distance_matrix)
+    mst_edges = np.argwhere(mst_mask)
+    
+    if len(mst_edges) > 0:
+        # Simple MST edge scoring based on degree in MST
+        mst_degrees = np.sum(mst_mask, axis=1)
+        for i, j in mst_edges:
+            if i != j:
+                # Edges connecting high-degree nodes in MST are more important
+                importance = (mst_degrees[i] + mst_degrees[j]) / (2 * (n - 1))
+                mst_score[i, j] = 0.3 + 0.7 * importance
+    
+    # ========== 5. ADAPTIVE COMBINATION ==========
+    # Normalize components
+    def safe_normalize(mat):
+        max_val = np.max(mat)
+        if max_val > 0:
+            return mat / max_val
+        return mat
+    
+    embedding_score_norm = safe_normalize(embedding_score)
+    local_score_norm = safe_normalize(local_score)
+    mst_score_norm = safe_normalize(mst_score)
+    
+    # Combine with learned weights
+    heuristic = (embedding_weight * embedding_score_norm +
+                local_weight * local_score_norm +
+                mst_weight * mst_score_norm)
+    
+    # Boost MST edges
+    heuristic[mst_mask] *= mst_boost
+    
+    # Additional boost for edges that are both in MST and local neighborhoods
+    mutual_mask = mst_mask & local_mask
+    heuristic[mutual_mask] *= 1.3
+    
+    # ========== 6. LEARNING-BASED ADJUSTMENT ==========
+    # Adjust based on instance characteristics learned during combination
+    if n > 10:
+        # Compute edge score variance to detect structure
+        edge_var = np.var(heuristic[heuristic > 0]) if np.any(heuristic > 0) else 0
+        
+        if edge_var < 0.01:  # Very uniform scores
+            # Boost inverse distance component
+            heuristic = 0.7 * heuristic + 0.3 * inv_dist / (np.max(inv_dist) + eps)
+        elif edge_var > 0.1 and cv > 0.5:  # High variance, clustered
+            # Strengthen high-scoring edges
+            high_mask = heuristic > np.percentile(heuristic[heuristic > 0], 75)
+            heuristic[high_mask] *= 1.2
+    
+    # ========== 7. EFFICIENT TOP-K SPARSIFICATION ==========
+    # Adaptive k based on instance characteristics
+    base_k = max(3, min(10, int(np.log2(n) * 2)))
+    if cv > 0.7:
+        k_sparse = base_k + 2  # Keep more edges for clustered instances
+    else:
+        k_sparse = base_k
+    
+    k_sparse = min(k_sparse, n - 1)
+    
+    sparsity_mask = np.zeros_like(heuristic, dtype=bool)
+    
+    # Always keep MST edges
+    sparsity_mask[mst_mask] = True
+    
+    # Keep top-k edges per node (excluding already selected MST edges)
+    for i in range(n):
+        node_scores = heuristic[i].copy()
+        node_scores[i] = -np.inf
+        node_scores[sparsity_mask[i]] = -np.inf
+        
+        # Select top remaining edges
+        remaining_slots = k_sparse - np.sum(sparsity_mask[i])
+        if remaining_slots > 0:
+            top_indices = np.argpartition(node_scores, -remaining_slots)[-remaining_slots:]
+            sparsity_mask[i, top_indices] = True
+    
+    # Ensure symmetry and connectivity
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Ensure minimum connectivity
+    min_conn = max(2, n // 15)
+    for i in range(n):
+        connections = np.sum(sparsity_mask[i])
+        if connections < min_conn:
+            needed = min_conn - connections
+            # Add nearest neighbors not already connected
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            distances[sparsity_mask[i]] = np.inf
+            closest = np.argsort(distances)[:needed]
+            sparsity_mask[i, closest] = True
+            sparsity_mask[closest, i] = True
+    
+    # Apply sparsification
+    heuristic = heuristic * sparsity_mask
+    
+    # ========== 8. FINAL REFINEMENT ==========
+    # Ensure diagonal is zero
+    np.fill_diagonal(heuristic, 0)
+    
+    # Symmetrize
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # Final normalization with robust scaling
+    non_zero = heuristic[heuristic > 0]
+    if len(non_zero) > 0:
+        q75 = np.percentile(non_zero, 75)
+        if q75 > 0:
+            heuristic = np.clip(heuristic / q75, 0, 1.5)
+    
+    # Smooth extreme values
+    heuristic = np.tanh(heuristic)
+    
+    # Final zeroing of diagonal
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

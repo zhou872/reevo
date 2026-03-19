@@ -1,0 +1,285 @@
+```json
+{
+    "algorithm_features": ["Lookahead Edge Potential Scoring", "Regret-based Competition Penalization", "Dynamic Density-aware Prioritization", "Multi-stage Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with lookahead edge potential scoring and
+    adaptive parameter tuning.
+    
+    Core innovations:
+    1. Lookahead Edge Potential: For each edge, evaluate the quality of
+       remaining connections available after its inclusion
+    2. Regret-based Competition Penalization: Penalize edges that face
+       strong competition from alternative connections at both endpoints
+    3. Dynamic Density-aware Prioritization: Adjust scoring based on local
+       cluster density with adaptive thresholds
+    4. Multi-stage Adaptive Sparsification: Progressive filtering with
+       connectivity preservation and degree balancing
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Matrix of edge heuristics scores (same shape as input)
+    """
+    
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # For trivial cases, return uniform scores
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    eps = 1e-12
+    
+    # ==================== STAGE 1: BASE SCORING ====================
+    
+    # 1.1 Dynamic power scaling for distance normalization
+    flat_distances = distance_matrix[np.triu_indices(n, k=1)]
+    if len(flat_distances) > 0:
+        distance_cv = np.std(flat_distances) / (np.mean(flat_distances) + eps)
+        # Higher power when distances are concentrated (low coefficient of variation)
+        power = 1.5 + 1.5 * np.exp(-distance_cv)
+    else:
+        power = 1.5
+    
+    # Base inverse distance with adaptive power
+    inv_dist_pow = (1 / (distance_matrix + eps)) ** power
+    np.fill_diagonal(inv_dist_pow, 0)
+    
+    # ==================== STAGE 2: REGRET-BASED COMPETITION ====================
+    
+    # 2.1 Compute competition strength for each edge
+    competition_matrix = np.ones_like(distance_matrix)
+    k_competition = min(4, n - 1)  # Number of alternative edges to consider
+    
+    if k_competition > 0:
+        for i in range(n):
+            # Get distances from node i, excluding self
+            dist_i = distance_matrix[i].copy()
+            dist_i[i] = np.inf
+            
+            # Sort distances to find top alternatives
+            sorted_indices = np.argsort(dist_i)
+            sorted_distances = dist_i[sorted_indices]
+            
+            # For each potential edge from i, compute competition score
+            for j in range(n):
+                if i != j:
+                    dist_ij = distance_matrix[i, j]
+                    
+                    # Find the best k alternative edges (excluding current edge if in top k)
+                    alt_distances = []
+                    for idx in range(k_competition + 1):
+                        if idx < len(sorted_indices):
+                            alt_idx = sorted_indices[idx]
+                            if alt_idx != j:
+                                alt_distances.append(sorted_distances[idx])
+                    
+                    if alt_distances:
+                        # Competition strength: how much better are the alternatives?
+                        best_alt = min(alt_distances)
+                        competition_strength = max(0, best_alt - dist_ij) / (best_alt + eps)
+                        
+                        # Penalty factor: edges with strong competition get lower scores
+                        # Use logistic function for smooth penalty
+                        penalty = 1.0 / (1.0 + np.exp(5.0 * competition_strength - 2.5))
+                        competition_matrix[i, j] *= penalty
+    
+    # Symmetrize competition matrix
+    competition_matrix = np.sqrt(competition_matrix * competition_matrix.T)
+    
+    # ==================== STAGE 3: LOOKAHEAD EDGE POTENTIAL ====================
+    
+    # 3.1 Evaluate quality of remaining connections after including each edge
+    lookahead_matrix = np.ones_like(distance_matrix)
+    k_lookahead = min(3, n - 2)  # Look ahead k steps
+    
+    if k_lookahead > 0 and n > 3:
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    # Consider nodes that would remain after including edge (i,j)
+                    remaining = [k for k in range(n) if k not in [i, j]]
+                    
+                    if len(remaining) >= k_lookahead:
+                        # Evaluate potential from node i's perspective
+                        dist_i_to_remaining = distance_matrix[i, remaining]
+                        i_potential = np.mean(np.partition(dist_i_to_remaining, k_lookahead)[:k_lookahead])
+                        
+                        # Evaluate potential from node j's perspective
+                        dist_j_to_remaining = distance_matrix[j, remaining]
+                        j_potential = np.mean(np.partition(dist_j_to_remaining, k_lookahead)[:k_lookahead])
+                        
+                        # Lookahead score: favor edges that leave good connection options
+                        avg_potential = (i_potential + j_potential) / 2
+                        current_dist = distance_matrix[i, j]
+                        
+                        # Score is ratio of current edge quality to future potential
+                        # Higher when current edge is relatively short compared to future options
+                        if avg_potential > eps:
+                            lookahead_score = current_dist / avg_potential
+                            # Transform to [0, 1] with sigmoid (lower lookahead_score is better)
+                            lookahead_matrix[i, j] = 1.0 / (1.0 + np.exp(2.0 * lookahead_score - 1.0))
+    
+    # Symmetrize lookahead matrix
+    lookahead_matrix = (lookahead_matrix + lookahead_matrix.T) / 2
+    
+    # ==================== STAGE 4: DENSITY-AWARE ADJUSTMENT ====================
+    
+    # 4.1 Compute local density metrics
+    density_factor = np.ones_like(distance_matrix)
+    k_density = min(6, n - 1)
+    
+    if k_density > 1:
+        # Precompute local densities for each node
+        local_densities = np.zeros(n)
+        for i in range(n):
+            dist_i = distance_matrix[i].copy()
+            dist_i[i] = np.inf
+            k_nearest = np.partition(dist_i, k_density)[:k_density]
+            local_densities[i] = 1.0 / (np.mean(k_nearest) + eps)
+        
+        # Normalize densities
+        if np.max(local_densities) > eps:
+            local_densities = local_densities / np.max(local_densities)
+        
+        # Adjust edge scores based on endpoint densities
+        for i in range(n):
+            for j in range(i + 1, n):
+                density_i = local_densities[i]
+                density_j = local_densities[j]
+                
+                # Bonus for edges within dense clusters
+                if density_i > 0.7 and density_j > 0.7:
+                    density_factor[i, j] = 1.3
+                    density_factor[j, i] = 1.3
+                # Moderate bonus for moderately dense connections
+                elif density_i > 0.5 and density_j > 0.5:
+                    density_factor[i, j] = 1.15
+                    density_factor[j, i] = 1.15
+                # Penalty for connecting sparse to very dense (often indicates outliers)
+                elif (density_i > 0.8 and density_j < 0.3) or (density_i < 0.3 and density_j > 0.8):
+                    density_factor[i, j] = 0.6
+                    density_factor[j, i] = 0.6
+    
+    # ==================== STAGE 5: COMBINE FACTORS ====================
+    
+    # 5.1 Degree-aware weighting
+    node_avg_dist = np.mean(distance_matrix, axis=1)
+    node_weights = np.ones(n)
+    if np.min(node_avg_dist) > eps:
+        node_weights = np.median(node_avg_dist) / (node_avg_dist + eps)
+        # Normalize to reasonable range
+        node_weights = np.clip(node_weights, 0.7, 1.3)
+    
+    degree_matrix = np.outer(node_weights, node_weights)
+    
+    # 5.2 Combine all factors
+    base_heuristic = inv_dist_pow * competition_matrix * lookahead_matrix * density_factor * degree_matrix
+    
+    # Ensure symmetry
+    base_heuristic = (base_heuristic + base_heuristic.T) / 2
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # ==================== STAGE 6: ADAPTIVE SPARSIFICATION ====================
+    
+    # 6.1 Initial sparsification based on nearest neighbors
+    k_nn_initial = min(max(3, n // 6), n - 1)
+    initial_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        row_scores = base_heuristic[i].copy()
+        row_scores[i] = -np.inf
+        top_indices = np.argpartition(row_scores, -k_nn_initial)[-k_nn_initial:]
+        initial_mask[i, top_indices] = True
+    
+    # Make symmetric
+    initial_mask = initial_mask | initial_mask.T
+    
+    # 6.2 Distance-based filtering
+    if len(flat_distances) > 0:
+        # Use adaptive quantile based on problem size
+        quantile = 0.4 + 0.3 * np.exp(-n / 20.0)  # More aggressive for larger n
+        dist_threshold = np.quantile(flat_distances, quantile)
+        dist_mask = distance_matrix <= dist_threshold
+        np.fill_diagonal(dist_mask, False)
+    else:
+        dist_mask = np.ones_like(distance_matrix, dtype=bool)
+        np.fill_diagonal(dist_mask, False)
+    
+    # Combine masks
+    combined_mask = initial_mask & dist_mask
+    
+    # Apply mask to heuristic
+    heuristic_masked = base_heuristic * combined_mask
+    
+    # 6.3 Ensure minimum connectivity
+    min_connections = min(2, n - 1)
+    for i in range(n):
+        current_connections = np.sum(heuristic_masked[i] > 0)
+        if current_connections < min_connections:
+            # Find strongest missing edges
+            candidate_scores = base_heuristic[i].copy()
+            candidate_scores[i] = -np.inf
+            candidate_scores[heuristic_masked[i] > 0] = -np.inf
+            
+            if np.any(candidate_scores > -np.inf):
+                num_needed = min_connections - current_connections
+                top_candidates = np.argsort(candidate_scores)[-num_needed:]
+                for j in top_candidates:
+                    if candidate_scores[j] > -np.inf:
+                        heuristic_masked[i, j] = candidate_scores[j]
+                        heuristic_masked[j, i] = candidate_scores[j]
+    
+    # ==================== STAGE 7: FINAL PROCESSING ====================
+    
+    # Ensure symmetry
+    final_heuristic = (heuristic_masked + heuristic_masked.T) / 2
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(final_heuristic)
+    if max_val > eps:
+        final_heuristic = final_heuristic / max_val
+    
+    # Apply soft threshold to remove very weak edges
+    threshold = 0.02 + 0.03 * np.exp(-n / 15.0)  # Adaptive threshold
+    final_heuristic[final_heuristic < threshold] = 0
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(final_heuristic, 0)
+    
+    return final_heuristic
+
+
+# Example usage and validation
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_cities = 15
+    coords = np.random.rand(n_cities, 2) * 100
+    
+    # Create distance matrix
+    distances = squareform(pdist(coords, 'euclidean'))
+    
+    # Compute heuristics
+    h_matrix = heuristics_v2(distances)
+    
+    print("Distance matrix (first 5x5):")
+    print(distances[:5, :5])
+    print("\nHeuristics matrix (first 5x5):")
+    print(h_matrix[:5, :5])
+    print(f"\nSparsity: {(h_matrix == 0).sum() / h_matrix.size:.1%}")
+    print(f"Non-zero entries: {(h_matrix != 0).sum()}")
+    print(f"Average degree: {np.sum(h_matrix > 0) / n_cities:.1f}")
+```

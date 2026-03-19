@@ -1,0 +1,191 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Lookahead Penalty", "Regret-based Edge Scoring", "Adaptive Neighborhood Clustering", "Symmetric Sparsification"]
+}
+```
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection with:
+    1. Efficient multi-hop lookahead (2-hop and 3-hop)
+    2. Regret-based scoring for missed opportunities
+    3. Adaptive nearest neighbor thresholds via spatial clustering
+    4. Symmetric sparsification for computational efficiency
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # 1. Base inverse distance with numerical stability
+    eps = 1e-12
+    inv_dist = 1 / (distance_matrix + eps)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Adaptive neighborhood clustering
+    # Compute local density for each node
+    base_k = max(3, min(15, n // 10))
+    local_density = np.zeros(n)
+    neighbor_counts = np.zeros(n, dtype=int)
+    
+    for i in range(n):
+        sorted_dists = np.sort(distance_matrix[i])
+        # Use base_k+1 to exclude self
+        local_density[i] = np.mean(sorted_dists[1:base_k+2])
+        # Adaptive threshold: nodes within 1.5x local density radius
+        neighbor_counts[i] = np.sum(distance_matrix[i] <= 1.5 * local_density[i]) - 1
+    
+    # 3. Efficient multi-hop lookahead penalty
+    # Precompute sorted neighbors for each node
+    sorted_neighbors = np.argsort(distance_matrix, axis=1)
+    
+    # Cache for 2-hop distances
+    two_hop_cache = {}
+    
+    def get_two_hop_dist(i, j):
+        """Compute minimum 2-hop distance between i and j"""
+        if (i, j) in two_hop_cache:
+            return two_hop_cache[(i, j)]
+        
+        min_dist = float('inf')
+        # Consider top k neighbors for intermediate nodes
+        k_lookahead = min(base_k, n-2)
+        for inter in sorted_neighbors[i, 1:k_lookahead+1]:
+            if inter == j:
+                continue
+            two_hop = distance_matrix[i, inter] + distance_matrix[inter, j]
+            min_dist = min(min_dist, two_hop)
+        
+        two_hop_cache[(i, j)] = min_dist
+        two_hop_cache[(j, i)] = min_dist
+        return min_dist
+    
+    # Compute penalty matrix
+    penalty = np.ones((n, n))
+    
+    for i in range(n):
+        for idx_j, j in enumerate(sorted_neighbors[i, 1:]):
+            # Consider more neighbors for dense regions
+            max_neighbors = min(neighbor_counts[i] + 5, n-1)
+            if idx_j >= max_neighbors:
+                break
+            
+            if i == j:
+                continue
+                
+            direct = distance_matrix[i, j]
+            
+            # 2-hop penalty
+            two_hop_min = get_two_hop_dist(i, j)
+            if two_hop_min < 0.85 * direct:
+                penalty[i, j] = 0.4
+            elif two_hop_min < 0.95 * direct:
+                penalty[i, j] = 0.7
+            
+            # 3-hop penalty (efficient approximation)
+            if penalty[i, j] > 0.7:  # Only check if not already heavily penalized
+                # Consider two intermediate nodes from top neighbors
+                k_limit = min(5, n-3)
+                for k in sorted_neighbors[i, 1:k_limit+1]:
+                    if k == j:
+                        continue
+                    three_hop_min = float('inf')
+                    # Second intermediate from k's neighbors
+                    for l in sorted_neighbors[k, 1:k_limit+1]:
+                        if l == i or l == j:
+                            continue
+                        three_hop = (distance_matrix[i, k] + 
+                                   distance_matrix[k, l] + 
+                                   distance_matrix[l, j])
+                        three_hop_min = min(three_hop_min, three_hop)
+                    
+                    if three_hop_min < 0.8 * direct:
+                        penalty[i, j] = min(penalty[i, j], 0.3)
+                        break
+                    elif three_hop_min < 0.9 * direct:
+                        penalty[i, j] = min(penalty[i, j], 0.6)
+    
+    np.fill_diagonal(penalty, 0)
+    
+    # 4. Regret-based scoring
+    regret_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get sorted distances excluding self
+        sorted_dists = np.sort(distance_matrix[i])
+        valid_dists = sorted_dists[sorted_dists > 0]
+        
+        if len(valid_dists) < 2:
+            continue
+            
+        # Compute regret as difference to next best alternative
+        for j in range(n):
+            if i == j:
+                continue
+                
+            dist_ij = distance_matrix[i, j]
+            # Find closest alternative distance (minimum excluding j)
+            alt_dist = float('inf')
+            for k in range(n):
+                if k == i or k == j:
+                    continue
+                alt_dist = min(alt_dist, distance_matrix[i, k])
+            
+            if alt_dist < float('inf'):
+                # Regret score: higher when direct edge is much better than alternatives
+                regret = (alt_dist - dist_ij) / (alt_dist + eps)
+                regret_matrix[i, j] = max(0, regret)  # Clip negative regrets
+    
+    # Symmetrize regret
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # 5. MST prior (preserve globally optimal structure)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 6. Combine factors
+    heuristics = inv_dist * penalty
+    
+    # Boost edges with high regret
+    regret_boost = 1.0 + 2.0 * regret_matrix
+    heuristics *= regret_boost
+    
+    # Bonus for MST edges
+    heuristics[mst_mask] *= 1.5
+    
+    # 7. Adaptive sparsification
+    sparsified = np.zeros_like(heuristics)
+    
+    for i in range(n):
+        # Keep top edges: more in dense regions, fewer in sparse
+        keep_count = min(max(5, neighbor_counts[i] // 2), n // 3)
+        top_indices = np.argpartition(heuristics[i], -keep_count)[-keep_count:]
+        sparsified[i, top_indices] = heuristics[i, top_indices]
+    
+    # Ensure symmetric connectivity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Add minimal connections for isolated nodes
+    for i in range(n):
+        if np.count_nonzero(sparsified[i]) < 3:
+            # Connect to nearest neighbors
+            sorted_idx = np.argsort(distance_matrix[i])
+            added = 0
+            for j in sorted_idx:
+                if j != i and sparsified[i, j] == 0:
+                    sparsified[i, j] = inv_dist[i, j]
+                    sparsified[j, i] = inv_dist[i, j]
+                    added += 1
+                    if added >= 3:
+                        break
+    
+    # Normalize for consistency
+    max_val = np.max(sparsified)
+    if max_val > eps:
+        sparsified = sparsified / max_val
+    
+    np.fill_diagonal(sparsified, 0)
+    return sparsified
+```

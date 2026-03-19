@@ -1,0 +1,184 @@
+```json
+{
+    "algorithm_features": ["Vectorized Computation", "Adaptive Weighting", "Graph-Theoretic Measures", "Multi-Criteria Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection using vectorized operations,
+    adaptive weighting, and graph-theoretic measures.
+    
+    Returns a sparsified matrix where unpromising edges are set to zero,
+    with higher values indicating more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # For trivial cases, return simple reciprocal
+        result = np.divide(1, distance_matrix, where=distance_matrix != 0)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # Avoid division by zero
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # ==================== 1. CORE FACTORS (VECTORIZED) ====================
+    
+    # 1a. Reciprocal distance (fundamental TSP heuristic)
+    inv_dist = 1.0 / safe_dist
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 1b. Nearest neighbor overlap (vectorized)
+    k = min(5, n - 1)
+    # Get indices of k nearest neighbors for each node (excluding self)
+    nearest_indices = np.argpartition(safe_dist, k+1, axis=1)[:, :k+1]
+    # Create binary mask for nearest neighbors
+    row_indices = np.repeat(np.arange(n), k+1)
+    col_indices = nearest_indices.ravel()
+    # Exclude self from the mask
+    mask_self = row_indices != col_indices
+    row_indices = row_indices[mask_self]
+    col_indices = col_indices[mask_self]
+    
+    # Create sparse binary matrix and compute overlap
+    nn_binary = np.zeros((n, n))
+    nn_binary[row_indices, col_indices] = 1
+    nn_overlap = nn_binary @ nn_binary.T / k
+    
+    # 1c. Triangle inequality score (vectorized)
+    # Compute alternative paths through all third nodes
+    # Using broadcasting: d(i,k) + d(k,j) for all i,j,k
+    alt_paths = safe_dist[:, :, np.newaxis] + safe_dist[np.newaxis, :, :]
+    # Direct distances reshaped for broadcasting
+    direct_dists = safe_dist[:, :, np.newaxis]
+    # Ratios of direct to alternative paths
+    ratios = np.divide(direct_dists, alt_paths, where=alt_paths > 0)
+    # For each edge (i,j), take median over all k ≠ i,j
+    mask_valid = ~np.eye(n, dtype=bool)[:, :, np.newaxis] & \
+                 ~np.eye(n, dtype=bool)[np.newaxis, :, :] & \
+                 ~np.equal.outer(np.arange(n), np.arange(n))[:, :, np.newaxis]
+    triangle_scores = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                valid_ratios = ratios[i, j, mask_valid[i, j]]
+                if len(valid_ratios) > 0:
+                    triangle_scores[i, j] = np.median(valid_ratios)
+    
+    # ==================== 2. GRAPH-THEORETIC MEASURES ====================
+    
+    # 2a. Minimum Spanning Tree importance
+    mst = minimum_spanning_tree(csr_matrix(distance_matrix))
+    mst_importance = (mst.toarray() != 0).astype(float)
+    
+    # 2b. Betweenness centrality approximation (using random walks)
+    # Simplified version: edges connecting nodes with many shortest paths
+    centrality = 1.0 / (distance_matrix.mean(axis=1) + 1e-10)
+    centrality = centrality / centrality.max()
+    betweenness_approx = np.outer(centrality, centrality)
+    
+    # ==================== 3. ADAPTIVE WEIGHTING ====================
+    
+    # Determine problem characteristics
+    dist_mean = distance_matrix.mean()
+    dist_std = distance_matrix.std()
+    variability = dist_std / (dist_mean + 1e-10)
+    
+    # Base weights that adapt to problem characteristics
+    if variability > 1.5:
+        # High variability: emphasize distance-based factors
+        weights = np.array([0.35, 0.20, 0.15, 0.15, 0.15])
+    elif variability < 0.5:
+        # Low variability: emphasize structural factors
+        weights = np.array([0.20, 0.25, 0.20, 0.20, 0.15])
+    else:
+        # Medium variability: balanced approach
+        weights = np.array([0.30, 0.25, 0.15, 0.15, 0.15])
+    
+    # Adjust weights based on problem size
+    size_factor = min(1.0, n / 50)  # Normalize by reference size of 50
+    weights = weights * (0.8 + 0.4 * size_factor)  # Scale weights
+    weights = weights / weights.sum()  # Renormalize
+    
+    # ==================== 4. COMBINE FACTORS ====================
+    
+    # Normalize each factor to [0, 1]
+    factors = []
+    factor_list = [inv_dist, nn_overlap, triangle_scores, mst_importance, betweenness_approx]
+    
+    for factor in factor_list:
+        f_max = factor.max()
+        if f_max > 0:
+            factors.append(factor / f_max)
+        else:
+            factors.append(factor)
+    
+    # Weighted combination
+    combined = np.zeros_like(distance_matrix)
+    for w, f in zip(weights, factors):
+        combined += w * f
+    
+    # ==================== 5. INTELLIGENT SPARSIFICATION ====================
+    
+    # Multi-criteria ranking approach
+    n_edges_to_keep = min(n * (n - 1) // 4, 5 * n)  # Adaptive edge count
+    
+    # Rank edges by each factor
+    rankings = []
+    for factor in factor_list:
+        # Flatten upper triangle excluding diagonal
+        triu_indices = np.triu_indices_from(factor, k=1)
+        values = factor[triu_indices]
+        if len(values) > 0:
+            # Assign ranks (higher values get higher ranks)
+            ranks = np.zeros(len(values))
+            sorted_indices = np.argsort(values)[::-1]  # Descending
+            ranks[sorted_indices] = np.arange(len(values))
+            rankings.append(ranks)
+    
+    if rankings:
+        # Average ranks across factors
+        avg_ranks = np.mean(rankings, axis=0)
+        
+        # Select top edges based on average rank
+        threshold_rank = np.sort(avg_ranks)[min(len(avg_ranks) - 1, n_edges_to_keep)]
+        mask = np.zeros_like(distance_matrix, dtype=bool)
+        
+        # Create mask for selected edges
+        selected_indices = np.where(avg_ranks <= threshold_rank)[0]
+        mask[triu_indices[0][selected_indices], triu_indices[1][selected_indices]] = True
+        mask = mask | mask.T  # Make symmetric
+        
+        # Ensure minimum connectivity: each node connects to at least 2 others
+        for i in range(n):
+            if mask[i].sum() < 2:
+                # Add best missing connections for this node
+                node_scores = combined[i].copy()
+                node_scores[mask[i]] = -np.inf  # Mask already selected
+                node_scores[i] = -np.inf  # Exclude self
+                top_indices = np.argsort(node_scores)[-2:]
+                mask[i, top_indices] = True
+                mask[top_indices, i] = True
+    else:
+        # Fallback: keep edges above median score
+        mask = combined > np.median(combined[combined > 0])
+    
+    # Apply sparsity mask
+    result = combined * mask
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(result, 0)
+    
+    # Normalize final result
+    max_val = result.max()
+    if max_val > 0:
+        result = result / max_val
+    
+    return result
+```

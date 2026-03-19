@@ -1,0 +1,285 @@
+```json
+{
+    "algorithm_features": ["Kernelized Distance Embedding", "Adaptive Regret Thresholds", "Multi-scale Candidate Selection", "Non-linear Score Fusion"]
+}
+```
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with kernel-based embeddings, adaptive thresholds,
+    and multi-scale analysis for improved edge prioritization.
+    
+    Key Innovations:
+    1. Kernelized distance embeddings with adaptive bandwidth
+    2. Dynamic regret computation with context-aware thresholds
+    3. Multi-scale candidate selection using geometric progression
+    4. Non-linear score fusion with instance-specific blending
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. INSTANCE CHARACTERIZATION ====================
+    # Extract distance statistics for adaptive parameter tuning
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    
+    # Compute key statistics
+    p10, p25, p50, p75, p90 = np.percentile(distances, [10, 25, 50, 75, 90])
+    median_dist = p50
+    iqr_dist = p75 - p25
+    dist_range = p90 - p10
+    
+    # Adaptive scaling factors
+    scale_factor = max(median_dist, 1e-10)
+    complexity_factor = min(1.0, max(0.1, iqr_dist / (scale_factor + 1e-10)))
+    size_factor = min(1.0, np.log10(n) / 2)  # Scale with log10(n)
+    
+    # ==================== 2. KERNELIZED DISTANCE EMBEDDING ====================
+    def compute_kernel_embedding() -> np.ndarray:
+        """Create non-linear embedding using adaptive kernel similarity"""
+        # Adaptive kernel bandwidth based on distance distribution
+        bandwidth = scale_factor * (0.5 + 0.5 * complexity_factor)
+        
+        # Gaussian kernel transformation
+        kernel_sim = np.exp(-distance_matrix**2 / (2 * bandwidth**2))
+        np.fill_diagonal(kernel_sim, 0)
+        
+        # Adjust for connectivity
+        row_sums = kernel_sim.sum(axis=1, keepdims=True)
+        normalized_kernel = kernel_sim / (row_sums + 1e-10)
+        
+        # Compute effective rank of kernel matrix
+        eigvals = np.linalg.eigvalsh(kernel_sim)
+        eigvals = eigvals[eigvals > 1e-10]
+        effective_dim = min(len(eigvals), max(3, int(np.sqrt(n))))
+        
+        if n >= 4 and effective_dim >= 2:
+            # Compute eigenvectors for embedding
+            _, eigvecs = np.linalg.eigh(kernel_sim)
+            
+            # Select eigenvectors corresponding to largest eigenvalues
+            embedding = eigvecs[:, -effective_dim:]
+            
+            # Compute embedding-based similarity
+            embedding_dist = squareform(pdist(embedding, 'euclidean'))
+            embedding_sim = np.exp(-embedding_dist / (np.median(embedding_dist) + 1e-10))
+            np.fill_diagonal(embedding_sim, 0)
+            
+            # Blend kernel and embedding similarities
+            blend_alpha = 0.3 + 0.4 * complexity_factor
+            combined_embedding = (1 - blend_alpha) * normalized_kernel + blend_alpha * embedding_sim
+        else:
+            combined_embedding = normalized_kernel
+        
+        return combined_embedding
+    
+    embedding_sim = compute_kernel_embedding()
+    
+    # ==================== 3. ADAPTIVE REGRET COMPUTATION ====================
+    def compute_context_aware_regret() -> np.ndarray:
+        """Compute regret scores with adaptive neighborhood and thresholds"""
+        regret_scores = np.ones_like(distance_matrix)
+        
+        if n <= 2:
+            return regret_scores
+        
+        # Adaptive neighborhood size based on problem complexity
+        base_neighbors = min(max(3, int(np.sqrt(n))), 8)
+        neighbor_factor = 1.0 + 0.5 * complexity_factor
+        k_neighbors = min(int(base_neighbors * neighbor_factor), n - 1)
+        
+        # Precompute nearest neighbors for each node
+        neighbor_indices = np.zeros((n, k_neighbors), dtype=int)
+        neighbor_dists = np.zeros((n, k_neighbors))
+        
+        for i in range(n):
+            row_dists = distance_matrix[i].copy()
+            row_dists[i] = np.inf
+            if n > k_neighbors:
+                partition_idx = np.argpartition(row_dists, k_neighbors)[:k_neighbors]
+                sorted_idx = partition_idx[np.argsort(row_dists[partition_idx])]
+                neighbor_indices[i] = sorted_idx
+                neighbor_dists[i] = row_dists[sorted_idx]
+            else:
+                valid_mask = np.arange(n) != i
+                neighbor_indices[i, :sum(valid_mask)] = np.where(valid_mask)[0]
+                neighbor_dists[i, :sum(valid_mask)] = row_dists[valid_mask]
+        
+        # Dynamic regret thresholds
+        regret_threshold = p75  # Use 75th percentile as baseline
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best alternative through neighbors
+                best_alternative = np.inf
+                for k_idx in range(k_neighbors):
+                    k = neighbor_indices[i, k_idx]
+                    if k == j:
+                        continue
+                    
+                    # Two-step alternative path
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alternative = min(best_alternative, alt_cost)
+                
+                if best_alternative < np.inf:
+                    # Compute regret with adaptive normalization
+                    regret = max(best_alternative - direct_cost, 1e-10)
+                    
+                    # Normalize using local context
+                    local_scale = min(neighbor_dists[i, 0], regret_threshold)
+                    norm_regret = regret / (local_scale + 1e-10)
+                    
+                    # Non-linear transformation with adaptive sensitivity
+                    sensitivity = 0.8 + 0.4 * complexity_factor
+                    regret_scores[i, j] = 1.0 / (1.0 + norm_regret * sensitivity)
+        
+        # Symmetrize using maximum (conservative approach)
+        regret_scores = np.maximum(regret_scores, regret_scores.T)
+        
+        return regret_scores
+    
+    regret_scores = compute_context_aware_regret()
+    
+    # ==================== 4. BASE DISTANCE TRANSFORMATION ====================
+    # Exponential decay with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_scores = np.exp(-distance_matrix / (scale_factor * (0.7 + 0.3 * complexity_factor)))
+    np.fill_diagonal(base_scores, 0)
+    
+    # Normalize base scores
+    if np.max(base_scores) > 0:
+        base_scores = base_scores / np.max(base_scores)
+    
+    # ==================== 5. MST-BASED STRUCTURAL SCORING ====================
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Boost MST edges but with diminishing returns for large n
+    mst_boost = 0.2 + 0.3 * (1 - size_factor)  # More boost for smaller instances
+    mst_scores = np.zeros_like(distance_matrix)
+    mst_scores[mst_mask] = mst_boost
+    
+    # ==================== 6. NON-LINEAR SCORE FUSION ====================
+    def fuse_scores_nonlinear() -> np.ndarray:
+        """Blend components using instance-adaptive weights"""
+        # Compute instance-specific weights
+        w_embedding = 0.3 + 0.2 * complexity_factor  # Higher for complex instances
+        w_regret = 0.25 + 0.15 * (1 - complexity_factor)  # Balanced
+        w_base = 0.25
+        w_mst = 0.2 + 0.1 * size_factor  # Higher for larger instances
+        
+        # Normalize weights
+        total = w_embedding + w_regret + w_base + w_mst
+        w_embedding /= total
+        w_regret /= total
+        w_base /= total
+        w_mst /= total
+        
+        # Non-linear fusion using weighted product
+        combined = (
+            embedding_sim ** w_embedding *
+            regret_scores ** w_regret *
+            base_scores ** w_base *
+            (1 + mst_scores) ** w_mst
+        )
+        
+        # Apply softmax per row with adaptive temperature
+        temperature = 0.1 + 0.9 * (1 - complexity_factor)
+        prob_matrix = np.zeros_like(combined)
+        
+        for i in range(n):
+            row = combined[i].copy()
+            row[i] = -np.inf
+            
+            # Temperature-scaled softmax
+            exp_row = np.exp(row / temperature)
+            row_sum = np.sum(exp_row)
+            
+            if row_sum > 0:
+                prob_matrix[i] = exp_row / row_sum
+            prob_matrix[i, i] = 0
+        
+        return prob_matrix
+    
+    fused_scores = fuse_scores_nonlinear()
+    
+    # ==================== 7. MULTI-SCALE CANDIDATE SELECTION ====================
+    def multi_scale_selection(scores: np.ndarray) -> np.ndarray:
+        """Select candidates at multiple scales for robustness"""
+        selected_scores = np.zeros_like(scores)
+        
+        for i in range(n):
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            
+            # Determine selection thresholds at multiple scales
+            if n <= 3:
+                thresholds = [np.max(row_scores) - 1e-10]
+            else:
+                # Three-scale selection: aggressive, balanced, conservative
+                max_score = np.max(row_scores)
+                min_score = np.min(row_scores[row_scores > -np.inf])
+                
+                # Percentile-based thresholds
+                q70 = np.percentile(row_scores, 70)
+                q40 = np.percentile(row_scores, 40)
+                
+                thresholds = [max_score - 1e-10, q70, q40]
+            
+            # Combine selections from all thresholds
+            selection_mask = np.zeros(n, dtype=bool)
+            for threshold in thresholds:
+                selection_mask = selection_mask | (row_scores >= threshold)
+            
+            # Always include MST edges
+            selection_mask = selection_mask | mst_mask[i]
+            
+            # Apply selection
+            selection_mask[i] = False
+            selected_scores[i][selection_mask] = scores[i][selection_mask]
+        
+        return selected_scores
+    
+    selected_scores = multi_scale_selection(fused_scores)
+    
+    # ==================== 8. FINAL REFINEMENT ====================
+    # Symmetrize using geometric mean for balanced influence
+    final_scores = np.sqrt(selected_scores * selected_scores.T)
+    
+    # Ensure MST edges have minimum presence
+    min_mst_score = 0.1 * (1 + size_factor)
+    final_scores[mst_mask] = np.maximum(final_scores[mst_mask], min_mst_score)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    # Apply non-linear compression for better discrimination
+    final_scores = np.tanh(final_scores * 3)  # S-shaped transformation
+    
+    # Zero diagonal
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

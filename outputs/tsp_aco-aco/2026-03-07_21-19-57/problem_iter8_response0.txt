@@ -1,0 +1,268 @@
+```json
+{
+    "algorithm_features": ["Adaptive Entropy Weighting", "Local Clustering Coefficient", "Multiplicative Component Fusion", "Dynamic Distribution-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with:
+    1. Adaptive entropy-based scaling for distance distributions
+    2. Local clustering coefficient for structural analysis
+    3. Multiplicative fusion of diverse heuristic components
+    4. Distribution-aware sparsification using skewness and kurtosis
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions (0 = discouraged edge)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # 1. ADAPTIVE PARAMETERS FROM DISTRIBUTION ANALYSIS
+    # Compute higher-order statistics of distances
+    triu_distances = distance_matrix[np.triu_indices(n, 1)]
+    avg_dist = np.mean(triu_distances)
+    std_dist = np.std(triu_distances)
+    cv = std_dist / (avg_dist + 1e-8)
+    
+    # Skewness and kurtosis for distribution shape
+    skewness = np.mean((triu_distances - avg_dist) ** 3) / (std_dist ** 3 + 1e-8)
+    kurtosis = np.mean((triu_distances - avg_dist) ** 4) / (std_dist ** 4 + 1e-8) - 3
+    
+    # Adaptive scaling based on distribution
+    scale_factor = np.log(n + 5) / np.log(25)  # Smooth scaling
+    decay_base = 1.5 + 0.5 * np.tanh(skewness)  # Skewness-adaptive decay
+    decay_factor = decay_base * scale_factor
+    
+    # Adaptive neighborhood size
+    k = max(3, int((0.12 + 0.08 * np.tanh(-kurtosis)) * n))  # Kurtosis influences connectivity
+    
+    # 2. COMPUTE ENHANCED COMPONENTS
+    
+    # 2.1 Rank-based incentive with entropy-weighted decay
+    rank_incentive = np.ones((n, n))
+    best_edges = {}
+    regret_gaps = {}
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Compute entropy of distances for adaptive weighting
+        dist_probs = (1 / (distances + 1e-8)) / np.sum(1 / (distances + 1e-8))
+        node_entropy = entropy(dist_probs[dist_probs > 0])
+        entropy_weight = 1.0 + 0.5 * np.tanh(node_entropy - 2.0)  # Scale 1.0-1.5
+        
+        sorted_indices = np.argsort(distances)
+        sorted_distances = distances[sorted_indices]
+        
+        # Store for lookahead
+        best_edges[i] = sorted_indices[0]
+        if len(sorted_distances) > 1:
+            regret_gaps[i] = sorted_distances[1] - sorted_distances[0]
+        else:
+            regret_gaps[i] = 0
+        
+        for rank, j in enumerate(sorted_indices):
+            if i == j:
+                continue
+            if rank == 0:
+                rank_incentive[i, j] = 1.5 * entropy_weight
+            else:
+                # Exponential decay with entropy-modulated rate
+                decay_rate = decay_factor * (1.0 + 0.2 * node_entropy)
+                rank_incentive[i, j] = np.exp(-decay_rate * rank / n)
+    
+    # 2.2 Local clustering coefficient
+    clustering_coef = np.zeros(n)
+    for i in range(n):
+        # Find k nearest neighbors
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, min(k, n-2))[:min(k, n-1)]
+        
+        if len(nn_indices) >= 2:
+            # Create adjacency matrix among neighbors (based on being in each other's NN)
+            neighbor_mask = np.zeros((len(nn_indices), len(nn_indices)), dtype=bool)
+            for idx_a, node_a in enumerate(nn_indices):
+                dists_a = distance_matrix[node_a, :].copy()
+                dists_a[node_a] = np.inf
+                top_k_a = np.argpartition(dists_a, min(k, n-2))[:min(k, n-1)]
+                
+                for idx_b, node_b in enumerate(nn_indices):
+                    if idx_a != idx_b and node_b in top_k_a:
+                        neighbor_mask[idx_a, idx_b] = True
+            
+            # Compute clustering coefficient for this node's neighborhood
+            tri_count = 0
+            for idx_a in range(len(nn_indices)):
+                for idx_b in range(idx_a + 1, len(nn_indices)):
+                    for idx_c in range(idx_b + 1, len(nn_indices)):
+                        if (neighbor_mask[idx_a, idx_b] and 
+                            neighbor_mask[idx_b, idx_c] and 
+                            neighbor_mask[idx_c, idx_a]):
+                            tri_count += 1
+            
+            max_triangles = len(nn_indices) * (len(nn_indices) - 1) * (len(nn_indices) - 2) / 6
+            clustering_coef[i] = tri_count / (max_triangles + 1e-8)
+    
+    # Normalize clustering coefficients
+    if np.max(clustering_coef) > 0:
+        clustering_coef = clustering_coef / np.max(clustering_coef)
+    
+    clustering_bonus = np.ones((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Higher bonus if both nodes have high clustering (dense regions)
+                avg_cluster = (clustering_coef[i] + clustering_coef[j]) / 2
+                clustering_bonus[i, j] = 1.0 + 0.6 * avg_cluster
+    
+    # 2.3 Density similarity with entropy adjustment
+    local_density = np.zeros(n)
+    density_entropy = np.zeros(n)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        nearest_dists = np.partition(distances, min(k, n-2))[:min(k+1, n)]
+        nearest_dists = nearest_dists[nearest_dists < np.inf]
+        local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+        
+        # Compute entropy of neighbor distances
+        if len(nearest_dists) > 1:
+            probs = (1 / (nearest_dists + 1e-8)) / np.sum(1 / (nearest_dists + 1e-8))
+            density_entropy[i] = entropy(probs)
+    
+    if np.max(local_density) > 0:
+        local_density = local_density / np.max(local_density)
+    
+    # Normalize entropy
+    if np.max(density_entropy[density_entropy > 0]) > 0:
+        density_entropy = density_entropy / np.max(density_entropy[density_entropy > 0])
+    
+    density_similarity = np.ones((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                density_diff = abs(local_density[i] - local_density[j])
+                entropy_penalty = 1.0 - 0.3 * (density_entropy[i] + density_entropy[j]) / 2
+                density_similarity[i, j] = np.exp(-2.0 * density_diff) * entropy_penalty
+    
+    # 2.4 Minimum spanning tree structural boost
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_boost = np.where(mst_mask, 1.4 + 0.2 * np.tanh(kurtosis), 1.0)  # Kurtosis affects boost
+    
+    # 2.5 Base inverse distance (normalized with entropy weighting)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Apply entropy-based smoothing
+    for i in range(n):
+        if density_entropy[i] > 0.5:  # High entropy = more uniform distances
+            inv_dist[i, :] = inv_dist[i, :] ** (1.0 - 0.2 * density_entropy[i])
+    
+    max_inv = np.max(inv_dist)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # 3. ENHANCED REGRET LOOKAHEAD
+    lookahead_factor = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if i == j:
+                continue
+                
+            bonus = 0.0
+            # Check if edge is best for either endpoint
+            if i in best_edges and best_edges[i] == j:
+                bonus += regret_gaps.get(i, 0)
+            if j in best_edges and best_edges[j] == i:
+                bonus += regret_gaps.get(j, 0)
+            
+            # Additional consideration for clustering structure
+            if clustering_coef[i] > 0.7 and clustering_coef[j] > 0.7:
+                # Both in dense clusters - prioritize intra-cluster edges
+                bonus += 0.3 * avg_dist
+            
+            if bonus > 0:
+                adaptive_scaling = 1.0 + 0.5 * cv  # Higher CV = more weight on regret
+                lookahead_factor[i, j] = lookahead_factor[j, i] = 1.0 + adaptive_scaling * bonus / (avg_dist + 1e-8)
+    
+    # 4. MULTIPLICATIVE COMPONENT FUSION
+    heuristic = inv_dist * rank_incentive * density_similarity * clustering_bonus * mst_boost * lookahead_factor
+    heuristic = (heuristic + heuristic.T) / 2  # Ensure symmetry
+    
+    # 5. DISTRIBUTION-AWARE SPARSIFICATION
+    # Compute adaptive thresholds based on distribution shape
+    base_density = 0.25
+    skew_effect = 0.15 * np.tanh(skewness)  # Positive skew = sparser
+    kurt_effect = 0.1 * np.tanh(kurtosis / 5)  # High kurtosis = denser
+    target_density = base_density + skew_effect + kurt_effect
+    target_density = np.clip(target_density, 0.15, 0.35)
+    
+    n_edges_to_keep = int(target_density * n * (n - 1) / 2)
+    
+    # Start with essential backbone
+    sparsity_mask = mst_mask.copy()
+    
+    # Keep top edges globally
+    if n_edges_to_keep > 0:
+        triu_indices = np.triu_indices(n, 1)
+        heuristic_vals = heuristic[triu_indices]
+        
+        if len(heuristic_vals) > n_edges_to_keep:
+            threshold = np.partition(heuristic_vals, -n_edges_to_keep)[-n_edges_to_keep]
+            top_global_mask = heuristic >= threshold
+            sparsity_mask = sparsity_mask | top_global_mask
+    
+    # Local connectivity enforcement with clustering awareness
+    for i in range(n):
+        connected = np.where(sparsity_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        min_connections = 2
+        if clustering_coef[i] > 0.6:  # Dense region needs more connections
+            min_connections = 3
+        
+        if len(connected) < min_connections:
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            distances[connected] = np.inf
+            needed = min_connections - len(connected)
+            nearest = np.argsort(distances)[:needed]
+            sparsity_mask[i, nearest] = True
+            sparsity_mask[nearest, i] = True
+    
+    # Apply sparsification mask
+    heuristic = heuristic * sparsity_mask
+    
+    # 6. FINAL NORMALIZATION WITH DISTRIBUTION-AWARE SCALING
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    # Adjust based on coefficient of variation
+    heuristic = heuristic ** (1.0 / (1.0 + cv))
+    
+    np.fill_diagonal(heuristic, 0)
+    return heuristic
+```

@@ -1,0 +1,250 @@
+```json
+{
+    "algorithm_features": ["Solution Sampling", "Centrality-Based Heuristics", "Adaptive Weighting", "Graph Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics combining solution sampling with centrality-based
+    approximations for efficient edge promise estimation.
+    
+    Key improvements over v1:
+    1. Simplified centrality computation using inverse distance sums
+    2. More efficient edge frequency sampling with focused 2-opt
+    3. Adjusted adaptive weighting based on instance characteristics
+    4. Refined sparsification strategy
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    # Extract basic statistics
+    distances_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    
+    # Size-dependent parameters
+    density_factor = min(1.0, n / 50.0)
+    log_n = np.log(n + 1)
+    
+    # ===== 2. SOLUTION SAMPLING (SIMPLIFIED) =====
+    def generate_tour(start_node: int = 0) -> np.ndarray:
+        """Generate tour using nearest neighbor with random restarts."""
+        tour = [start_node]
+        unvisited = set(range(n)) - {start_node}
+        while unvisited:
+            current = tour[-1]
+            # Consider top 3 nearest neighbors for some randomness
+            candidates = list(unvisited)
+            candidate_dists = [distance_matrix[current, c] for c in candidates]
+            # Weighted random choice favoring closer nodes
+            if len(candidates) > 1:
+                probs = 1.0 / (np.array(candidate_dists) + 1e-10)
+                probs = probs / probs.sum()
+                nearest = np.random.choice(candidates, p=probs)
+            else:
+                nearest = candidates[0]
+            tour.append(nearest)
+            unvisited.remove(nearest)
+        return np.array(tour)
+    
+    def fast_two_opt(tour: np.ndarray, iterations: int = 10) -> np.ndarray:
+        """Quick 2-opt improvement with limited iterations."""
+        current_tour = tour.copy()
+        improved = True
+        it = 0
+        
+        while improved and it < iterations:
+            improved = False
+            for i in range(n - 1):
+                for j in range(i + 2, min(n, i + int(np.sqrt(n)) + 5)):
+                    # Check only promising swaps
+                    a, b = current_tour[i], current_tour[(i + 1) % n]
+                    c, d = current_tour[j], current_tour[(j + 1) % n]
+                    
+                    old_cost = distance_matrix[a, b] + distance_matrix[c, d]
+                    new_cost = distance_matrix[a, c] + distance_matrix[b, d]
+                    
+                    if new_cost < old_cost - 1e-10:
+                        # Perform the swap
+                        current_tour[i + 1:j + 1] = current_tour[i + 1:j + 1][::-1]
+                        improved = True
+                        break
+                if improved:
+                    break
+            it += 1
+        
+        return current_tour
+    
+    # Generate a diverse set of tours efficiently
+    num_tours = min(10, max(3, n // 5))
+    edge_frequency = np.zeros_like(distance_matrix)
+    
+    for _ in range(num_tours):
+        start = np.random.randint(0, n)
+        tour = generate_tour(start)
+        tour = fast_two_opt(tour, iterations=max(5, n // 20))
+        
+        # Record edges in this tour
+        for i in range(n):
+            j = (i + 1) % n
+            u, v = tour[i], tour[j]
+            edge_frequency[u, v] += 1
+            edge_frequency[v, u] += 1
+    
+    # Normalize edge frequency
+    if edge_frequency.max() > 0:
+        edge_frequency = edge_frequency / edge_frequency.max()
+    
+    # ===== 3. SIMPLIFIED CENTRALITY APPROXIMATION =====
+    # Node centrality as inverse of average distance to other nodes
+    row_sums = np.sum(distance_matrix, axis=1) - np.diag(distance_matrix)
+    node_centrality = (n - 1) / (row_sums + 1e-10)
+    
+    # Normalize centrality
+    if node_centrality.max() > node_centrality.min():
+        node_centrality = (node_centrality - node_centrality.min()) / \
+                         (node_centrality.max() - node_centrality.min() + 1e-10)
+    
+    # Edge potential as product of node centralities
+    edge_potential = np.outer(node_centrality, node_centrality)
+    
+    # ===== 4. ADAPTIVE WEIGHT COMBINATION =====
+    # Weights based on instance size and characteristics
+    if n < 20:
+        # Small instances: rely more on sampling and less on heuristics
+        w_freq = 0.6
+        w_dist = 0.2
+        w_cent = 0.1
+        w_mst = 0.1
+    elif n < 100:
+        # Medium instances: balanced approach
+        w_freq = 0.4 - 0.1 * cv  # Less weight on sampling if distances are uniform
+        w_dist = 0.3 + 0.1 * cv  # More weight on distance if distances vary
+        w_cent = 0.2
+        w_mst = 0.1
+    else:
+        # Large instances: rely more on heuristics
+        w_freq = 0.3
+        w_dist = 0.3
+        w_cent = 0.2 + 0.1 * min(1.0, 1.0 / log_n)  # More centrality for very large instances
+        w_mst = 0.2
+    
+    # Normalize weights
+    total = w_freq + w_dist + w_cent + w_mst
+    w_freq /= total
+    w_dist /= total
+    w_cent /= total
+    w_mst /= total
+    
+    # ===== 5. COMPONENT COMPUTATION =====
+    # Inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    if inv_dist.max() > 0:
+        inv_dist = inv_dist / inv_dist.max()
+    
+    # MST component
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    mst_scores = np.zeros_like(distance_matrix)
+    mst_scores[mst_mask] = 1.0
+    
+    # ===== 6. COMBINE COMPONENTS =====
+    heuristics_matrix = (
+        w_freq * edge_frequency +
+        w_dist * inv_dist +
+        w_cent * edge_potential +
+        w_mst * mst_scores
+    )
+    
+    # Boost edges that are both in MST and frequently appear in tours
+    strong_edges = (edge_frequency > np.percentile(edge_frequency[edge_frequency > 0], 75)) if np.any(edge_frequency > 0) else edge_frequency
+    heuristics_matrix[mst_mask & strong_edges] *= 1.3
+    
+    # ===== 7. FOCUSED SPARSIFICATION =====
+    # Determine edges to keep per node
+    min_edges = max(2, int(np.log2(n + 1)))
+    max_edges = min(n - 1, int(2 * np.sqrt(n)))
+    
+    sparsity_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Always include the nearest neighbors
+        k_nn = min(3, n - 1)
+        if k_nn > 0:
+            nn_indices = np.argsort(distance_matrix[i])[1:k_nn + 1]
+            sparsity_mask[i, nn_indices] = True
+        
+        # Include additional promising edges
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        scores[sparsity_mask[i]] = -np.inf  # Already included
+        
+        # Determine how many additional edges to include
+        n_additional = max(0, min_edges - k_nn)
+        n_additional = min(n_additional, max_edges - k_nn)
+        
+        if n_additional > 0 and np.any(scores > -np.inf):
+            # Include edges with score above median of non-zero scores
+            valid_scores = scores[scores > -np.inf]
+            if len(valid_scores) > 0:
+                threshold = np.median(valid_scores)
+                additional_mask = scores >= threshold
+                sparsity_mask[i] = sparsity_mask[i] | additional_mask
+        
+        # Ensure we keep at least min_edges
+        if np.sum(sparsity_mask[i]) < min_edges:
+            # Add the highest scoring edges not already included
+            remaining = np.where(~sparsity_mask[i])[0]
+            remaining = remaining[remaining != i]
+            if len(remaining) > 0:
+                k = min(min_edges - np.sum(sparsity_mask[i]), len(remaining))
+                top_k = np.argsort(heuristics_matrix[i, remaining])[-k:]
+                sparsity_mask[i, remaining[top_k]] = True
+    
+    # Ensure MST edges are included and maintain symmetry
+    sparsity_mask = sparsity_mask | mst_mask
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # ===== 8. FINAL PROCESSING =====
+    # Ensure symmetry
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    
+    # Zero diagonal
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize non-zero values
+    non_zero = heuristics_matrix[heuristics_matrix > 0]
+    if len(non_zero) > 0:
+        # Robust normalization excluding outliers
+        q_low, q_high = np.percentile(non_zero, [10, 90])
+        heuristics_matrix = np.clip(heuristics_matrix, q_low, q_high)
+        if heuristics_matrix.max() > 0:
+            heuristics_matrix = heuristics_matrix / heuristics_matrix.max()
+    
+    return heuristics_matrix
+```

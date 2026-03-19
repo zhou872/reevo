@@ -1,0 +1,156 @@
+```json
+{
+    "algorithm_features": ["Regret-based Degree Penalization", "MST-NN Hybrid Boosting", "Instance-Adaptive Weight Tuning", "Symmetric Edge Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristics with regret-based balancing and adaptive boosting.
+    Returns a matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Base inverse distance with numerical stability
+    epsilon = 1e-10
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 1. INSTANCE-ADAPTIVE PARAMETERS
+    # Determine problem characteristics for adaptive tuning
+    mean_dist = np.mean(distance_matrix[np.triu_indices(n, 1)])
+    std_dist = np.std(distance_matrix[np.triu_indices(n, 1)])
+    uniformity = 1.0 - min(1.0, std_dist / mean_dist) if mean_dist > 0 else 0.5
+    density_factor = min(1.0, n / 100)  # Scales with problem size
+    
+    # Adaptive k for nearest neighbors
+    k = max(2, int(np.sqrt(n) * (1 + 0.5 * uniformity)))
+    
+    # 2. REGRET-BASED DEGREE PENALIZATION
+    # Compute regret as opportunity cost for choosing this edge
+    regret_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get distances for node i (excluding self)
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        
+        # Find best and second-best distances
+        sorted_indices = np.argsort(distances_i)
+        best_dist = distances_i[sorted_indices[0]]
+        second_best = distances_i[sorted_indices[1]]
+        
+        # Base regret for node i
+        base_regret_i = second_best - best_dist
+        
+        for j in range(n):
+            if j != i:
+                # Symmetric regret calculation
+                distances_j = distance_matrix[j].copy()
+                distances_j[j] = np.inf
+                sorted_j = np.argsort(distances_j)
+                best_dist_j = distances_j[sorted_j[0]]
+                second_best_j = distances_j[sorted_j[1]]
+                base_regret_j = second_best_j - best_dist_j
+                
+                # Combined normalized regret
+                current_dist = distance_matrix[i, j]
+                regret_i = max(0, current_dist - best_dist) / (best_dist + epsilon)
+                regret_j = max(0, current_dist - best_dist_j) / (best_dist_j + epsilon)
+                combined_regret = (regret_i + regret_j) / 2
+                
+                # Convert to penalty factor (lower regret = higher score)
+                regret_matrix[i, j] = np.exp(-3 * combined_regret)
+    
+    # 3. MST-NN HYBRID BOOSTING
+    # Minimum Spanning Tree edges (asymmetric for now)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Symmetric nearest neighbor connections
+    nn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        # Get k+1 nearest (including self)
+        nearest = np.argpartition(distance_matrix[i], k+1)[:k+1]
+        nearest = nearest[nearest != i]
+        if len(nearest) > k:
+            nearest = nearest[:k]
+        nn_mask[i, nearest] = True
+    
+    # Create symmetric hybrid mask
+    hybrid_mask = mst_mask | (nn_mask & nn_mask.T)  # MST OR mutual NN
+    
+    # 4. ADAPTIVE WEIGHT COMBINATION
+    # Factor weights based on instance characteristics
+    weights = {
+        'base': 0.3 + 0.2 * uniformity,  # Higher for uniform instances
+        'regret': 0.4 + 0.2 * density_factor,  # Higher for larger instances
+        'hybrid': 0.3 + 0.1 * (1 - uniformity)  # Higher for non-uniform
+    }
+    # Normalize
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    # Combine factors
+    heuristics = np.zeros_like(distance_matrix)
+    
+    # Base component (inverse distance)
+    base_component = inv_dist / np.max(inv_dist) if np.max(inv_dist) > 0 else inv_dist
+    
+    # Regret component
+    regret_component = regret_matrix
+    
+    # Hybrid boost component
+    hybrid_boost = np.ones_like(distance_matrix)
+    # Adaptive boost factor based on MST edge quality
+    if mst_mask.any():
+        mst_edges = distance_matrix[mst_mask]
+        avg_mst_dist = np.mean(mst_edges) if len(mst_edges) > 0 else mean_dist
+        boost_factor = 1.5 + 0.5 * (mean_dist / (avg_mst_dist + epsilon))
+        boost_factor = min(boost_factor, 2.5)  # Cap the boost
+    else:
+        boost_factor = 1.8
+    
+    hybrid_boost[hybrid_mask] = boost_factor
+    
+    # Weighted combination
+    heuristics = (
+        weights['base'] * base_component +
+        weights['regret'] * regret_component +
+        weights['hybrid'] * hybrid_boost
+    )
+    
+    # Ensure symmetry by taking average
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # 5. ADAPTIVE SPARSIFICATION WITH SYMMETRY PRESERVATION
+    for i in range(n):
+        row = heuristics[i].copy()
+        # Adaptive keep count: more edges for uniform instances
+        base_keep = int(0.15 * n * (1 + uniformity))
+        keep_count = min(n - 1, max(k + 2, base_keep))
+        
+        if keep_count < n - 1:
+            threshold = np.partition(row, -keep_count)[-keep_count]
+            # Soft threshold: gradual reduction rather than hard cutoff
+            below_threshold = row < threshold
+            row[below_threshold] *= 0.3  # Reduce but don't eliminate
+    
+    # Final symmetry enforcement with stronger preservation
+    symmetric_heuristics = np.maximum(heuristics, heuristics.T * 0.8)
+    
+    # Zero diagonal
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Normalize to [0, 1] range if needed
+    max_val = np.max(symmetric_heuristics)
+    if max_val > 0:
+        symmetric_heuristics /= max_val
+    
+    return symmetric_heuristics
+```

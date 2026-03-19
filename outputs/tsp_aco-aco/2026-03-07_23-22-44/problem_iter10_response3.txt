@@ -1,0 +1,256 @@
+```json
+{
+    "algorithm_features": ["Vectorized Regret Approximation", "Adaptive Ensemble Weighting", "Density-Weighted Clustering", "Degree-Constrained Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP heuristic with vectorized regret computation, adaptive ensemble
+    weighting, efficient density clustering, and degree-constrained sparsification.
+    
+    Core Improvements:
+    1. Vectorized Regret: O(n²) pairwise alternative cost with broadcasting
+    2. Adaptive Ensemble: Problem-size aware component weighting
+    3. Density Clustering: Fast k-NN density estimation without eigendecomposition
+    4. Degree-Constrained Sparsification: Preserves connectivity while removing noise
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=RuntimeWarning)
+        
+        # ============ 1. VECTORIZED REGRET COMPUTATION ============
+        def vectorized_regret() -> np.ndarray:
+            """Efficient regret computation using broadcasting"""
+            # Get sorted distances for each node (excluding self)
+            dists_sorted = np.sort(distance_matrix + np.eye(n) * np.inf, axis=1)
+            idx_sorted = np.argsort(distance_matrix + np.eye(n) * np.inf, axis=1)
+            
+            # Best and second-best distances for each node
+            best_dists = dists_sorted[:, 0]
+            second_best = dists_sorted[:, 1]
+            best_idx = idx_sorted[:, 0]
+            
+            # For each edge (i,j), determine best alternative
+            # If j is i's nearest neighbor, use second best; otherwise use best
+            alt_i = np.where(best_idx[:, None] == np.arange(n)[None, :], 
+                           second_best[:, None], best_dists[:, None])
+            alt_j = np.where(best_idx[None, :] == np.arange(n)[:, None],
+                           second_best[None, :], best_dists[None, :])
+            
+            # Regret: (alternative_i + alternative_j) - 2*direct_edge
+            regret = alt_i + alt_j - 2 * distance_matrix
+            
+            # Normalize with sigmoid
+            scale = np.median(distance_matrix[np.triu_indices(n, 1)])
+            regret_scores = 1.0 / (1.0 + np.exp(-regret / (scale + 1e-8)))
+            
+            # Symmetrize and zero diagonal
+            regret_scores = (regret_scores + regret_scores.T) / 2
+            np.fill_diagonal(regret_scores, 0)
+            return regret_scores
+        
+        regret_scores = vectorized_regret()
+        
+        # ============ 2. EFFICIENT DENSITY CLUSTERING ============
+        def density_clustering() -> np.ndarray:
+            """Cluster scoring based on local k-NN density"""
+            if n < 4:
+                return np.zeros((n, n))
+            
+            # Adaptive k for density estimation
+            k = max(3, min(10, n // 4))
+            
+            # Compute local density as inverse of average distance to k-NN
+            local_densities = np.zeros(n)
+            for i in range(n):
+                dists = np.partition(distance_matrix[i], k)[:k+1]
+                # Exclude self (distance 0) if present
+                valid_dists = dists[dists > 0]
+                if len(valid_dists) > 0:
+                    local_densities[i] = 1.0 / (np.mean(valid_dists) + 1e-8)
+            
+            # Normalize densities
+            max_density = np.max(local_densities)
+            if max_density > 0:
+                local_densities /= max_density
+            
+            # Score edges: density_product / distance
+            with np.errstate(divide='ignore', invalid='ignore'):
+                density_scores = (local_densities[:, None] * local_densities[None, :]) / (distance_matrix + 1e-8)
+            
+            density_scores[np.isinf(density_scores)] = 0
+            np.fill_diagonal(density_scores, 0)
+            
+            # Normalize
+            max_score = np.max(density_scores)
+            if max_score > 0:
+                density_scores /= max_score
+            
+            return density_scores
+        
+        density_scores = density_clustering()
+        
+        # ============ 3. MST CONNECTIVITY ============
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst > 0) | (mst.T > 0)
+        mst_scores = mst_edges.astype(float) * 0.7  # Moderate preference
+        
+        # ============ 4. INVERSE DISTANCE COMPONENT ============
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / distance_matrix
+        
+        inv_dist[np.isinf(inv_dist)] = 0
+        np.fill_diagonal(inv_dist, 0)
+        max_inv = np.max(inv_dist)
+        if max_inv > 0:
+            inv_dist /= max_inv
+        
+        # ============ 5. ADAPTIVE ENSEMBLE WEIGHTING ============
+        # Base weights adjusted by problem characteristics
+        if n <= 15:
+            # Small problems: balanced approach
+            w_regret, w_density, w_mst, w_inv = 0.3, 0.3, 0.2, 0.2
+        elif n <= 50:
+            # Medium problems: emphasize regret and MST
+            w_regret, w_density, w_mst, w_inv = 0.4, 0.2, 0.3, 0.1
+        else:
+            # Large problems: focus on regret and inverse distance
+            w_regret, w_density, w_mst, w_inv = 0.5, 0.1, 0.2, 0.2
+        
+        # Adjust based on distance distribution
+        upper_dists = distance_matrix[np.triu_indices(n, 1)]
+        dist_cv = np.std(upper_dists) / (np.mean(upper_dists) + 1e-8)
+        
+        if dist_cv > 0.7:  # High variability: trust distance-based measures
+            w_inv *= 1.3
+            w_regret *= 0.9
+        elif dist_cv < 0.3:  # Low variability: emphasize structure
+            w_density *= 1.2
+            w_mst *= 1.1
+        
+        # Normalize weights
+        total = w_regret + w_density + w_mst + w_inv
+        w_regret /= total
+        w_density /= total
+        w_mst /= total
+        w_inv /= total
+        
+        # Combine components
+        combined = (
+            w_regret * regret_scores +
+            w_density * density_scores +
+            w_mst * mst_scores +
+            w_inv * inv_dist
+        )
+        
+        # Apply mild distance decay
+        median_dist = np.median(distance_matrix)
+        if median_dist > 0:
+            decay = np.exp(-distance_matrix / (2 * median_dist + 1e-8))
+            combined *= decay
+        
+        # ============ 6. DEGREE-CONSTRAINED SPARSIFICATION ============
+        def degree_constrained_sparsify(scores: np.ndarray) -> np.ndarray:
+            """Keep most promising edges while ensuring connectivity"""
+            sparsified = np.zeros_like(scores)
+            
+            # Always keep MST edges
+            sparsified[mst_edges] = scores[mst_edges]
+            
+            # Determine degree limit adaptively
+            base_degree = min(4, max(2, int(np.log2(n)) + 1))
+            max_degree = min(base_degree, n - 1)
+            
+            # For each node, add top non-MST edges up to max_degree
+            for i in range(n):
+                # Current degree from kept edges
+                current_degree = np.sum(sparsified[i] > 0)
+                
+                if current_degree < max_degree:
+                    # Candidate edges (non-MST, non-zero)
+                    mask = (~mst_edges[i]) & (scores[i] > 0)
+                    candidate_scores = scores[i][mask]
+                    candidate_idx = np.where(mask)[0]
+                    
+                    if len(candidate_scores) > 0:
+                        # Sort by score
+                        order = np.argsort(-candidate_scores)
+                        needed = max_degree - current_degree
+                        
+                        for idx in order[:needed]:
+                            j = candidate_idx[idx]
+                            # Only add if the other node hasn't reached max_degree
+                            if np.sum(sparsified[j] > 0) < max_degree:
+                                sparsified[i, j] = scores[i, j]
+                                sparsified[j, i] = scores[j, i]
+            
+            return sparsified
+        
+        sparsified = degree_constrained_sparsify(combined)
+        
+        # ============ 7. FAST TOUR REINFORCEMENT ============
+        def fast_reinforcement(scores: np.ndarray) -> np.ndarray:
+            """Boost edges that appear in quick nearest-neighbor tours"""
+            reinforced = scores.copy()
+            
+            # Number of tours based on problem size
+            n_tours = min(5, max(2, n // 20))
+            
+            for _ in range(n_tours):
+                start = np.random.randint(0, n)
+                visited = np.zeros(n, dtype=bool)
+                current = start
+                
+                while not np.all(visited):
+                    visited[current] = True
+                    
+                    # Find nearest unvisited neighbor
+                    dists = distance_matrix[current].copy()
+                    dists[visited] = np.inf
+                    if np.all(dists == np.inf):
+                        break
+                    next_node = np.argmin(dists)
+                    
+                    # Boost this edge
+                    boost = 1.1
+                    reinforced[current, next_node] *= boost
+                    reinforced[next_node, current] *= boost
+                    
+                    current = next_node
+            
+            return reinforced
+        
+        reinforced = fast_reinforcement(sparsified)
+        
+        # ============ 8. FINAL PROCESSING ============
+        # Ensure symmetry
+        final_scores = (reinforced + reinforced.T) / 2
+        
+        # Final normalization
+        max_score = np.max(final_scores)
+        if max_score > 0:
+            final_scores /= max_score
+        
+        np.fill_diagonal(final_scores, 0)
+        
+        return final_scores
+```

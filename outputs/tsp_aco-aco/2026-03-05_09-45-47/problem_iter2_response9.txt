@@ -1,0 +1,442 @@
+```json
+{
+    "algorithm_features": ["Geometric Embedding", "Adaptive Factor Fusion", "Graph Structure Analysis", "Dynamic Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from sklearn.manifold import MDS
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection using geometric embedding,
+    adaptive factor fusion, and graph structure analysis.
+    
+    Key improvements over v1:
+    1. Dynamic factor weighting based on problem characteristics
+    2. Enhanced geometric embedding with validation
+    3. Graph-based feature extraction (betweenness approximation)
+    4. Adaptive sparsification with connectivity preservation
+    5. Local search-based refinement of promising edges
+    
+    Args:
+        distance_matrix: Square symmetric distance matrix (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 4:
+        # Simple case: return normalized reciprocal distances
+        with np.errstate(divide='ignore', invalid='ignore'):
+            h = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            h[np.isinf(h) | np.isnan(h)] = 0
+        if np.max(h) > 0:
+            h /= np.max(h)
+        return h
+    
+    # 1. Base reciprocal heuristic with adaptive scaling
+    eps = 1e-12
+    avg_dist = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    reciprocal_base = 1 / (distance_matrix + np.eye(n) * eps)
+    np.fill_diagonal(reciprocal_base, 0)
+    
+    # 2. Geometric embedding with dimensionality selection
+    coords = _embed_geometry(distance_matrix, n)
+    
+    # 3. Compute multiple feature matrices
+    features = _compute_features(distance_matrix, coords, n, avg_dist)
+    
+    # 4. Dynamic factor fusion with problem-adaptive weights
+    weights = _compute_adaptive_weights(distance_matrix, coords, n)
+    heuristic_matrix = _fuse_features(features, weights)
+    
+    # 5. Graph structure analysis and enhancement
+    heuristic_matrix = _enhance_with_graph_structure(
+        heuristic_matrix, distance_matrix, coords, n
+    )
+    
+    # 6. Adaptive sparsification with connectivity guarantee
+    heuristic_matrix = _adaptive_sparsification(heuristic_matrix, distance_matrix, n)
+    
+    # 7. Local refinement around promising edges
+    heuristic_matrix = _local_refinement(heuristic_matrix, distance_matrix, n)
+    
+    # 8. Final normalization and symmetry enforcement
+    heuristic_matrix = (heuristic_matrix + heuristic_matrix.T) / 2
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    if np.max(heuristic_matrix) > eps:
+        heuristic_matrix /= np.max(heuristic_matrix)
+    
+    return heuristic_matrix
+
+def _embed_geometry(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Embed distance matrix into Euclidean space with validation."""
+    if n <= 10:
+        # Use 2D coordinates for small instances
+        mds = MDS(
+            n_components=2,
+            dissimilarity='precomputed',
+            random_state=42,
+            max_iter=300,
+            eps=1e-6
+        )
+        return mds.fit_transform(distance_matrix)
+    else:
+        # Use adaptive dimensionality for larger instances
+        dims = min(3, int(np.log2(n)))
+        mds = MDS(
+            n_components=dims,
+            dissimilarity='precomputed',
+            random_state=42,
+            max_iter=200,
+            eps=1e-5,
+            n_jobs=-1
+        )
+        return mds.fit_transform(distance_matrix)
+
+def _compute_features(
+    dist_mat: np.ndarray, 
+    coords: np.ndarray, 
+    n: int, 
+    avg_dist: float
+) -> dict:
+    """Compute multiple feature matrices for edge evaluation."""
+    features = {}
+    
+    # Feature 1: Normalized reciprocal distances
+    features['reciprocal'] = 1 / (dist_mat + np.eye(n) * 1e-12)
+    np.fill_diagonal(features['reciprocal'], 0)
+    
+    # Feature 2: MST-based importance
+    mst = minimum_spanning_tree(dist_mat).toarray()
+    mst_binary = (mst > 0) | (mst.T > 0)
+    features['mst'] = mst_binary.astype(float)
+    
+    # Feature 3: Spatial neighborhood
+    tree = KDTree(coords)
+    k_spatial = max(3, min(10, int(np.log2(n)) + 2))
+    spatial_neighbors = np.zeros((n, n))
+    
+    for i in range(n):
+        # Query k+1 to exclude self
+        _, indices = tree.query(coords[i], k=k_spatial + 1)
+        if len(indices) > 1:
+            indices = indices[1:] if indices[0] == i else indices[:k_spatial]
+            spatial_neighbors[i, indices] = 1.0
+    
+    features['spatial'] = spatial_neighbors
+    
+    # Feature 4: Local density contrast
+    local_density = np.zeros(n)
+    for i in range(n):
+        # Average distance to k nearest neighbors
+        sorted_dists = np.sort(dist_mat[i])
+        k_density = min(5, n - 1)
+        local_density[i] = np.mean(sorted_dists[1:k_density + 1])
+    
+    density_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            max_density = max(local_density[i], local_density[j])
+            density_matrix[i, j] = density_matrix[j, i] = np.exp(
+                -(dist_mat[i, j] / (max_density + 1e-12)) ** 2
+            )
+    
+    features['density'] = density_matrix
+    
+    # Feature 5: Angle-based compatibility (for 2D+ embeddings)
+    if coords.shape[1] >= 2:
+        angle_compat = np.ones((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Compute vectors to nearest neighbors
+                vec_ij = coords[j] - coords[i]
+                norm_ij = np.linalg.norm(vec_ij) + 1e-12
+                
+                # Find two nearest neighbors for i and j
+                i_dists = dist_mat[i].copy()
+                i_dists[i] = np.inf
+                i_nn = np.argpartition(i_dists, 2)[:2]
+                
+                j_dists = dist_mat[j].copy()
+                j_dists[j] = np.inf
+                j_nn = np.argpartition(j_dists, 2)[:2]
+                
+                # Compute compatibility based on angles
+                compat = 1.0
+                for k in i_nn:
+                    vec_ik = coords[k] - coords[i]
+                    norm_ik = np.linalg.norm(vec_ik) + 1e-12
+                    cos_angle = np.dot(vec_ij, vec_ik) / (norm_ij * norm_ik)
+                    compat *= (1 + max(0, cos_angle)) / 2
+                
+                for k in j_nn:
+                    vec_jk = coords[k] - coords[j]
+                    vec_ji = -vec_ij
+                    norm_jk = np.linalg.norm(vec_jk) + 1e-12
+                    cos_angle = np.dot(vec_ji, vec_jk) / (norm_ij * norm_jk)
+                    compat *= (1 + max(0, cos_angle)) / 2
+                
+                angle_compat[i, j] = angle_compat[j, i] = compat ** 0.25
+        
+        features['angle'] = angle_compat
+    
+    return features
+
+def _compute_adaptive_weights(
+    dist_mat: np.ndarray, 
+    coords: np.ndarray, 
+    n: int
+) -> dict:
+    """Compute adaptive weights for feature fusion based on problem characteristics."""
+    weights = {}
+    
+    # Analyze problem characteristics
+    std_dev = np.std(dist_mat[np.triu_indices(n, k=1)])
+    mean_val = np.mean(dist_mat[np.triu_indices(n, k=1)])
+    cv = std_dev / (mean_val + 1e-12)  # Coefficient of variation
+    
+    # Spatial regularity (how well points can be embedded)
+    if coords.shape[1] >= 2:
+        # Compute stress of embedding
+        from sklearn.metrics import pairwise_distances
+        embedded_dists = pairwise_distances(coords)
+        stress = np.mean((dist_mat - embedded_dists) ** 2)
+        spatial_quality = np.exp(-stress / mean_val)
+    else:
+        spatial_quality = 0.5
+    
+    # Base weights adjusted by problem characteristics
+    weights['reciprocal'] = 1.0
+    weights['mst'] = 2.0 * (1 + cv)  # More important for irregular problems
+    weights['spatial'] = 1.5 * spatial_quality
+    weights['density'] = 1.2 * (1 + cv)
+    
+    if 'angle' in _compute_features(dist_mat, coords, n, mean_val):
+        weights['angle'] = 1.3 * spatial_quality
+    
+    # Normalize weights
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
+def _fuse_features(features: dict, weights: dict) -> np.ndarray:
+    """Fuse multiple feature matrices with adaptive weights."""
+    n = list(features.values())[0].shape[0]
+    fused = np.zeros((n, n))
+    
+    for feature_name, weight in weights.items():
+        if feature_name in features:
+            # Normalize each feature matrix
+            feat = features[feature_name]
+            if np.max(feat) > 0:
+                feat = feat / np.max(feat)
+            fused += weight * feat
+    
+    # Add multiplicative interactions for key feature pairs
+    if 'mst' in features and 'spatial' in features:
+        interaction = features['mst'] * features['spatial']
+        if np.max(interaction) > 0:
+            interaction /= np.max(interaction)
+        fused += 0.2 * interaction
+    
+    if 'reciprocal' in features and 'density' in features:
+        interaction = features['reciprocal'] * features['density']
+        if np.max(interaction) > 0:
+            interaction /= np.max(interaction)
+        fused += 0.15 * interaction
+    
+    return fused
+
+def _enhance_with_graph_structure(
+    heuristic: np.ndarray, 
+    dist_mat: np.ndarray, 
+    coords: np.ndarray, 
+    n: int
+) -> np.ndarray:
+    """Enhance heuristic using graph structure analysis."""
+    enhanced = heuristic.copy()
+    
+    # 1. Triangle closure enhancement
+    triangle_boost = np.zeros_like(heuristic)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if heuristic[i, j] > 0:
+                # Find common neighbors with significant edges
+                common_mask = (heuristic[i] > 0) & (heuristic[j] > 0)
+                common_count = np.sum(common_mask)
+                if common_count > 0:
+                    # Quality-weighted count
+                    quality_sum = np.sum(heuristic[i, common_mask] * heuristic[j, common_mask])
+                    triangle_boost[i, j] = triangle_boost[j, i] = 1 + 0.3 * np.sqrt(quality_sum)
+    
+    enhanced *= triangle_boost
+    
+    # 2. Betweenness approximation (simplified)
+    if n <= 100:  # Only for moderate-sized problems
+        k_paths = min(5, n // 4)
+        betweenness_approx = np.zeros((n, n))
+        
+        for i in range(n):
+            # Find k shortest paths from i to all others (approximate)
+            for _ in range(k_paths):
+                path = _grow_path_from_node(i, enhanced, dist_mat, n)
+                for a in range(len(path) - 1):
+                    b = path[a + 1]
+                    betweenness_approx[path[a], b] += 1
+                    betweenness_approx[b, path[a]] += 1
+        
+        if np.max(betweenness_approx) > 0:
+            betweenness_approx /= np.max(betweenness_approx)
+            enhanced = 0.7 * enhanced + 0.3 * betweenness_approx
+    
+    # 3. Convex hull edge boost (for 2D embeddings)
+    if coords.shape[1] == 2 and n >= 4:
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(coords)
+            hull_edges = set()
+            for simplex in hull.simplices:
+                for a, b in [(simplex[i], simplex[(i + 1) % len(simplex)]) 
+                           for i in range(len(simplex))]:
+                    hull_edges.add((min(a, b), max(a, b)))
+            
+            for i, j in hull_edges:
+                enhanced[i, j] *= 1.5
+                enhanced[j, i] *= 1.5
+        except:
+            pass
+    
+    return enhanced
+
+def _grow_path_from_node(
+    start: int, 
+    heuristic: np.ndarray, 
+    dist_mat: np.ndarray, 
+    n: int
+) -> List[int]:
+    """Grow a greedy path from start node based on heuristic values."""
+    visited = set([start])
+    path = [start]
+    current = start
+    
+    while len(visited) < min(10, n):
+        # Find best unvisited neighbor
+        mask = np.ones(n, dtype=bool)
+        mask[list(visited)] = False
+        mask[current] = False
+        
+        if not np.any(mask):
+            break
+        
+        scores = heuristic[current] * mask
+        if np.max(scores) <= 0:
+            break
+        
+        next_node = np.argmax(scores)
+        visited.add(next_node)
+        path.append(next_node)
+        current = next_node
+    
+    return path
+
+def _adaptive_sparsification(
+    heuristic: np.ndarray, 
+    dist_mat: np.ndarray, 
+    n: int
+) -> np.ndarray:
+    """Adaptive sparsification that preserves connectivity."""
+    sparsified = heuristic.copy()
+    
+    # Determine sparsity level adaptively
+    if n <= 20:
+        keep_ratio = 0.5
+    elif n <= 100:
+        keep_ratio = 0.3
+    else:
+        keep_ratio = 0.2
+    
+    # Ensure MST edges are always kept
+    mst = minimum_spanning_tree(dist_mat).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # For each node, keep top k edges
+    k = max(3, int(keep_ratio * n))
+    
+    for i in range(n):
+        row = sparsified[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Always keep MST edges
+        mst_indices = np.where(mst_mask[i])[0]
+        
+        # Get top k non-MST edges
+        non_mst_mask = ~np.isin(np.arange(n), mst_indices)
+        non_mst_indices = np.where(non_mst_mask)[0]
+        
+        if len(non_mst_indices) > 0:
+            non_mst_scores = row[non_mst_indices]
+            if len(non_mst_scores) > k:
+                threshold = np.partition(non_mst_scores, -k)[-k]
+                keep_non_mst = non_mst_indices[non_mst_scores >= threshold]
+            else:
+                keep_non_mst = non_mst_indices
+            
+            # Create keep mask
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[mst_indices] = True
+            keep_mask[keep_non_mst] = True
+            
+            # Apply mask
+            sparsified[i, ~keep_mask] = 0
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+
+def _local_refinement(
+    heuristic: np.ndarray, 
+    dist_mat: np.ndarray, 
+    n: int
+) -> np.ndarray:
+    """Local refinement around promising edges."""
+    refined = heuristic.copy()
+    
+    # For each promising edge, consider 2-opt style improvements
+    edge_threshold = np.percentile(heuristic[np.triu_indices(n, k=1)], 70)
+    promising_edges = np.argwhere(heuristic >= edge_threshold)
+    
+    for i, j in promising_edges:
+        if i >= j:
+            continue
+            
+        # Look for triangles that could be improved
+        for k in range(n):
+            if k == i or k == j:
+                continue
+                
+            # Consider alternative connections
+            current_score = heuristic[i, j] + heuristic[j, k]
+            alt_score = heuristic[i, k] + heuristic[k, j]
+            
+            # If alternative is better by some margin, adjust heuristics
+            if alt_score > current_score * 1.1:
+                # Boost the alternative edges
+                boost_factor = 1.2
+                refined[i, k] = max(refined[i, k], heuristic[i, k] * boost_factor)
+                refined[k, j] = max(refined[k, j], heuristic[k, j] * boost_factor)
+                refined[k, i] = refined[i, k]
+                refined[j, k] = refined[k, j]
+    
+    return refined
+```

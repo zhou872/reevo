@@ -1,0 +1,231 @@
+```json
+{
+    "algorithm_features": ["Reciprocal Distance", "Adaptive Weighting", "Stochastic Sparsification", "Online Parameter Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection with online parameter adaptation
+    and hybrid local search integration. Returns matrix of edge promise indicators.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1.0 / np.maximum(distance_matrix, 1e-10)
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic[np.isnan(heuristic)] = 0
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ==================== ONLINE PARAMETER ADAPTATION ====================
+    # Analyze problem characteristics for dynamic parameter adjustment
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / dist_mean if dist_mean > 0 else 1.0
+    
+    # Compute edge density pattern (normalized entropy)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dists = 1.0 / np.maximum(distance_matrix, 1e-10)
+    inv_dists[np.isinf(inv_dists)] = 0
+    inv_dists[np.isnan(inv_dists)] = 0
+    np.fill_diagonal(inv_dists, 0)
+    
+    # Normalize and compute entropy
+    row_sums = inv_dists.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    prob_matrix = inv_dists / row_sums
+    entropy = -np.sum(prob_matrix * np.log(prob_matrix + 1e-10), axis=1)
+    entropy_norm = entropy / np.log(n) if n > 1 else np.ones(n)
+    edge_entropy = np.mean(entropy_norm)  # Higher = more uniform edge weights
+    
+    # Adaptive parameters based on problem characteristics
+    # Sparsity: higher CV means more variation, need more exploration
+    sparsity_factor = min(1.5, max(0.5, 1.0 + 0.5 * dist_cv))
+    # Stochasticity: higher entropy means less clear structure, need more randomness
+    stochasticity_factor = min(1.0, max(0.2, edge_entropy))
+    # MST weight: smaller problems benefit more from MST structure
+    mst_weight_factor = min(1.2, max(0.8, 1.0 - 0.2 * np.log10(max(2, n))))
+    
+    # ==================== CORE HEURISTIC COMPONENTS ====================
+    # 1. Reciprocal distance (distance-based attraction)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1.0 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # 2. Node centrality using Gaussian similarity (softened)
+    # Use Gaussian kernel for smoother centrality measure
+    sigma = np.median(distance_matrix[distance_matrix > 0])
+    gaussian_sim = np.exp(-distance_matrix**2 / (2 * sigma**2))
+    np.fill_diagonal(gaussian_sim, 0)
+    
+    # PageRank-inspired centrality with teleportation
+    centrality = np.ones(n) / n
+    for _ in range(10):  # Small fixed number of iterations
+        centrality_new = 0.85 * gaussian_sim.T @ (centrality / (gaussian_sim.sum(axis=1) + 1e-10))
+        centrality_new += 0.15 / n
+        centrality = centrality_new
+    centrality = centrality / np.max(centrality) if np.max(centrality) > 0 else centrality
+    
+    # Centrality matrix: product of centralities weighted by reciprocal distance
+    centrality_matrix = np.outer(centrality, centrality) * reciprocal
+    
+    # 3. MST component with enhanced scoring
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst > 0).astype(float)
+        
+        # Boost MST edges based on their structural importance
+        # Compute edge betweenness in MST (simplified)
+        edge_scores = np.zeros_like(mst_mask)
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    # Score based on subtree sizes if we cut this edge
+                    # Simple approximation: product of node degrees in MST
+                    deg_i = np.sum(mst_mask[i])
+                    deg_j = np.sum(mst_mask[j])
+                    edge_scores[i, j] = edge_scores[j, i] = (deg_i * deg_j) ** 0.5
+                    
+        # Normalize and apply
+        if np.max(edge_scores) > 0:
+            edge_scores = edge_scores / np.max(edge_scores)
+        mst_component = mst_mask * (0.5 + 0.5 * edge_scores) * mst_weight_factor
+    except:
+        mst_component = np.zeros_like(distance_matrix)
+    
+    # 4. Local search informed component (2-opt neighborhood)
+    local_search_component = np.zeros_like(distance_matrix)
+    # For each node, identify promising 2-opt moves
+    for i in range(n):
+        # Find nearest neighbors (adaptive number)
+        k_neighbors = max(3, min(10, int(np.sqrt(n))))
+        nearest = np.argsort(distance_matrix[i])[1:k_neighbors+1]  # Exclude self
+        
+        # Score edges that complete promising triangles
+        for j in nearest:
+            # Find common neighbors for potential 2-opt improvements
+            for k in range(n):
+                if k != i and k != j:
+                    # Original edges: (i,j) and (k,?)
+                    # Alternative edges: (i,k) and (j,?)
+                    gain = (distance_matrix[i, j] + distance_matrix[k, k-1 if k>0 else 1]) \
+                         - (distance_matrix[i, k] + distance_matrix[j, k-1 if k>0 else 1])
+                    if gain > 0:
+                        # Positive gain suggests (i,k) might be good
+                        local_search_component[i, k] += gain / (distance_matrix[i, k] + 1e-10)
+    
+    # Normalize local search component
+    if np.max(local_search_component) > 0:
+        local_search_component = local_search_component / np.max(local_search_component)
+    
+    # ==================== ADAPTIVE COMBINATION ====================
+    # Dynamic weights based on online analysis
+    if n < 20:
+        weights = [0.4, 0.3, 0.2, 0.1]  # Smaller problems: favor distance and centrality
+    elif n < 100:
+        weights = [0.3, 0.25, 0.3, 0.15]  # Medium: balanced
+    else:
+        weights = [0.25, 0.2, 0.4, 0.15]  # Larger: favor MST structure
+    
+    # Adjust weights based on problem characteristics
+    if dist_cv > 1.5:  # High variation in distances
+        weights[0] *= 1.2  # Increase distance importance
+        weights[2] *= 0.8  # Decrease MST importance
+    
+    # Normalize weights
+    weight_sum = sum(weights)
+    weights = [w / weight_sum for w in weights]
+    
+    # Combine components
+    combined = (weights[0] * reciprocal + 
+                weights[1] * centrality_matrix + 
+                weights[2] * mst_component + 
+                weights[3] * local_search_component)
+    
+    # ==================== STOCHASTIC SPARSIFICATION ====================
+    sparsified = np.zeros_like(combined)
+    
+    # Adaptive k per node based on problem characteristics
+    base_k = max(3, min(15, int(5 + n / 20)))  # Scales slowly with n
+    k_vals = np.full(n, base_k)
+    
+    # Add stochastic variation and problem-specific adjustment
+    for i in range(n):
+        # Node-specific adjustment based on centrality
+        centrality_factor = 0.8 + 0.4 * centrality[i]
+        # Edge entropy adjustment: uniform nodes need more exploration
+        entropy_factor = 1.0 + 0.5 * entropy_norm[i]
+        
+        k = int(base_k * centrality_factor * entropy_factor * sparsity_factor)
+        k = max(2, min(n-1, k))
+        
+        # Add small random variation
+        k += np.random.randint(-1, 2)
+        k = max(2, min(n-1, k))
+        
+        # Get row and exclude self
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Stochastic ranking: add noise to break ties
+        noise = np.random.randn(n) * stochasticity_factor * 0.1
+        row_noisy = row * (1 + noise)
+        row_noisy[i] = -np.inf
+        
+        # Select top k edges with stochastic decay
+        if k < n-1:
+            sorted_indices = np.argsort(row_noisy)[::-1]
+            keep_indices = sorted_indices[:k]
+        else:
+            keep_indices = np.arange(n)
+            keep_indices = keep_indices[keep_indices != i]
+        
+        # Apply rank-based decay with stochastic perturbation
+        sorted_keep = keep_indices[np.argsort(row_noisy[keep_indices])[::-1]]
+        for rank, j in enumerate(sorted_keep):
+            # Exponential decay with adaptive rate
+            decay_rate = 1.5 + 0.5 * stochasticity_factor
+            decay = np.exp(-rank / decay_rate)
+            
+            # Add adaptive noise based on rank and problem characteristics
+            if rank < k // 2:  # Top half: less noise
+                noise_factor = 0.05
+            else:  # Bottom half: more noise for exploration
+                noise_factor = 0.1 * stochasticity_factor
+            
+            noise = 1 + noise_factor * np.random.randn()
+            sparsified[i, j] = combined[i, j] * decay * max(0.7, noise)
+    
+    # ==================== FINAL PROCESSING ====================
+    # Ensure symmetry with weighted averaging
+    alpha = 0.7  # Weight for original direction
+    symmetric = alpha * sparsified + (1 - alpha) * sparsified.T
+    
+    # Final stochastic smoothing
+    if stochasticity_factor > 0.3:
+        noise = np.random.randn(n, n) * 0.02 * stochasticity_factor
+        np.fill_diagonal(noise, 0)
+        symmetric = symmetric + noise
+    
+    # Ensure non-negative and zero diagonal
+    symmetric = np.maximum(symmetric, 0)
+    np.fill_diagonal(symmetric, 0)
+    
+    # Normalize if needed
+    max_val = symmetric.max()
+    if max_val > 0:
+        symmetric = symmetric / max_val
+    
+    return symmetric
+```

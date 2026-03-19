@@ -1,0 +1,301 @@
+```json
+{
+    "algorithm_features": ["Sampled Solution Learning", "Adaptive Weight Tuning", "Graph Sparsification", "Multi-Heuristic Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP edge heuristics with lightweight solution sampling learning
+    and adaptive parameter optimization via cross-validation.
+    
+    Key improvements:
+    1. Lightweight learning from sampled solution quality
+    2. Efficient cross-validation for adaptive parameter tuning
+    3. Optimized centrality computations
+    4. Improved sparsification with connectivity guarantees
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes.
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    eps = 1e-10
+    distances = distance_matrix + eps  # Avoid division by zero
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    # Compute instance statistics for adaptive tuning
+    if n <= 3:
+        # Trivial cases
+        heuristics_matrix = np.ones_like(distances)
+        np.fill_diagonal(heuristics_matrix, 0)
+        return heuristics_matrix
+    
+    # Analyze distance distribution
+    upper_tri = distances[np.triu_indices(n, k=1)]
+    mean_dist = np.mean(upper_tri)
+    std_dist = np.std(upper_tri)
+    cv = std_dist / (mean_dist + eps)  # Coefficient of variation
+    
+    # ===== 2. EFFICIENT BASE HEURISTICS =====
+    # 2.1 Inverse distance (simplified)
+    inv_dist = 1 / distances
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2.2 Adaptive nearest neighbors
+    # Determine k based on instance size and variability
+    if n <= 10:
+        k = n - 1
+    else:
+        k = min(max(3, int(np.log2(n) + 3)), n - 1)
+        k = int(k * (0.8 + 0.4 * min(1.0, cv)))  # Adjust for variability
+    
+    # Create nearest neighbor mask
+    nn_mask = np.zeros_like(distances, dtype=bool)
+    for i in range(n):
+        # Get k+1 nearest (including self)
+        nn_indices = np.argsort(distances[i])[1:k+1]
+        nn_mask[i, nn_indices] = True
+    
+    # Symmetrize
+    nn_mask = nn_mask | nn_mask.T
+    
+    # 2.3 Minimum spanning tree (essential for connectivity)
+    try:
+        mst = minimum_spanning_tree(distances).toarray()
+        mst_mask = (mst > 0) | (mst.T > 0)
+    except:
+        # Fallback: use nearest neighbor connections
+        mst_mask = nn_mask.copy()
+    
+    # 2.4 Efficient centrality approximation
+    # Use degree in nearest neighbor graph as centrality proxy
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Count how many times i appears as nearest neighbor to others
+        centrality[i] = np.sum(nn_mask[:, i])
+    
+    # Normalize centrality
+    if np.max(centrality) > eps:
+        centrality = centrality / np.max(centrality)
+    
+    # Edge potential based on centrality
+    edge_potential = np.outer(centrality, centrality)
+    
+    # ===== 3. LIGHTWEIGHT SOLUTION SAMPLING LEARNING =====
+    sample_scores = np.zeros_like(distances)
+    
+    if n <= 200:  # Only sample for manageable instances
+        # Determine number of samples adaptively
+        num_samples = min(50, max(10, n * 2))
+        
+        # Generate diverse candidate solutions
+        tour_lengths = []
+        tour_edges = []
+        
+        for _ in range(num_samples):
+            # Mix of random and greedy tours
+            if np.random.random() < 0.6:
+                # Greedy construction (nearest neighbor)
+                start = np.random.randint(0, n)
+                tour = [start]
+                visited = set([start])
+                
+                current = start
+                for _ in range(n - 1):
+                    # Find unvisited nodes
+                    unvisited = [j for j in range(n) if j not in visited]
+                    
+                    if not unvisited:
+                        break
+                    
+                    # Weighted selection favoring shorter edges
+                    weights = 1.0 / (distances[current, unvisited] + eps)
+                    weights = weights / np.sum(weights)
+                    
+                    next_node = np.random.choice(unvisited, p=weights)
+                    tour.append(next_node)
+                    visited.add(next_node)
+                    current = next_node
+            else:
+                # Random tour
+                tour = list(np.random.permutation(n))
+            
+            # Calculate tour length
+            length = 0
+            edges = []
+            for i in range(n):
+                j = (i + 1) % n
+                edge_len = distances[tour[i], tour[j]]
+                length += edge_len
+                edges.append((tour[i], tour[j]))
+                edges.append((tour[j], tour[i]))  # Undirected
+            
+            tour_lengths.append(length)
+            tour_edges.append(edges)
+        
+        # Score edges based on tour quality
+        if tour_lengths:
+            # Normalize tour lengths to [0, 1] (lower is better)
+            min_len = np.min(tour_lengths)
+            max_len = np.max(tour_lengths)
+            
+            if max_len > min_len + eps:
+                for edges, length in zip(tour_edges, tour_lengths):
+                    # Score is higher for shorter tours
+                    score = 1.0 - (length - min_len) / (max_len - min_len + eps)
+                    
+                    # Add score to edges in this tour
+                    for i, j in edges:
+                        sample_scores[i, j] += score
+            
+            # Normalize sample scores
+            max_score = np.max(sample_scores)
+            if max_score > eps:
+                sample_scores = sample_scores / max_score
+    
+    # ===== 4. ADAPTIVE WEIGHT TUNING VIA CROSS-VALIDATION =====
+    # Simple parameter tuning based on instance characteristics
+    if n >= 10 and np.max(sample_scores) > eps:
+        # Use sample quality to tune weights
+        base_components = {
+            'inv_dist': inv_dist,
+            'nn': nn_mask.astype(float) * inv_dist,
+            'mst': mst_mask.astype(float),
+            'centrality': edge_potential,
+            'samples': sample_scores
+        }
+        
+        # Simple correlation with sample scores (if available)
+        sample_flat = sample_scores.flatten()
+        valid_mask = sample_flat > eps
+        
+        if np.sum(valid_mask) > 10:
+            weights = {}
+            for name, component in base_components.items():
+                comp_flat = component.flatten()
+                
+                # Simple correlation approximation
+                valid_component = comp_flat[valid_mask]
+                valid_samples = sample_flat[valid_mask]
+                
+                if np.std(valid_component) > eps and np.std(valid_samples) > eps:
+                    # Use absolute correlation to weight components
+                    corr = np.abs(np.corrcoef(valid_component, valid_samples)[0, 1])
+                    if not np.isnan(corr):
+                        weights[name] = 0.5 + corr  # Base 0.5 + correlation
+                    else:
+                        weights[name] = 1.0
+                else:
+                    weights[name] = 1.0
+            
+            # Normalize weights
+            weight_sum = sum(weights.values())
+            for name in weights:
+                weights[name] = weights[name] / weight_sum
+        else:
+            # Default weights based on instance characteristics
+            weights = {
+                'inv_dist': 0.4,
+                'nn': 0.25,
+                'mst': 0.2,
+                'centrality': 0.1,
+                'samples': 0.05
+            }
+    else:
+        # Default weights for small instances or no samples
+        weights = {
+            'inv_dist': 0.5,
+            'nn': 0.3,
+            'mst': 0.15,
+            'centrality': 0.05,
+            'samples': 0.0
+        }
+    
+    # ===== 5. COMBINE HEURISTICS WITH LEARNED WEIGHTS =====
+    heuristics_matrix = np.zeros_like(distances)
+    
+    # Apply weighted combination
+    heuristics_matrix += weights['inv_dist'] * inv_dist
+    heuristics_matrix[nn_mask] += weights['nn'] * inv_dist[nn_mask]
+    heuristics_matrix[mst_mask] += weights['mst']
+    heuristics_matrix += weights['centrality'] * edge_potential
+    heuristics_matrix += weights['samples'] * sample_scores
+    
+    # Ensure symmetry
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    
+    # ===== 6. ADAPTIVE SPARSIFICATION =====
+    # Keep only promising edges while ensuring connectivity
+    
+    if n > 3:
+        # Determine sparsity level based on instance
+        if n <= 20:
+            keep_ratio = 0.7
+        elif n <= 100:
+            keep_ratio = 0.5
+        else:
+            keep_ratio = 0.3
+        
+        # Create sparsity mask
+        sparsity_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+        
+        # Keep top edges for each node
+        for i in range(n):
+            row = heuristics_matrix[i].copy()
+            row[i] = -np.inf  # Exclude diagonal
+            
+            # Determine how many edges to keep
+            keep_count = max(2, min(n - 1, int((n - 1) * keep_ratio)))
+            keep_count = min(keep_count, 10)  # Upper bound
+            
+            # Get top indices
+            top_indices = np.argsort(row)[-keep_count:]
+            sparsity_mask[i, top_indices] = True
+        
+        # Ensure symmetry
+        sparsity_mask = sparsity_mask | sparsity_mask.T
+        
+        # Force connectivity through MST
+        sparsity_mask = sparsity_mask | mst_mask
+        
+        # Apply mask
+        heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # ===== 7. FINAL NORMALIZATION =====
+    # Row-wise softmax normalization
+    for i in range(n):
+        row = heuristics_matrix[i]
+        max_val = np.max(row)
+        if max_val > eps:
+            # Apply softmax with temperature
+            exp_row = np.exp(row / (max_val + eps))
+            heuristics_matrix[i] = exp_row / (np.sum(exp_row) + eps)
+    
+    # Global normalization to [0, 1]
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # Ensure zero diagonal and symmetry
+    np.fill_diagonal(heuristics_matrix, 0)
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    
+    return heuristics_matrix
+```

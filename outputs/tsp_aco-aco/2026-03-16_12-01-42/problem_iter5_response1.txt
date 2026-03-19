@@ -1,0 +1,240 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret-Sparsification", "Lookahead Spatial Averaging", "Mutual Neighborhood Reinforcement", "Balanced Degree Penalization"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristics with adaptive regret-sparsification
+    and mutual neighborhood reinforcement.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # For trivial cases, return uniform non-zero values for non-diagonal edges
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance with stability epsilon ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Adaptive regret-based penalization ===
+    # Use dynamic k based on problem size for regret calculation
+    k_regret = min(max(3, n // 5), 10)
+    regret_boost = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dist_i = distance_matrix[i].copy()
+        dist_i[i] = np.inf
+        
+        # Find k_regret + 1 smallest distances to account for current edge
+        k_consider = min(k_regret + 1, n - 1)
+        if k_consider > 0:
+            # Get indices of k_consider nearest neighbors
+            nearest_indices = np.argpartition(dist_i, k_consider)[:k_consider]
+            nearest_dists = dist_i[nearest_indices]
+            
+            # For each potential edge from i
+            for j in range(n):
+                if i == j:
+                    continue
+                    
+                d_ij = distance_matrix[i, j]
+                
+                # Find best alternative distance (excluding edge i-j)
+                alternative_mask = nearest_indices != j
+                if np.any(alternative_mask):
+                    best_alternative = np.min(nearest_dists[alternative_mask])
+                    # Normalized regret score
+                    regret = max(0, best_alternative - d_ij) / (d_ij + epsilon)
+                    # Apply adaptive boost based on regret significance
+                    regret_boost[i, j] = 1.0 + 1.5 * np.tanh(regret)
+                else:
+                    # No alternatives, edge is essential
+                    regret_boost[i, j] = 2.0
+    
+    # === 3. Lookahead spatial averaging ===
+    # Dynamic neighborhood size for spatial averaging
+    k_spatial = min(max(5, n // 3), 15)
+    spatial_scores = np.ones_like(distance_matrix)
+    
+    # Pre-compute spatial quality for each node
+    node_spatial_quality = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if n > k_spatial:
+            # Get k_spatial nearest distances
+            k_nearest_dists = np.partition(dists, k_spatial)[:k_spatial]
+            # Use geometric mean for robustness to outliers
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_dists = np.log(k_nearest_dists + epsilon)
+                node_spatial_quality[i] = np.exp(np.mean(log_dists))
+        else:
+            # For small n, use all distances
+            node_spatial_quality[i] = np.mean(dists[dists < np.inf])
+    
+    # Compute spatial score for each edge
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            # Combine endpoint qualities harmonically (favor balanced endpoints)
+            if node_spatial_quality[i] > 0 and node_spatial_quality[j] > 0:
+                spatial_scores[i, j] = 2.0 / (1.0/node_spatial_quality[i] + 
+                                             1.0/node_spatial_quality[j])
+    
+    # Normalize spatial scores to reasonable range
+    if np.max(spatial_scores) > 0:
+        spatial_scores = spatial_scores / np.max(spatial_scores)
+    
+    # === 4. Mutual neighborhood reinforcement ===
+    # Dynamic neighborhood size for mutual reinforcement
+    k_mutual = min(max(3, int(np.sqrt(n))), 10)
+    mutual_boost = np.ones_like(distance_matrix)
+    
+    # Find nearest neighbors for each node
+    nn_sets = [set() for _ in range(n)]
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if n - 1 > k_mutual:
+            nearest_indices = np.argpartition(dists, k_mutual)[:k_mutual]
+        else:
+            nearest_indices = np.arange(n)
+            nearest_indices = nearest_indices[nearest_indices != i]
+        
+        nn_sets[i] = set(nearest_indices)
+    
+    # Apply mutual reinforcement boost
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if j in nn_sets[i] and i in nn_sets[j]:
+                # Strong mutual reinforcement
+                mutual_boost[i, j] = 1.8
+            elif j in nn_sets[i] or i in nn_sets[j]:
+                # One-way reinforcement
+                mutual_boost[i, j] = 1.3
+    
+    # === 5. Degree balancing with popularity penalty ===
+    degree_penalty = np.ones_like(distance_matrix)
+    
+    # Calculate node popularity (how many times node appears in others' neighborhoods)
+    popularity = np.zeros(n)
+    for i in range(n):
+        for j in range(n):
+            if i != j and j in nn_sets[i]:
+                popularity[j] += 1
+    
+    # Normalize popularity
+    if np.max(popularity) > 0:
+        popularity = popularity / np.max(popularity)
+    
+    # Apply degree penalty: penalize highly popular nodes less severely
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            # Balanced penalty considering popularity of both endpoints
+            avg_popularity = (popularity[i] + popularity[j]) / 2.0
+            # Inverted penalty: popular nodes get less penalty
+            degree_penalty[i, j] = 0.7 + 0.3 * (1.0 - avg_popularity)
+    
+    # === 6. Combine factors multiplicatively ===
+    heuristics = inv_dist.copy()
+    heuristics *= regret_boost
+    heuristics *= spatial_scores
+    heuristics *= mutual_boost
+    heuristics *= degree_penalty
+    
+    # === 7. Adaptive sparsification with regret-aware threshold ===
+    # Dynamic sparsification parameter
+    adaptive_k = min(max(4, int(np.sqrt(n) * 1.5)), 20)
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        
+        if adaptive_k < n - 1:
+            # Calculate regret-adjusted scores for thresholding
+            regret_adjusted = row.copy()
+            for j in range(n):
+                if i != j:
+                    regret_adjusted[j] *= (regret_boost[i, j] ** 0.7)
+            
+            # Keep top edges by regret-adjusted score
+            top_k_indices = np.argsort(regret_adjusted)[-adaptive_k:]
+            
+            # Ensure mutual neighbors are always considered
+            for j in nn_sets[i]:
+                if i in nn_sets[j]:  # Mutual neighbor
+                    if j not in top_k_indices:
+                        # Expand the set to include mutual neighbors
+                        if len(top_k_indices) < n - 1:
+                            top_k_indices = np.append(top_k_indices, j)
+            
+            # Create mask for edges to keep
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[top_k_indices] = True
+            
+            # Ensure we keep at least 2 edges (for connectivity)
+            if np.sum(keep_mask) < 2:
+                # Fallback to original scores
+                top2_indices = np.argsort(row)[-2:]
+                keep_mask[top2_indices] = True
+            
+            # Apply sparsification
+            row[~keep_mask] = 0
+            heuristics[i] = row
+    
+    # === 8. Symmetrize with preference for mutual high scores ===
+    symmetric_heuristics = np.zeros_like(heuristics)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                symmetric_heuristics[i, j] = 0
+            else:
+                # Weight mutual decisions more heavily
+                mutual_factor = 1.0
+                if j in nn_sets[i] and i in nn_sets[j]:
+                    mutual_factor = 1.2
+                
+                symmetric_heuristics[i, j] = max(
+                    heuristics[i, j],
+                    heuristics[j, i] * 0.8 * mutual_factor
+                )
+    
+    # === 9. Final normalization and cleanup ===
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Ensure non-negativity
+    symmetric_heuristics = np.maximum(symmetric_heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(symmetric_heuristics)
+    if max_val > 0:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+```

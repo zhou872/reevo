@@ -1,0 +1,287 @@
+```json
+{
+    "algorithm_features": ["Adaptive Mutual K-NN", "Two-hop Efficiency Scoring", "Lightweight Rank Regret", "Dynamic Parameter Adjustment"]
+}
+```
+
+```python
+import numpy as np
+from typing import Optional
+
+def heuristics_v2(distance_matrix: np.ndarray,
+                  k_neighbors: Optional[int] = None,
+                  sparsity_factor: Optional[float] = None) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with adaptive parameters
+    and lightweight regret mechanism.
+    
+    Key improvements over v1:
+    1. Adaptive k_neighbors based on instance density and variance
+    2. Lightweight rank-based regret mechanism
+    3. Dynamic sparsity_factor based on instance characteristics
+    4. More robust efficiency scoring with normalized detour ratios
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        k_neighbors: Optional fixed number of neighbors; if None, computed adaptively
+        sparsity_factor: Optional fixed sparsity; if None, computed adaptively
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges. Diagonal is zero.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === INSTANCE CHARACTERIZATION ===
+    # Compute instance statistics for adaptive parameter tuning
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_cv = dist_std / (dist_mean + 1e-12)  # Coefficient of variation
+    
+    # === ADAPTIVE PARAMETER SETTING ===
+    # Adaptive k_neighbors based on instance size and variability
+    if k_neighbors is None:
+        base_k = max(2, int(np.sqrt(n)))
+        # Adjust based on coefficient of variation
+        if dist_cv > 0.7:  # High variability - focus on strongest connections
+            k_neighbors = max(2, int(base_k * 0.7))
+        elif dist_cv < 0.3:  # Low variability - consider more neighbors
+            k_neighbors = min(n-1, int(base_k * 1.3))
+        else:
+            k_neighbors = base_k
+    
+    k_neighbors = min(k_neighbors, n - 1)
+    
+    # Adaptive sparsity_factor
+    if sparsity_factor is None:
+        if n < 10:
+            sparsity_factor = 0.1  # Keep most edges for small instances
+        elif dist_cv > 0.8:
+            sparsity_factor = 0.4  # More aggressive sparsification for varied instances
+        else:
+            sparsity_factor = 0.3  # Default moderate sparsification
+    
+    # === BASE INVERSE DISTANCE WEIGHTING ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        eps = np.finfo(distance_matrix.dtype).eps * 10
+        inv_dist = 1.0 / (distance_matrix + eps * np.eye(n))
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distances to [0, 1] range
+    max_inv = inv_dist.max()
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # === MUTUAL K-NN PRIORITIZATION ===
+    # Get k-nearest neighbors for each node
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_neighbors+1]
+    
+    # Create k-NN adjacency matrix
+    knn_adjacency = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        knn_adjacency[i, nearest_indices[i]] = True
+    
+    # Mutual K-NN: both nodes are in each other's k-nearest neighbors
+    mutual_knn = knn_adjacency & knn_adjacency.T
+    # One-way K-NN: only one node is in the other's k-nearest neighbors
+    oneway_knn = knn_adjacency ^ mutual_knn
+    
+    # === LIGHTWEIGHT RANK-BASED REGRET MECHANISM ===
+    regret_matrix = np.ones((n, n))
+    
+    # For each node, compute regret penalties based on edge ranks
+    for i in range(n):
+        # Get distances to all other nodes
+        mask = np.arange(n) != i
+        dists_i = distance_matrix[i, mask]
+        other_indices = np.where(mask)[0]
+        
+        # Sort by distance and get ranks
+        sorted_idx = np.argsort(dists_i)
+        ranks = np.argsort(sorted_idx) + 1  # Rank 1 for nearest, 2 for second nearest, etc.
+        
+        # Compute regret penalty: higher penalty for edges with many near alternatives
+        # Using a soft rank-based penalty: 1/(1 + α*rank)
+        alpha = 0.3  # Controls regret strength
+        penalties = 1.0 / (1.0 + alpha * (ranks - 1))
+        
+        # Apply penalties to regret matrix
+        regret_matrix[i, other_indices] = penalties
+    
+    # Make symmetric by taking geometric mean
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # === TWO-HOP EFFICIENCY SCORING WITH NORMALIZED DETOUR RATIOS ===
+    efficiency_score = np.ones((n, n))
+    
+    # Precompute nearest neighbors for efficiency checking
+    eff_k = min(k_neighbors + 2, n - 1)  # Slightly more neighbors for efficiency check
+    eff_nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:eff_k+1]
+    
+    for i in range(n):
+        i_neighbors = eff_nearest_indices[i]
+        
+        for j in range(i + 1, n):
+            direct_dist = distance_matrix[i, j]
+            
+            if direct_dist <= 0:
+                efficiency_score[i, j] = efficiency_score[j, i] = 1.0
+                continue
+            
+            j_neighbors = eff_nearest_indices[j]
+            
+            # Combine candidate intermediate nodes
+            candidates = np.union1d(i_neighbors, j_neighbors)
+            candidates = candidates[candidates != i]
+            candidates = candidates[candidates != j]
+            
+            if len(candidates) == 0:
+                continue
+            
+            # Find best two-hop alternative through candidates
+            best_alternative = np.inf
+            for k in candidates:
+                alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                if alt_dist < best_alternative:
+                    best_alternative = alt_dist
+            
+            if best_alternative < np.inf:
+                # Normalize detour ratio by instance characteristics
+                efficiency_ratio = best_alternative / direct_dist
+                
+                # Convert to score with adaptive thresholding
+                # Direct edge is very efficient if no good detour exists
+                if efficiency_ratio >= 1.5:  # No good alternative
+                    score = 1.5
+                elif efficiency_ratio >= 1.1:  # Moderate alternative
+                    score = 1.2
+                elif efficiency_ratio >= 0.9:  # Comparable alternative
+                    score = 1.0
+                else:  # Better alternative exists
+                    score = 0.8
+                
+                efficiency_score[i, j] = efficiency_score[j, i] = score
+    
+    # === COMBINE ALL FACTORS WITH ADAPTIVE WEIGHTS ===
+    # Dynamic weights based on instance characteristics
+    if dist_cv > 0.6:
+        # High variability: emphasize mutual K-NN and regret
+        knn_weight = 1.6
+        regret_weight = 1.2
+        efficiency_weight = 1.0
+    else:
+        # Balanced approach for uniform instances
+        knn_weight = 1.5
+        regret_weight = 1.0
+        efficiency_weight = 1.1
+    
+    # Start with base inverse distance
+    heuristics = inv_dist.copy()
+    
+    # Apply efficiency scoring
+    heuristics *= efficiency_score ** efficiency_weight
+    
+    # Apply regret mechanism
+    heuristics *= regret_matrix ** regret_weight
+    
+    # Boost mutual and one-way K-NN edges
+    heuristics[mutual_knn] *= knn_weight
+    heuristics[oneway_knn] *= 1.2
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # === ADAPTIVE SPARSIFICATION ===
+    if sparsity_factor > 0 and n > 3:
+        # For each node, keep top edges based on adaptive keep_count
+        for i in range(n):
+            row_values = heuristics[i].copy()
+            row_values[i] = -np.inf  # Ignore diagonal
+            
+            # Adaptive keep_count: at least k_neighbors, up to (1-sparsity_factor)*(n-1)
+            min_keep = max(k_neighbors, 3)  # Ensure minimum connectivity
+            max_keep = int((1 - sparsity_factor) * (n - 1))
+            keep_count = min(max_keep, max(min_keep, n - 1))
+            
+            if keep_count < n - 1:
+                # Find threshold for top keep_count edges
+                threshold = np.partition(row_values, -keep_count)[-keep_count]
+                
+                # Zero out edges below threshold
+                mask = row_values < threshold
+                heuristics[i, mask] = 0
+        
+        # Restore symmetry after sparsification
+        # Keep edge if strong in either direction
+        symmetric_mask = (heuristics > 0) | (heuristics.T > 0)
+        heuristics = np.where(symmetric_mask,
+                              np.maximum(heuristics, heuristics.T),
+                              0)
+    
+    # === FINAL PROCESSING ===
+    # Ensure zero diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize non-zero values to [0, 1] range
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = heuristics[non_zero_mask].max()
+        if max_val > 0:
+            heuristics[non_zero_mask] = heuristics[non_zero_mask] / max_val
+    
+    return heuristics
+
+
+# Example usage and test
+if __name__ == "__main__":
+    from scipy.spatial.distance import pdist, squareform
+    
+    # Generate test instances with different characteristics
+    np.random.seed(42)
+    
+    # Instance 1: Uniform distribution
+    print("=== Instance 1: Uniform Distribution ===")
+    n_nodes = 25
+    coords = np.random.rand(n_nodes, 2) * 100
+    dist_matrix = squareform(pdist(coords))
+    
+    heuristics = heuristics_v2(dist_matrix.copy())
+    
+    print(f"Shape: {heuristics.shape}")
+    print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+    non_zero_edges = np.sum(heuristics > 0, axis=1)
+    print(f"Edges per node: min={non_zero_edges.min()}, max={non_zero_edges.max()}, mean={non_zero_edges.mean():.1f}")
+    
+    # Instance 2: Clustered distribution (high variability)
+    print("\n=== Instance 2: Clustered Distribution ===")
+    n_clusters = 3
+    points_per_cluster = 15
+    cluster_centers = np.random.rand(n_clusters, 2) * 100
+    coords = []
+    for c in cluster_centers:
+        cluster_points = c + np.random.randn(points_per_cluster, 2) * 5
+        coords.append(cluster_points)
+    coords = np.vstack(coords)
+    dist_matrix2 = squareform(pdist(coords))
+    
+    heuristics2 = heuristics_v2(dist_matrix2.copy())
+    
+    print(f"Shape: {heuristics2.shape}")
+    print(f"Sparsity: {(heuristics2 == 0).sum() / heuristics2.size:.1%}")
+    non_zero_edges2 = np.sum(heuristics2 > 0, axis=1)
+    print(f"Edges per node: min={non_zero_edges2.min()}, max={non_zero_edges2.max()}, mean={non_zero_edges2.mean():.1f}")
+    
+    # Verify symmetry
+    print(f"\nInstance 1 symmetric: {np.allclose(heuristics, heuristics.T)}")
+    print(f"Instance 2 symmetric: {np.allclose(heuristics2, heuristics2.T)}")
+```

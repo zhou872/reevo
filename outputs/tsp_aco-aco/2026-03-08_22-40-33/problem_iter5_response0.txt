@@ -1,0 +1,167 @@
+```json
+{
+    "algorithm_features": ["Two-Hop Efficiency Ratio", "Mutual K-NN Sparsification", "Distance Inverse Weighting", "Symmetric Clipping"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization using efficient two-hop
+    lookahead and mutual k-NN sparsification.
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input with values in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Adaptive parameter tuning based on instance size
+    k = min(max(3, int(np.sqrt(n))), n - 1)
+    
+    # 1. Base inverse distance weighting
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Use median for more robust scaling than mean
+        scale = np.median(distance_matrix[np.triu_indices(n, k=1)])
+        inv_dist = scale / (distance_matrix + 0.1 * scale * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Compute k-nearest neighbors for all nodes
+    # Add small noise to break distance ties for consistent sorting
+    noise = np.random.randn(n, n) * 1e-10 * distance_matrix.max()
+    noisy_dist = distance_matrix + noise
+    # Sort by distance, excluding self
+    sorted_indices = np.argsort(noisy_dist, axis=1)[:, 1:k+1]
+    
+    # 3. Two-hop lookahead efficiency scoring
+    efficiency_score = np.ones((n, n))
+    
+    # Precompute nearest neighbor distances for faster lookup
+    neighbor_distances = np.zeros((n, k))
+    for i in range(n):
+        neighbor_distances[i] = distance_matrix[i, sorted_indices[i]]
+    
+    # For each node pair (i, j), find best two-hop alternative
+    for i in range(n):
+        # Get i's nearest neighbors (excluding j)
+        i_neighbors = sorted_indices[i]
+        i_distances = neighbor_distances[i]
+        
+        for j in range(i + 1, n):
+            # Get j's nearest neighbors (excluding i)
+            j_neighbors = sorted_indices[j]
+            j_distances = neighbor_distances[j]
+            
+            # Find minimum two-hop distance through intermediate nodes
+            best_alternative = np.inf
+            
+            # Check through i's neighbors
+            for idx, k_node in enumerate(i_neighbors):
+                if k_node != j:
+                    # Check if k_node connects to j (either direct or via nearest neighbor)
+                    if k_node in j_neighbors:
+                        k_to_j_dist = distance_matrix[k_node, j]
+                    else:
+                        # Find k_node's nearest neighbor that might connect to j
+                        k_neighbors = sorted_indices[k_node]
+                        # Check if j is in k_node's neighbors
+                        if j in k_neighbors:
+                            k_to_j_dist = distance_matrix[k_node, j]
+                        else:
+                            # Use minimum of k_node's neighbor distances to j
+                            k_to_j_dist = min([distance_matrix[m, j] for m in k_neighbors[:2] 
+                                             if m != i and m != j], default=np.inf)
+                    
+                    alternative = i_distances[idx] + k_to_j_dist
+                    best_alternative = min(best_alternative, alternative)
+            
+            # Check through j's neighbors
+            for idx, k_node in enumerate(j_neighbors):
+                if k_node != i:
+                    # Check if k_node connects to i (either direct or via nearest neighbor)
+                    if k_node in i_neighbors:
+                        k_to_i_dist = distance_matrix[k_node, i]
+                    else:
+                        # Find k_node's nearest neighbor that might connect to i
+                        k_neighbors = sorted_indices[k_node]
+                        # Check if i is in k_node's neighbors
+                        if i in k_neighbors:
+                            k_to_i_dist = distance_matrix[k_node, i]
+                        else:
+                            # Use minimum of k_node's neighbor distances to i
+                            k_to_i_dist = min([distance_matrix[m, i] for m in k_neighbors[:2] 
+                                             if m != i and m != j], default=np.inf)
+                    
+                    alternative = j_distances[idx] + k_to_i_dist
+                    best_alternative = min(best_alternative, alternative)
+            
+            # Calculate efficiency ratio
+            direct_dist = distance_matrix[i, j]
+            if best_alternative < np.inf and direct_dist > 0:
+                efficiency = best_alternative / direct_dist
+                # Clip and normalize to [0.1, 2.0] range
+                efficiency = np.clip(efficiency, 0.1, 2.0)
+                # Convert to score: higher efficiency means direct edge is worse
+                # So we invert: score = 2.0 / efficiency (but keep in [0.5, 2.0])
+                score = 2.0 / efficiency if efficiency > 1.0 else efficiency
+                efficiency_score[i, j] = efficiency_score[j, i] = np.clip(score, 0.5, 2.0)
+    
+    # 4. Mutual nearest neighbor boosting
+    mutual_nn_boost = np.ones((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if i in sorted_indices[j] and j in sorted_indices[i]:
+                # Both are in each other's k-nearest neighbors
+                mutual_nn_boost[i, j] = mutual_nn_boost[j, i] = 1.5
+    
+    # 5. Combine factors
+    heuristics = inv_dist * efficiency_score * mutual_nn_boost
+    
+    # 6. Sparsification based on mutual k-NN
+    # First, create adjacency mask from mutual nearest neighbors
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        # Include self k-nearest neighbors
+        adjacency_mask[i, sorted_indices[i]] = True
+        # Include nodes that have i as their nearest neighbor
+        for j in range(n):
+            if i != j and i in sorted_indices[j, :min(3, k)]:
+                adjacency_mask[i, j] = True
+    
+    # Symmetrize the mask
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    
+    # Zero out non-promising edges (not in adjacency mask and low heuristic score)
+    for i in range(n):
+        row = heuristics[i]
+        # Keep edges in adjacency mask
+        keep_mask = adjacency_mask[i]
+        # For edges not in mask, zero if below median of non-zero values
+        if np.any(~keep_mask):
+            non_masked_vals = row[~keep_mask & (row > 0)]
+            if len(non_masked_vals) > 0:
+                threshold = np.median(non_masked_vals) * 0.7
+                low_value_mask = ~keep_mask & (row < threshold)
+                row[low_value_mask] = 0
+        heuristics[i] = row
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # 7. Final normalization to [0, 1] range
+    non_zero = heuristics > 0
+    if np.any(non_zero):
+        max_val = heuristics[non_zero].max()
+        if max_val > 0:
+            heuristics[non_zero] = heuristics[non_zero] / max_val
+    
+    return heuristics
+```

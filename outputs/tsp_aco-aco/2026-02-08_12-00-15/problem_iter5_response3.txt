@@ -1,0 +1,146 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristics for TSP edge selection.
+    Combines MST, nearest neighbors, triangle inequality checks,
+    adaptive sparsification, and logarithmic boosting.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base heuristic: inverse distance (avoid division by zero)
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    base_heuristic = 1.0 / safe_dist
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. Minimum Spanning Tree inclusion
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 3. Nearest neighbor mask with adaptive sparsity
+    # Keep more edges for smaller instances, fewer for larger
+    k = max(2, min(8, int(np.sqrt(n))))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        nearest = np.argsort(safe_dist[i])[:k+1]
+        nearest = nearest[nearest != i]
+        nn_mask[i, nearest[:min(k, len(nearest))]] = True
+    
+    # Symmetrize nearest neighbor mask
+    nn_mask = nn_mask | nn_mask.T
+    
+    # 4. Triangle inequality violation penalty (vectorized)
+    # Check for strong violations: d(i,j) > d(i,k) + d(k,j) + tolerance
+    violation_penalty = np.ones_like(distance_matrix)
+    if n >= 3:
+        # Use broadcasting for efficient triangle checks
+        for k in range(n):
+            # Compute triangle inequality: d(i,j) <= d(i,k) + d(k,j)
+            triangle_sum = safe_dist[:, k:k+1] + safe_dist[k:k+1, :]
+            # Find violations (direct path significantly longer than two-hop)
+            violations = safe_dist > (triangle_sum * 1.05)  # 5% tolerance
+            # Only penalize if not already zero (diagonal or inf)
+            mask = (safe_dist < np.inf) & violations
+            # Gradually reduce penalty based on violation severity
+            violation_ratio = np.where(mask, triangle_sum / (safe_dist + 1e-10), 1)
+            violation_penalty *= np.clip(violation_ratio, 0.3, 1.0)
+    
+    # 5. Multiply MST and nearest neighbor masks (as per reflection)
+    combined_mask = mst_mask & nn_mask
+    edges_in_both = combined_mask.sum() / 2  # Count undirected edges
+    
+    # 6. Combine factors with boosted weights for edges in both masks
+    heuristics = base_heuristic.copy()
+    
+    # Base bonuses
+    mst_bonus = 2.0
+    nn_bonus = 1.5
+    both_bonus = 3.0  # Higher bonus for edges in both MST and NN
+    
+    # Apply bonuses
+    heuristics[mst_mask & ~combined_mask] *= mst_bonus
+    heuristics[nn_mask & ~combined_mask] *= nn_bonus
+    heuristics[combined_mask] *= both_bonus
+    
+    # Apply triangle inequality penalty
+    heuristics *= violation_penalty
+    
+    # 7. Adaptive sparsification by node degree
+    # Keep different number of edges based on instance size
+    if n <= 10:
+        edges_to_keep = n - 1  # Almost complete
+    elif n <= 50:
+        edges_to_keep = max(4, n // 3)
+    else:
+        edges_to_keep = max(5, int(np.log2(n)) * 3)
+    
+    # Create sparsity mask
+    sparsity_mask = np.zeros_like(heuristics, dtype=bool)
+    
+    for i in range(n):
+        # Get edges for this node, exclude self
+        row_vals = heuristics[i].copy()
+        row_vals[i] = -np.inf
+        
+        # Find threshold for top edges
+        if edges_to_keep < len(row_vals):
+            # Use argsort to get top edges
+            top_indices = np.argsort(row_vals)[-edges_to_keep:]
+            sparsity_mask[i, top_indices] = True
+        else:
+            # Keep all except diagonal
+            sparsity_mask[i, :] = True
+            sparsity_mask[i, i] = False
+    
+    # Symmetrize the sparsity mask
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Apply sparsity mask
+    heuristics = heuristics * sparsity_mask
+    
+    # 8. Logarithmic boosting for top edges per node
+    for i in range(n):
+        # Get non-zero values for this node
+        row_vals = heuristics[i]
+        non_zero_mask = row_vals > 0
+        non_zero_indices = np.where(non_zero_mask)[0]
+        
+        if len(non_zero_indices) > 1:
+            # Get the values and sort them
+            values = row_vals[non_zero_indices]
+            sorted_idx = np.argsort(values)
+            
+            # Apply logarithmic boost based on rank
+            ranks = np.arange(len(values)) + 1
+            boost_factors = 1 + np.log1p(ranks[::-1]) / 2  # Top gets ~1.8x, bottom ~1.1x
+            
+            # Apply boost factors in sorted order
+            for idx, factor in zip(sorted_idx, boost_factors):
+                j = non_zero_indices[idx]
+                heuristics[i, j] *= factor
+                heuristics[j, i] *= factor  # Maintain symmetry
+    
+    # 9. Final normalization
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Ensure symmetry (numerical precision)
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    return heuristics
+```

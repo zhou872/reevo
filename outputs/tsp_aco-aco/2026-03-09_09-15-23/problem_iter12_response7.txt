@@ -1,0 +1,209 @@
+```json
+{
+    "algorithm_features": ["Logarithmic Edge Sparsification", "Rank-Based Distance Weighting", "Density-Aware Two-Hop Regret", "Common Neighbor Connectivity Bonus"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with adaptive logarithmic sparsification and
+    efficient regret analysis for high-performance edge prioritization.
+    
+    Features:
+    1. Adaptive logarithmic sparsification with variance-sensitive neighbor selection
+    2. Rank-based distance weighting with exponential decay
+    3. Density-aware two-hop regret analysis using limited candidate sets
+    4. Common neighbor connectivity scoring with triangle completion bonus
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values for more promising edges
+    """
+    n = len(distance_matrix)
+    
+    # Handle trivial cases
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ADAPTIVE LOGARITHMIC SPARSIFICATION ====================
+    # Compute instance characteristics for adaptive parameter tuning
+    avg_dist = np.mean(distance_matrix)
+    std_dist = np.std(distance_matrix)
+    coeff_var = std_dist / (avg_dist + 1e-10)
+    
+    # Dynamic base neighbor count based on instance size and variability
+    base_k = max(3, int(np.log2(n) * (1.0 + 0.5 * np.tanh(coeff_var - 0.5))))
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Compute sorted neighbors for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    # Adaptive neighbor selection: more neighbors in high-variance instances
+    for i in range(n):
+        # Determine adaptive k for this node based on local variance
+        local_dists = distance_matrix[i]
+        local_std = np.std(local_dists[local_dists > 0])
+        local_k = min(n - 1, int(base_k * (1.0 + 0.3 * local_std / (avg_dist + 1e-10))))
+        
+        # Select k nearest neighbors (excluding self)
+        neighbors = sorted_indices[i, 1:local_k + 1]
+        adjacency_mask[i, neighbors] = True
+    
+    # Ensure symmetry and remove self-loops
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. DENSITY AND STRUCTURE ANALYSIS ====================
+    # Compute graph density metrics
+    degrees = np.sum(adjacency_mask, axis=1)
+    avg_degree = np.mean(degrees)
+    density = avg_degree / (n - 1)
+    
+    # Precompute inverse distances for efficient scoring
+    inv_dist_matrix = 1.0 / (distance_matrix + 1e-10)
+    np.fill_diagonal(inv_dist_matrix, 0)
+    
+    # ==================== 3. RANK-BASED DISTANCE WEIGHTING ====================
+    rank_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        # Get neighbors and their distances
+        neighbors = np.where(adjacency_mask[i])[0]
+        if len(neighbors) == 0:
+            continue
+            
+        neighbor_dists = distance_matrix[i, neighbors]
+        
+        # Rank neighbors by distance (1 = closest)
+        ranks = np.argsort(np.argsort(neighbor_dists)) + 1
+        
+        # Exponential rank weighting: closer neighbors get exponentially higher weight
+        weights = np.exp(-ranks / (len(neighbors) / 4.0))
+        weights = weights / np.sum(weights)
+        
+        # Apply weighted inverse distance scoring
+        rank_scores[i, neighbors] = inv_dist_matrix[i, neighbors] * weights
+    
+    # Symmetrize rank scores
+    rank_scores = 0.5 * (rank_scores + rank_scores.T)
+    
+    # ==================== 4. DENSITY-AWARE TWO-HOP REGRET ANALYSIS ====================
+    regret_scores = np.ones_like(distance_matrix, dtype=float)
+    
+    # Determine regret check intensity based on density
+    if density > 0.15:  # Only perform regret analysis for sufficiently dense graphs
+        # Compute candidate limit: more candidates for denser graphs
+        candidate_limit = max(5, int(10 * density))
+        
+        for i in range(n):
+            # Get this node's neighbors
+            i_neighbors = np.where(adjacency_mask[i])[0]
+            if len(i_neighbors) == 0:
+                continue
+                
+            for j in i_neighbors:
+                if i >= j:
+                    continue
+                    
+                direct_dist = distance_matrix[i, j]
+                if direct_dist < 1e-10:
+                    continue
+                
+                # Get candidate intermediate nodes from both endpoints
+                i_candidates = sorted_indices[i, 1:min(candidate_limit + 1, n)]
+                j_candidates = sorted_indices[j, 1:min(candidate_limit + 1, n)]
+                
+                # Take union of candidates (excluding i and j)
+                candidates = np.unique(np.concatenate([i_candidates, j_candidates]))
+                candidates = candidates[(candidates != i) & (candidates != j)]
+                
+                if len(candidates) > 0:
+                    # Vectorized two-hop distance computation
+                    two_hop_dists = distance_matrix[i, candidates] + distance_matrix[candidates, j]
+                    min_two_hop = np.min(two_hop_dists)
+                    
+                    # Compute regret ratio
+                    regret_ratio = min_two_hop / direct_dist
+                    
+                    # Sigmoid mapping of regret: higher ratio -> higher score
+                    if regret_ratio > 1.2:
+                        # Direct edge is significantly better
+                        regret_score = 1.2
+                    elif regret_ratio > 1.0:
+                        # Direct edge is moderately better
+                        regret_score = 0.9 + 0.3 * (regret_ratio - 1.0) / 0.2
+                    else:
+                        # Two-hop path is competitive or better
+                        regret_score = 0.7 + 0.2 * regret_ratio
+                    
+                    regret_scores[i, j] = regret_scores[j, i] = np.clip(regret_score, 0.5, 1.2)
+    
+    # ==================== 5. COMMON NEIGHBOR CONNECTIVITY SCORING ====================
+    connectivity_scores = np.ones_like(distance_matrix, dtype=float)
+    
+    # Only compute for medium to high density graphs where it's meaningful
+    if density > 0.1:
+        for i in range(n):
+            i_neighbors = set(np.where(adjacency_mask[i])[0])
+            
+            for j in range(i + 1, n):
+                if not adjacency_mask[i, j]:
+                    continue
+                    
+                j_neighbors = set(np.where(adjacency_mask[j])[0])
+                common_neighbors = i_neighbors.intersection(j_neighbors)
+                
+                if common_neighbors:
+                    # Triangle completion bonus
+                    common_count = len(common_neighbors)
+                    max_possible = min(degrees[i], degrees[j]) - 1
+                    common_ratio = common_count / max(max_possible, 1)
+                    
+                    # Stronger bonus for more common neighbors
+                    connectivity_scores[i, j] = connectivity_scores[j, i] = 0.9 + 0.2 * common_ratio
+    
+    # ==================== 6. COMBINE SCORING COMPONENTS ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Dynamic weighting based on instance characteristics
+    if coeff_var > 0.8:  # High variability instances
+        w_rank, w_regret, w_connect = 0.6, 0.3, 0.1
+    elif coeff_var > 0.4:  # Medium variability
+        w_rank, w_regret, w_connect = 0.5, 0.3, 0.2
+    else:  # Low variability (uniform distances)
+        w_rank, w_regret, w_connect = 0.4, 0.4, 0.2
+    
+    # Combine scores for edges in adjacency mask
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                score = (w_rank * rank_scores[i, j] +
+                        w_regret * regret_scores[i, j] +
+                        w_connect * connectivity_scores[i, j])
+                
+                # Add small deterministic noise for tie-breaking
+                noise = 1e-8 * ((i * 137 + j * 257) % 1000) / 1000.0
+                heuristics[i, j] = heuristics[j, i] = score + noise
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

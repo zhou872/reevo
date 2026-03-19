@@ -1,0 +1,305 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret Criticality", "Dynamic Weighted Ensemble", "Degree Constraint Integration", "Reinforcement-based Adaptive Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with multi-step regret analysis, dynamic weighting,
+    degree constraint awareness, and reinforcement-based adaptation.
+    
+    Core Innovations:
+    1. Multi-step Regret: Extends criticality analysis to 2-3 step lookahead paths
+    2. Dynamic Ensemble Weighting: Automatically balances heuristic components
+    3. Degree Constraint Integration: Penalizes edges violating degree balance
+    4. Reinforcement Adaptation: Learns optimal scoring patterns from MST structure
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. PRELIMINARY COMPUTATIONS ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST for reinforcement learning and constraint enforcement
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. MULTI-STEP REGRET ANALYSIS ====================
+    def compute_multi_step_regret(k_steps: int = 3) -> np.ndarray:
+        """Compute regret scores considering k-step alternative paths"""
+        regret_scores = np.zeros_like(distance_matrix)
+        
+        for i in range(n):
+            # Get sorted distances from node i
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            sorted_indices = np.argsort(dists_i)
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                # Compute k-step alternative paths excluding edge (i,j)
+                k = min(k_steps, n - 2)
+                alt_path_costs = []
+                
+                # Explore k best alternatives for first step
+                for alt_idx in sorted_indices[:k+2]:  # Extra margin
+                    if alt_idx == j:
+                        continue
+                    
+                    # Simple recursive path evaluation (depth-limited)
+                    def evaluate_path(current: int, visited: set, depth: int, cost: float) -> float:
+                        if depth == 0:
+                            return cost
+                        
+                        # Get best next step (greedy)
+                        next_dists = distance_matrix[current].copy()
+                        for v in visited:
+                            next_dists[v] = np.inf
+                        next_dists[current] = np.inf
+                        
+                        if np.all(np.isinf(next_dists)):
+                            return cost
+                        
+                        next_node = np.argmin(next_dists)
+                        visited.add(next_node)
+                        return evaluate_path(next_node, visited, depth-1, cost + next_dists[next_node])
+                    
+                    # Evaluate k-step alternative path starting from alternative node
+                    alt_cost = distance_matrix[i, alt_idx] + evaluate_path(
+                        alt_idx, {i, alt_idx}, k-1, 0
+                    )
+                    alt_path_costs.append(alt_cost)
+                
+                # Calculate regret as difference between current edge and best alternative
+                if alt_path_costs:
+                    best_alt = np.min(alt_path_costs)
+                    current_path_cost = distance_matrix[i, j] + evaluate_path(
+                        j, {i, j}, k-1, 0
+                    )
+                    regret = max(0, best_alt - current_path_cost)
+                    
+                    # Convert regret to score (higher regret = more critical edge)
+                    regret_scores[i, j] = 1.0 / (1.0 + np.exp(-regret / (np.mean(alt_path_costs) + 1e-8)))
+        
+        return (regret_scores + regret_scores.T) / 2
+    
+    # Compute both 2-step and 3-step regret
+    regret_2step = compute_multi_step_regret(2)
+    regret_3step = compute_multi_step_regret(3)
+    
+    # ==================== 3. DYNAMIC ENSEMBLE WEIGHTING ====================
+    def compute_optimal_weights() -> Tuple[float, float, float, float]:
+        """Dynamically determine optimal weights for heuristic components"""
+        # Analyze problem characteristics
+        avg_distance = np.mean(distance_matrix[np.triu_indices(n, 1)])
+        distance_std = np.std(distance_matrix[np.triu_indices(n, 1)])
+        sparsity = np.sum(distance_matrix > 2 * avg_distance) / (n * n)
+        
+        # Weight adaptation based on problem characteristics
+        w_regret = 0.4 + 0.3 * (1 - sparsity)  # Higher for dense problems
+        w_invdist = 0.2 + 0.2 * sparsity       # Higher for sparse problems
+        w_cluster = 0.3 - 0.1 * (distance_std / avg_distance if avg_distance > 0 else 0)
+        w_degree = 0.1 + 0.1 * (n / 50)        # Scale with problem size
+        
+        # Normalize to sum to 1
+        total = w_regret + w_invdist + w_cluster + w_degree
+        return (
+            w_regret / total,
+            w_invdist / total,
+            w_cluster / total,
+            w_degree / total
+        )
+    
+    w_r, w_i, w_c, w_d = compute_optimal_weights()
+    
+    # ==================== 4. CLUSTER ANALYSIS WITH DEGREE CONSTRAINTS ====================
+    cluster_scores = np.ones_like(distance_matrix)
+    degree_violation = np.zeros_like(distance_matrix)
+    
+    if n > 3:
+        # Detect clusters using MST structure
+        cluster_centers = []
+        for i in range(n):
+            if np.sum(mst_edges[i]) == 1:  # Leaf nodes as potential cluster centers
+                cluster_centers.append(i)
+        
+        # If no clear leaf nodes, use nodes with highest MST degree
+        if not cluster_centers:
+            mst_degrees = np.sum(mst_edges, axis=1)
+            cluster_centers = np.argsort(-mst_degrees)[:min(3, n)]
+        
+        # Calculate cluster bonuses with degree awareness
+        for center in cluster_centers:
+            # Find nodes in cluster (within 1.5x average MST distance)
+            center_distances = distance_matrix[center]
+            avg_mst_dist = np.mean(center_distances[mst_edges[center]])
+            cluster_radius = 1.5 * avg_mst_dist
+            
+            in_cluster = distance_matrix[center] < cluster_radius
+            in_cluster[center] = False
+            
+            if np.any(in_cluster):
+                # Calculate intra-cluster bonus inversely proportional to potential degree violations
+                cluster_nodes = np.where(in_cluster)[0]
+                
+                for node in cluster_nodes:
+                    # Degree constraint: prefer edges that don't overload nodes
+                    node_mst_degree = np.sum(mst_edges[node])
+                    center_mst_degree = np.sum(mst_edges[center])
+                    
+                    # Penalty if adding this edge would create high-degree nodes
+                    degree_penalty = 1.0 - 0.2 * min(2, node_mst_degree + center_mst_degree)
+                    
+                    # Distance-based bonus
+                    dist_bonus = 1.0 / (distance_matrix[center, node] + 1e-8)
+                    
+                    cluster_scores[center, node] = dist_bonus * degree_penalty
+                    cluster_scores[node, center] = dist_bonus * degree_penalty
+                    
+                    # Track degree violation scores
+                    degree_violation[center, node] = 1.0 / (1.0 + node_mst_degree + center_mst_degree)
+                    degree_violation[node, center] = degree_violation[center, node]
+    
+    # ==================== 5. REINFORCEMENT-BASED ADAPTIVE SCORING ====================
+    def reinforcement_scoring(base_scores: np.ndarray) -> np.ndarray:
+        """Adapt scores based on MST structure reinforcement"""
+        reinforced = base_scores.copy()
+        
+        # Boost scores for edges that connect MST components in promising ways
+        mst_components = np.zeros(n, dtype=int)
+        component_id = 1
+        
+        # Simple component detection in MST
+        visited = np.zeros(n, dtype=bool)
+        for i in range(n):
+            if not visited[i]:
+                stack = [i]
+                while stack:
+                    node = stack.pop()
+                    if not visited[node]:
+                        visited[node] = True
+                        mst_components[node] = component_id
+                        neighbors = np.where(mst_edges[node])[0]
+                        for neighbor in neighbors:
+                            if not visited[neighbor]:
+                                stack.append(neighbor)
+                component_id += 1
+        
+        # Calculate inter-component connection bonuses
+        unique_components = np.unique(mst_components)
+        if len(unique_components) > 1:
+            for comp1 in unique_components:
+                for comp2 in unique_components:
+                    if comp1 >= comp2:
+                        continue
+                    
+                    nodes1 = np.where(mst_components == comp1)[0]
+                    nodes2 = np.where(mst_components == comp2)[0]
+                    
+                    # Find best connection between components
+                    best_score = -np.inf
+                    best_pair = (0, 0)
+                    
+                    for i in nodes1:
+                        for j in nodes2:
+                            current_score = base_scores[i, j] * distance_matrix[i, j]
+                            if current_score > best_score:
+                                best_score = current_score
+                                best_pair = (i, j)
+                    
+                    # Reinforce the best connection
+                    i, j = best_pair
+                    reinforced[i, j] *= 1.5
+                    reinforced[j, i] *= 1.5
+        
+        return reinforced
+    
+    # ==================== 6. COMPOSITE SCORE CALCULATION ====================
+    # Base composite using dynamic weights
+    base_composite = (
+        w_r * (0.6 * regret_2step + 0.4 * regret_3step) +
+        w_i * inv_dist +
+        w_c * cluster_scores +
+        w_d * (1.0 - degree_violation)  # Invert violation to get compliance
+    )
+    
+    # Apply MST reinforcement
+    reinforced_composite = reinforcement_scoring(base_composite)
+    
+    # Strong MST edge boost
+    mst_boost_factor = 2.0 + np.log1p(n) / 10  # Scale with problem size
+    final_scores = reinforced_composite * np.where(mst_edges, mst_boost_factor, 1.0)
+    
+    # ==================== 7. ADAPTIVE SPARSIFICATION ====================
+    sparsified = np.zeros_like(final_scores)
+    
+    # Determine adaptive edge retention
+    base_retention = max(3, int(0.3 * np.sqrt(n)))  # Scale with sqrt(n)
+    
+    for i in range(n):
+        row_scores = final_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Calculate robust statistics
+        positive_scores = row_scores[row_scores > 0]
+        if len(positive_scores) > 0:
+            q75 = np.percentile(positive_scores, 75)
+            q25 = np.percentile(positive_scores, 25)
+            iqr = q75 - q25
+            
+            # Adaptive threshold: above Q3 + 0.5*IQR
+            threshold = q75 + 0.5 * iqr
+            keep_mask = row_scores >= max(threshold, np.mean(positive_scores))
+            
+            # Ensure minimum retention
+            if np.sum(keep_mask) < base_retention:
+                indices = np.argsort(row_scores)[-base_retention:]
+                keep_mask = np.zeros_like(row_scores, dtype=bool)
+                keep_mask[indices] = True
+        else:
+            keep_mask = np.zeros_like(row_scores, dtype=bool)
+        
+        keep_mask[i] = False
+        sparsified[i][keep_mask] = final_scores[i][keep_mask]
+    
+    # ==================== 8. FINAL PROCESSING ====================
+    # Symmetrize
+    symmetric_scores = (sparsified + sparsified.T) / 2
+    
+    # Distance-based final attenuation (exponential decay)
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        distance_decay = np.exp(-distance_matrix / (0.25 * max_dist + 1e-8))
+        symmetric_scores *= distance_decay
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

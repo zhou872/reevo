@@ -1,0 +1,326 @@
+```json
+{
+    "algorithm_features": ["Dynamic Centrality-Weighted Regret", "Spectral Geometric Clustering", "Degree-Constrained Greedy Selection", "Multi-Factor Adaptive Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from scipy.sparse.linalg import eigs
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection featuring dynamic regret weighting,
+    spectral geometric clustering, and degree-constrained greedy sparsification.
+    
+    Returns a sparse heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # For trivial cases, return simple inverse distance
+        result = 1.0 / (distance_matrix + np.eye(n))
+        np.fill_diagonal(result, 0.0)
+        return result
+    
+    # 1. Core inverse distance (baseline)
+    with np.errstate(divide='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0.0)
+    
+    # 2. MST-based structural mask (binary)
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # 3. Enhanced spectral clustering bonus
+    cluster_bonus = _compute_spectral_cluster_bonus(distance_matrix)
+    
+    # 4. Dynamic centrality-weighted regret penalty
+    regret_penalty, node_centrality = _compute_centrality_weighted_regret(distance_matrix)
+    
+    # 5. Adaptive fusion with centrality-modulated weights
+    # Weight factors based on node centrality quartiles
+    centrality_quartiles = np.percentile(node_centrality, [25, 50, 75])
+    centrality_mask_low = node_centrality[:, np.newaxis] < centrality_quartiles[0]
+    centrality_mask_high = node_centrality[:, np.newaxis] > centrality_quartiles[2]
+    
+    # Base combination with centrality-adaptive regret influence
+    regret_weight = np.where(centrality_mask_high, 0.4,  # High centrality: stronger regret
+                          np.where(centrality_mask_low, 0.1,  # Low centrality: weaker regret
+                                   0.25))  # Medium centrality: default
+    
+    base_score = inv_dist * (1.0 + 0.6 * mst_mask) * (1.0 + 0.4 * cluster_bonus)
+    heuristics = base_score * (1.0 - regret_weight * regret_penalty)
+    
+    # 6. Graph-theoretic edge embedding (betweenness approximation)
+    edge_betweenness = _compute_edge_betweenness_approx(distance_matrix, mst_mask)
+    heuristics *= (1.0 + 0.3 * edge_betweenness)
+    
+    # 7. Degree-constrained iterative greedy sparsification
+    heuristics = _degree_constrained_sparsification(heuristics, distance_matrix, mst_mask, node_centrality)
+    
+    # 8. Symmetrize and final normalization
+    heuristics = (heuristics + heuristics.T) / 2.0
+    np.fill_diagonal(heuristics, 0.0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics /= max_val
+    
+    return heuristics
+
+def _compute_mst_mask(dist_matrix: np.ndarray) -> np.ndarray:
+    """Binary mask for edges in Minimum Spanning Tree using Prim's algorithm."""
+    n = dist_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=float)
+    
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    # Prim's algorithm
+    for _ in range(n - 1):
+        min_edge = None
+        min_dist = np.inf
+        
+        # Find minimum edge from visited to unvisited
+        visited_indices = np.where(visited)[0]
+        unvisited_indices = np.where(~visited)[0]
+        
+        # Vectorized version for performance
+        if len(visited_indices) > 0 and len(unvisited_indices) > 0:
+            # Create meshgrid of visited and unvisited indices
+            v_grid, u_grid = np.meshgrid(visited_indices, unvisited_indices, indexing='ij')
+            distances = dist_matrix[v_grid, u_grid]
+            
+            min_idx = np.argmin(distances)
+            i, j_idx = np.unravel_index(min_idx, distances.shape)
+            i = visited_indices[i]
+            j = unvisited_indices[j_idx]
+            
+            mst_mask[i, j] = 1.0
+            mst_mask[j, i] = 1.0
+            visited[j] = True
+    
+    return mst_mask
+
+def _compute_spectral_cluster_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Bonus for edges within spectral clusters.
+    Uses Laplacian eigenmaps for dimensionality reduction.
+    """
+    n = dist_matrix.shape[0]
+    bonus = np.zeros((n, n))
+    
+    if n < 4:
+        return bonus
+    
+    try:
+        # Convert distances to similarities using Gaussian kernel
+        sigma = np.median(dist_matrix[dist_matrix > 0])
+        if sigma == 0:
+            sigma = 1.0
+        similarity = np.exp(-dist_matrix**2 / (2 * sigma**2))
+        np.fill_diagonal(similarity, 0)
+        
+        # Compute normalized Laplacian
+        degree = np.sum(similarity, axis=1)
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(degree))
+        L_norm = np.eye(n) - D_inv_sqrt @ similarity @ D_inv_sqrt
+        
+        # Get eigenvectors for smallest eigenvalues (excluding first)
+        k = min(3, n - 2)
+        eigvals, eigvecs = eigs(L_norm, k=k, which='SR')  # Smallest real
+        
+        # Use eigenvectors as coordinates (skip first if close to constant)
+        if k >= 2:
+            coords = eigvecs.real[:, :2]
+            
+            # Build KDTree for spatial queries
+            tree = KDTree(coords)
+            
+            # Adaptive k based on graph size
+            k_nn = min(10, max(3, n // 5))
+            distances, indices = tree.query(coords, k=k_nn + 1)
+            
+            # Assign bonus based on spectral neighborhood
+            for i in range(n):
+                for rank, j in enumerate(indices[i][1:], 1):
+                    if i < j:
+                        # Exponential decay with rank
+                        bonus_factor = np.exp(-rank / 2.0)
+                        bonus[i, j] = bonus_factor
+                        bonus[j, i] = bonus_factor
+        
+    except Exception:
+        # Fallback to distance-based clustering
+        for i in range(n):
+            k = max(2, n // 5)
+            closest = np.argsort(dist_matrix[i])[1:k+1]
+            for rank, j in enumerate(closest, 1):
+                if i < j:
+                    bonus_factor = 1.0 / (rank + 1)
+                    bonus[i, j] = bonus_factor
+                    bonus[j, i] = bonus_factor
+    
+    # Normalize bonus to [0, 1]
+    max_bonus = np.max(bonus)
+    if max_bonus > 0:
+        bonus /= max_bonus
+    
+    return bonus
+
+def _compute_centrality_weighted_regret(dist_matrix: np.ndarray):
+    """
+    Compute regret penalty weighted by node centrality.
+    Returns: (regret_penalty_matrix, node_centrality_array)
+    """
+    n = dist_matrix.shape[0]
+    regret_penalty = np.zeros((n, n))
+    node_centrality = np.zeros(n)
+    
+    # Compute node centrality as inverse of average distance to other nodes
+    for i in range(n):
+        other_dists = dist_matrix[i, np.arange(n) != i]
+        if len(other_dists) > 0:
+            node_centrality[i] = 1.0 / (np.mean(other_dists) + 1e-10)
+    
+    # Normalize centrality to [0, 1]
+    max_centrality = np.max(node_centrality)
+    if max_centrality > 0:
+        node_centrality /= max_centrality
+    
+    # Compute regret for each node
+    node_regret = np.zeros(n)
+    for i in range(n):
+        sorted_dists = np.sort(dist_matrix[i])
+        valid_dists = sorted_dists[sorted_dists > 0]
+        
+        if len(valid_dists) >= 3:
+            # Multi-step regret: consider 1st, 2nd, and 3rd best alternatives
+            regret_2 = valid_dists[2] - valid_dists[1]  # Missing 2nd best
+            regret_3 = valid_dists[2] - valid_dists[0]  # Missing best
+            
+            # Combine regrets, weighted by centrality
+            max_range = np.max(valid_dists[1:]) - np.min(valid_dists[:-1])
+            if max_range > 0:
+                node_regret[i] = (0.7 * regret_2 + 0.3 * regret_3) / max_range
+    
+    # Create edge regret penalty with centrality modulation
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Base regret penalty
+                rank_i = np.sum(dist_matrix[i] < dist_matrix[i, j]) - 1
+                rank_penalty = rank_i / max(1, n - 1)
+                
+                # Centrality-weighted combination of node regrets
+                centrality_weight = (node_centrality[i] + node_centrality[j]) / 2.0
+                combined_regret = (node_regret[i] + node_regret[j]) / 2.0
+                
+                regret_penalty[i, j] = centrality_weight * combined_regret * rank_penalty
+    
+    # Normalize penalty to [0, 1]
+    max_penalty = np.max(regret_penalty)
+    if max_penalty > 0:
+        regret_penalty /= max_penalty
+    
+    return regret_penalty, node_centrality
+
+def _compute_edge_betweenness_approx(dist_matrix: np.ndarray, mst_mask: np.ndarray) -> np.ndarray:
+    """
+    Approximate edge betweenness centrality using MST and shortest path tree.
+    Higher values for edges that appear in many shortest paths.
+    """
+    n = dist_matrix.shape[0]
+    betweenness = np.zeros((n, n))
+    
+    # Use MST edges as baseline
+    betweenness[mst_mask == 1.0] = 0.5
+    
+    # Add contributions from shortest path trees rooted at each node
+    for root in range(min(n, 20)):  # Sample roots for efficiency
+        # Dijkstra-like propagation (simplified)
+        visited = np.zeros(n, dtype=bool)
+        dist = np.full(n, np.inf)
+        prev = np.full(n, -1, dtype=int)
+        
+        dist[root] = 0
+        for _ in range(n):
+            # Find unvisited node with minimum distance
+            unvisited = np.where(~visited)[0]
+            if len(unvisited) == 0:
+                break
+            
+            current = unvisited[np.argmin(dist[unvisited])]
+            visited[current] = True
+            
+            # Update neighbors
+            for neighbor in range(n):
+                if neighbor != current and not visited[neighbor]:
+                    new_dist = dist[current] + dist_matrix[current, neighbor]
+                    if new_dist < dist[neighbor]:
+                        dist[neighbor] = new_dist
+                        prev[neighbor] = current
+        
+        # Count edge usage in shortest path tree
+        for node in range(n):
+            if prev[node] != -1:
+                i, j = min(node, prev[node]), max(node, prev[node])
+                betweenness[i, j] += 1.0
+    
+    # Normalize
+    max_bet = np.max(betweenness)
+    if max_bet > 0:
+        betweenness /= max_bet
+    
+    return betweenness
+
+def _degree_constrained_sparsification(heuristics: np.ndarray, dist_matrix: np.ndarray, 
+                                       mst_mask: np.ndarray, centrality: np.ndarray) -> np.ndarray:
+    """
+    Iterative greedy sparsification with degree constraints.
+    Maintains connectivity while selecting promising edges.
+    """
+    n = heuristics.shape[0]
+    result = np.zeros((n, n))
+    
+    # Phase 1: Always include MST edges
+    result[mst_mask == 1.0] = heuristics[mst_mask == 1.0]
+    current_degree = np.sum(result > 0, axis=1)
+    
+    # Phase 2: Greedy selection with degree constraints
+    # Target degree based on centrality: high-centrality nodes get more connections
+    max_degree = np.clip(3 + (centrality * 2).astype(int), 3, min(6, n-1))
+    
+    # Create candidate edges list (excluding MST edges)
+    candidates = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_mask[i, j] == 0 and heuristics[i, j] > 0:
+                candidates.append((heuristics[i, j], i, j))
+    
+    # Sort candidates by heuristic value
+    candidates.sort(reverse=True)
+    
+    # Greedy selection
+    for score, i, j in candidates:
+        # Check degree constraints
+        if current_degree[i] < max_degree[i] and current_degree[j] < max_degree[j]:
+            # Check if edge is not too long compared to MST edges
+            mst_distances = dist_matrix[mst_mask == 1.0]
+            if len(mst_distances) > 0:
+                avg_mst_dist = np.mean(mst_distances)
+                if dist_matrix[i, j] < 2.5 * avg_mst_dist:
+                    result[i, j] = score
+                    result[j, i] = score
+                    current_degree[i] += 1
+                    current_degree[j] += 1
+        
+        # Early stopping if all nodes have sufficient edges
+        if np.all(current_degree >= np.minimum(3, max_degree)):
+            break
+    
+    return result
+```

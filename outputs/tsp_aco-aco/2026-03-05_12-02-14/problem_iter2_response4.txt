@@ -1,0 +1,179 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsification", "Dynamic Weight Adjustment", "Structural Centrality", "Multi-hop Connectivity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute enhanced heuristic indicators for TSP edges with dynamic parameter tuning.
+    Features:
+    1. Adaptive sparsification based on distance distribution
+    2. Dynamic MST edge weighting based on local structure
+    3. Multi-hop connectivity with progressive decay
+    4. Node centrality-based normalization
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Ensure no zero or negative distances (add small epsilon if needed)
+    epsilon = 1e-10
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    safe_dist[safe_dist <= 0] = epsilon
+    
+    # 1. Base reciprocal heuristic with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1.0 / safe_dist
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    
+    # 2. MST-based heuristic with dynamic edge weighting
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Dynamic MST weight based on edge importance in local structure
+    mst_weights = np.zeros_like(safe_dist)
+    if mst_mask.any():
+        # Compute local importance: edges connecting high-degree MST nodes get higher weight
+        mst_degree = mst_mask.sum(axis=1)
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    local_importance = (mst_degree[i] + mst_degree[j]) / (2 * n)
+                    # Shorter MST edges get higher weight
+                    edge_weight = (1.0 / safe_dist[i, j]) * (1.0 + 2.0 * local_importance)
+                    mst_weights[i, j] = mst_weights[j, i] = edge_weight
+    
+    # 3. Adaptive sparsification based on distance statistics
+    # Compute distance percentiles for each node
+    sparsity_mask = np.zeros_like(safe_dist, dtype=bool)
+    
+    for i in range(n):
+        # Get distances for this node (excluding self)
+        dist_row = safe_dist[i].copy()
+        dist_row[i] = np.inf
+        
+        # Dynamic k based on distance distribution
+        median_dist = np.median(dist_row[dist_row < np.inf])
+        std_dist = np.std(dist_row[dist_row < np.inf])
+        if std_dist == 0:
+            std_dist = median_dist * 0.1
+        
+        # Include edges within reasonable range of minimum
+        min_dist = np.min(dist_row)
+        threshold = min_dist + 0.5 * std_dist
+        
+        # Always include MST edges and nearest neighbors
+        nn_indices = np.where(dist_row <= threshold)[0]
+        
+        # Ensure minimum connectivity
+        min_edges = max(3, min(n // 4, 10))
+        if len(nn_indices) < min_edges:
+            nn_indices = np.argsort(dist_row)[:min_edges]
+        
+        sparsity_mask[i, nn_indices] = True
+    
+    # Make symmetric
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    sparsity_mask = sparsity_mask | mst_mask  # Ensure all MST edges included
+    
+    # 4. Multi-hop connectivity with progressive decay
+    heuristic_matrix = reciprocal.copy()
+    
+    # Add MST contribution (dynamic weights)
+    heuristic_matrix += mst_weights
+    
+    # Apply initial sparsification
+    heuristic_matrix[~sparsity_mask] = 0
+    
+    # Compute 2-hop and 3-hop connections with decay factors
+    mask_binary = sparsity_mask.astype(float)
+    np.fill_diagonal(mask_binary, 0)
+    
+    # Two-hop connections
+    two_hop = mask_binary @ mask_binary
+    two_hop = np.minimum(two_hop, 1)
+    np.fill_diagonal(two_hop, 0)
+    
+    # Three-hop connections (weakened)
+    three_hop = two_hop @ mask_binary
+    three_hop = np.minimum(three_hop, 1)
+    np.fill_diagonal(three_hop, 0)
+    
+    # Apply multi-hop contributions with distance-based decay
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            if two_hop[i, j] > 0:
+                # Find common neighbors for potential path
+                common_neighbors = np.where(mask_binary[i] & mask_binary[j])[0]
+                if len(common_neighbors) > 0:
+                    # Use best intermediate path
+                    best_path_strength = 0
+                    for k in common_neighbors:
+                        path_strength = (reciprocal[i, k] * reciprocal[k, j]) ** 0.5
+                        best_path_strength = max(best_path_strength, path_strength)
+                    
+                    # Decay based on path length
+                    heuristic_matrix[i, j] += 0.4 * best_path_strength
+            
+            if three_hop[i, j] > 0 and heuristic_matrix[i, j] == 0:
+                # Only add if no direct or 2-hop connection exists
+                heuristic_matrix[i, j] += 0.1 * reciprocal[i, j]
+    
+    # 5. Node centrality-based normalization
+    # Compute approximate centrality using current heuristic weights
+    centrality = np.zeros(n)
+    for i in range(n):
+        row_weights = heuristic_matrix[i]
+        if row_weights.sum() > 0:
+            # Nodes with strong connections to many other nodes have higher centrality
+            centrality[i] = np.sum(row_weights > np.percentile(row_weights, 50))
+    
+    # Normalize centrality
+    if centrality.max() > 0:
+        centrality = centrality / centrality.max()
+    
+    # Adjust weights based on centrality: peripheral nodes get slightly boosted
+    centrality_factor = 1.0 + 0.3 * (1.0 - centrality)  # Inverse relationship
+    
+    for i in range(n):
+        heuristic_matrix[i] *= centrality_factor[i]
+        heuristic_matrix[:, i] *= centrality_factor[i]  # Symmetric adjustment
+    
+    # 6. Final sparsification and symmetry enforcement
+    # Keep only top edges per node (adaptive number)
+    for i in range(n):
+        row = heuristic_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Dynamic number of kept edges based on node's connectivity pattern
+        non_zero = np.sum(row > 0)
+        keep_count = max(3, min(n // 3, int(non_zero * 0.7)))
+        
+        if keep_count < n - 1:
+            threshold = np.sort(row)[-keep_count]
+            row[row < threshold] = 0
+            heuristic_matrix[i] = row
+    
+    # Ensure symmetry by taking maximum of (i,j) and (j,i)
+    heuristic_matrix = np.maximum(heuristic_matrix, heuristic_matrix.T)
+    
+    # Final normalization by row sums (with smoothing)
+    row_sums = heuristic_matrix.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristic_matrix = heuristic_matrix / row_sums
+    
+    # Set diagonal to zero
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    return heuristic_matrix
+```

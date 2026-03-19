@@ -1,0 +1,305 @@
+```json
+{
+    "algorithm_features": ["Christofides Components", "Iterative Refinement", "Learning Heuristics", "Adaptive Sparsity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+from collections import defaultdict, deque
+from sklearn.cluster import DBSCAN
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection with Christofides-inspired
+    components, iterative refinement with memory, and learned edge importance.
+    
+    Key innovations:
+    1. Christofides algorithm components: MST, perfect matching on odd vertices
+    2. Iterative refinement with memory: Progressive improvement of edge preferences
+    3. Learned edge importance: Statistical learning from instance features
+    4. Adaptive sparsity with structural preservation
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Christofides-Inspired Components ==========
+    
+    # 1A. Minimum Spanning Tree (MST) with importance weighting
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    
+    # Compute MST edge importance based on tree structure
+    mst_importance = np.zeros_like(distance_matrix)
+    mst_edges = np.where(mst_array > 0)
+    for i, j in zip(*mst_edges):
+        if i != j:
+            # Edges that connect different tree branches are more important
+            mst_importance[i, j] = 1.0 / distance_matrix[i, j]
+    
+    # 1B. Perfect Matching on odd-degree vertices (Christofides component)
+    # First, find odd-degree vertices in MST
+    degrees = (mst_array > 0).sum(axis=1)
+    odd_vertices = np.where(degrees % 2 == 1)[0]
+    
+    matching_boost = np.zeros_like(distance_matrix)
+    if len(odd_vertices) > 0:
+        # Greedy minimum-weight perfect matching approximation
+        sorted_pairs = []
+        for idx, i in enumerate(odd_vertices):
+            for j in odd_vertices[idx+1:]:
+                sorted_pairs.append((distance_matrix[i, j], i, j))
+        
+        sorted_pairs.sort()
+        matched = set()
+        
+        for dist, i, j in sorted_pairs:
+            if i not in matched and j not in matched:
+                # Boost matching edges inversely proportional to distance
+                matching_boost[i, j] = matching_boost[j, i] = 1.0 / dist
+                matched.update([i, j])
+    
+    # 1C. Nearest-neighbor tours for initialization
+    nn_tours = []
+    starts = np.random.choice(n, min(10, n), replace=False)
+    
+    for start in starts:
+        tour = [start]
+        visited = set([start])
+        
+        while len(visited) < n:
+            current = tour[-1]
+            # Find nearest unvisited neighbor
+            mask = np.ones(n, dtype=bool)
+            mask[list(visited)] = False
+            if not np.any(mask):
+                break
+            # Add small random noise to break ties
+            distances = distance_matrix[current].copy()
+            distances[~mask] = np.inf
+            distances += np.random.rand(n) * 1e-6
+            next_node = np.argmin(distances)
+            tour.append(next_node)
+            visited.add(next_node)
+        
+        nn_tours.append(tour)
+    
+    # ========== Phase 2: Iterative Refinement with Memory ==========
+    
+    # Memory of promising edges across iterations
+    edge_memory = defaultdict(float)
+    recent_tours = deque(maxlen=5)  # Keep recent best tours
+    
+    def apply_2opt(tour, max_iterations=100):
+        """Apply 2-opt local search to improve a tour."""
+        n = len(tour)
+        improved = True
+        iterations = 0
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            for i in range(n):
+                for j in range(i+2, n):
+                    a1, a2 = tour[i], tour[(i+1)%n]
+                    b1, b2 = tour[j], tour[(j+1)%n]
+                    
+                    current = (distance_matrix[a1, a2] + 
+                              distance_matrix[b1, b2])
+                    new = (distance_matrix[a1, b1] + 
+                          distance_matrix[a2, b2])
+                    
+                    if new < current:
+                        # Reverse segment between i+1 and j
+                        tour[i+1:j+1] = tour[i+1:j+1][::-1]
+                        improved = True
+                        break
+                if improved:
+                    break
+            iterations += 1
+        return tour
+    
+    # Generate and improve initial tours
+    for tour in nn_tours:
+        improved_tour = apply_2opt(tour.copy())
+        recent_tours.append(improved_tour)
+        
+        # Add edges to memory (weighted by tour quality)
+        tour_length = sum(distance_matrix[improved_tour[i], 
+                         improved_tour[(i+1)%n]] for i in range(n))
+        weight = 1.0 / (tour_length + 1e-10)
+        
+        for i in range(n):
+            u, v = improved_tour[i], improved_tour[(i+1)%n]
+            edge_key = (min(u, v), max(u, v))
+            edge_memory[edge_key] += weight
+    
+    # ========== Phase 3: Learning Edge Importance ==========
+    
+    # 3A. Compute instance features for learning
+    # Extract statistical features from distance matrix
+    triu_distances = distance_matrix[np.triu_indices(n, k=1)]
+    dist_features = {
+        'mean': np.mean(triu_distances),
+        'std': np.std(triu_distances),
+        'cv': np.std(triu_distances) / (np.mean(triu_distances) + 1e-10),
+        'skewness': (np.mean((triu_distances - np.mean(triu_distances))**3) / 
+                    (np.std(triu_distances)**3 + 1e-10))
+    }
+    
+    # 3B. DBSCAN clustering for structural analysis
+    # Convert distance matrix to similarity for DBSCAN
+    epsilon = np.percentile(triu_distances, 25)  # Use 25th percentile as epsilon
+    db = DBSCAN(eps=epsilon, min_samples=3, metric='precomputed')
+    cluster_labels = db.fit_predict(distance_matrix)
+    
+    cluster_boost = np.ones_like(distance_matrix)
+    if len(set(cluster_labels)) > 1:  # More than one cluster found
+        for i in range(n):
+            for j in range(i+1, n):
+                if cluster_labels[i] == cluster_labels[j] and cluster_labels[i] != -1:
+                    # Intra-cluster edges get a boost
+                    cluster_size = np.sum(cluster_labels == cluster_labels[i])
+                    boost = 1.0 + 0.5 * min(1.0, cluster_size / n)
+                    cluster_boost[i, j] = cluster_boost[j, i] = boost
+                elif cluster_labels[i] != cluster_labels[j]:
+                    # Inter-cluster edges get a penalty based on distance
+                    penalty = 0.5 + 0.5 * (distance_matrix[i, j] / 
+                                          np.max(triu_distances))
+                    cluster_boost[i, j] = cluster_boost[j, i] = max(0.3, penalty)
+    
+    # 3C. Learn feature weights based on instance characteristics
+    if dist_features['cv'] < 0.3:
+        # Uniform distances: emphasize MST and matching
+        weights = {'mst': 0.4, 'matching': 0.3, 'memory': 0.2, 'cluster': 0.1}
+    elif dist_features['cv'] > 0.7:
+        # Variable distances: emphasize memory and clustering
+        weights = {'memory': 0.4, 'cluster': 0.3, 'mst': 0.2, 'matching': 0.1}
+    else:
+        # Mixed: balanced approach
+        weights = {'mst': 0.3, 'matching': 0.25, 'memory': 0.25, 'cluster': 0.2}
+    
+    # Adjust for clustering quality
+    if len(set(cluster_labels)) > n // 4:
+        # Good clustering structure found
+        weights['cluster'] = min(0.4, weights['cluster'] * 1.5)
+        # Renormalize
+        total = sum(weights.values())
+        weights = {k: v/total for k, v in weights.items()}
+    
+    # ========== Phase 4: Combine Components ==========
+    
+    # Convert edge memory to matrix
+    memory_matrix = np.zeros_like(distance_matrix)
+    for (u, v), weight in edge_memory.items():
+        memory_matrix[u, v] = memory_matrix[v, u] = weight
+    
+    # Normalize components
+    for mat in [mst_importance, matching_boost, memory_matrix, cluster_boost]:
+        if np.max(mat) > 0:
+            mat /= np.max(mat)
+    
+    # Combine with learned weights
+    combined = (weights['mst'] * mst_importance +
+                weights['matching'] * matching_boost +
+                weights['memory'] * memory_matrix +
+                weights['cluster'] * cluster_boost)
+    
+    # Add reciprocal distance baseline (safety net)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    if np.max(reciprocal) > 0:
+        reciprocal /= np.max(reciprocal)
+    
+    # Blend with combined (20% safety weight)
+    combined = 0.8 * combined + 0.2 * reciprocal
+    
+    # ========== Phase 5: Adaptive Sparsity ==========
+    
+    # Determine sparsity level based on problem characteristics
+    if n < 50:
+        edges_per_node = n - 1  # Keep all edges for small problems
+    elif n < 200:
+        edges_per_node = int(2 * np.sqrt(n))
+    else:
+        edges_per_node = int(1.5 * np.sqrt(n))
+    
+    # Preserve MST edges and promising memory edges
+    preserved_edges = set()
+    mst_edges = set(zip(*np.where(mst_array > 0)))
+    preserved_edges.update(mst_edges)
+    
+    # Add top memory edges
+    top_memory_edges = set()
+    if len(edge_memory) > 0:
+        sorted_edges = sorted(edge_memory.items(), key=lambda x: x[1], reverse=True)
+        top_count = min(len(sorted_edges), max(10, n // 2))
+        for (u, v), _ in sorted_edges[:top_count]:
+            top_memory_edges.add((u, v))
+    preserved_edges.update(top_memory_edges)
+    
+    # Create sparsified matrix
+    sparsified = np.zeros_like(combined)
+    
+    # First, preserve important edges
+    for i, j in preserved_edges:
+        if i != j:
+            sparsified[i, j] = combined[i, j]
+    
+    # For each node, select top additional edges with decay
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Get candidate edges (excluding already preserved)
+        candidates = []
+        for j in range(n):
+            if i != j and (i, j) not in preserved_edges and (j, i) not in preserved_edges:
+                candidates.append((j, row[j]))
+        
+        if not candidates:
+            continue
+            
+        # Sort candidates by value
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select top edges with exponential decay
+        max_additional = max(0, edges_per_node - 
+                           sum(1 for j in range(n) if (i, j) in preserved_edges))
+        selected = candidates[:max_additional]
+        
+        for rank, (j, value) in enumerate(selected):
+            decay = np.exp(-rank / 3.0)  # Exponential decay
+            sparsified[i, j] = value * decay
+    
+    # Ensure symmetry and final processing
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # Final normalization
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified /= max_val
+    
+    return sparsified
+```

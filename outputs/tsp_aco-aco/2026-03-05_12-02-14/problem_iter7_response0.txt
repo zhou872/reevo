@@ -1,0 +1,226 @@
+```json
+{
+    "algorithm_features": ["Exploration-Exploitation Balance", "Stochastic Edge Sparsification", "Enhanced Centrality Combination", "Adaptive Graph Analysis"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with:
+    1. Improved centrality via Floyd-Warshall shortest paths
+    2. Geometric mean combination of centrality metrics
+    3. Adaptive stochastic sparsification with entropy-based exploration
+    4. Graph topology-aware feature weighting
+    
+    Returns: Row-normalized non-negative matrix for stochastic edge sampling
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / np.maximum(distance_matrix, 1e-10)
+        np.fill_diagonal(result, 0)
+        row_sums = result.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return result / row_sums
+    
+    # ===== 1. BASE COMPONENTS =====
+    # 1.1 Inverse distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 1.2 MST connectivity
+    mst_mask = np.zeros((n, n), dtype=bool)
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix).toarray()
+        mst_mask = mst > 0
+    except Exception:
+        pass
+    
+    # ===== 2. ENHANCED CENTRALITY COMBINATION =====
+    # 2.1 Closeness centrality from row sums
+    row_sums = distance_matrix.sum(axis=1)
+    closeness_centrality = 1 / np.maximum(row_sums, 1e-10)
+    
+    # 2.2 Shortest-path centrality via Floyd-Warshall
+    # Initialize with distance matrix
+    shortest_paths = distance_matrix.copy()
+    np.fill_diagonal(shortest_paths, 0)
+    
+    # Floyd-Warshall algorithm for all-pairs shortest paths
+    for k in range(n):
+        through_k = shortest_paths[:, k:k+1] + shortest_paths[k:k+1, :]
+        shortest_paths = np.minimum(shortest_paths, through_k)
+    
+    # Avoid division by zero for diagonal
+    np.fill_diagonal(shortest_paths, np.inf)
+    sp_centrality = 1 / np.maximum(shortest_paths.sum(axis=1), 1e-10)
+    np.fill_diagonal(shortest_paths, 0)
+    
+    # 2.3 Geometric mean combination
+    centrality = np.sqrt(closeness_centrality * sp_centrality)
+    centrality = centrality / np.maximum(centrality.max(), 1e-10)  # Normalize
+    
+    # Create centrality matrix using geometric mean in outer product
+    centrality_matrix = np.sqrt(np.outer(centrality, centrality))
+    
+    # ===== 3. ADAPTIVE GRAPH ANALYSIS =====
+    # 3.1 Triangle inequality violations (Euclidean measure)
+    euclidean_score = 1.0
+    if n >= 3:
+        sample_size = min(30, n)
+        sample_indices = np.random.choice(n, sample_size, replace=False)
+        violations = 0
+        total_checks = 0
+        
+        for i_idx in range(sample_size):
+            i = sample_indices[i_idx]
+            for j_idx in range(i_idx + 1, sample_size):
+                j = sample_indices[j_idx]
+                for k_idx in range(j_idx + 1, sample_size):
+                    k = sample_indices[k_idx]
+                    # Check triangle inequality in both directions
+                    if (distance_matrix[i, j] > 
+                        distance_matrix[i, k] + distance_matrix[k, j] + 1e-6):
+                        violations += 1
+                    if (distance_matrix[i, k] > 
+                        distance_matrix[i, j] + distance_matrix[j, k] + 1e-6):
+                        violations += 1
+                    if (distance_matrix[j, k] > 
+                        distance_matrix[j, i] + distance_matrix[i, k] + 1e-6):
+                        violations += 1
+                    total_checks += 3
+        
+        if total_checks > 0:
+            euclidean_score = 1.0 - (violations / total_checks)
+    
+    # 3.2 Local structure analysis
+    avg_dist = np.median(distance_matrix[np.triu_indices(n, k=1)])
+    if avg_dist > 0:
+        # Coefficient of variation as density measure
+        dist_std = np.std(distance_matrix[np.triu_indices(n, k=1)])
+        cv = dist_std / avg_dist
+        density_factor = np.clip(1.0 / (1.0 + cv), 0.3, 3.0)
+    else:
+        density_factor = 1.0
+    
+    # ===== 4. ADAPTIVE WEIGHTING =====
+    # Weight components based on graph characteristics
+    w_inv = 0.4 * euclidean_score
+    w_mst = 0.3 * density_factor
+    w_cent = 0.3 * (1.0 - 0.7 * euclidean_score)  # More weight for non-Euclidean
+    
+    # Normalize
+    total_w = w_inv + w_mst + w_cent + 1e-10
+    w_inv /= total_w
+    w_mst /= total_w
+    w_cent /= total_w
+    
+    # Boost MST edges for Euclidean graphs
+    mst_boost = 1.0 + 0.8 * euclidean_score
+    
+    # Combine components
+    combined = (w_inv * inv_dist + 
+                w_mst * mst_boost * mst_mask.astype(float) + 
+                w_cent * centrality_matrix)
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    # ===== 5. STOCHASTIC EDGE SPARSIFICATION =====
+    sparsified = np.zeros_like(combined)
+    
+    # Base k with sqrt(n) scaling
+    base_k = max(2, min(20, int(np.sqrt(n))))
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Calculate coefficient of variation for adaptive k
+        positive_mask = row > 0
+        if positive_mask.sum() > 0:
+            positive_vals = row[positive_mask]
+            row_mean = positive_vals.mean()
+            row_std = positive_vals.std()
+            cv = row_std / max(row_mean, 1e-10)
+            
+            # Adaptive k based on CV
+            k = base_k + int(cv * 2)
+            k = min(max(k, 2), n - 1)
+            
+            # Entropy-based exploration-exploitation balance
+            if len(positive_vals) > 1:
+                # Normalize for entropy calculation
+                norm_vals = positive_vals / positive_vals.sum()
+                entropy = -np.sum(norm_vals * np.log(norm_vals + 1e-10))
+                max_entropy = np.log(len(positive_vals))
+                exploration_ratio = entropy / max_entropy if max_entropy > 0 else 0.5
+                
+                # Temperature for softmax: higher temperature = more exploration
+                temperature = 1.0 + 2.0 * exploration_ratio
+            else:
+                temperature = 1.5
+        else:
+            # Fallback: use closest neighbors
+            k = min(base_k, n - 1)
+            sorted_idx = np.argsort(distance_matrix[i])[1:k+1]
+            sparsified[i, sorted_idx] = 1.0
+            continue
+        
+        # Stochastic selection with controlled noise
+        candidate_indices = np.where(positive_mask)[0]
+        candidate_values = row[candidate_indices]
+        
+        # Add exploration noise proportional to value
+        noise_scale = 0.1 * (1.0 + exploration_ratio)
+        noise = noise_scale * candidate_values * np.random.randn(len(candidate_values))
+        noisy_values = candidate_values * (1.0 + noise)
+        
+        # Select top k with exponential decay
+        top_k_idx = np.argsort(noisy_values)[-k:]
+        selected_indices = candidate_indices[top_k_idx]
+        
+        # Apply exponential decay
+        sorted_by_value = selected_indices[np.argsort(candidate_values[top_k_idx])[::-1]]
+        for rank, j in enumerate(sorted_by_value):
+            decay = np.exp(-rank / 2.5)  # Slower decay than v1
+            sparsified[i, j] = combined[i, j] * decay
+    
+    # ===== 6. FINAL PROCESSING =====
+    # Symmetrize
+    result = (sparsified + sparsified.T) / 2
+    
+    # Add adaptive noise for exploration
+    exploration_noise = 0.03 * (1.0 - euclidean_score) + 0.02
+    noise = exploration_noise * np.random.rand(n, n)
+    noise = np.triu(noise) + np.triu(noise, 1).T  # Make symmetric
+    np.fill_diagonal(noise, 0)
+    result = result + noise
+    
+    # Ensure non-negativity
+    result = np.maximum(result, 0)
+    np.fill_diagonal(result, 0)
+    
+    # Row normalization with fallback
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_mask = row_sums.flatten() == 0
+    
+    if np.any(zero_mask):
+        # Use inverse distance as fallback for isolated rows
+        fallback = inv_dist[zero_mask]
+        row_sums[zero_mask] = fallback.sum(axis=1, keepdims=True)
+        result[zero_mask] = fallback
+    
+    row_sums[row_sums == 0] = 1
+    result = result / row_sums
+    
+    return result
+```

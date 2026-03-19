@@ -1,0 +1,402 @@
+```json
+{
+    "algorithm_features": ["Adaptive k-NN Regret Analysis", "Multi-scale Entropy Sparsification", "Iterative Feedback Approximation", "Dynamic Component Weighting"]
+}
+```
+
+```python
+import numpy as np
+import warnings
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.cluster import SpectralClustering
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with adaptive regret analysis, multi-scale entropy sparsification,
+    iterative feedback approximation, and dynamic component weighting.
+    
+    Core Innovations:
+    1. Adaptive k-NN Regret: Dynamic neighbor selection based on local density and problem size
+    2. Multi-scale Entropy Sparsification: Hierarchical thresholding at global and local scales
+    3. Iterative Feedback Approximation: Simulated tour construction to adjust edge preferences
+    4. Dynamic Component Weighting: Self-tuning weights based on component correlation analysis
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Suppress warnings for clean output
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=RuntimeWarning)
+        
+        # ==================== 1. PROBLEM CHARACTERIZATION ====================
+        triu_idx = np.triu_indices(n, 1)
+        upper_dists = distance_matrix[triu_idx]
+        
+        dist_mean = np.mean(upper_dists)
+        dist_std = np.std(upper_dists)
+        dist_cv = dist_std / (dist_mean + 1e-8)
+        
+        # ==================== 2. ADAPTIVE k-NN REGRET ANALYSIS ====================
+        def compute_adaptive_regret() -> np.ndarray:
+            """Compute regret with dynamic neighbor selection based on local properties"""
+            regret_matrix = np.zeros((n, n))
+            
+            # First pass: analyze local neighborhood characteristics
+            neighborhood_stats = []
+            for i in range(n):
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                sorted_dists = np.sort(dists)
+                
+                # Compute density gradient
+                if len(sorted_dists) >= 5:
+                    local_density = 1.0 / np.mean(sorted_dists[:5])
+                    density_gradient = sorted_dists[4] / (sorted_dists[0] + 1e-8)
+                else:
+                    local_density = 1.0
+                    density_gradient = 1.0
+                
+                neighborhood_stats.append({
+                    'local_density': local_density,
+                    'density_gradient': density_gradient,
+                    'sorted_dists': sorted_dists
+                })
+            
+            # Determine adaptive k for each node
+            for i in range(n):
+                stats_i = neighborhood_stats[i]
+                
+                # Base k from problem size
+                base_k = max(3, min(int(0.2 * n), 10))
+                
+                # Adjust based on local density (denser regions need more exploration)
+                density_factor = 1.0 + 0.5 * np.tanh(stats_i['local_density'] / np.median([s['local_density'] for s in neighborhood_stats]))
+                
+                # Adjust based on density gradient (steep gradients need more precision)
+                gradient_factor = 1.0 + 0.3 * (stats_i['density_gradient'] - 1.0)
+                
+                k_i = int(base_k * density_factor * gradient_factor)
+                k_i = max(3, min(k_i, min(15, n-1)))
+                
+                # Get k_i nearest neighbors
+                knn_i = np.argsort(distance_matrix[i])[1:k_i+1]
+                
+                for j in range(n):
+                    if i == j:
+                        continue
+                    
+                    direct_cost = distance_matrix[i, j]
+                    min_alternative = np.inf
+                    
+                    # Check alternatives through i's adaptive neighbors
+                    for neighbor in knn_i:
+                        if neighbor == j:
+                            continue
+                        alt_cost = distance_matrix[i, neighbor] + distance_matrix[neighbor, j]
+                        min_alternative = min(min_alternative, alt_cost)
+                    
+                    # Symmetric check through j's adaptive neighbors
+                    if j > i:
+                        stats_j = neighborhood_stats[j]
+                        k_j = int(base_k * (1.0 + 0.5 * np.tanh(stats_j['local_density'] / np.median([s['local_density'] for s in neighborhood_stats]))))
+                        k_j = max(3, min(k_j, min(15, n-1)))
+                        knn_j = np.argsort(distance_matrix[j])[1:k_j+1]
+                        
+                        for neighbor in knn_j:
+                            if neighbor == i:
+                                continue
+                            alt_cost = distance_matrix[j, neighbor] + distance_matrix[neighbor, i]
+                            min_alternative = min(min_alternative, alt_cost)
+                    
+                    # Compute regret with adaptive scaling
+                    if min_alternative < np.inf and min_alternative > 0:
+                        regret = max(0, min_alternative - direct_cost)
+                        # Adaptive scaling based on local statistics
+                        local_scale = np.mean([stats_i['sorted_dists'][0], stats_j.get('sorted_dists', [dist_mean])[0]])
+                        scale = max(local_scale, 0.1 * dist_mean)
+                        regret_matrix[i, j] = 1.0 / (1.0 + np.exp(-regret / (scale + 1e-8)))
+                    else:
+                        regret_matrix[i, j] = 0.5
+            
+            # Symmetrize and apply smoothing
+            regret_matrix = (regret_matrix + regret_matrix.T) / 2
+            return regret_matrix
+        
+        regret_scores = compute_adaptive_regret()
+        
+        # ==================== 3. ITERATIVE FEEDBACK APPROXIMATION ====================
+        def compute_iterative_feedback() -> np.ndarray:
+            """Approximate iterative improvement through simulated greedy construction"""
+            feedback_scores = np.zeros((n, n))
+            
+            if n < 4:
+                return feedback_scores
+            
+            # Build multiple greedy tours from different starting points
+            n_tours = min(10, n)
+            tour_stats = defaultdict(lambda: {'count': 0, 'total_score': 0})
+            
+            for start in range(0, n, max(1, n // n_tours)):
+                # Greedy tour construction
+                visited = {start}
+                current = start
+                tour = [start]
+                
+                while len(visited) < n:
+                    # Find nearest unvisited neighbor
+                    unvisited = [j for j in range(n) if j not in visited]
+                    if not unvisited:
+                        break
+                    
+                    # Weighted selection favoring short edges
+                    dists = distance_matrix[current, unvisited]
+                    weights = 1.0 / (dists + 1e-8)
+                    weights = weights / np.sum(weights)
+                    
+                    # Probabilistic selection to avoid deterministic bias
+                    next_node = np.random.choice(unvisited, p=weights)
+                    
+                    # Record edge usage
+                    edge = tuple(sorted((current, next_node)))
+                    tour_stats[edge]['count'] += 1
+                    tour_stats[edge]['total_score'] += 1.0 / (distance_matrix[current, next_node] + 1e-8)
+                    
+                    visited.add(next_node)
+                    tour.append(next_node)
+                    current = next_node
+                
+                # Return to start
+                edge = tuple(sorted((current, start)))
+                tour_stats[edge]['count'] += 1
+                tour_stats[edge]['total_score'] += 1.0 / (distance_matrix[current, start] + 1e-8)
+            
+            # Convert statistics to scores
+            for (i, j), stats in tour_stats.items():
+                # Combine frequency and quality
+                frequency_score = stats['count'] / n_tours
+                quality_score = stats['total_score'] / (stats['count'] + 1e-8)
+                feedback_scores[i, j] = frequency_score * quality_score
+            
+            # Smooth and normalize
+            feedback_scores = (feedback_scores + feedback_scores.T) / 2
+            max_val = np.max(feedback_scores)
+            if max_val > 0:
+                feedback_scores = feedback_scores / max_val
+            
+            return feedback_scores
+        
+        feedback_scores = compute_iterative_feedback()
+        
+        # ==================== 4. MULTI-SCALE SPATIAL ANALYSIS ====================
+        def compute_multi_scale_scores() -> np.ndarray:
+            """Combine multiple spatial analysis techniques"""
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst > 0) | (mst.T > 0)
+            mst_scores = mst_edges.astype(float) * 0.7
+            
+            # Inverse distance component
+            with np.errstate(divide='ignore', invalid='ignore'):
+                inv_dist = 1.0 / distance_matrix
+            inv_dist[np.isinf(inv_dist)] = 0
+            np.fill_diagonal(inv_dist, 0)
+            max_inv = np.max(inv_dist)
+            if max_inv > 0:
+                inv_dist = inv_dist / max_inv
+            
+            # Spectral clustering for regional analysis
+            cluster_scores = np.zeros((n, n))
+            if n >= 8:
+                try:
+                    # Adaptive number of clusters
+                    n_clusters = max(2, min(5, int(np.sqrt(n))))
+                    spectral = SpectralClustering(
+                        n_clusters=n_clusters,
+                        affinity='precomputed',
+                        random_state=42
+                    )
+                    
+                    # Convert distances to similarities
+                    max_dist = np.max(distance_matrix)
+                    similarities = np.exp(-distance_matrix / (0.3 * max_dist + 1e-8))
+                    np.fill_diagonal(similarities, 1)
+                    
+                    labels = spectral.fit_predict(similarities)
+                    
+                    # Boost intra-cluster edges
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            if labels[i] == labels[j]:
+                                # Same cluster - prioritize shorter edges
+                                score = 1.0 / (distance_matrix[i, j] + 1e-8)
+                                # Adjust by cluster density
+                                cluster_i = np.where(labels == labels[i])[0]
+                                if len(cluster_i) > 1:
+                                    avg_intra_dist = np.mean(distance_matrix[cluster_i][:, cluster_i])
+                                    density_factor = dist_mean / (avg_intra_dist + 1e-8)
+                                    cluster_scores[i, j] = score * min(2.0, density_factor)
+            
+                except:
+                    pass
+            
+            # Normalize cluster scores
+            max_cluster = np.max(cluster_scores)
+            if max_cluster > 0:
+                cluster_scores = cluster_scores / max_cluster
+            
+            return mst_scores, inv_dist, cluster_scores
+        
+        mst_scores, inv_dist, cluster_scores = compute_multi_scale_scores()
+        
+        # ==================== 5. DYNAMIC COMPONENT WEIGHTING ====================
+        def compute_dynamic_weights() -> tuple:
+            """Compute optimal weights based on component correlation and problem characteristics"""
+            # Collect all component matrices
+            components = {
+                'regret': regret_scores,
+                'feedback': feedback_scores,
+                'mst': mst_scores,
+                'inv_dist': inv_dist,
+                'cluster': cluster_scores
+            }
+            
+            # Base weights from problem characteristics
+            if n <= 10:
+                base_weights = {'regret': 0.3, 'feedback': 0.2, 'mst': 0.3, 'inv_dist': 0.1, 'cluster': 0.1}
+            elif n <= 50:
+                base_weights = {'regret': 0.25, 'feedback': 0.25, 'mst': 0.2, 'inv_dist': 0.15, 'cluster': 0.15}
+            else:
+                base_weights = {'regret': 0.3, 'feedback': 0.3, 'mst': 0.2, 'inv_dist': 0.1, 'cluster': 0.1}
+            
+            # Adjust based on distance variability
+            if dist_cv > 0.6:  # High variability
+                base_weights['regret'] *= 1.3
+                base_weights['feedback'] *= 0.8
+            elif dist_cv < 0.3:  # Low variability
+                base_weights['feedback'] *= 1.2
+                base_weights['cluster'] *= 1.2
+            
+            # Adjust based on component diversity (encourage diverse perspectives)
+            component_entropies = {}
+            for name, matrix in components.items():
+                upper_vals = matrix[triu_idx]
+                if len(upper_vals) > 1:
+                    hist, _ = np.histogram(upper_vals, bins=min(10, len(upper_vals)), range=(0, 1))
+                    hist = hist[hist > 0]
+                    probs = hist / np.sum(hist)
+                    entropy = -np.sum(probs * np.log(probs + 1e-8))
+                    component_entropies[name] = entropy
+                else:
+                    component_entropies[name] = 0
+            
+            # Boost weights for components with high entropy (more information)
+            avg_entropy = np.mean(list(component_entropies.values()))
+            for name in base_weights:
+                if avg_entropy > 0:
+                    entropy_factor = 1.0 + 0.3 * (component_entropies[name] / avg_entropy - 1.0)
+                    base_weights[name] *= entropy_factor
+            
+            # Normalize weights
+            total = sum(base_weights.values())
+            normalized_weights = {name: w/total for name, w in base_weights.items()}
+            
+            return (
+                normalized_weights['regret'],
+                normalized_weights['feedback'],
+                normalized_weights['mst'],
+                normalized_weights['inv_dist'],
+                normalized_weights['cluster']
+            )
+        
+        w_regret, w_feedback, w_mst, w_inv, w_cluster = compute_dynamic_weights()
+        
+        # ==================== 6. COMPOSITE SCORING ====================
+        composite = (
+            w_regret * regret_scores +
+            w_feedback * feedback_scores +
+            w_mst * mst_scores +
+            w_inv * inv_dist +
+            w_cluster * cluster_scores
+        )
+        
+        # Apply distance-aware modulation
+        max_dist = np.max(distance_matrix)
+        if max_dist > 0:
+            dist_modulation = np.exp(-distance_matrix / (0.5 * max_dist + 1e-8))
+            composite *= dist_modulation
+        
+        # ==================== 7. MULTI-SCALE ENTROPY SPARSIFICATION ====================
+        def multi_scale_sparsify(scores: np.ndarray) -> np.ndarray:
+            """Hierarchical sparsification using global and local entropy measures"""
+            sparsified = np.zeros_like(scores)
+            
+            # Global entropy threshold
+            upper_scores = scores[triu_idx]
+            if len(upper_scores) > 10:
+                # Global histogram
+                hist, bins = np.histogram(upper_scores, bins=min(20, len(upper_scores)), range=(0, np.max(upper_scores)))
+                hist = hist[hist > 0]
+                probs = hist / np.sum(hist)
+                global_entropy = -np.sum(probs * np.log(probs + 1e-8))
+                max_entropy = np.log(len(probs)) if len(probs) > 0 else 1.0
+                global_norm_entropy = global_entropy / (max_entropy + 1e-8)
+                
+                # Global threshold based on entropy
+                global_percentile = 50 - 20 * global_norm_entropy  # High entropy -> lower threshold
+                global_threshold = np.percentile(upper_scores, max(20, min(80, global_percentile)))
+            else:
+                global_threshold = 0
+            
+            # Apply global threshold
+            sparsified[scores >= global_threshold] = scores[scores >= global_threshold]
+            
+            # Local (per-node) refinement
+            for i in range(n):
+                node_scores = scores[i]
+                if np.sum(node_scores > 0) < 2:  # Ensure minimum connectivity
+                    # Find top edges for this node
+                    sorted_idx = np.argsort(node_scores)[::-1]
+                    count = 0
+                    for j in sorted_idx:
+                        if j != i and sparsified[i, j] == 0 and count < 2:
+                            sparsified[i, j] = scores[i, j]
+                            sparsified[j, i] = scores[j, i]
+                            count += 1
+            
+            # Ensure MST edges are included
+            sparsified[mst_scores > 0] = np.maximum(sparsified[mst_scores > 0], scores[mst_scores > 0])
+            
+            return sparsified
+        
+        sparsified = multi_scale_sparsify(composite)
+        
+        # ==================== 8. FINAL REFINEMENT ====================
+        # Symmetrize
+        final_scores = (sparsified + sparsified.T) / 2
+        
+        # Apply sigmoid normalization for better contrast
+        median_score = np.median(final_scores[final_scores > 0])
+        if median_score > 0:
+            scaled = final_scores / (2 * median_score)
+            final_scores = 1.0 / (1.0 + np.exp(-scaled))
+        
+        # Normalize to [0, 1]
+        max_score = np.max(final_scores)
+        if max_score > 0:
+            final_scores = final_scores / max_score
+        
+        np.fill_diagonal(final_scores, 0)
+        
+        return final_scores
+```

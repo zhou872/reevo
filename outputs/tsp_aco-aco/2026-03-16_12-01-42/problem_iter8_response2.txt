@@ -1,0 +1,346 @@
+```json
+{
+    "algorithm_features": ["Dynamic Regret Thresholding", "Adaptive Neighbor Sampling", "Multi-scale Quality Scoring", "Instance-aware Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP edge heuristics with dynamic regret modeling, adaptive sampling,
+    and instance-aware fusion of multiple scoring strategies.
+    
+    Key innovations:
+    1. Dynamic regret thresholds based on local distance distributions
+    2. Multi-scale quality scoring with adaptive neighborhood sampling
+    3. Lightweight clustering for global pattern detection
+    4. Instance-aware weighting with automatic parameter tuning
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix with higher values indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # Base case
+    if n <= 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. INSTANCE CHARACTERIZATION ===
+    # Compute key features for adaptive parameter tuning
+    triu_vals = distance_matrix[np.triu_indices(n, k=1)]
+    avg_dist = np.mean(triu_vals)
+    std_dist = np.std(triu_vals)
+    uniformity = std_dist / (avg_dist + epsilon)
+    
+    # Compute skewness without external dependencies
+    centered = triu_vals - avg_dist
+    skewness = np.mean(centered**3) / (std_dist**3 + epsilon) if std_dist > epsilon else 0
+    
+    # Estimate spatial structure
+    if n > 10:
+        # Compute approximate cluster structure
+        from scipy.cluster.hierarchy import linkage, fcluster
+        from scipy.spatial.distance import squareform
+        condensed = squareform(distance_matrix)
+        Z = linkage(condensed, method='average')
+        # Dynamic clustering based on instance size
+        n_clusters = max(2, int(np.sqrt(n)))
+        labels = fcluster(Z, n_clusters, criterion='maxclust')
+        # Compute intra-cluster density
+        intra_mask = labels[:, None] == labels[None, :]
+        intra_density = np.mean(distance_matrix[intra_mask & ~np.eye(n, dtype=bool)]) if np.any(intra_mask) else avg_dist
+        inter_density = np.mean(distance_matrix[~intra_mask & ~np.eye(n, dtype=bool)]) if np.any(~intra_mask) else avg_dist
+        cluster_contrast = inter_density / (intra_density + epsilon)
+    else:
+        labels = np.zeros(n, dtype=int)
+        cluster_contrast = 1.0
+    
+    # === 2. DYNAMIC REGRET MODELING ===
+    # Compute adaptive regret thresholds per node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    
+    regret_scores = np.ones_like(distance_matrix)
+    
+    # Dynamic neighborhood size based on instance characteristics
+    base_k = max(2, min(8, int(np.log2(n + 1))))
+    k_regret = base_k + int(2 * (1 - uniformity))  # More neighbors for uniform instances
+    
+    for i in range(n):
+        # Compute local distance distribution
+        local_dists = distance_matrix[i].copy()
+        local_dists[i] = np.inf
+        
+        # Dynamic threshold: percentile based on uniformity
+        if uniformity < 0.3:  # Clustered instance
+            threshold_pct = 20
+        elif uniformity < 0.7:  # Moderate structure
+            threshold_pct = 40
+        else:  # Uniform instance
+            threshold_pct = 60
+            
+        threshold_val = np.percentile(local_dists[local_dists < np.inf], threshold_pct)
+        
+        # Find candidate alternatives within threshold
+        candidate_mask = (local_dists <= threshold_val) & (local_dists > 0)
+        if np.sum(candidate_mask) == 0:
+            candidate_mask = local_dists < np.inf
+            candidate_mask[i] = False
+            
+        # Compute regret for each edge
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            if not candidate_mask[j]:
+                # If j is not a candidate alternative, use best candidate as comparison
+                if np.any(candidate_mask):
+                    best_alt = np.min(local_dists[candidate_mask])
+                    if d_ij > epsilon:
+                        regret = (best_alt - d_ij) / d_ij
+                    else:
+                        regret = 0
+                else:
+                    regret = 0
+            else:
+                # j is a candidate, find best alternative excluding j
+                temp_mask = candidate_mask.copy()
+                temp_mask[j] = False
+                if np.any(temp_mask):
+                    best_alt = np.min(local_dists[temp_mask])
+                    if d_ij > epsilon:
+                        regret = (best_alt - d_ij) / d_ij
+                    else:
+                        regret = 0
+                else:
+                    regret = 0
+            
+            # Enhanced regret transformation with dynamic scaling
+            # More aggressive boosting for clustered instances
+            scale_factor = 1.5 + 0.5 * (1 - uniformity)
+            regret_boost = 1.0 + scale_factor * np.tanh(max(0, regret))
+            regret_scores[i, j] = regret_boost
+    
+    # === 3. MULTI-SCALE QUALITY SCORING ===
+    # Adaptive neighborhood sampling at multiple scales
+    quality_scores = np.zeros((n, n))
+    
+    # Base scale: immediate neighbors
+    k1 = max(2, min(10, n // 4))
+    # Secondary scale: extended neighborhood
+    k2 = max(k1, min(15, n // 3))
+    
+    # Compute node quality at different scales
+    node_quality_k1 = np.zeros(n)
+    node_quality_k2 = np.zeros(n)
+    
+    for i in range(n):
+        # First-order quality (harmonic mean of k1 nearest)
+        if n > 1:
+            nearest_k1 = sorted_dists[i, 1:min(k1+1, n)]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                node_quality_k1[i] = len(nearest_k1) / np.sum(1 / (nearest_k1 + epsilon))
+        
+        # Second-order quality (average of neighbor qualities)
+        if n > 2:
+            neighbor_indices = sorted_indices[i, 1:min(k2+1, n)]
+            neighbor_qualities = []
+            for nb in neighbor_indices:
+                if nb != i:
+                    nb_nearest = sorted_dists[nb, 1:min(k1+1, n)]
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        nb_quality = len(nb_nearest) / np.sum(1 / (nb_nearest + epsilon))
+                    neighbor_qualities.append(nb_quality)
+            
+            if neighbor_qualities:
+                node_quality_k2[i] = np.mean(neighbor_qualities)
+    
+    # Combine scales with instance-aware weighting
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Multi-scale combination
+            scale1 = np.sqrt(node_quality_k1[i] * node_quality_k1[j])
+            scale2 = np.sqrt(node_quality_k2[i] * node_quality_k2[j])
+            
+            # Weight scales based on instance structure
+            if uniformity < 0.4:
+                # Clustered: emphasize local scale
+                quality_scores[i, j] = 0.7 * scale1 + 0.3 * scale2
+            else:
+                # Uniform/mixed: balance scales
+                quality_scores[i, j] = 0.5 * scale1 + 0.5 * scale2
+    
+    # Normalize quality scores
+    if np.max(quality_scores) > 0:
+        q_min, q_max = np.min(quality_scores[quality_scores > 0]), np.max(quality_scores)
+        if q_max > q_min:
+            quality_scores = 0.1 + 0.9 * (quality_scores - q_min) / (q_max - q_min)
+    
+    # === 4. GLOBAL STRUCTURE FACTOR ===
+    global_factor = np.ones_like(distance_matrix)
+    
+    # Lightweight clustering-based adjustments
+    if n > 10:
+        # Intra-cluster bonus
+        for i in range(n):
+            for j in range(i+1, n):
+                if labels[i] == labels[j]:
+                    # Same cluster: bonus based on cluster contrast
+                    bonus = 1.0 + 0.3 * (1 / (cluster_contrast + epsilon))
+                    global_factor[i, j] = global_factor[j, i] = min(1.5, bonus)
+                else:
+                    # Different clusters: penalty that decreases with distance
+                    # Long edges between clusters can be valuable
+                    norm_dist = distance_matrix[i, j] / (avg_dist + epsilon)
+                    if norm_dist < 1.5:
+                        # Moderate inter-cluster edges get slight penalty
+                        global_factor[i, j] = global_factor[j, i] = 0.8
+                    else:
+                        # Very long edges get stronger penalty
+                        global_factor[i, j] = global_factor[j, i] = 0.6
+    
+    # === 5. MST PRESERVATION ENHANCEMENT ===
+    mst_factor = np.ones_like(distance_matrix)
+    if n > 2:
+        # Compute MST using Prim's algorithm for efficiency
+        in_mst = np.zeros(n, dtype=bool)
+        in_mst[0] = True
+        min_edge = distance_matrix[0].copy()
+        min_edge[0] = np.inf
+        parent = np.zeros(n, dtype=int)
+        
+        mst_edges = set()
+        
+        for _ in range(n - 1):
+            # Find minimum edge connecting MST to non-MST
+            valid_mask = ~in_mst
+            if not np.any(valid_mask):
+                break
+            min_val = np.min(min_edge[valid_mask])
+            min_idx = np.argwhere(min_edge == min_val)[0][0]
+            
+            in_mst[min_idx] = True
+            p = parent[min_idx]
+            
+            # Store MST edge
+            mst_edges.add((min(p, min_idx), max(p, min_idx)))
+            
+            # Update MST factor
+            mst_boost = 1.0 + 0.5 * quality_scores[p, min_idx]
+            mst_factor[p, min_idx] = mst_boost
+            mst_factor[min_idx, p] = mst_boost
+            
+            # Update distances
+            for v in range(n):
+                if not in_mst[v] and distance_matrix[min_idx, v] < min_edge[v]:
+                    min_edge[v] = distance_matrix[min_idx, v]
+                    parent[v] = min_idx
+        
+        # Additional bonus for edges that connect MST components efficiently
+        for i in range(n):
+            for j in range(i+1, n):
+                if (i, j) not in mst_edges:
+                    # Check if this edge could replace a longer MST edge
+                    # Simple approximation: if edge is significantly shorter than average
+                    if distance_matrix[i, j] < 0.7 * avg_dist:
+                        mst_factor[i, j] = mst_factor[j, i] = 1.2
+    
+    # === 6. INSTANCE-AWARE FUSION ===
+    # Adaptive component weights based on instance features
+    w_inv = 1.0  # Base inverse distance
+    
+    # Regret weight: higher for instances with clear structure
+    w_regret = 0.8 + 0.4 * (1 - uniformity)
+    
+    # Quality weight: balanced across instance types
+    w_quality = 1.2 - 0.3 * abs(skewness)
+    
+    # Global factor weight: higher for clustered instances
+    w_global = 0.5 + 0.5 * (1 - uniformity)
+    
+    # MST weight: consistent but slightly adaptive
+    w_mst = 0.7 + 0.2 * (1 - cluster_contrast / (cluster_contrast + 1))
+    
+    # Base inverse distance with smoothing
+    inv_dist = 1 / (distance_matrix + avg_dist * 0.01)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Combine components with instance-aware weights
+    combined = inv_dist ** w_inv
+    combined *= regret_scores ** w_regret
+    combined *= quality_scores ** w_quality
+    combined *= global_factor ** w_global
+    combined *= mst_factor ** w_mst
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    # === 7. ADAPTIVE SPARSIFICATION ===
+    # Dynamic sparsification based on instance complexity
+    if n > 20:
+        # Compute sparsity target based on instance characteristics
+        if uniformity < 0.3:
+            # Clustered: keep more edges for flexibility
+            keep_ratio = 0.25 + 0.1 * (1 - uniformity)
+        else:
+            # Uniform/mixed: more aggressive sparsification
+            keep_ratio = 0.15 + 0.05 * uniformity
+        
+        k_keep = max(3, int(keep_ratio * n))
+        
+        sparsified = np.zeros_like(combined)
+        for i in range(n):
+            row = combined[i].copy()
+            row[i] = -np.inf
+            
+            if k_keep < n - 1:
+                threshold = np.partition(row, -k_keep)[-k_keep]
+                mask = row >= threshold
+            else:
+                mask = row > -np.inf
+            
+            # Ensure minimum connectivity
+            if mask.sum() < 2:
+                # Add top edges
+                top_indices = np.argsort(row)[-2:]
+                mask[top_indices] = True
+            
+            sparsified[i] = combined[i] * mask
+        
+        # Ensure symmetry
+        sparsified = np.maximum(sparsified, sparsified.T)
+        combined = sparsified
+    
+    # === 8. FINAL NORMALIZATION ===
+    # Row-wise normalization with smoothing
+    for i in range(n):
+        row_sum = combined[i].sum()
+        if row_sum > 0:
+            # Soft normalization: blend with uniform distribution
+            alpha = 0.9 - 0.2 * uniformity  # More smoothing for uniform instances
+            combined[i] = alpha * (combined[i] / row_sum) + (1 - alpha) * (1 / (n - 1))
+        else:
+            combined[i] = 1 / (n - 1)
+        combined[i, i] = 0
+    
+    # Final symmetrization
+    combined = (combined + combined.T) / 2
+    
+    return combined
+```

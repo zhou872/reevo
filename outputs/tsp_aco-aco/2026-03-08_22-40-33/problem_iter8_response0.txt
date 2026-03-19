@@ -1,0 +1,395 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Scoring", "Two-step Graph Attention", "Spatial Cluster Density", "Probabilistic Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from collections import defaultdict
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray,
+                  lookahead_depth: int = 3,
+                  regret_adaptive: bool = True,
+                  sparsity_adaptive: bool = True,
+                  attention_radius: float = 0.25) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with graph attention
+    and adaptive spatial clustering.
+    
+    Key innovations:
+    1. Graph attention mechanism for localized edge evaluation
+    2. Spatial clustering with density-aware scoring
+    3. Probabilistic edge pruning based on Bernoulli trials
+    4. Adaptive regret scoring with instance-aware normalization
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        lookahead_depth: Maximum depth for attention-based lookahead
+        regret_adaptive: Adapt regret scoring to instance characteristics
+        sparsity_adaptive: Enable intelligent edge sparsification
+        attention_radius: Fraction of nodes to consider in attention window
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        result = np.ones_like(distance_matrix) - np.eye(n)
+        return result
+    
+    # === 1. INSTANCE ANALYSIS AND CHARACTERIZATION ===
+    # Extract upper triangular distances for analysis
+    triu_indices = np.triu_indices(n, k=1)
+    distances_flat = distance_matrix[triu_indices]
+    
+    # Compute instance statistics
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # Percentile distances for adaptive thresholds
+    p25 = np.percentile(distances_flat, 25)
+    p75 = np.percentile(distances_flat, 75)
+    iqr = p75 - p25
+    
+    # Adaptive parameters based on instance characteristics
+    if regret_adaptive:
+        # Higher regret power for more uniform distributions
+        regret_power = 1.2 + 0.6 * np.tanh(1.5 * dist_cv)
+    else:
+        regret_power = 1.5
+    
+    # Attention window size
+    attention_window = max(4, int(attention_radius * n))
+    
+    # === 2. SPATIAL CLUSTERING ANALYSIS ===
+    # Identify dense regions using distance-based clustering
+    cluster_scores = np.zeros(n)
+    if n >= 8:
+        # Use local density estimation
+        local_density = np.zeros(n)
+        for i in range(n):
+            # Count neighbors within 1.5 * median distance
+            median_dist = np.median(distances_flat)
+            threshold = 1.5 * median_dist
+            local_density[i] = np.sum(distance_matrix[i] < threshold) - 1
+        
+        # Normalize density scores
+        if np.max(local_density) > 0:
+            local_density = local_density / np.max(local_density)
+        
+        # Use density to adjust cluster importance
+        cluster_scores = local_density
+    
+    # === 3. GRAPH ATTENTION MECHANISM ===
+    # Precompute attention weights for each node
+    attention_weights = np.zeros((n, n))
+    
+    # For each node, compute attention to other nodes based on distance and density
+    for i in range(n):
+        # Get distances from node i
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find attention window nodes (closest attention_window nodes)
+        attention_indices = np.argsort(dists_i)[:attention_window]
+        
+        # Compute attention weights using softmax over inverse distances
+        attention_dists = dists_i[attention_indices]
+        if np.any(attention_dists > 0):
+            # Use exponential decay for attention
+            attn_values = np.exp(-attention_dists / (dist_mean + 1e-12))
+            attn_values = attn_values / np.sum(attn_values)
+            attention_weights[i, attention_indices] = attn_values
+    
+    # === 4. ADAPTIVE REGRET SCORING WITH ATTENTION ===
+    regret_scores = np.ones((n, n))
+    
+    # For each node, compute regret relative to attention neighbors
+    for i in range(n):
+        # Get attention neighbors
+        attn_neighbors = np.where(attention_weights[i] > 0)[0]
+        
+        if len(attn_neighbors) >= 2:
+            # Get distances to attention neighbors
+            dists_to_neighbors = distance_matrix[i, attn_neighbors]
+            
+            # Sort neighbors by distance
+            sorted_idx = np.argsort(dists_to_neighbors)
+            sorted_neighbors = attn_neighbors[sorted_idx]
+            sorted_dists = dists_to_neighbors[sorted_idx]
+            
+            best_dist = sorted_dists[0]
+            
+            for rank, j in enumerate(sorted_neighbors):
+                current_dist = distance_matrix[i, j]
+                
+                if rank == 0:
+                    regret_scores[i, j] = 1.0
+                else:
+                    # Enhanced regret calculation with attention weighting
+                    norm_rank = rank / (len(sorted_neighbors) - 1)
+                    dist_ratio = current_dist / (best_dist + 1e-12)
+                    
+                    # Include attention weight in regret calculation
+                    attn_weight = attention_weights[i, j]
+                    regret_factor = 1 / (1 + regret_power * norm_rank * np.sqrt(dist_ratio))
+                    
+                    # Blend with attention weight
+                    regret_scores[i, j] = 0.7 * regret_factor + 0.3 * attn_weight
+    
+    # Symmetrize regret scores
+    regret_scores = np.sqrt(regret_scores * regret_scores.T)
+    
+    # === 5. TWO-STEP GRAPH ATTENTION LOOKAHEAD ===
+    lookahead_scores = np.ones((n, n))
+    
+    if n >= 4 and lookahead_depth >= 2:
+        # Precompute expanded attention sets for each node
+        expanded_attention = []
+        for i in range(n):
+            # Get primary attention neighbors
+            primary = np.where(attention_weights[i] > 0.01)[0]
+            
+            # Expand to secondary neighbors
+            secondary = set()
+            for j in primary:
+                secondary.update(np.where(attention_weights[j] > 0.01)[0])
+            
+            # Combine and remove self
+            combined = set(primary) | secondary
+            combined.discard(i)
+            expanded_attention.append(list(combined))
+        
+        # Compute lookahead scores using expanded attention sets
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_dist = distance_matrix[i, j]
+                
+                if direct_dist <= 0:
+                    continue
+                
+                # Get expanded attention sets for both nodes
+                i_attention = expanded_attention[i]
+                j_attention = expanded_attention[j]
+                
+                # Find common attention nodes
+                common_attention = set(i_attention) & set(j_attention)
+                
+                best_alternative = np.inf
+                
+                # Check 2-hop paths through common attention nodes
+                for k in common_attention:
+                    if k != i and k != j:
+                        alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternative = min(best_alternative, alt_dist)
+                
+                # Check 3-hop paths if depth allows
+                if lookahead_depth >= 3 and common_attention:
+                    for k in common_attention:
+                        k_attention = expanded_attention[k]
+                        valid_hops = k_attention - {i, j, k}
+                        
+                        for l in valid_hops:
+                            if l not in common_attention:
+                                alt_dist = (distance_matrix[i, k] + 
+                                          distance_matrix[k, l] + 
+                                          distance_matrix[l, j])
+                                best_alternative = min(best_alternative, alt_dist)
+                
+                if best_alternative < np.inf:
+                    efficiency = best_alternative / direct_dist
+                    
+                    # Enhanced scoring with cluster awareness
+                    cluster_factor = 0.5 + 0.5 * (cluster_scores[i] + cluster_scores[j])
+                    score = np.clip(efficiency * cluster_factor, 0.4, 2.5)
+                    
+                    lookahead_scores[i, j] = lookahead_score[j, i] = score
+    
+    # === 6. BASE INVERSE DISTANCE WITH CLUSTER AWARENESS ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Adaptive scaling based on instance characteristics
+        scale = dist_mean if dist_mean > 0 else 1.0
+        epsilon = 0.1 * scale
+        
+        # Enhanced inverse distance with cluster adjustment
+        inv_dist = scale / (distance_matrix + epsilon * np.eye(n))
+    
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Apply cluster density adjustment
+    for i in range(n):
+        for j in range(i + 1, n):
+            cluster_bonus = 1.0 + 0.3 * (cluster_scores[i] + cluster_scores[j])
+            inv_dist[i, j] = inv_dist[j, i] = inv_dist[i, j] * cluster_bonus
+    
+    # === 7. COMBINE ALL COMPONENTS ===
+    heuristics = inv_dist.copy()
+    heuristics *= regret_scores
+    heuristics *= lookahead_scores
+    
+    # Symmetrize
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 8. PROBABILISTIC EDGE SPARSIFICATION ===
+    if sparsity_adaptive and n > 4:
+        # Determine target sparsity based on instance size
+        base_keep_prob = min(0.3, 20 / n)
+        
+        for i in range(n):
+            row = heuristics[i].copy()
+            
+            # Skip self
+            row[i] = -np.inf
+            
+            # Determine keep probability for each edge
+            for j in range(n):
+                if i != j and row[j] > 0:
+                    # Higher probability to keep edges with high heuristic scores
+                    keep_prob = base_keep_prob + 0.7 * (row[j] / np.max(row[row > 0]))
+                    
+                    # Adjust based on cluster scores
+                    if cluster_scores[i] > 0.7 or cluster_scores[j] > 0.7:
+                        keep_prob = min(1.0, keep_prob * 1.3)
+                    
+                    # Bernoulli trial for edge retention
+                    if np.random.random() > keep_prob:
+                        heuristics[i, j] = 0
+            
+            # Ensure at least 3 edges per node
+            non_zero = np.sum(heuristics[i] > 0)
+            if non_zero < 3:
+                # Find top 3 edges by heuristic value
+                top_indices = np.argsort(row)[-3:]
+                heuristics[i, top_indices] = row[top_indices]
+        
+        # Re-symmetrize after sparsification
+        heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # === 9. FINAL NORMALIZATION AND CLEANUP ===
+    # Zero out diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize non-zero values to [0, 1]
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = heuristics[non_zero_mask].max()
+        if max_val > 0:
+            heuristics[non_zero_mask] = heuristics[non_zero_mask] / max_val
+    
+    # Apply final smoothing
+    heuristics = 0.5 * heuristics + 0.5 * (heuristics + heuristics.T) / 2
+    
+    return heuristics
+
+# Helper function for MST computation (used in test)
+def _compute_mst_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute Minimum Spanning Tree using Prim's algorithm."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        u = -1
+        min_val = np.inf
+        for i in range(n):
+            if not visited[i] and min_edge[i] < min_val:
+                min_val = min_edge[i]
+                u = i
+        
+        if u == -1:
+            break
+        
+        visited[u] = True
+        
+        if parent[u] != -1:
+            mst_mask[u, parent[u]] = True
+            mst_mask[parent[u], u] = True
+        
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    return mst_mask
+
+# Test function
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Create test instances with varying characteristics
+    n_nodes = 30
+    
+    # Instance 1: Mixed clusters and sparse points
+    coords1 = np.zeros((n_nodes, 2))
+    
+    # Create three clusters
+    coords1[:10] = np.random.randn(10, 2) * 5 + np.array([20, 20])
+    coords1[10:20] = np.random.randn(10, 2) * 5 + np.array([60, 60])
+    coords1[20:] = np.random.rand(n_nodes-20, 2) * 100  # Sparse points
+    
+    dist_matrix1 = squareform(pdist(coords1))
+    
+    # Instance 2: Uniform distribution
+    coords2 = np.random.rand(n_nodes, 2) * 100
+    dist_matrix2 = squareform(pdist(coords2))
+    
+    # Test heuristics on both instances
+    for idx, (name, dist_matrix) in enumerate([("Clustered", dist_matrix1), 
+                                               ("Uniform", dist_matrix2)]):
+        print(f"\n{'='*60}")
+        print(f"Testing {name} Instance")
+        print(f"{'='*60}")
+        
+        heuristics = heuristics_v2(dist_matrix.copy(), 
+                                  lookahead_depth=3,
+                                  attention_radius=0.2)
+        
+        print(f"Instance size: {dist_matrix.shape[0]}")
+        
+        # Analyze heuristic matrix
+        n = dist_matrix.shape[0]
+        non_zero_count = np.sum(heuristics > 0)
+        total_edges = n * n - n
+        sparsity = 1 - non_zero_count / total_edges
+        
+        print(f"Sparsity: {sparsity:.1%}")
+        print(f"Non-zero edges per node: min={np.sum(heuristics > 0, axis=1).min()}, "
+              f"max={np.sum(heuristics > 0, axis=1).max()}, "
+              f"mean={np.sum(heuristics > 0, axis=1).mean():.1f}")
+        
+        # Check symmetry
+        is_symmetric = np.allclose(heuristics, heuristics.T, rtol=1e-5)
+        print(f"Matrix is symmetric: {is_symmetric}")
+        
+        # Sample edge information
+        print("\nSample edge analysis:")
+        print("i  j  Distance  Heuristic  Cluster(i)  Cluster(j)")
+        for i, j in [(0, 5), (2, 8), (10, 15), (20, 25)]:
+            if i < n and j < n:
+                # Recompute cluster scores for display
+                distances_flat = dist_matrix[np.triu_indices(n, k=1)]
+                median_dist = np.median(distances_flat)
+                threshold = 1.5 * median_dist
+                
+                cluster_i = np.sum(dist_matrix[i] < threshold) - 1
+                cluster_j = np.sum(dist_matrix[j] < threshold) - 1
+                max_cluster = max(np.sum(dist_matrix < threshold, axis=1)) - 1
+                
+                if max_cluster > 0:
+                    cluster_i = cluster_i / max_cluster
+                    cluster_j = cluster_j / max_cluster
+                
+                print(f"{i:2d} {j:2d} {dist_matrix[i, j]:9.2f} {heuristics[i, j]:10.4f} "
+                      f"{cluster_i:11.3f} {cluster_j:11.3f}")
+```

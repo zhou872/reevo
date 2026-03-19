@@ -1,0 +1,191 @@
+```json
+{
+    "algorithm_features": ["Sampled Path Betweenness Centrality", "Dynamic Multi-factor Weighting", "Regret-based Edge Scoring", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+from heapq import heappush, heappop
+from typing import Tuple, List
+import math
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with improved:
+    1. Fast sampled edge betweenness using Dijkstra on sparse subgraph
+    2. Dynamic factor weighting based on graph properties
+    3. Regret-based scoring prioritizing edges with large cost differentials
+    4. Adaptive sparsification maintaining solution space diversity
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + 1e-10)
+    
+    # 1. BASE SIMILARITY & ADAPTIVE PARAMETERS
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1 / (distance_matrix + 1e-10)
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # Dynamic parameters based on graph properties
+    k_neighbors = max(2, min(8, n // 6))
+    sampling_factor = min(0.4, max(0.1, 20/n))  # Adaptive sampling rate for betweenness
+    
+    # 2. SPARSE PROMISING EDGE MASK
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    nearest_distances = np.zeros((n, k_neighbors))
+    
+    for i in range(n):
+        # Get k nearest neighbors with their distances
+        indices = np.argsort(distance_matrix[i])[1:k_neighbors+1]
+        distances = distance_matrix[i, indices]
+        nn_mask[i, indices] = True
+        nn_mask[indices, i] = True
+        nearest_distances[i] = distances
+    
+    # 3. MINIMUM SPANNING TREE BONUS
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = (mst + mst.T) > 0
+    
+    # 4. FAST SAMPLED EDGE BETWEENNESS (Dijkstra-based)
+    betweenness = np.zeros_like(distance_matrix)
+    sample_size = max(3, int(n * sampling_factor))
+    
+    if n > 10:
+        # Sample source nodes
+        sources = np.random.choice(n, min(sample_size, n), replace=False)
+        
+        for s in sources:
+            # Dijkstra from source s on sparse subgraph
+            dist = np.full(n, np.inf)
+            dist[s] = 0
+            prev = [[] for _ in range(n)]  # Store multiple predecessors for shortest paths
+            visited = np.zeros(n, dtype=bool)
+            heap = [(0, s)]
+            
+            while heap:
+                d_u, u = heappop(heap)
+                if visited[u]:
+                    continue
+                visited[u] = True
+                
+                # Only consider promising edges from u
+                neighbors = np.where(nn_mask[u])[0]
+                for v in neighbors:
+                    alt = d_u + distance_matrix[u, v]
+                    if alt < dist[v] - 1e-10:
+                        dist[v] = alt
+                        prev[v] = [u]
+                        heappush(heap, (alt, v))
+                    elif abs(alt - dist[v]) < 1e-10:
+                        prev[v].append(u)
+            
+            # Backward accumulation of edge usage
+            edge_counts = np.zeros_like(distance_matrix)
+            # Process nodes in reverse distance order
+            sorted_nodes = np.argsort(dist)[::-1]
+            
+            for v in sorted_nodes:
+                if v == s:
+                    continue
+                for u in prev[v]:
+                    edge_counts[min(u, v), max(u, v)] += 1
+            
+            betweenness += edge_counts + edge_counts.T
+    
+    # Normalize betweenness
+    if np.max(betweenness) > 0:
+        betweenness = betweenness / np.max(betweenness)
+    
+    # 5. REGRET-BASED SCORING
+    regret_scores = np.zeros_like(distance_matrix)
+    
+    # Compute second best distances for each node
+    second_best = np.zeros(n)
+    for i in range(n):
+        if k_neighbors >= 2:
+            second_best[i] = nearest_distances[i, 1] if k_neighbors > 1 else nearest_distances[i, 0]
+        else:
+            # If k_neighbors is 1, use the distance to the second nearest (sorted)
+            sorted_dists = np.sort(distance_matrix[i])[1:3]
+            second_best[i] = sorted_dists[1] if len(sorted_dists) > 1 else sorted_dists[0]
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if nn_mask[i, j]:
+                # Regret for not using edge (i,j): difference between this edge and next best alternative
+                regret_i = max(0, second_best[i] - distance_matrix[i, j])
+                regret_j = max(0, second_best[j] - distance_matrix[i, j])
+                regret_scores[i, j] = regret_scores[j, i] = (regret_i + regret_j) / (distance_matrix[i, j] + 1e-10)
+    
+    # Normalize regret scores
+    max_regret = np.max(regret_scores)
+    if max_regret > 0:
+        regret_scores = regret_scores / max_regret
+    
+    # 6. DYNAMIC FACTOR WEIGHTING BASED ON GRAPH PROPERTIES
+    # Compute graph properties
+    if n > 10:
+        # Clusteriness: variance of nearest neighbor distances
+        clusteriness = np.var(nearest_distances) / (np.mean(nearest_distances) + 1e-10)
+        
+        # Density measure: MST weight vs complete graph weight
+        mst_weight = np.sum(mst[mst > 0])
+        avg_distance = np.mean(distance_matrix)
+        density_ratio = mst_weight / (avg_distance * (n-1) + 1e-10)
+        
+        # Dynamic weights based on graph properties
+        w_base = 1.0
+        w_betweenness = min(1.5, max(0.5, 1.0 + clusteriness))
+        w_regret = min(1.5, max(0.5, 1.0 + (1 - density_ratio)))
+        w_mst = 1.5  # Constant high weight for MST edges
+    else:
+        w_base = w_betweenness = w_regret = 1.0
+        w_mst = 1.5
+    
+    # 7. COMBINE FACTORS WITH DYNAMIC WEIGHTS
+    heuristic_matrix = np.zeros_like(distance_matrix)
+    promising_mask = nn_mask | mst_bonus
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if promising_mask[i, j]:
+                # Apply dynamic weights
+                base_score = base_heuristic[i, j] ** w_base
+                betweenness_score = (1 + betweenness[i, j]) ** w_betweenness
+                regret_score = (1 + regret_scores[i, j]) ** w_regret
+                mst_factor = w_mst if mst_bonus[i, j] else 1.0
+                
+                # Degree normalization (modified)
+                degree_i = np.sum(nn_mask[i])
+                degree_j = np.sum(nn_mask[j])
+                degree_norm = 1 + 1 / (np.sqrt(degree_i * degree_j) + 1)
+                
+                combined = base_score * betweenness_score * regret_score * mst_factor * degree_norm
+                heuristic_matrix[i, j] = heuristic_matrix[j, i] = combined
+    
+    # 8. ADAPTIVE SPARSIFICATION
+    # Keep varying proportions based on graph size
+    keep_ratio = 0.3 + 0.2 * (1 - min(1, n/50))  # Keep more edges for smaller graphs
+    
+    for i in range(n):
+        row = heuristic_matrix[i]
+        positive_vals = row[row > 0]
+        if len(positive_vals) > 1:
+            threshold = np.percentile(positive_vals, (1 - keep_ratio) * 100)
+            row[row < threshold] = 0
+    
+    # Ensure MST edges are always kept
+    heuristic_matrix[mst_bonus] = np.maximum(heuristic_matrix[mst_bonus], 
+                                            np.percentile(heuristic_matrix[heuristic_matrix > 0], 80) 
+                                            if np.any(heuristic_matrix > 0) else 1.0)
+    
+    # Normalize final matrix
+    max_val = np.max(heuristic_matrix)
+    if max_val > 0:
+        heuristic_matrix = heuristic_matrix / max_val
+    
+    return heuristic_matrix
+```

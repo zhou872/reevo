@@ -1,0 +1,162 @@
+```json
+{
+    "algorithm_features": ["MST Connectivity Bonus", "Symmetric Regret Penalization", "Distance-Adaptive Sparsification", "Two-Step Regret Smoothing"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges with improved regret modeling and adaptive sparsification.
+    
+    Key improvements over v1:
+    1. Two-step regret calculation considering alternative path costs
+    2. Symmetric regret normalization using geometric mean
+    3. Distance-adaptive sparsification thresholds
+    4. Smoother MST edge preservation with proportional bonuses
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix of shape (n, n)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # 1. Base inverse distance with stable normalization
+    # Use median distance for scaling to handle varying distance scales
+    non_zero_mask = ~np.eye(n, dtype=bool) & (distance_matrix > 0)
+    if np.any(non_zero_mask):
+        median_dist = np.median(distance_matrix[non_zero_mask])
+        scaled_dist = distance_matrix / (median_dist + 1e-10)
+    else:
+        scaled_dist = distance_matrix.copy()
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (scaled_dist + 1e-10)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Two-step regret calculation with smooth exponential decay
+    # First step: Direct alternative regret
+    direct_regret = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        min_dist = np.min(row_dists[row_dists < np.inf])
+        
+        if min_dist < np.inf and min_dist > 0:
+            # Exponential decay: edges much longer than minimum get heavily penalized
+            regret_ratio = distance_matrix[i] / min_dist
+            direct_regret[i] = np.exp(-regret_ratio + 1)  # exp(1) for edge equal to min
+    
+    # Second step: Path-based regret via triangle inequality
+    path_regret = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Consider alternative two-hop paths i->k->j
+                alt_costs = distance_matrix[i] + distance_matrix[:, j]
+                alt_costs[i] = np.inf  # Exclude self
+                alt_costs[j] = np.inf  # Exclude direct connection
+                
+                if np.any(alt_costs < np.inf):
+                    best_alt = np.min(alt_costs)
+                    if best_alt > 0:
+                        # Path regret: how much worse is direct edge than best alternative path
+                        path_ratio = distance_matrix[i, j] / best_alt
+                        path_regret[i, j] = np.exp(-path_ratio + 1)
+    
+    # Combine regrets using geometric mean for symmetry
+    combined_regret = np.sqrt(direct_regret * path_regret)
+    np.fill_diagonal(combined_regret, 0)
+    
+    # 3. MST connectivity with proportional bonus
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Compute MST edge quality scores
+    mst_scores = np.zeros_like(distance_matrix)
+    mst_scores[mst_mask] = inv_dist[mst_mask] * combined_regret[mst_mask]
+    
+    # Apply proportional bonus based on MST edge quality
+    mst_bonus = np.ones_like(distance_matrix)
+    if np.any(mst_scores > 0):
+        max_mst_score = np.max(mst_scores[mst_mask])
+        min_mst_score = np.min(mst_scores[mst_scores > 0])
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    # Bonus proportional to how good this MST edge is
+                    edge_score = mst_scores[i, j]
+                    if max_mst_score > min_mst_score:
+                        normalized = (edge_score - min_mst_score) / (max_mst_score - min_mst_score)
+                        mst_bonus[i, j] = mst_bonus[j, i] = 1.0 + 0.5 * normalized
+    
+    # 4. Combine components with MST bonus
+    base_scores = inv_dist * combined_regret * mst_bonus
+    
+    # 5. Distance-adaptive sparsification
+    sparsified = np.zeros_like(base_scores)
+    
+    # Calculate adaptive sparsity level based on problem size and distance distribution
+    if n <= 5:
+        target_edges = min(10, n * (n - 1) // 2)
+    elif n <= 20:
+        target_edges = int(0.4 * n * (n - 1) // 2)
+    else:
+        # For larger problems, keep edges proportional to n*log(n)
+        target_edges = int(1.5 * n * np.log(n + 1))
+    
+    # Ensure we keep at least enough edges for connectivity
+    min_edges = max(n - 1, target_edges // 2)
+    target_edges = max(target_edges, min_edges)
+    target_edges = min(target_edges, n * (n - 1) // 2)
+    
+    # Keep top edges globally (symmetric)
+    upper_tri_indices = np.triu_indices(n, k=1)
+    upper_scores = base_scores[upper_tri_indices]
+    
+    if len(upper_scores) > target_edges:
+        threshold = np.partition(upper_scores, -target_edges)[-target_edges]
+        keep_mask_upper = upper_scores >= threshold
+    else:
+        keep_mask_upper = np.ones_like(upper_scores, dtype=bool)
+    
+    # Create symmetric matrix from upper triangle selection
+    keep_matrix = np.zeros_like(base_scores, dtype=bool)
+    keep_matrix[upper_tri_indices] = keep_mask_upper
+    keep_matrix = keep_matrix | keep_matrix.T
+    
+    # Ensure MST edges are always kept
+    keep_matrix = keep_matrix | mst_mask
+    
+    # Apply sparsification
+    sparsified[keep_matrix] = base_scores[keep_matrix]
+    
+    # 6. Final processing
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Normalize non-zero scores
+    non_zero_scores = sparsified[sparsified > 0]
+    if len(non_zero_scores) > 0:
+        min_score = np.min(non_zero_scores)
+        max_score = np.max(non_zero_scores)
+        if max_score > min_score:
+            sparsified[sparsified > 0] = (sparsified[sparsified > 0] - min_score) / (max_score - min_score)
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

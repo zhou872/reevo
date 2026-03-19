@@ -1,0 +1,399 @@
+```json
+{
+    "algorithm_features": ["Learned Component Weighting", "Adaptive Sparsification", "Clustering Cohesion Bonus", "Path Completion Heuristic"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Next-generation TSP edge heuristics with learned component fusion,
+    adaptive sparsification, and enhanced structural analysis.
+    
+    Key innovations:
+    1. Learned component weighting via instance characterization
+    2. Adaptive sparsification with connectivity preservation
+    3. Cluster cohesion bonus for intra-community edges
+    4. Path completion heuristic for edge impact assessment
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # =============================================
+    # 1. INSTANCE CHARACTERIZATION FOR WEIGHT LEARNING
+    # =============================================
+    
+    # Compute instance characteristics for weight adaptation
+    instance_stats = {}
+    
+    # Size factor (logarithmic scaling)
+    instance_stats['size_factor'] = np.log10(n + 1)
+    
+    # Distance variability (sparsity measure)
+    flat_dists = distance_matrix[np.triu_indices(n, 1)]
+    instance_stats['variability'] = np.std(flat_dists) / (np.mean(flat_dists) + 1e-8)
+    
+    # Spatial clustering tendency
+    # Estimate via nearest neighbor statistics
+    k_neighbors = max(3, min(10, n // 10))
+    nearest_dists = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        nearest_k = np.partition(dists, k_neighbors)[:k_neighbors]
+        nearest_dists[i] = np.mean(nearest_k)
+    
+    cluster_tendency = np.std(nearest_dists) / (np.mean(nearest_dists) + 1e-8)
+    instance_stats['clustering'] = cluster_tendency
+    
+    # Learn component weights based on instance characteristics
+    # Formula: weight = base * exp(-distance_from_ideal)
+    
+    # Define ideal instance profiles for each component
+    profiles = {
+        'distance': {'size': 0.5, 'variability': 0.3, 'clustering': 0.2},
+        'lookahead': {'size': 0.2, 'variability': 0.5, 'clustering': 0.7},
+        'regret': {'size': 0.7, 'variability': 0.8, 'clustering': 0.4},
+        'cluster': {'size': 0.3, 'variability': 0.6, 'clustering': 0.9}
+    }
+    
+    # Normalize instance characteristics to [0, 1]
+    norm_stats = {}
+    for key in ['size_factor', 'variability', 'clustering']:
+        # Use empirical bounds for normalization
+        if key == 'size_factor':
+            norm_stats[key] = min(instance_stats[key] / 3.0, 1.0)
+        elif key == 'variability':
+            norm_stats[key] = min(instance_stats[key] / 2.0, 1.0)
+        else:
+            norm_stats[key] = min(instance_stats[key] / 1.5, 1.0)
+    
+    # Compute component weights
+    weights = {}
+    for component, ideal in profiles.items():
+        dist = 0
+        for stat, ideal_val in ideal.items():
+            if stat == 'size':
+                actual = norm_stats['size_factor']
+            elif stat == 'variability':
+                actual = norm_stats['variability']
+            else:
+                actual = norm_stats['clustering']
+            dist += (actual - ideal_val) ** 2
+        
+        # Weight inversely proportional to distance from ideal
+        weights[component] = np.exp(-2.0 * np.sqrt(dist))
+    
+    # Normalize weights to sum to 1
+    weight_sum = sum(weights.values())
+    for key in weights:
+        weights[key] /= weight_sum
+    
+    # =============================================
+    # 2. COMPONENT COMPUTATION
+    # =============================================
+    
+    # 2.1 Distance component (base inverse distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 0.01 * np.mean(flat_dists))
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # 2.2 Lookahead component (improved two-step anticipation)
+    lookahead_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Consider the next step after i->j
+            remaining = [k for k in range(n) if k != i and k != j]
+            
+            if remaining:
+                # Get distances from j to remaining nodes
+                next_dists = distance_matrix[j, remaining]
+                
+                # Look at multiple potential next steps
+                if len(next_dists) >= 3:
+                    sorted_next = np.sort(next_dists)[:3]  # Top 3 options
+                    
+                    # Weighted combination favoring shorter distances
+                    weights_next = np.exp(-sorted_next / np.mean(sorted_next))
+                    weights_next = weights_next / np.sum(weights_next)
+                    
+                    # Expected next step cost
+                    expected_next = np.sum(weights_next * sorted_next)
+                    
+                    # Consider also the step back to i (completion)
+                    completion_cost = distance_matrix[j, i]
+                    
+                    # Combined lookahead score
+                    total_cost = distance_matrix[i, j] + 0.6 * expected_next + 0.4 * completion_cost
+                    
+                    lookahead_matrix[i, j] = np.mean(flat_dists) / (total_cost + 1e-8)
+                else:
+                    lookahead_matrix[i, j] = 1.0
+            else:
+                lookahead_matrix[i, j] = 1.0
+    
+    # 2.3 Regret component (opportunity cost)
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        sorted_indices = np.argsort(distances)
+        sorted_distances = distances[sorted_indices]
+        
+        if len(sorted_distances) > 1:
+            best_dist = sorted_distances[0]
+            
+            for rank, j in enumerate(sorted_indices):
+                if i == j:
+                    continue
+                
+                dist_ij = distance_matrix[i, j]
+                
+                # Consider multiple alternatives
+                alt_mask = np.ones(len(sorted_distances), dtype=bool)
+                alt_mask[rank] = False
+                alt_dists = sorted_distances[alt_mask]
+                
+                # Average of top 3 alternatives (or all if fewer)
+                k_alt = min(3, len(alt_dists))
+                avg_alt = np.mean(alt_dists[:k_alt]) if k_alt > 0 else dist_ij
+                
+                # Regret calculation with rank weighting
+                regret = (avg_alt - dist_ij) / (best_dist + 1e-8)
+                rank_penalty = rank / (len(sorted_distances) - 1) if len(sorted_distances) > 1 else 0
+                
+                regret_matrix[i, j] = 1.0 + np.clip(regret, 0, 1.5) * (1.0 - 0.6 * rank_penalty)
+    
+    # 2.4 Cluster cohesion component
+    cluster_matrix = np.ones((n, n))
+    
+    # Detect clusters via MST analysis
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    
+    # Find connected components in a thresholded graph
+    threshold = np.percentile(flat_dists, 30)  # 30th percentile as connection threshold
+    adj = (distance_matrix <= threshold).astype(int)
+    np.fill_diagonal(adj, 0)
+    
+    # Simple connected component detection
+    visited = np.zeros(n, dtype=bool)
+    components = []
+    
+    for i in range(n):
+        if not visited[i]:
+            # Start BFS
+            component = []
+            stack = [i]
+            visited[i] = True
+            
+            while stack:
+                node = stack.pop()
+                component.append(node)
+                
+                neighbors = np.where(adj[node, :])[0]
+                for neighbor in neighbors:
+                    if not visited[neighbor]:
+                        visited[neighbor] = True
+                        stack.append(neighbor)
+            
+            if len(component) > 1:
+                components.append(component)
+    
+    # Assign cohesion bonuses
+    if components:
+        node_to_component = np.zeros(n, dtype=int) - 1
+        for comp_idx, comp in enumerate(components):
+            for node in comp:
+                node_to_component[node] = comp_idx
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                if node_to_component[i] == node_to_component[j] and node_to_component[i] != -1:
+                    # Same component: bonus based on component density
+                    comp_nodes = components[node_to_component[i]]
+                    comp_size = len(comp_nodes)
+                    
+                    # Calculate intra-component distances
+                    intra_dists = []
+                    for a in comp_nodes:
+                        for b in comp_nodes:
+                            if a < b:
+                                intra_dists.append(distance_matrix[a, b])
+                    
+                    if intra_dists:
+                        avg_intra = np.mean(intra_dists)
+                        # Stronger bonus for shorter edges within dense components
+                        density_factor = min(1.0, avg_intra / (distance_matrix[i, j] + 1e-8))
+                        cluster_matrix[i, j] = 1.0 + 0.6 * density_factor * np.exp(-comp_size / 20.0)
+    
+    # =============================================
+    # 3. LEARNED WEIGHT FUSION
+    # =============================================
+    
+    # Normalize components for fusion
+    def normalize_component(mat):
+        mask = ~np.eye(n, dtype=bool)
+        valid_vals = mat[mask]
+        if len(valid_vals) > 0:
+            min_val = np.min(valid_vals)
+            max_val = np.max(valid_vals)
+            if max_val > min_val:
+                mat_norm = (mat - min_val) / (max_val - min_val)
+                mat_norm[np.diag_indices(n)] = 0
+                return mat_norm
+        return mat
+    
+    inv_dist_norm = normalize_component(inv_dist)
+    lookahead_norm = normalize_component(lookahead_matrix)
+    regret_norm = normalize_component(regret_matrix)
+    cluster_norm = normalize_component(cluster_matrix)
+    
+    # Weighted fusion
+    heuristic = (
+        weights['distance'] * inv_dist_norm +
+        weights['lookahead'] * lookahead_norm +
+        weights['regret'] * regret_norm +
+        weights['cluster'] * cluster_norm
+    )
+    
+    # =============================================
+    # 4. ADAPTIVE SPARSIFICATION
+    # =============================================
+    
+    # Always include MST edges
+    mst_mask = (mst_array > 0) | (mst_array.T > 0)
+    final_mask = mst_mask.copy()
+    
+    # Adaptive edge selection per node
+    for i in range(n):
+        node_scores = heuristic[i, :].copy()
+        node_scores[i] = -np.inf
+        
+        # Determine number of edges to keep based on instance size and clustering
+        if n < 50:
+            base_edges = max(3, n // 5)
+        else:
+            # More edges for larger instances to preserve connectivity
+            base_edges = max(5, int(np.sqrt(n)))
+        
+        # Adjust based on local connectivity needs
+        mst_degree = np.sum(mst_mask[i, :])
+        additional_edges = max(0, base_edges - mst_degree)
+        
+        if additional_edges > 0:
+            # Select top additional edges
+            top_indices = np.argpartition(node_scores, -additional_edges)[-additional_edges:]
+            final_mask[i, top_indices] = True
+            final_mask[top_indices, i] = True
+    
+    # Ensure minimum degree of 2 for all nodes
+    for i in range(n):
+        connected = np.where(final_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        if len(connected) < 2:
+            # Add nearest neighbors not already connected
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            distances[connected] = np.inf
+            
+            needed = 2 - len(connected)
+            nearest = np.argsort(distances)[:needed]
+            
+            final_mask[i, nearest] = True
+            final_mask[nearest, i] = True
+    
+    # Ensure global connectivity
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        current = stack.pop()
+        neighbors = np.where(final_mask[current, :])[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                stack.append(neighbor)
+    
+    if not np.all(visited):
+        # Connect disconnected components with shortest edges
+        components = []
+        unvisited = np.where(~visited)[0]
+        
+        while len(unvisited) > 0:
+            start = unvisited[0]
+            comp = []
+            local_stack = [start]
+            local_visited = np.zeros(n, dtype=bool)
+            local_visited[start] = True
+            
+            while local_stack:
+                node = local_stack.pop()
+                comp.append(node)
+                neighbors = np.where(final_mask[node, :])[0]
+                for neighbor in neighbors:
+                    if not local_visited[neighbor]:
+                        local_visited[neighbor] = True
+                        local_stack.append(neighbor)
+            
+            components.append(comp)
+            unvisited = [u for u in unvisited if not local_visited[u]]
+        
+        # Connect components
+        for i in range(len(components) - 1):
+            comp1 = components[i]
+            comp2 = components[i + 1]
+            
+            # Find shortest edge between components
+            min_dist = np.inf
+            min_pair = (0, 0)
+            
+            for node1 in comp1:
+                for node2 in comp2:
+                    if distance_matrix[node1, node2] < min_dist:
+                        min_dist = distance_matrix[node1, node2]
+                        min_pair = (node1, node2)
+            
+            final_mask[min_pair] = True
+            final_mask[min_pair[::-1]] = True
+    
+    # Apply final mask and normalize
+    heuristic = heuristic * final_mask
+    
+    # Final normalization with softmax per node
+    for i in range(n):
+        row = heuristic[i, :]
+        if np.sum(row > 0) > 0:
+            # Apply softmax to non-zero entries
+            mask = row > 0
+            exp_row = np.exp(row[mask] - np.max(row[mask]))  # Numerical stability
+            heuristic[i, mask] = exp_row / np.sum(exp_row)
+    
+    return heuristic
+```

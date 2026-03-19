@@ -1,0 +1,146 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection.
+    Combines MST, nearest neighbors, triangle quality checks, and adaptive sparsification.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base heuristic: inverse distance with safe handling
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    base_heuristic = 1.0 / safe_dist
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. Minimum Spanning Tree bonus with edge quality consideration
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_binary = (mst + mst.T) > 0
+    
+    # Compute MST edge quality: shorter edges in MST get higher bonus
+    mst_distances = np.where(mst_binary, safe_dist, np.inf)
+    if np.any(np.isfinite(mst_distances)):
+        min_mst_dist = mst_distances[mst_distances != np.inf].min()
+        max_mst_dist = mst_distances[mst_distances != np.inf].max()
+        if max_mst_dist > min_mst_dist:
+            mst_edge_quality = (max_mst_dist - mst_distances) / (max_mst_dist - min_mst_dist)
+            mst_edge_quality = np.nan_to_num(mst_edge_quality, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            mst_edge_quality = np.ones_like(mst_distances)
+    else:
+        mst_edge_quality = np.zeros_like(mst_distances)
+    
+    # Apply MST bonus with quality weighting
+    mst_bonus = 1.5 + 0.5 * mst_edge_quality  # Base bonus + quality adjustment
+    
+    # 3. Adaptive nearest neighbor selection with logarithmic rank boosting
+    # Dynamic k based on problem size
+    k_neighbors = max(2, min(8, n // 3))
+    
+    # Create nearest neighbor matrix with rank-based weights
+    nn_weights = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        # Get sorted distances (excluding self)
+        sorted_indices = np.argsort(safe_dist[i])
+        sorted_indices = sorted_indices[sorted_indices != i][:k_neighbors]
+        
+        # Assign weights based on rank (logarithmic decay)
+        ranks = np.arange(1, len(sorted_indices) + 1)
+        weights = 1.0 / np.log1p(ranks)  # Logarithmic decay
+        
+        for idx, j in enumerate(sorted_indices):
+            nn_weights[i, j] = weights[idx]
+    
+    # Symmetrize by taking maximum
+    nn_weights = np.maximum(nn_weights, nn_weights.T)
+    nn_bonus = 1.2 + 0.3 * nn_weights  # Base + weighted adjustment
+    
+    # 4. Triangle inequality quality check
+    triangle_scores = np.ones_like(distance_matrix)
+    
+    if n >= 3:
+        # Sample nodes for triangle checks to balance computation
+        sample_size = min(20, n)
+        sampled_nodes = np.random.choice(n, size=sample_size, replace=False)
+        
+        for i in range(n):
+            for k in sampled_nodes:
+                if i == k:
+                    continue
+                # Check if edge (i,k) satisfies triangle inequality well
+                for j in range(n):
+                    if i == j or j == k:
+                        continue
+                    # Triangle inequality: d(i,j) ¡Ü d(i,k) + d(k,j)
+                    direct = safe_dist[i, j]
+                    indirect = safe_dist[i, k] + safe_dist[k, j]
+                    
+                    if indirect > 0:
+                        ratio = direct / indirect
+                        # Edges that satisfy triangle inequality well get boost
+                        if ratio < 1.0:
+                            triangle_scores[i, j] += 0.1 * (1.0 - ratio)
+    
+    # Normalize triangle scores
+    triangle_scores = np.minimum(triangle_scores, 1.3)
+    
+    # 5. Combine all factors with adaptive weighting
+    heuristics = base_heuristic.copy()
+    heuristics = heuristics * np.where(mst_binary, mst_bonus, 1.0)
+    heuristics = heuristics * np.where(nn_weights > 0, nn_bonus, 1.0)
+    heuristics = heuristics * triangle_scores
+    
+    # Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # 6. Adaptive sparsification
+    # Keep edges based on multiple criteria
+    final_mask = np.zeros_like(heuristics, dtype=bool)
+    
+    # Always keep MST edges
+    final_mask = final_mask | mst_binary
+    
+    # Keep top nearest neighbors
+    nn_threshold = np.percentile(nn_weights[nn_weights > 0], 70) if np.any(nn_weights > 0) else 0
+    final_mask = final_mask | (nn_weights >= nn_threshold)
+    
+    # Keep edges with high heuristic values (adaptive threshold)
+    for i in range(n):
+        row_heuristics = heuristics[i]
+        if np.any(row_heuristics > 0):
+            # Dynamic threshold based on row statistics
+            row_threshold = np.percentile(row_heuristics[row_heuristics > 0], 75)
+            final_mask[i] = final_mask[i] | (row_heuristics >= row_threshold)
+    
+    # Apply the mask
+    heuristics = heuristics * final_mask
+    
+    # 7. Final normalization and boosting of overlapping edges
+    # Boost edges that appear in multiple criteria
+    overlap_boost = np.zeros_like(heuristics)
+    overlap_count = mst_binary.astype(int) + (nn_weights >= nn_threshold).astype(int)
+    
+    # Logarithmic boosting for overlaps
+    overlap_boost = np.log1p(overlap_count) / np.log1p(2)
+    heuristics = heuristics * (1.0 + 0.2 * overlap_boost)
+    
+    # Normalize
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

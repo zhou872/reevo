@@ -1,0 +1,346 @@
+```json
+{
+    "algorithm_features": ["Entropy-Based Sparsity", "Exponential Decay Selection", "Vectorized Adaptive Filtering", "Memory-Guided Exploration"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse
+import warnings
+from collections import defaultdict, deque
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    warnings.filterwarnings('ignore')
+    
+    """
+    Enhanced TSP edge sampling heuristic with entropy-based adaptive sparsification.
+    Features:
+    1. Entropy-driven edge selection: Adjusts per-node sparsity based on row uncertainty
+    2. Vectorized exponential decay: Prioritizes top edges while preserving diversity
+    3. Memory-guided exploration: Learns from high-quality historical tours
+    4. Adaptive temperature control: Balishes exploration vs exploitation
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Row-normalized heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic = np.nan_to_num(heuristic, nan=0, posinf=0, neginf=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== PROBLEM CHARACTERIZATION ==========
+    triu_distances = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(triu_distances)
+    dist_std = np.std(triu_distances)
+    dist_cv = dist_std / max(dist_mean, 1e-10)
+    
+    # ========== ADAPTIVE PARAMETERS ==========
+    n_tours = min(20, max(5, int(2 * np.sqrt(n))))
+    
+    # Base sparsity parameters (will be adjusted per node)
+    if n < 50:
+        k_min, k_max = n - 1, n - 1
+    elif dist_cv > 0.8:
+        k_min, k_max = int(2 * np.sqrt(n)), int(4 * np.sqrt(n))
+    else:
+        k_min, k_max = int(1.5 * np.sqrt(n)), int(3 * np.sqrt(n))
+    
+    # Temperature for exponential decay (adapts to problem characteristics)
+    base_temp = 1.5 if dist_cv < 0.3 else 2.5 if dist_cv > 0.7 else 2.0
+    
+    # ========== TOUR GENERATION & MEMORY ==========
+    edge_memory = defaultdict(float)
+    tour_memory = deque(maxlen=10)
+    
+    def vectorized_2opt(tour, max_iterations=100):
+        """Fast vectorized 2-opt implementation."""
+        n_nodes = len(tour)
+        improved = True
+        iterations = 0
+        tour = np.array(tour)
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            
+            # Generate all possible 2-opt move indices
+            i_indices, j_indices = [], []
+            for i in range(n_nodes):
+                for j in range(i + 2, n_nodes):
+                    i_indices.append(i)
+                    j_indices.append(j)
+            
+            if not i_indices:
+                break
+                
+            # Vectorized gain calculation
+            i_arr = np.array(i_indices)
+            j_arr = np.array(j_indices)
+            
+            # Get node indices for the four affected edges
+            a1 = tour[i_arr]
+            a2 = tour[(i_arr + 1) % n_nodes]
+            b1 = tour[j_arr]
+            b2 = tour[(j_arr + 1) % n_nodes]
+            
+            # Calculate gains
+            gains = (distance_matrix[a1, a2] + distance_matrix[b1, b2]) - \
+                    (distance_matrix[a1, b1] + distance_matrix[a2, b2])
+            
+            best_idx = np.argmax(gains)
+            best_gain = gains[best_idx]
+            
+            if best_gain > 1e-6:
+                i_opt = i_arr[best_idx]
+                j_opt = j_arr[best_idx]
+                
+                # Apply 2-opt swap
+                if i_opt < j_opt:
+                    tour[i_opt+1:j_opt+1] = tour[i_opt+1:j_opt+1][::-1]
+                else:
+                    segment = np.concatenate([tour[i_opt+1:], tour[:j_opt+1]])
+                    segment = segment[::-1]
+                    tour[i_opt+1:] = segment[:n_nodes-i_opt-1]
+                    tour[:j_opt+1] = segment[n_nodes-i_opt-1:]
+                
+                improved = True
+                iterations += 1
+            else:
+                break
+        
+        return tour.tolist()
+    
+    # Generate diverse initial tours
+    for _ in range(n_tours):
+        if np.random.random() < 0.7:
+            # Nearest neighbor with random start
+            start = np.random.randint(n)
+            tour = [start]
+            visited = np.zeros(n, dtype=bool)
+            visited[start] = True
+            
+            current = start
+            for _ in range(n - 1):
+                mask = ~visited
+                if not np.any(mask):
+                    break
+                    
+                distances = distance_matrix[current].copy()
+                distances[~mask] = np.inf
+                distances[mask] += np.random.rand(np.sum(mask)) * 1e-8
+                next_node = np.argmin(distances)
+                tour.append(next_node)
+                visited[next_node] = True
+                current = next_node
+        else:
+            # Random permutation
+            tour = np.random.permutation(n).tolist()
+        
+        # Apply local optimization
+        if len(set(tour)) == n:
+            improved_tour = vectorized_2opt(tour)
+            tour_memory.append(improved_tour)
+    
+    # Update edge memory from recent tours
+    memory_decay = 0.95
+    for tour_idx, tour in enumerate(tour_memory):
+        if len(tour) != n:
+            continue
+            
+        tour_length = sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n))
+        weight = (1.0 / (tour_length + 1e-10)) * (memory_decay ** tour_idx)
+        
+        for i in range(n):
+            u, v = tour[i], tour[(i+1)%n]
+            key = (min(u, v), max(u, v))
+            edge_memory[key] += weight
+    
+    # ========== STRUCTURAL COMPONENTS ==========
+    # 1. Minimum Spanning Tree
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_mask = mst.toarray() > 0
+    except:
+        mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+        for i in range(n):
+            row = distance_matrix[i].copy()
+            row[i] = np.inf
+            j = np.argmin(row)
+            mst_mask[i, j] = mst_mask[j, i] = True
+    
+    # 2. Reciprocal distances with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / np.maximum(distance_matrix, 1e-10)
+        reciprocal = np.nan_to_num(reciprocal, nan=0, posinf=0, neginf=0)
+    
+    scale_exp = 0.5 if dist_cv < 0.3 else 0.8 if dist_cv > 0.7 else 0.65
+    reciprocal = reciprocal ** scale_exp
+    
+    # 3. Memory component
+    memory_matrix = np.zeros_like(distance_matrix)
+    for (u, v), weight in edge_memory.items():
+        memory_matrix[u, v] = memory_matrix[v, u] = weight
+    
+    # ========== COMBINE COMPONENTS ==========
+    # MST component (boost MST edges)
+    mst_matrix = np.zeros_like(distance_matrix)
+    mst_matrix[mst_mask] = reciprocal[mst_mask] * 1.5
+    
+    # Normalize components
+    components = [memory_matrix, mst_matrix, reciprocal]
+    normalized = []
+    for comp in components:
+        max_val = comp.max()
+        if max_val > 0:
+            normalized.append(comp / max_val)
+        else:
+            normalized.append(np.zeros_like(comp))
+    
+    # Adaptive weights based on search progress
+    memory_weight = min(0.5, 0.2 + 0.3 * len(tour_memory) / n_tours)
+    mst_weight = 0.3
+    recip_weight = 1.0 - memory_weight - mst_weight
+    
+    # Combine into raw heuristic matrix
+    raw_heuristic = (memory_weight * normalized[0] + 
+                     mst_weight * normalized[1] + 
+                     recip_weight * normalized[2])
+    
+    raw_heuristic = (raw_heuristic + raw_heuristic.T) / 2
+    np.fill_diagonal(raw_heuristic, 0)
+    
+    # ========== ENTROPY-BASED ADAPTIVE SPARSIFICATION ==========
+    sparsified = np.zeros_like(raw_heuristic)
+    
+    # Identify must-preserve edges (MST and top memory edges)
+    preserved = set()
+    
+    # MST edges
+    mst_edges = np.column_stack(np.where(mst_mask))
+    for i, j in mst_edges:
+        if i != j:
+            preserved.add((min(i, j), max(i, j)))
+    
+    # Top memory edges
+    if edge_memory:
+        sorted_edges = sorted(edge_memory.items(), key=lambda x: x[1], reverse=True)
+        top_k = min(len(sorted_edges), max(5, n // 4))
+        for (u, v), _ in sorted_edges[:top_k]:
+            preserved.add((u, v))
+    
+    # Fill preserved edges
+    for u, v in preserved:
+        sparsified[u, v] = sparsified[v, u] = raw_heuristic[u, v]
+    
+    # ========== PER-NODE ENTROPY CALCULATION ==========
+    # Calculate entropy for each row to determine sparsity level
+    row_entropies = np.zeros(n)
+    for i in range(n):
+        row = raw_heuristic[i].copy()
+        row[i] = 0  # Exclude diagonal
+        
+        # Remove already preserved edges from entropy calculation
+        for j in range(n):
+            if (min(i, j), max(i, j)) in preserved:
+                row[j] = 0
+        
+        row_sum = row.sum()
+        if row_sum > 0:
+            # Normalize to probability distribution
+            probs = row / row_sum
+            # Calculate entropy (avoid log(0))
+            entropy = -np.sum(probs[probs > 0] * np.log(probs[probs > 0]))
+            # Normalize entropy to [0, 1]
+            max_entropy = np.log(max(1, np.count_nonzero(row) - 1))
+            if max_entropy > 0:
+                row_entropies[i] = entropy / max_entropy
+    
+    # ========== VECTORIZED EDGE SELECTION WITH EXPONENTIAL DECAY ==========
+    for i in range(n):
+        # Determine number of edges to keep for this node
+        entropy_factor = row_entropies[i]
+        k_i = int(k_min + entropy_factor * (k_max - k_min))
+        k_i = min(n - 1, max(k_i, len([j for j in range(n) if (min(i, j), max(i, j)) in preserved])))
+        
+        # Get current row values
+        row = raw_heuristic[i].copy()
+        row[i] = -np.inf  # Exclude diagonal
+        
+        # Mark preserved edges as already selected
+        selected_mask = np.zeros(n, dtype=bool)
+        for j in range(n):
+            if (min(i, j), max(i, j)) in preserved:
+                selected_mask[j] = True
+        
+        # Determine how many more edges we need
+        already_selected = np.sum(selected_mask)
+        needed = max(0, k_i - already_selected)
+        
+        if needed > 0:
+            # Find top candidates (excluding already selected and diagonal)
+            candidate_mask = ~selected_mask
+            candidate_mask[i] = False
+            candidates = np.where(candidate_mask)[0]
+            
+            if len(candidates) > 0:
+                candidate_values = row[candidates]
+                
+                # Sort candidates by value
+                sorted_idx = np.argsort(-candidate_values)
+                top_candidates = candidates[sorted_idx[:needed]]
+                
+                # Apply exponential decay based on rank
+                ranks = np.arange(len(top_candidates))
+                decay = np.exp(-ranks / base_temp)
+                sparsified[i, top_candidates] = row[top_candidates] * decay
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # ========== EXPLORATION FACTOR ==========
+    # Add small exploration bonus for edges not already in sparsified
+    exploration = np.zeros_like(sparsified)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Calculate exploration bonus based on distance distribution
+        if np.any(distances < np.inf):
+            med_dist = np.median(distances[distances < np.inf])
+            if med_dist > 0:
+                # Gaussian exploration around median distance
+                exploration_bonus = 0.1 * np.exp(-(distances - med_dist)**2 / (2*(med_dist*0.5)**2))
+                # Only apply to edges not already in sparsified
+                exploration_mask = sparsified[i] == 0
+                exploration_mask[i] = False
+                exploration[i, exploration_mask] = exploration_bonus[exploration_mask]
+    
+    exploration = (exploration + exploration.T) / 2
+    np.fill_diagonal(exploration, 0)
+    
+    result = sparsified + exploration
+    
+    # ========== FINAL NORMALIZATION ==========
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_mask = row_sums.flatten() == 0
+    
+    if np.any(zero_mask):
+        # Fallback to reciprocal distances for isolated rows
+        result[zero_mask] = reciprocal[zero_mask]
+        row_sums = result.sum(axis=1, keepdims=True)
+    
+    row_sums[row_sums == 0] = 1
+    result = result / row_sums
+    
+    return result
+```

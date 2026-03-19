@@ -1,0 +1,360 @@
+```json
+{
+    "algorithm_features": ["Adaptive Lookahead Regret", "Ensemble Heuristic Blending", "Lightweight Local Search Simulation", "Dynamic Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with adaptive lookahead regret and ensemble learning.
+    
+    Key innovations:
+    1. Adaptive lookahead regret calculation with variable depth
+    2. Ensemble of simple heuristics with learned blending weights
+    3. Lightweight local search simulation via constrained 2-opt sampling
+    4. Dynamic edge sparsification with connectivity preservation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Suppress warnings for cleaner execution
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+    
+    # ==================== 1. PROBLEM CHARACTERIZATION ====================
+    # Compute distance statistics for adaptive parameter tuning
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    
+    distance_mean = np.mean(distances)
+    distance_std = np.std(distances)
+    distance_cv = distance_std / (distance_mean + 1e-8)
+    
+    # Problem complexity indicators
+    is_regular = distance_cv < 0.3
+    is_large = n > 50
+    
+    # ==================== 2. ENSEMBLE OF SIMPLE HEURISTICS ====================
+    # Heuristic 1: Normalized inverse distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # Heuristic 2: MST connectivity with degree weighting
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_binary = (mst > 0) | (mst.T > 0)
+    mst_degree = np.sum(mst_binary, axis=1)
+    mst_weighted = mst_binary.astype(float)
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_binary[i, j]:
+                # Boost edges connecting low-degree MST nodes
+                degree_factor = 2.0 - (mst_degree[i] + mst_degree[j]) / (2 * np.max(mst_degree))
+                mst_weighted[i, j] = mst_weighted[j, i] = degree_factor
+    mst_weighted = mst_weighted / np.max(mst_weighted) if np.max(mst_weighted) > 0 else mst_weighted
+    
+    # Heuristic 3: Local density clustering
+    density_scores = np.zeros_like(distance_matrix)
+    if n >= 4:
+        k = min(5, n - 1)
+        local_radii = np.zeros(n)
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            k_nearest = np.partition(dists, k)[:k]
+            local_radii[i] = np.mean(k_nearest[k_nearest < np.inf])
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                avg_radius = (local_radii[i] + local_radii[j]) / 2
+                if distance_matrix[i, j] < avg_radius:
+                    density_scores[i, j] = density_scores[j, i] = avg_radius / (distance_matrix[i, j] + 1e-8)
+        if np.max(density_scores) > 0:
+            density_scores = density_scores / np.max(density_scores)
+    
+    # Heuristic 4: Distance percentile ranking
+    percentile_scores = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        if np.any(np.isfinite(row_dists)):
+            # Score inversely proportional to distance rank
+            sorted_indices = np.argsort(row_dists)
+            for rank, j in enumerate(sorted_indices):
+                if i != j:
+                    percentile_scores[i, j] = 1.0 / (rank + 1)
+    percentile_scores = (percentile_scores + percentile_scores.T) / 2
+    
+    # ==================== 3. ADAPTIVE LOOKAHEAD REGRET ====================
+    def compute_adaptive_regret():
+        """Compute regret with adaptive lookahead depth based on edge context"""
+        regret_scores = np.ones_like(distance_matrix)
+        
+        # Determine base lookahead depth
+        if n <= 10:
+            base_depth = 2
+        elif n <= 30:
+            base_depth = 3
+        else:
+            base_depth = 4 if is_regular else 3
+        
+        for i in range(n):
+            # Get candidate edges for this node
+            row_dists = distance_matrix[i].copy()
+            row_dists[i] = np.inf
+            
+            # Sort neighbors by distance
+            neighbor_indices = np.argsort(row_dists)
+            n_neighbors = min(10, n-1)
+            candidates = neighbor_indices[:n_neighbors]
+            
+            for j in candidates:
+                if i == j:
+                    continue
+                
+                # Adaptive depth based on edge quality
+                edge_quality = inv_dist[i, j] * 0.5 + percentile_scores[i, j] * 0.5
+                depth = base_depth + int(edge_quality * 2)
+                depth = min(depth, 5)
+                
+                # Evaluate alternative paths with given depth
+                alternative_costs = []
+                current_edge_cost = distance_matrix[i, j]
+                
+                # Sample alternative neighbors
+                for k in candidates:
+                    if k == j:
+                        continue
+                    
+                    # Construct alternative path i->k->...->j with limited depth
+                    path_cost = distance_matrix[i, k]
+                    current_node = k
+                    visited = {i, k}
+                    steps_remaining = depth - 1
+                    
+                    # Greedy exploration to reach j
+                    while steps_remaining > 0 and current_node != j:
+                        # Find best next step toward j
+                        next_dists = distance_matrix[current_node].copy()
+                        for v in visited:
+                            next_dists[v] = np.inf
+                        next_dists[current_node] = np.inf
+                        
+                        if np.all(np.isinf(next_dists)):
+                            break
+                        
+                        # Prefer nodes closer to j
+                        distances_to_j = distance_matrix[:, j].copy()
+                        distances_to_j[list(visited)] = np.inf
+                        distances_to_j[current_node] = np.inf
+                        
+                        if not np.all(np.isinf(distances_to_j)):
+                            next_node = np.argmin(distances_to_j)
+                            path_cost += distance_matrix[current_node, next_node]
+                            current_node = next_node
+                            visited.add(next_node)
+                            steps_remaining -= 1
+                        else:
+                            break
+                    
+                    if current_node == j:
+                        alternative_costs.append(path_cost)
+                
+                if alternative_costs:
+                    best_alternative = np.min(alternative_costs)
+                    regret = max(0, best_alternative - current_edge_cost)
+                    
+                    # Normalize by edge cost
+                    if current_edge_cost > 0:
+                        normalized_regret = regret / current_edge_cost
+                        # Convert regret to score (higher regret = better edge)
+                        regret_scores[i, j] = 1.0 / (1.0 + np.exp(-normalized_regret))
+        
+        # Symmetrize and zero diagonal
+        regret_scores = (regret_scores + regret_scores.T) / 2
+        np.fill_diagonal(regret_scores, 0)
+        return regret_scores
+    
+    regret_scores = compute_adaptive_regret()
+    
+    # ==================== 4. ENSEMBLE BLENDING ====================
+    # Adaptive weights based on problem characteristics
+    if is_regular:
+        w_regret = 0.35
+        w_invdist = 0.20
+        w_mst = 0.25
+        w_density = 0.10
+        w_percentile = 0.10
+    else:
+        w_regret = 0.30
+        w_invdist = 0.15
+        w_mst = 0.20
+        w_density = 0.25
+        w_percentile = 0.10
+    
+    # Normalize weights
+    total = w_regret + w_invdist + w_mst + w_density + w_percentile
+    w_regret /= total
+    w_invdist /= total
+    w_mst /= total
+    w_density /= total
+    w_percentile /= total
+    
+    ensemble_scores = (
+        w_regret * regret_scores +
+        w_invdist * inv_dist +
+        w_mst * mst_weighted +
+        w_density * density_scores +
+        w_percentile * percentile_scores
+    )
+    
+    # ==================== 5. LIGHTWEIGHT LOCAL SEARCH SIMULATION ====================
+    def simulate_local_search(base_scores):
+        """Simulate constrained 2-opt moves to refine edge scores"""
+        refined_scores = base_scores.copy()
+        
+        if n < 4:
+            return refined_scores
+        
+        # Only process edges above threshold
+        threshold = np.percentile(base_scores[base_scores > 0], 30) if np.any(base_scores > 0) else 0
+        
+        for i in range(n):
+            # Get promising edges from this node
+            row_scores = base_scores[i].copy()
+            row_scores[i] = -1
+            candidate_mask = row_scores > threshold
+            
+            if np.sum(candidate_mask) < 2:
+                continue
+            
+            candidate_j = np.where(candidate_mask)[0]
+            
+            for j in candidate_j:
+                if j <= i:
+                    continue
+                
+                # Sample potential 2-opt partners
+                n_samples = min(10, len(candidate_j))
+                if n_samples < 2:
+                    continue
+                
+                # Weighted sampling based on scores
+                sample_probs = base_scores[i, candidate_j].copy()
+                sample_probs[candidate_j == j] = 0
+                if np.sum(sample_probs) > 0:
+                    sample_probs = sample_probs / np.sum(sample_probs)
+                    k_samples = np.random.choice(candidate_j, size=n_samples, 
+                                                replace=False, p=sample_probs)
+                else:
+                    continue
+                
+                improvements = []
+                for k in k_samples:
+                    if k == j:
+                        continue
+                    
+                    # Find l to complete 2-opt
+                    for l in range(n):
+                        if l not in [i, j, k] and base_scores[j, l] > threshold:
+                            current = distance_matrix[i, j] + distance_matrix[k, l]
+                            new = distance_matrix[i, k] + distance_matrix[j, l]
+                            if new < current:
+                                improvements.append(current - new)
+                
+                if improvements:
+                    avg_improvement = np.mean(improvements)
+                    # Boost score based on improvement potential
+                    boost = min(0.3, avg_improvement / (distance_matrix[i, j] + 1e-8))
+                    refined_scores[i, j] = min(1.0, base_scores[i, j] + boost)
+                    refined_scores[j, i] = refined_scores[i, j]
+        
+        return refined_scores
+    
+    refined_scores = simulate_local_search(ensemble_scores)
+    
+    # ==================== 6. DYNAMIC EDGE SPARSIFICATION ====================
+    def adaptive_sparsification(scores):
+        """Intelligently sparsify while preserving connectivity"""
+        sparse_scores = np.zeros_like(scores)
+        
+        # Always keep MST edges
+        sparse_scores[mst_binary] = scores[mst_binary]
+        
+        # Determine number of additional edges per node
+        if n <= 10:
+            k_extra = 3
+        elif n <= 30:
+            k_extra = 4
+        elif n <= 100:
+            k_extra = int(3 + np.log2(n))
+        else:
+            k_extra = int(4 + np.log2(n))
+        
+        k_extra = min(k_extra, n - 1)
+        
+        for i in range(n):
+            # Get non-MST edges for this node
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            non_mst_mask = ~mst_binary[i]
+            non_mst_mask[i] = False
+            
+            if np.any(non_mst_mask):
+                non_mst_scores = row_scores.copy()
+                non_mst_scores[~non_mst_mask] = -np.inf
+                
+                # Select top k_extra non-MST edges
+                valid_scores = non_mst_scores[non_mst_scores > -np.inf]
+                if len(valid_scores) > 0:
+                    n_select = min(k_extra, len(valid_scores))
+                    if n_select > 0:
+                        threshold = np.partition(valid_scores, -n_select)[-n_select]
+                        keep_mask = non_mst_mask & (row_scores >= threshold)
+                        sparse_scores[i][keep_mask] = scores[i][keep_mask]
+        
+        # Ensure symmetry and connectivity
+        sparse_scores = np.maximum(sparse_scores, sparse_scores.T)
+        
+        # Fill diagonal with zeros
+        np.fill_diagonal(sparse_scores, 0)
+        
+        return sparse_scores
+    
+    final_scores = adaptive_sparsification(refined_scores)
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    # Ensure non-negativity
+    final_scores = np.maximum(final_scores, 0)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    # Clip to ensure valid range
+    final_scores = np.clip(final_scores, 0, 1)
+    
+    # Restore warnings
+    warnings.filterwarnings('default', category=RuntimeWarning)
+    
+    return final_scores
+```

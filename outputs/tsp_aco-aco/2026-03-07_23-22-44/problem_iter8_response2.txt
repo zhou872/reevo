@@ -1,0 +1,273 @@
+```json
+{
+    "algorithm_features": ["k-Nearest Neighbor Regret", "Entropy-based Threshold Sparsification", "Local Density Clustering", "Distance-Aware Score Blending"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with k-NN regret analysis, entropy-based sparsification,
+    spatial clustering for dense regions, and distance-aware blending.
+    
+    Core Improvements:
+    1. k-NN Regret: Use k-nearest neighbors for more robust opportunity cost estimation
+    2. Entropy Thresholding: Dynamically determine sparsification thresholds using graph entropy
+    3. Adaptive Clustering: Identify and prioritize intra-cluster edges in dense regions
+    4. Distance-Blended Scoring: Balance distance-based and topology-based information
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Suppress warnings for clean output
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=RuntimeWarning)
+        
+        # ==================== 1. PROBLEM CHARACTERIZATION ====================
+        # Compute basic statistics
+        triu_idx = np.triu_indices(n, 1)
+        upper_dists = distance_matrix[triu_idx]
+        
+        dist_mean = np.mean(upper_dists)
+        dist_std = np.std(upper_dists)
+        dist_cv = dist_std / (dist_mean + 1e-8)
+        
+        # ==================== 2. k-NN REGRET ANALYSIS ====================
+        def compute_knn_regret(k_factor: float = 0.2) -> np.ndarray:
+            """Compute regret using k-nearest neighbors for each node"""
+            # Adaptive k based on problem size
+            k = max(3, min(int(k_factor * n), 10))
+            
+            regret_matrix = np.zeros((n, n))
+            
+            for i in range(n):
+                # Get k-nearest neighbors for node i
+                dists_i = distance_matrix[i].copy()
+                dists_i[i] = np.inf
+                knn_i = np.argsort(dists_i)[:k]
+                
+                for j in range(n):
+                    if i == j:
+                        continue
+                    
+                    # For edge i-j, find best alternative through neighbors
+                    min_alternative = np.inf
+                    direct_cost = distance_matrix[i, j]
+                    
+                    # Check alternatives through i's neighbors
+                    for neighbor in knn_i:
+                        if neighbor == j:
+                            continue
+                        alt_cost = distance_matrix[i, neighbor] + distance_matrix[neighbor, j]
+                        if alt_cost < min_alternative:
+                            min_alternative = alt_cost
+                    
+                    # Also check through j's neighbors (symmetry)
+                    if j > i:  # Avoid duplicate computation
+                        dists_j = distance_matrix[j].copy()
+                        dists_j[j] = np.inf
+                        knn_j = np.argsort(dists_j)[:k]
+                        
+                        for neighbor in knn_j:
+                            if neighbor == i:
+                                continue
+                            alt_cost = distance_matrix[j, neighbor] + distance_matrix[neighbor, i]
+                            if alt_cost < min_alternative:
+                                min_alternative = alt_cost
+                    
+                    # Compute normalized regret
+                    if min_alternative < np.inf and min_alternative > 0:
+                        regret = max(0, min_alternative - direct_cost)
+                        # Use sigmoid for bounded scores
+                        regret_matrix[i, j] = 1.0 / (1.0 + np.exp(-regret/(0.1*min_alternative)))
+                    else:
+                        regret_matrix[i, j] = 0.5  # Neutral score if no alternative found
+            
+            # Symmetrize
+            regret_matrix = (regret_matrix + regret_matrix.T) / 2
+            return regret_matrix
+        
+        regret_scores = compute_knn_regret()
+        
+        # ==================== 3. LOCAL DENSITY CLUSTERING ====================
+        def compute_cluster_scores() -> np.ndarray:
+            """Identify and score edges within dense regions"""
+            cluster_scores = np.zeros((n, n))
+            
+            if n < 4:
+                return cluster_scores
+            
+            # Compute local density for each node (inverse of average distance to k neighbors)
+            k_density = min(5, n-1)
+            local_densities = np.zeros(n)
+            
+            for i in range(n):
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                if k_density > 0:
+                    k_nearest = np.partition(dists, k_density)[:k_density+1]
+                    valid_dists = k_nearest[k_nearest < np.inf]
+                    if len(valid_dists) > 0:
+                        local_densities[i] = 1.0 / (np.mean(valid_dists) + 1e-8)
+            
+            # Normalize densities
+            max_density = np.max(local_densities)
+            if max_density > 0:
+                local_densities = local_densities / max_density
+            
+            # Score edges based on both endpoints being in dense regions
+            threshold = np.percentile(local_densities, 50)  # Median density threshold
+            
+            for i in range(n):
+                for j in range(i+1, n):
+                    if local_densities[i] > threshold and local_densities[j] > threshold:
+                        # Both nodes in dense region - prioritize short connections
+                        score = 1.0 / (distance_matrix[i, j] + 1e-8)
+                        # Boost score if both very dense
+                        density_factor = (local_densities[i] + local_densities[j]) / 2
+                        cluster_scores[i, j] = score * (0.5 + 0.5 * density_factor)
+                        cluster_scores[j, i] = cluster_scores[i, j]
+            
+            # Normalize
+            max_score = np.max(cluster_scores)
+            if max_score > 0:
+                cluster_scores = cluster_scores / max_score
+            
+            return cluster_scores
+        
+        cluster_scores = compute_cluster_scores()
+        
+        # ==================== 4. MST CONNECTIVITY ====================
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst > 0) | (mst.T > 0)
+        mst_scores = mst_edges.astype(float) * 0.8  # Strong but not absolute preference
+        
+        # ==================== 5. ENTROPY-BASED THRESHOLDING ====================
+        def compute_entropy_threshold(scores: np.ndarray) -> float:
+            """Compute sparsification threshold using entropy of edge score distribution"""
+            upper_scores = scores[triu_idx]
+            
+            if len(upper_scores) < 2:
+                return 0.0
+            
+            # Bin scores into histogram
+            hist, _ = np.histogram(upper_scores, bins=min(20, len(upper_scores)), range=(0, 1))
+            hist = hist[hist > 0]  # Remove empty bins
+            probs = hist / np.sum(hist)
+            
+            # Compute entropy
+            entropy = -np.sum(probs * np.log(probs + 1e-8))
+            max_entropy = np.log(len(probs)) if len(probs) > 0 else 1.0
+            
+            # Normalized entropy
+            norm_entropy = entropy / (max_entropy + 1e-8)
+            
+            # High entropy = uniform distribution = be less aggressive
+            # Low entropy = concentrated distribution = be more aggressive
+            base_percentile = 50  # Median
+            entropy_adjust = (1.0 - norm_entropy) * 30  # Adjust up to ±30 percentile
+            
+            target_percentile = min(80, max(20, base_percentile + entropy_adjust))
+            
+            return np.percentile(upper_scores, target_percentile)
+        
+        # ==================== 6. DISTANCE-AWARE BLENDING ====================
+        # Compute inverse distance component
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        np.fill_diagonal(inv_dist, 0)
+        max_inv = np.max(inv_dist)
+        if max_inv > 0:
+            inv_dist = inv_dist / max_inv
+        
+        # Dynamic weights based on problem characteristics
+        if n <= 10:
+            w_regret, w_cluster, w_mst, w_inv = 0.4, 0.2, 0.3, 0.1
+        elif n <= 30:
+            # Balance all components for medium problems
+            w_regret, w_cluster, w_mst, w_inv = 0.3, 0.3, 0.2, 0.2
+        else:
+            # For large problems, emphasize regret and MST
+            w_regret, w_cluster, w_mst, w_inv = 0.4, 0.1, 0.3, 0.2
+        
+        # Adjust weights based on distance variability
+        if dist_cv > 0.5:  # High variability
+            w_regret *= 1.2
+            w_inv *= 0.8
+        elif dist_cv < 0.2:  # Low variability
+            w_regret *= 0.8
+            w_cluster *= 1.2
+        
+        # Normalize weights
+        total_weight = w_regret + w_cluster + w_mst + w_inv
+        w_regret /= total_weight
+        w_cluster /= total_weight
+        w_mst /= total_weight
+        w_inv /= total_weight
+        
+        # Combine components
+        combined = (
+            w_regret * regret_scores +
+            w_cluster * cluster_scores +
+            w_mst * mst_scores +
+            w_inv * inv_dist
+        )
+        
+        # Apply distance-aware attenuation
+        max_dist = np.max(distance_matrix)
+        if max_dist > 0:
+            # Exponential decay based on distance
+            dist_decay = np.exp(-distance_matrix / (0.7 * max_dist + 1e-8))
+            combined *= dist_decay
+        
+        # ==================== 7. ENTROPY-BASED SPARSIFICATION ====================
+        threshold = compute_entropy_threshold(combined)
+        
+        # Retain edges above threshold
+        sparsified = np.where(combined >= threshold, combined, 0)
+        
+        # Ensure each node has at least 2 connections
+        for i in range(n):
+            node_edges = sparsified[i]
+            if np.sum(node_edges > 0) < 2:
+                # Find and add the best missing edges
+                sorted_idx = np.argsort(combined[i])[::-1]
+                added = 0
+                for j in sorted_idx:
+                    if j != i and sparsified[i, j] == 0:
+                        sparsified[i, j] = combined[i, j]
+                        sparsified[j, i] = combined[j, i]
+                        added += 1
+                        if added >= 2:
+                            break
+        
+        # ==================== 8. FINAL PROCESSING ====================
+        # Symmetrize
+        final_scores = (sparsified + sparsified.T) / 2
+        
+        # Normalize to [0, 1]
+        max_score = np.max(final_scores)
+        if max_score > 0:
+            final_scores = final_scores / max_score
+        
+        np.fill_diagonal(final_scores, 0)
+        
+        return final_scores
+```

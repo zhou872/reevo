@@ -1,0 +1,307 @@
+```json
+{
+    "algorithm_features": ["Three-hop Path Quality Anticipation", "Distance-Preserving Spectral Regularization", "Adaptive Multi-Stage Scoring", "Local Search Pattern Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.cluster import KMeans, SpectralClustering
+from scipy.spatial.distance import cdist
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with three-hop anticipation, spectral regularization,
+    and local search pattern reinforcement.
+    
+    Core Innovations:
+    1. Three-hop Path Quality Anticipation: Evaluates edge quality through 
+       three-step connectivity patterns using matrix exponentiation.
+    2. Distance-Preserving Spectral Regularization: Uses spectral embeddings
+       to preserve global distance structure while regularizing local connections.
+    3. Adaptive Multi-Stage Scoring: Dynamically applies different scoring
+       strategies based on graph size and density characteristics.
+    4. Local Search Pattern Reinforcement: Identifies and reinforces edges
+       that form part of locally optimal 2-opt and 3-opt configurations.
+    
+    Returns:
+        np.ndarray: Heuristic score matrix with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== 1. INITIALIZATION & GRAPH ANALYSIS ==========
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # Compute graph statistics for adaptive parameter tuning
+    triu_indices = np.triu_indices(n, k=1)
+    distances_flat = dist[triu_indices]
+    mean_dist = np.mean(distances_flat)
+    std_dist = np.std(distances_flat)
+    cv_dist = std_dist / (mean_dist + 1e-12)
+    
+    # Graph density proxy
+    density_proxy = n / (mean_dist + 1e-12) if mean_dist > 0 else 1.0
+    size_factor = np.log(n + 1)
+    
+    # ========== 2. SPECTRAL DISTANCE-PRESERVING REGULARIZATION ==========
+    # Compute Laplacian-based embeddings for global structure preservation
+    inv_dist = 1 / (dist + 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Degree-normalized Laplacian for spectral analysis
+    degree = np.sum(inv_dist, axis=1)
+    degree_sqrt_inv = np.diag(1 / np.sqrt(degree + 1e-12))
+    normalized_laplacian = np.eye(n) - degree_sqrt_inv @ inv_dist @ degree_sqrt_inv
+    
+    # Spectral embedding (if feasible)
+    spectral_embedding = np.zeros((n, min(10, n-1)))
+    if n <= 500:
+        try:
+            eigvals, eigvecs = np.linalg.eigh(normalized_laplacian)
+            # Take eigenvectors corresponding to smallest eigenvalues (excluding zero)
+            idx = np.argsort(eigvals)[1:min(11, n)]
+            spectral_embedding = eigvecs[:, idx]
+            
+            # Compute distance in embedding space
+            spectral_dist = cdist(spectral_embedding, spectral_embedding)
+            spectral_similarity = 1 / (1 + spectral_dist)
+            np.fill_diagonal(spectral_similarity, 0)
+        except:
+            spectral_similarity = inv_dist.copy()
+    else:
+        spectral_similarity = inv_dist.copy()
+    
+    # ========== 3. THREE-HOP PATH QUALITY ANTICIPATION ==========
+    # Extended neighborhood analysis using matrix powers
+    k_neighbors = max(2, int(np.sqrt(n)))
+    
+    # Precompute multi-hop connectivity matrices
+    # Normalize inv_dist for stable matrix powers
+    inv_dist_norm = inv_dist / (inv_dist.max() + 1e-12)
+    
+    # Two-hop connectivity (matrix square)
+    if n <= 1000:
+        two_hop_connectivity = inv_dist_norm @ inv_dist_norm
+        # Three-hop connectivity (matrix cube)
+        three_hop_connectivity = two_hop_connectivity @ inv_dist_norm
+        
+        # Adaptive weighting based on graph properties
+        w1 = 1.0  # Direct connection
+        w2 = 0.7 * (1.0 + cv_dist)  # Two-hop (higher for sparse graphs)
+        w3 = 0.3 * density_proxy / (density_proxy + 1)  # Three-hop (higher for dense graphs)
+        
+        multi_hop_factor = (w1 * inv_dist_norm + 
+                           w2 * two_hop_connectivity + 
+                           w3 * three_hop_connectivity)
+    else:
+        # Fallback for large graphs: approximate multi-hop with neighbor expansion
+        multi_hop_factor = np.zeros_like(inv_dist_norm)
+        for i in range(n):
+            # Get immediate neighbors
+            neighbors = np.argsort(dist[i])[1:k_neighbors+1]
+            # Get neighbors of neighbors
+            two_hop_neighbors = set()
+            for nb in neighbors:
+                two_hop_neighbors.update(np.argsort(dist[nb])[1:k_neighbors//2+1])
+            two_hop_neighbors = list(two_hop_neighbors - {i})
+            
+            # Combine influence
+            for j in range(n):
+                if i != j:
+                    direct = inv_dist_norm[i, j]
+                    # Two-hop influence through common neighbors
+                    common_neighbors = set(neighbors) & set(two_hop_neighbors)
+                    if common_neighbors:
+                        indirect = np.mean([inv_dist_norm[i, k] * inv_dist_norm[k, j] 
+                                          for k in common_neighbors if k != i and k != j])
+                        multi_hop_factor[i, j] = 0.7 * direct + 0.3 * indirect
+                    else:
+                        multi_hop_factor[i, j] = direct
+    
+    # Normalize multi-hop factor
+    max_mh = multi_hop_factor.max()
+    if max_mh > 0:
+        multi_hop_factor = multi_hop_factor / max_mh
+    
+    # ========== 4. ADAPTIVE REGRET WITH LOCAL PATTERN ANALYSIS ==========
+    regret_penalty = np.ones_like(dist)
+    
+    for i in range(n):
+        sorted_dists = np.sort(dist[i])
+        if len(sorted_dists) >= 3:  # Need at least 2 neighbors + self
+            best, second_best = sorted_dists[0], sorted_dists[1]
+            
+            # Dynamic regret threshold based on local clustering
+            local_dists = dist[i][dist[i] < np.inf]
+            local_cv = np.std(local_dists) / (np.mean(local_dists) + 1e-12)
+            threshold_factor = 0.5 + 0.5 * local_cv
+            
+            for j in range(n):
+                if i != j and dist[i, j] < np.inf:
+                    regret = dist[i, j] - best
+                    regret_gap = second_best - best
+                    
+                    if regret_gap > 0:
+                        norm_regret = regret / regret_gap
+                        # Penalize based on how much worse than threshold
+                        if norm_regret > threshold_factor:
+                            penalty = np.exp(-2.0 * (norm_regret - threshold_factor))
+                            regret_penalty[i, j] = min(regret_penalty[i, j], penalty)
+    
+    # ========== 5. CLUSTERING WITH HIERARCHICAL STRUCTURE ==========
+    if n >= 8:
+        # Determine optimal number of clusters adaptively
+        n_clusters = max(2, min(8, n // 6))
+        
+        try:
+            # Use spectral clustering for better distance preservation
+            clustering = SpectralClustering(
+                n_clusters=n_clusters,
+                affinity='precomputed',
+                random_state=42,
+                n_init=10
+            )
+            clusters = clustering.fit_predict(1 / (dist + 1e-12))
+            
+            # Two-level scoring: intra-cluster and critical inter-cluster connections
+            cluster_bonus = np.ones_like(dist)
+            
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if clusters[i] == clusters[j]:
+                        # Intra-cluster: boost based on cluster compactness
+                        cluster_mask = clusters == clusters[i]
+                        cluster_dists = dist[cluster_mask][:, cluster_mask]
+                        compactness = np.mean(cluster_dists[cluster_dists < np.inf])
+                        
+                        # Stronger boost for compact clusters
+                        boost = 1.0 + 0.3 * (mean_dist / (compactness + 1e-12))
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = min(boost, 1.8)
+                    else:
+                        # Inter-cluster: identify bridge edges
+                        i_cluster_dist = np.min(dist[i, clusters == clusters[j]])
+                        j_cluster_dist = np.min(dist[j, clusters == clusters[i]])
+                        
+                        # Boost if this is a critical bridge
+                        bridge_score = (dist[i, j] / (i_cluster_dist + 1e-12) + 
+                                       dist[i, j] / (j_cluster_dist + 1e-12)) / 2
+                        
+                        if bridge_score < 1.2:  # Good bridge candidate
+                            cluster_bonus[i, j] = cluster_bonus[j, i] = 1.4
+        except:
+            cluster_bonus = np.ones_like(dist)
+    else:
+        cluster_bonus = np.ones_like(dist)
+    
+    # ========== 6. LOCAL SEARCH PATTERN REINFORCEMENT ==========
+    # Identify edges that would be part of good 2-opt and 3-opt moves
+    local_pattern_boost = np.ones_like(dist)
+    
+    if n >= 10 and n <= 200:  # Computationally feasible range
+        try:
+            # Quick nearest-neighbor tour for pattern analysis
+            tour = [0]
+            unvisited = set(range(1, n))
+            while unvisited:
+                current = tour[-1]
+                nearest = min(unvisited, key=lambda x: dist[current, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+            
+            # Analyze 2-opt improvement potential
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if dist[i, j] < np.inf:
+                        # Find potential cross edges that would create improvement
+                        improvement_potential = 0
+                        count = 0
+                        
+                        # Sample some potential 2-opt moves
+                        for _ in range(min(10, n)):
+                            k = np.random.randint(n)
+                            l = np.random.randint(n)
+                            if len({i, j, k, l}) == 4:
+                                current_cost = dist[i, j] + dist[k, l]
+                                swapped_cost = dist[i, k] + dist[j, l]
+                                
+                                if swapped_cost < current_cost:
+                                    improvement_potential += (current_cost - swapped_cost)
+                                    count += 1
+                        
+                        if count > 0:
+                            avg_improvement = improvement_potential / count
+                            # Boost edges with high improvement potential
+                            boost = 1.0 + 0.5 * np.tanh(avg_improvement / mean_dist)
+                            local_pattern_boost[i, j] = local_pattern_boost[j, i] = boost
+        except:
+            pass
+    
+    # ========== 7. ADAPTIVE MULTI-STAGE SCORING ==========
+    # Dynamic weights based on graph characteristics
+    w_spectral = 0.8 + 0.4 * (1.0 - cv_dist)  # Higher for dense, regular graphs
+    w_multi_hop = 0.6 + 0.4 * density_proxy / (density_proxy + 1)  # Higher for dense
+    w_regret = 0.7 + 0.3 * cv_dist  # Higher for irregular graphs
+    w_cluster = 0.5 + 0.3 * size_factor / 5  # Higher for larger graphs
+    w_local = 0.4 + 0.3 * (n <= 200)  # Higher for medium-sized graphs
+    
+    # Combined scoring with exponential smoothing
+    scores = (spectral_similarity ** w_spectral) * \
+             (multi_hop_factor ** w_multi_hop) * \
+             (regret_penalty ** w_regret) * \
+             (cluster_bonus ** w_cluster) * \
+             (local_pattern_boost ** w_local)
+    
+    # ========== 8. MST-BASED CONNECTIVITY ENHANCEMENT ==========
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    
+    # Strong reinforcement for MST edges with distance weighting
+    mst_boost = np.where(mst_mask, 1.0 + 0.8 * (1.0 / (1.0 + dist/mean_dist)), 1.0)
+    scores *= mst_boost
+    
+    # ========== 9. ADAPTIVE SPARSIFICATION ==========
+    # Dynamic edge retention preserving connectivity
+    base_retention = int(np.sqrt(n) * (1.5 + cv_dist))
+    k_retain = max(4, min(base_retention, n // 3))
+    
+    final_mask = np.zeros_like(scores, dtype=bool)
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Keep top edges and ensure connectivity
+        top_indices = np.argsort(row_scores)[-k_retain:]
+        final_mask[i, top_indices] = True
+        
+        # Always keep connections to nearest neighbors
+        nearest = np.argsort(dist[i])[1:min(3, n)]
+        final_mask[i, nearest] = True
+        final_mask[nearest, i] = True
+    
+    # Ensure symmetry and MST inclusion
+    final_mask = final_mask | final_mask.T | mst_mask
+    
+    # Apply smooth sparsification
+    scores = scores * final_mask
+    scores += 0.05 * scores.max() * (~final_mask)  # Small residual connectivity
+    
+    # ========== 10. POST-PROCESSING ==========
+    # Adaptive normalization with soft thresholding
+    score_mean = scores.mean()
+    score_std = scores.std()
+    
+    if score_std > 0:
+        # Softmax-like normalization with temperature
+        temperature = 1.0 + 2.0 * cv_dist  # Higher temperature for irregular graphs
+        scores_norm = (scores - score_mean) / (score_std + 1e-12)
+        scores = 1 / (1 + np.exp(-temperature * scores_norm))
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(scores, 0.0)
+    
+    return scores
+```

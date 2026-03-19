@@ -1,0 +1,330 @@
+```json
+{
+    "algorithm_features": ["Dynamic Component Weighting", "Global Variance Calibrated Thresholds", "Two-Step Lookahead Regret", "Multi-Criteria Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with dynamic weighting,
+    global variance calibration, and lookahead regret mechanisms.
+    
+    Core improvements:
+    1. Dynamic Component Weighting: Adjusts relative influence of heuristic components
+       based on problem size and distance distribution characteristics
+    2. Global Variance Calibrated Thresholds: Uses global distance statistics to set
+       adaptive thresholds for spatial proximity and sparsification
+    3. Two-Step Lookahead Regret: Incorporates second-best alternative costs to
+       identify edges with high selection regret
+    4. Multi-Criteria Sparsification: Integrates multiple edge quality measures with
+       size-adaptive connectivity preservation
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Precompute global statistics for dynamic parameter adjustment
+    non_diag_mask = ~np.eye(n, dtype=bool)
+    global_distances = distance_matrix[non_diag_mask]
+    global_mean = np.mean(global_distances)
+    global_std = np.std(global_distances)
+    global_cv = global_std / (global_mean + 1e-8)  # Coefficient of variation
+    
+    # Dynamic weighting parameters based on problem characteristics
+    size_factor = min(1.0, n / 100.0)  # Scales from 0 to 1 as n increases to 100
+    
+    # Base weights that adapt to problem size and variability
+    w_inv_dist = 1.0 - 0.2 * size_factor  # Less emphasis on inverse distance for larger problems
+    w_rank = 0.8 + 0.2 * size_factor  # More emphasis on rank for larger problems
+    w_density = 0.6 - 0.3 * size_factor  # Less emphasis on density for larger problems
+    w_lookahead = 0.4 + 0.3 * size_factor  # More lookahead for larger problems
+    
+    # Initialize component matrices
+    inv_dist = np.zeros((n, n))
+    rank_matrix = np.ones((n, n))
+    density_matrix = np.ones((n, n))
+    lookahead_matrix = np.ones((n, n))
+    
+    # 1. BASE INVERSE DISTANCE COMPONENT (with size-adaptive regularization)
+    reg_factor = 1e-8 * global_mean * (1.0 + size_factor)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg_factor)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # 2. RANK-BASED REGRET INCENTIVE WITH TWO-STEP LOOKAHEAD
+    # Precompute sorted distances and indices for all nodes
+    sorted_indices = np.zeros((n, n-1), dtype=int)
+    sorted_distances = np.zeros((n, n-1))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        idx = np.argsort(distances)
+        sorted_indices[i] = idx[:n-1]
+        sorted_distances[i] = distances[idx[:n-1]]
+    
+    # Compute rank-based incentives with two-step regret
+    for i in range(n):
+        best_dist = sorted_distances[i, 0]
+        
+        for rank_idx in range(n-1):
+            j = sorted_indices[i, rank_idx]
+            
+            if rank_idx == 0:
+                # Best edge: strong incentive
+                rank_matrix[i, j] = 1.8 - 0.3 * size_factor  # Slightly less for larger problems
+            else:
+                # Other edges: scaled by distance ratio with regret consideration
+                current_dist = distance_matrix[i, j]
+                
+                if best_dist > 0:
+                    # Base scaling
+                    base_scale = best_dist / current_dist
+                    
+                    # Two-step regret: consider second-best alternative if we don't take this edge
+                    if rank_idx == 1:
+                        # This is the second-best, so alternative is the best
+                        alt_dist = best_dist
+                    else:
+                        # Alternative is the second-best (index 1)
+                        alt_dist = sorted_distances[i, 1]
+                    
+                    # Regret factor: how much worse is the alternative?
+                    regret_factor = 1.0 + (current_dist - alt_dist) / (alt_dist + 1e-8)
+                    regret_factor = np.clip(regret_factor, 0.7, 1.3)
+                    
+                    rank_matrix[i, j] = base_scale * regret_factor
+                else:
+                    rank_matrix[i, j] = 1.0
+    
+    # 3. ADAPTIVE DENSITY SIMILARITY WITH GLOBAL VARIANCE CALIBRATION
+    # Compute local density using adaptive neighborhood size
+    base_k = max(3, int(0.1 * n))
+    k = min(base_k + int(5 * global_cv), n-1)  # More neighbors in high-variance problems
+    
+    local_density = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        if n > k:
+            kth_dist = np.partition(distances, k)[k]
+            nearest_mask = distances <= kth_dist
+            nearest_dists = distances[nearest_mask]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        
+        if len(nearest_dists) > 0:
+            # Inverse of average distance to k-nearest neighbors
+            local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+        else:
+            local_density[i] = 1.0
+    
+    # Normalize densities with variance-aware scaling
+    density_range = np.max(local_density) - np.min(local_density)
+    if density_range > 0:
+        # Scale more aggressively in high-variance problems
+        scale_factor = 1.0 + 0.5 * global_cv
+        local_density = scale_factor * (local_density - np.min(local_density)) / density_range
+    
+    # Apply exponential similarity bonus with variance calibration
+    density_sigma = 2.0 / (1.0 + global_cv)  # Wider tolerance for high-variance problems
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            density_diff = abs(local_density[i] - local_density[j])
+            density_matrix[i, j] = 1.0 + 0.5 * np.exp(-density_sigma * density_diff)
+    
+    # 4. TWO-STEP LOOKAHEAD REGRET COMPONENT
+    # For each edge (i,j), consider the cost of best alternatives at both ends
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist_ij = distance_matrix[i, j]
+            
+            # Find best alternative to i (excluding j)
+            alt_i_dist = np.inf
+            for k in range(n-1):
+                candidate = sorted_indices[i, k]
+                if candidate != j:
+                    alt_i_dist = sorted_distances[i, k]
+                    break
+            
+            # Find best alternative to j (excluding i)
+            alt_j_dist = np.inf
+            for k in range(n-1):
+                candidate = sorted_indices[j, k]
+                if candidate != i:
+                    alt_j_dist = sorted_distances[j, k]
+                    break
+            
+            # Compute regret factors
+            if alt_i_dist < np.inf:
+                regret_i = 1.0 + (dist_ij - alt_i_dist) / (alt_i_dist + 1e-8)
+            else:
+                regret_i = 1.0
+                
+            if alt_j_dist < np.inf:
+                regret_j = 1.0 + (dist_ij - alt_j_dist) / (alt_j_dist + 1e-8)
+            else:
+                regret_j = 1.0
+            
+            # Combined regret (lower is better, so invert for heuristic)
+            combined_regret = (regret_i + regret_j) / 2.0
+            lookahead_matrix[i, j] = 1.0 / (combined_regret + 0.1)  # Add small constant for stability
+    
+    # 5. MINIMUM SPANNING TREE STRUCTURAL PRIORITY
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost = np.where(mst_mask, 1.4 - 0.1 * size_factor, 1.0)  # Slightly less boost for larger problems
+    except:
+        mst_boost = np.ones((n, n))
+    
+    # 6. SPATIAL PROXIMITY WITH GLOBAL VARIANCE CALIBRATION
+    # Compute adaptive thresholds based on global statistics
+    proximity_matrix = np.ones((n, n))
+    
+    # Base threshold multiplier increases with problem variability
+    base_multiplier = 1.5 + 0.5 * global_cv
+    
+    for i in range(n):
+        # Compute local statistics for this node
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        if n > 5:
+            # Use 5th percentile as local reference (more robust than mean)
+            local_ref = np.percentile(distances[distances < np.inf], 5)
+        else:
+            local_ref = np.mean(distances[distances < np.inf])
+        
+        # Adaptive threshold based on local and global statistics
+        threshold = base_multiplier * max(local_ref, 0.5 * global_mean)
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist = distance_matrix[i, j]
+            
+            if dist <= threshold:
+                # Within threshold: bonus decays with distance
+                proximity_matrix[i, j] *= 1.0 + 0.4 * (1.0 - dist / (threshold + 1e-8))
+            else:
+                # Beyond threshold: penalty increases with distance
+                excess_ratio = dist / (threshold + 1e-8)
+                proximity_matrix[i, j] *= np.exp(1.0 - excess_ratio)
+    
+    # 7. COMBINE COMPONENTS WITH DYNAMIC WEIGHTING
+    # Use weighted geometric mean for combination
+    combined = (
+        np.power(inv_dist, w_inv_dist) *
+        np.power(rank_matrix, w_rank) *
+        np.power(density_matrix, w_density) *
+        np.power(lookahead_matrix, w_lookahead) *
+        mst_boost *
+        proximity_matrix
+    )
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2.0
+    np.fill_diagonal(combined, 0)
+    
+    # 8. MULTI-CRITERIA SPARSIFICATION WITH SIZE-ADAPTIVE CONNECTIVITY
+    sparsified = combined.copy()
+    
+    # Compute multiple edge quality measures for sparsification
+    edge_quality = np.zeros((n, n))
+    
+    # Criterion 1: Combined heuristic score
+    edge_quality += sparsified
+    
+    # Criterion 2: Rank-based score
+    edge_quality += rank_matrix
+    
+    # Criterion 3: Spatial proximity (normalized)
+    proximity_norm = proximity_matrix / np.max(proximity_matrix)
+    edge_quality += proximity_norm
+    
+    # Determine number of edges to keep per node
+    if n <= 10:
+        min_edges = 3
+        max_edges = n - 1
+    elif n <= 50:
+        min_edges = max(3, int(0.2 * n))
+        max_edges = max(6, int(0.3 * n))
+    else:
+        min_edges = max(4, int(0.15 * n))
+        max_edges = max(8, int(0.25 * n))
+    
+    # Create sparsification mask
+    keep_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always keep MST edges
+    if 'mst_mask' in locals():
+        keep_mask = keep_mask | mst_mask
+    
+    # Keep top edges by multiple criteria
+    for i in range(n):
+        # Get edges sorted by combined quality
+        quality_scores = edge_quality[i, :].copy()
+        quality_scores[i] = -np.inf
+        
+        # Determine how many edges to keep for this node
+        target_edges = min(max_edges, n-1)
+        
+        # Keep top edges
+        top_indices = np.argpartition(quality_scores, -target_edges)[-target_edges:]
+        keep_mask[i, top_indices] = True
+        keep_mask[top_indices, i] = True
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(keep_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        if len(connected) < min_edges:
+            # Add nearest neighbors to meet minimum
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            
+            # Sort by distance and add until we reach min_edges
+            sorted_candidates = np.argsort(distances)
+            added = 0
+            for j in sorted_candidates:
+                if j != i and not keep_mask[i, j]:
+                    keep_mask[i, j] = True
+                    keep_mask[j, i] = True
+                    added += 1
+                    if len(connected) + added >= min_edges:
+                        break
+    
+    # Apply sparsification
+    sparsified = sparsified * keep_mask
+    
+    # 9. FINAL NORMALIZATION
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

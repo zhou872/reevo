@@ -1,0 +1,307 @@
+```json
+{
+    "algorithm_features": ["Christofides-Inspired MST Boost", "Adaptive Regret Penalization", "Two-Hop Path Efficiency Scoring", "Local 2-opt Gain Estimation"]
+}
+```
+
+```python
+import numpy as np
+import warnings
+from typing import Tuple, Dict
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP edge heuristic focusing on core principles with theoretical backing.
+    
+    Combines:
+    1. Christofides-inspired MST edges for connectivity guarantee
+    2. Adaptive regret penalization based on instance statistics
+    3. Two-hop path efficiency scoring for local competitiveness
+    4. Local 2-opt gain estimation for improvement potential
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (shape n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with scores in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    warnings.filterwarnings('ignore')
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    # Use only upper triangular to avoid diagonal
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # ===== 2. CHRISTOFIDES-INSPIRED MST BOOST =====
+    def compute_mst_mask(dist_mat: np.ndarray) -> np.ndarray:
+        """Compute minimum spanning tree edges using Prim's algorithm."""
+        mst_mask = np.zeros((n, n), dtype=bool)
+        
+        if n <= 1:
+            return mst_mask
+        
+        visited = np.zeros(n, dtype=bool)
+        min_edge = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        min_edge[0] = 0
+        
+        for _ in range(n):
+            # Find unvisited vertex with minimum edge
+            unvisited = np.where(~visited)[0]
+            u = unvisited[np.argmin(min_edge[unvisited])]
+            visited[u] = True
+            
+            if parent[u] != -1:
+                mst_mask[u, parent[u]] = mst_mask[parent[u], u] = True
+            
+            # Update distances to unvisited neighbors
+            for v in np.where(~visited)[0]:
+                if dist_mat[u, v] < min_edge[v]:
+                    min_edge[v] = dist_mat[u, v]
+                    parent[v] = u
+        
+        return mst_mask
+    
+    mst_mask = compute_mst_mask(distance_matrix)
+    
+    # ===== 3. BASE INVERSE DISTANCE WITH ADAPTIVE SCALING =====
+    scale = dist_mean if dist_mean > 0 else 1.0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = scale / (distance_matrix + 0.1 * scale * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ===== 4. ADAPTIVE REGRET PENALIZATION =====
+    regret_penalty = np.ones((n, n))
+    
+    # Adaptive regret power based on coefficient of variation
+    regret_power = 1.2 + 0.6 * np.tanh(2 * dist_cv)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Sort distances, excluding self
+        sorted_idx = np.argsort(dists)
+        best_dist = dists[sorted_idx[0]]
+        
+        if best_dist > 0:
+            for rank, j in enumerate(sorted_idx):
+                if rank == 0:
+                    regret_penalty[i, j] = 1.0  # Best edge
+                else:
+                    # Combined rank and distance ratio penalty
+                    norm_rank = rank / (n - 2)  # Normalized to [0, 1]
+                    dist_ratio = dists[j] / best_dist
+                    
+                    # Stronger penalty for higher ranks and larger ratios
+                    penalty = 1.0 / (1.0 + regret_power * norm_rank * np.sqrt(dist_ratio))
+                    regret_penalty[i, j] = penalty
+    
+    # Symmetrize using geometric mean
+    regret_penalty = np.sqrt(regret_penalty * regret_penalty.T)
+    
+    # ===== 5. TWO-HOP PATH EFFICIENCY SCORING =====
+    path_efficiency = np.ones((n, n))
+    
+    if n >= 4:
+        # Adaptive neighborhood size
+        k_lookahead = min(max(3, int(np.sqrt(n) + dist_cv * 2)), n - 1)
+        nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_lookahead + 1]
+        
+        for i in range(n):
+            i_neighbors = set(nearest_indices[i].tolist())
+            
+            for j in range(i + 1, n):
+                if j in i_neighbors:
+                    direct_dist = distance_matrix[i, j]
+                    best_alternative = np.inf
+                    
+                    # Find best 2-hop path through common neighbors
+                    j_neighbors = set(nearest_indices[j].tolist())
+                    common_neighbors = i_neighbors.intersection(j_neighbors)
+                    
+                    for k in common_neighbors:
+                        if k != i and k != j:
+                            alt_path = distance_matrix[i, k] + distance_matrix[k, j]
+                            if alt_path < best_alternative:
+                                best_alternative = alt_path
+                    
+                    # Calculate efficiency ratio
+                    if best_alternative < np.inf:
+                        efficiency_ratio = best_alternative / direct_dist
+                        
+                        # Score: higher when direct edge is clearly better
+                        # Sigmoid transformation centered at ratio=1.2
+                        score = 0.5 + 0.5 / (1.0 + np.exp(-8.0 * (efficiency_ratio - 1.2)))
+                        path_efficiency[i, j] = path_efficiency[j, i] = score
+    
+    # ===== 6. LOCAL 2-OPT GAIN ESTIMATION =====
+    improvement_potential = np.ones((n, n))
+    
+    if n >= 5:
+        # Estimate 2-opt gains for each edge
+        for i in range(n):
+            # Get closest 4 neighbors for i
+            i_neighbors = np.argsort(distance_matrix[i])[1:min(5, n)]
+            
+            for j in range(i + 1, n):
+                current_dist = distance_matrix[i, j]
+                if current_dist <= 0:
+                    continue
+                
+                # Get closest 4 neighbors for j
+                j_neighbors = np.argsort(distance_matrix[j])[1:min(5, n)]
+                
+                best_gain = 0
+                
+                # Check 2-opt swap gains
+                for k in i_neighbors:
+                    if k == j:
+                        continue
+                    for l in j_neighbors:
+                        if l == i or l == k:
+                            continue
+                        
+                        gain = (current_dist + distance_matrix[k, l] - 
+                               distance_matrix[i, k] - distance_matrix[j, l])
+                        if gain > best_gain:
+                            best_gain = gain
+                
+                # Convert gain to potential score
+                if best_gain > 0:
+                    norm_gain = min(best_gain / (dist_mean + 1e-12), 2.0)
+                    # Higher potential when gain is significant
+                    potential = 1.0 + 0.3 * np.tanh(2.0 * norm_gain)
+                    improvement_potential[i, j] = improvement_potential[j, i] = potential
+    
+    # ===== 7. ADAPTIVE COMPONENT FUSION =====
+    # Weights based on instance size and distance characteristics
+    if n > 30:  # Larger instances
+        weights = {
+            'inverse': 1.0,
+            'regret': 1.0,
+            'efficiency': 1.1,
+            'improvement': 0.7
+        }
+    elif dist_cv > 0.5:  # High distance variability
+        weights = {
+            'inverse': 1.0,
+            'regret': 1.1,
+            'efficiency': 0.9,
+            'improvement': 1.0
+        }
+    else:  # Medium instances
+        weights = {
+            'inverse': 1.0,
+            'regret': 1.0,
+            'efficiency': 1.0,
+            'improvement': 1.0
+        }
+    
+    # Combine components with adaptive weights
+    heuristics = inv_dist.copy()
+    heuristics *= regret_penalty ** weights['regret']
+    heuristics *= path_efficiency ** weights['efficiency']
+    heuristics *= improvement_potential ** weights['improvement']
+    
+    # Strong boost for MST edges (connectivity guarantee)
+    heuristics[mst_mask] *= 1.6
+    
+    # Ensure symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # ===== 8. CONNECTIVITY-AWARE SPARSIFICATION =====
+    if n > 3:
+        # Ensure each node keeps enough edges for connectivity
+        min_edges_per_node = min(max(3, int(1.5 * np.sqrt(n))), n - 1)
+        
+        for i in range(n):
+            row = heuristics[i].copy()
+            row[i] = 0  # Exclude diagonal
+            
+            # Always keep MST edges
+            keep_mask = mst_mask[i].copy()
+            
+            # Determine number of additional edges needed
+            current_edges = np.sum(keep_mask)
+            additional_needed = max(0, min_edges_per_node - current_edges)
+            
+            if additional_needed > 0:
+                # Sort non-MST edges by heuristic score
+                non_mst_mask = ~keep_mask
+                non_mst_mask[i] = False  # Exclude self
+                
+                if np.any(non_mst_mask):
+                    non_mst_scores = row[non_mst_mask]
+                    non_mst_indices = np.where(non_mst_mask)[0]
+                    
+                    if len(non_mst_scores) > 0:
+                        # Select top additional_needed edges
+                        top_k = min(additional_needed, len(non_mst_scores))
+                        if top_k > 0:
+                            top_indices = np.argsort(non_mst_scores)[-top_k:]
+                            top_nodes = non_mst_indices[top_indices]
+                            
+                            # Keep these edges
+                            for node in top_nodes:
+                                row[node] = heuristics[i, node]  # Keep original score
+            
+            heuristics[i] = row
+        
+        # Re-symmetrize
+        heuristics = (heuristics + heuristics.T) / 2
+    
+    # ===== 9. FINAL NORMALIZATION =====
+    np.fill_diagonal(heuristics, 0)
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Ensure exact symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # Clip to ensure all values are in [0, 1]
+    heuristics = np.clip(heuristics, 0, 1)
+    
+    return heuristics
+
+
+# Example usage and test
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_nodes = 25
+    
+    # Create symmetric distance matrix
+    coords = np.random.rand(n_nodes, 2) * 100
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(coords))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity (zero entries): {(heuristics == 0).sum() / heuristics.size:.1%}")
+    
+    non_zero_edges = np.sum(heuristics > 0, axis=1)
+    print(f"Non-zero edges per node: min={non_zero_edges.min()}, "
+          f"max={non_zero_edges.max()}, mean={non_zero_edges.mean():.1f}")
+    
+    print(f"Matrix symmetric? {np.allclose(heuristics, heuristics.T)}")
+    
+    print("\nSample edge scores (i, j, distance, heuristic):")
+    for i, j in [(0, 1), (0, 5), (2, 8), (3, 7), (10, 15)]:
+        if i < n_nodes and j < n_nodes:
+            print(f"({i}, {j}): dist={dist_matrix[i, j]:.2f}, "
+                  f"heuristic={heuristics[i, j]:.4f}")
+```

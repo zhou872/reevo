@@ -1,0 +1,333 @@
+```json
+{
+    "algorithm_features": ["Regret-based Edge Penalty", "Density-aware Normalization", "Two-tier Centrality Scoring", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from typing import Optional, Tuple
+
+
+def heuristics_v2(distance_matrix: np.ndarray,
+                  regret_power: float = 0.7,
+                  centrality_mode: str = 'adaptive',
+                  sparsity_mode: str = 'dynamic') -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with regret-based measures
+    and non-linear factor combinations.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        regret_power: Exponent for non-linear regret weighting (0-1)
+        centrality_mode: 'adaptive' (default), 'hub', or 'bridge'
+        sparsity_mode: 'dynamic' (default), 'percentile', or 'fixed'
+    
+    Returns:
+        Heuristic matrix with higher values for more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros_like(distance_matrix)
+    np.fill_diagonal(heuristic, 0)
+    
+    if n < 2:
+        return heuristic
+    
+    # 1. Compute base inverse distances with epsilon
+    epsilon = 1e-10
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Compute Minimum Spanning Tree (Prim's algorithm)
+    mst_mask = _compute_mst_mask(distance_matrix)
+    mst_degrees = mst_mask.sum(axis=1)
+    
+    # 3. Compute two-tier centrality metrics
+    centrality_scores = _compute_centrality(distance_matrix, mode=centrality_mode)
+    
+    # 4. Compute regret-based penalty for each edge
+    regret_matrix = _compute_regret_penalty(distance_matrix, power=regret_power)
+    
+    # 5. Compute density-aware normalization
+    density_factors = _compute_density_factors_v2(distance_matrix)
+    
+    # 6. For each edge, compute composite score with non-linear combinations
+    for i in range(n):
+        for j in range(i + 1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+                
+            # Base inverse distance (non-linear transform)
+            base_score = np.power(inv_dist[i, j], 0.8)
+            
+            # MST factor: bonus for MST edges, penalty for non-MST with high regret
+            if mst_mask[i, j]:
+                mst_factor = 2.0 + 0.3 * (4 - mst_degrees[i] - mst_degrees[j])
+            else:
+                mst_factor = 1.0 - 0.2 * regret_matrix[i, j]
+            
+            # Centrality factor: non-linear combination
+            centrality_factor = _combine_centrality(
+                centrality_scores[i], centrality_scores[j], mode=centrality_mode
+            )
+            
+            # Regret factor: penalize edges that are not locally optimal
+            regret_factor = 1.0 - 0.4 * regret_matrix[i, j]
+            
+            # Density factor: normalize based on local graph density
+            density_factor = density_factors[i, j]
+            
+            # Non-linear combination using geometric mean with weighted exponents
+            factors = [
+                (base_score, 1.0),
+                (mst_factor, 0.7),
+                (centrality_factor, 0.6),
+                (regret_factor, 0.8),
+                (density_factor, 0.5)
+            ]
+            
+            # Compute weighted geometric mean
+            log_score = 0.0
+            weight_sum = 0.0
+            for value, weight in factors:
+                if value > 0:
+                    log_score += weight * np.log(value + 1e-10)
+                    weight_sum += weight
+            score = np.exp(log_score / weight_sum) if weight_sum > 0 else 0
+            
+            # Apply dynamic scaling based on graph size
+            score *= (1.0 + np.log(n) / 10)
+            
+            heuristic[i, j] = heuristic[j, i] = score
+    
+    # 7. Adaptive sparsification
+    heuristic = _sparsify_heuristic(heuristic, distance_matrix, mode=sparsity_mode)
+    
+    return heuristic
+
+
+def _compute_mst_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute Minimum Spanning Tree mask using Prim's algorithm."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    if n <= 1:
+        return mst_mask
+    
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    for _ in range(n - 1):
+        min_dist = np.inf
+        u = v = -1
+        
+        visited_indices = np.where(visited)[0]
+        unvisited_indices = np.where(~visited)[0]
+        
+        if len(visited_indices) == 0 or len(unvisited_indices) == 0:
+            break
+        
+        # Efficient min edge search using broadcasting
+        visited_dist = distance_matrix[visited_indices][:, unvisited_indices]
+        min_idx = np.unravel_index(np.argmin(visited_dist), visited_dist.shape)
+        u = visited_indices[min_idx[0]]
+        v = unvisited_indices[min_idx[1]]
+        
+        if u >= 0 and v >= 0:
+            mst_mask[u, v] = True
+            mst_mask[v, u] = True
+            visited[v] = True
+    
+    return mst_mask
+
+
+def _compute_centrality(distance_matrix: np.ndarray, 
+                        mode: str = 'adaptive') -> np.ndarray:
+    """Compute node centrality scores using multiple metrics."""
+    n = distance_matrix.shape[0]
+    
+    # Closeness centrality: inverse of average distance to other nodes
+    with np.errstate(divide='ignore', invalid='ignore'):
+        closeness = (n - 1) / (distance_matrix.sum(axis=1) + 1e-10)
+    
+    # Betweenness approximation: sum of inverse distances to all other nodes
+    inv_dist_sum = np.sum(1.0 / (distance_matrix + np.eye(n)), axis=1)
+    
+    # Degree centrality in k-nearest neighbor graph (k = n//4)
+    k = max(2, n // 4)
+    degree_centrality = np.zeros(n)
+    for i in range(n):
+        neighbors = np.argsort(distance_matrix[i])[1:k+1]
+        degree_centrality[i] = len(neighbors) / k
+    
+    # Combine based on mode
+    if mode == 'hub':
+        # Emphasize high-degree nodes
+        centrality = 0.6 * degree_centrality + 0.4 * closeness
+    elif mode == 'bridge':
+        # Emphasize betweenness
+        centrality = 0.5 * inv_dist_sum / inv_dist_sum.max() + 0.5 * closeness
+    else:  # adaptive
+        # Balanced combination
+        centrality = (0.4 * closeness + 0.3 * inv_dist_sum / inv_dist_sum.max() + 
+                      0.3 * degree_centrality)
+    
+    # Normalize to [0.5, 1.5] range
+    c_min, c_max = centrality.min(), centrality.max()
+    if c_max - c_min > 1e-10:
+        centrality = 0.5 + (centrality - c_min) / (c_max - c_min)
+    
+    return centrality
+
+
+def _compute_regret_penalty(distance_matrix: np.ndarray, 
+                            power: float = 0.7) -> np.ndarray:
+    """Compute regret-based penalty for edges."""
+    n = distance_matrix.shape[0]
+    regret = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances to all other nodes
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Find two nearest neighbors
+        nearest_indices = np.argsort(distances)[:2]
+        if len(nearest_indices) < 2:
+            continue
+            
+        nearest_dist = distances[nearest_indices[0]]
+        second_dist = distances[nearest_indices[1]]
+        
+        # Compute regret for each edge from i
+        for j in range(n):
+            if i == j:
+                continue
+                
+            if j == nearest_indices[0]:
+                # This is the best edge - no regret
+                regret[i, j] = 0
+            else:
+                # Regret is how much worse this edge is than the best alternative
+                current_regret = (distance_matrix[i, j] - nearest_dist) / (second_dist + 1e-10)
+                regret[i, j] = np.clip(current_regret, 0, 2)
+    
+    # Symmetrize and apply non-linear transform
+    regret = (regret + regret.T) / 2
+    regret = np.power(regret, power)
+    
+    return regret
+
+
+def _compute_density_factors_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute density-aware normalization factors."""
+    n = distance_matrix.shape[0]
+    density_factors = np.ones_like(distance_matrix)
+    
+    if n <= 2:
+        return density_factors
+    
+    # Estimate local density for each node
+    densities = np.zeros(n)
+    k = max(2, n // 3)
+    
+    for i in range(n):
+        # Use median distance to k nearest neighbors as density measure
+        distances = np.partition(distance_matrix[i], k+1)[:k+1]
+        distances = distances[distances > 0]  # Remove zero (self)
+        if len(distances) > 0:
+            densities[i] = np.median(distances)
+        else:
+            densities[i] = 1.0
+    
+    # Normalize densities
+    density_mean = densities.mean()
+    if density_mean > 0:
+        relative_density = densities / density_mean
+    
+    # Create normalization matrix
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Edges in dense regions get slightly down-weighted
+                # Edges between dense and sparse regions get balanced treatment
+                if relative_density[i] > 1.2 and relative_density[j] > 1.2:
+                    density_factors[i, j] = 0.9
+                elif relative_density[i] < 0.8 and relative_density[j] < 0.8:
+                    density_factors[i, j] = 1.1
+                else:
+                    density_factors[i, j] = 1.0
+    
+    return density_factors
+
+
+def _combine_centrality(ci: float, cj: float, mode: str = 'adaptive') -> float:
+    """Combine centrality scores of two nodes non-linearly."""
+    if mode == 'hub':
+        # Favor edges where at least one node is highly central
+        return max(ci, cj) * 0.7 + min(ci, cj) * 0.3
+    elif mode == 'bridge':
+        # Favor edges between nodes of similar centrality
+        similarity = 1.0 - abs(ci - cj) / max(ci, cj)
+        return (ci * cj) ** 0.5 * (0.5 + 0.5 * similarity)
+    else:  # adaptive
+        # Balanced approach favoring moderately central connections
+        avg_centrality = (ci + cj) / 2
+        # S-curve transformation to emphasize moderate values
+        if avg_centrality < 0.8:
+            return avg_centrality ** 1.2
+        elif avg_centrality > 1.2:
+            return avg_centrality ** 0.8
+        else:
+            return avg_centrality
+
+
+def _sparsify_heuristic(heuristic: np.ndarray, 
+                        distance_matrix: np.ndarray,
+                        mode: str = 'dynamic') -> np.ndarray:
+    """Apply adaptive sparsification to heuristic matrix."""
+    n = heuristic.shape[0]
+    result = heuristic.copy()
+    
+    # Always keep MST edges
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    if mode == 'fixed':
+        # Keep top 3n edges
+        flat_heuristic = result.flatten()
+        threshold = np.partition(flat_heuristic, -3*n)[-3*n]
+        keep_mask = (result >= threshold) | mst_mask
+        
+    elif mode == 'percentile':
+        # Keep top 30% of non-zero edges
+        non_zero = result[result > 0]
+        if len(non_zero) > 0:
+            threshold = np.percentile(non_zero, 70)
+            keep_mask = (result >= threshold) | mst_mask
+        else:
+            keep_mask = mst_mask
+            
+    else:  # dynamic
+        # Adaptive threshold based on score distribution
+        non_zero = result[result > 0]
+        if len(non_zero) > 0:
+            mean_score = non_zero.mean()
+            std_score = non_zero.std()
+            # Dynamic threshold: mean + 0.5*std, but at least keep 2n edges
+            threshold = mean_score + 0.5 * std_score
+            flat_heuristic = result.flatten()
+            min_threshold = np.partition(flat_heuristic, -2*n)[-2*n]
+            threshold = max(threshold, min_threshold)
+            keep_mask = (result >= threshold) | mst_mask
+        else:
+            keep_mask = mst_mask
+    
+    # Apply mask
+    result[~keep_mask] = 0
+    np.fill_diagonal(result, 0)
+    
+    return result
+```

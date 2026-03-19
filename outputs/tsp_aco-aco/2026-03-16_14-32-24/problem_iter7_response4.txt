@@ -1,0 +1,230 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Spatial Scoring", "Adaptive Neighborhood Regret Penalty", "Kernel Density Aggregation", "Hierarchical Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with two-step lookahead spatial scoring,
+    adaptive regret modeling, and hierarchical sparsification.
+    
+    Core Improvements:
+    1. Two-step Lookahead Spatial Scoring: Evaluates edges considering neighbor-of-neighbor connectivity
+    2. Adaptive Neighborhood Regret Penalty: Dynamically adjusts regret based on local cluster density
+    3. Kernel Density Aggregation: Combines individual node densities with path-based clustering
+    4. Hierarchical Sparsification: Progressive edge pruning with connectivity preservation
+    """
+    n = distance_matrix.shape[0]
+    
+    # Initialize safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Two-step Lookahead Spatial Scoring
+    # Consider not just direct edges but also neighbor-of-neighbor connections
+    lookahead_scores = np.zeros_like(distance_matrix)
+    
+    # Precompute nearest neighbors for each node
+    k_lookahead = max(3, min(10, int(np.sqrt(n))))
+    neighbor_indices = np.argsort(safe_dist, axis=1)[:, 1:k_lookahead+1]
+    
+    for i in range(n):
+        for idx, j in enumerate(neighbor_indices[i]):
+            # Get neighbors of j (excluding i)
+            j_neighbors = neighbor_indices[j]
+            j_neighbors = j_neighbors[j_neighbors != i]
+            
+            if len(j_neighbors) > 0:
+                # Average distance to j's neighbors as lookahead metric
+                avg_lookahead_dist = np.mean(safe_dist[j, j_neighbors])
+                
+                # Two-step score: direct edge quality * reciprocal of lookahead distance
+                direct_quality = 1.0 / safe_dist[i, j]
+                lookahead_factor = 1.0 / (avg_lookahead_dist + eps)
+                
+                # Weighted combination with decay based on j's position in i's neighbor list
+                decay = 0.8 ** idx
+                lookahead_scores[i, j] = direct_quality * lookahead_factor * decay
+    
+    # Symmetrize lookahead scores
+    lookahead_scores = np.maximum(lookahead_scores, lookahead_scores.T)
+    
+    # 2. Adaptive Neighborhood Regret Penalty
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    # Compute local density for each node
+    k_density = min(7, n-1)
+    local_densities = np.zeros(n)
+    
+    for i in range(n):
+        k_nearest = np.partition(safe_dist[i], k_density)[:k_density+1]
+        local_densities[i] = np.mean(k_nearest[k_nearest > 0])
+    
+    # Normalize densities
+    density_min = np.min(local_densities)
+    density_range = np.max(local_densities) - density_min + eps
+    normalized_densities = (local_densities - density_min) / density_range
+    
+    for i in range(n):
+        # Get distances to all other nodes
+        dists = safe_dist[i].copy()
+        
+        # Sort distances
+        sorted_idx = np.argsort(dists)
+        sorted_dists = dists[sorted_idx]
+        
+        if len(sorted_dists) >= 3:
+            # Adaptive thresholds based on local density
+            density_factor = normalized_densities[i]
+            
+            # Denser regions have stricter regret thresholds
+            tier1_cutoff = max(3, int(k_lookahead * (0.5 + 0.3 * density_factor)))
+            tier2_cutoff = max(6, int(k_lookahead * (1.0 + 0.5 * density_factor)))
+            
+            # Tier-based regret calculation
+            for rank, j in enumerate(sorted_idx):
+                if i == j:
+                    continue
+                    
+                edge_dist = dists[j]
+                
+                if rank < tier1_cutoff:
+                    # Top tier: minimal regret
+                    base_regret = 0.1 * rank / (tier1_cutoff + eps)
+                elif rank < tier2_cutoff:
+                    # Middle tier: moderate regret
+                    rel_rank = (rank - tier1_cutoff) / (tier2_cutoff - tier1_cutoff + eps)
+                    base_regret = 0.3 + 0.3 * rel_rank
+                else:
+                    # Bottom tier: high regret
+                    rel_rank = (rank - tier2_cutoff) / (n - tier2_cutoff + eps)
+                    base_regret = 0.6 + 0.4 * rel_rank
+                
+                # Adjust based on density (denser regions tolerate less regret)
+                density_adjustment = 1.2 - 0.4 * density_factor
+                regret_matrix[i, j] = base_regret * density_adjustment
+    
+    # 3. Kernel Density Aggregation with Path-based Clustering
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Adaptive bandwidth using k-nearest neighbor distances
+    k_bandwidth = min(5, n-1)
+    bandwidths = np.zeros(n)
+    
+    for i in range(n):
+        k_nearest = np.partition(safe_dist[i], k_bandwidth)[:k_bandwidth+1]
+        bandwidths[i] = np.median(k_nearest[k_nearest > 0])
+    
+    # Compute kernel-based densities
+    kernel_densities = np.zeros((n, n))
+    
+    for i in range(n):
+        sigma_i = bandwidths[i] / 2
+        kernel_densities[i] = np.exp(-0.5 * (safe_dist[i] / sigma_i) ** 2)
+    
+    # Aggregated density for node pairs
+    for i in range(n):
+        for j in range(i+1, n):
+            # Individual kernel densities
+            ki = kernel_densities[i]
+            kj = kernel_densities[j]
+            
+            # Path-based aggregation: consider common neighbors
+            common_neighbors = np.minimum(ki, kj)
+            common_score = np.sum(common_neighbors) - 2  # Exclude i and j
+            
+            # Also consider the minimum kernel value along potential paths
+            min_along_path = np.minimum(ki, kj)
+            path_score = np.mean(min_along_path[min_along_path > 0.1])
+            
+            # Combined density metric
+            combined_density = 0.6 * np.log1p(common_score) + 0.4 * path_score
+            
+            if combined_density > 0:
+                density_bonus[i, j] = combined_density * 0.12
+            else:
+                density_bonus[i, j] = -0.08
+    
+    density_bonus = np.maximum(density_bonus, density_bonus.T)
+    
+    # 4. Hierarchical Sparsification
+    # Base candidate selection with adaptive thresholds
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Primary candidates: nearest neighbors
+    k_primary = max(4, int(np.sqrt(n) * 1.2))
+    
+    for i in range(n):
+        # Get primary candidates
+        primary = np.argsort(safe_dist[i])[:k_primary]
+        candidate_mask[i, primary] = True
+        
+        # Secondary candidates: consider density-based connections
+        if normalized_densities[i] < 0.7:  # Less dense nodes get more candidates
+            k_secondary = int(k_primary * 1.5)
+            secondary = np.argsort(safe_dist[i])[:k_secondary]
+            candidate_mask[i, secondary] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 5. Combine Components
+    # Base score from lookahead scoring
+    base_score = lookahead_scores
+    
+    # Apply regret penalty with adaptive strength
+    regret_strength = 2.5 - 0.8 * np.mean(normalized_densities)
+    regret_penalty = np.exp(-regret_strength * regret_matrix)
+    penalized_score = base_score * regret_penalty
+    
+    # Add density bonus with saturation
+    density_factor = 1.0 + np.tanh(density_bonus)  # Tanh for saturation
+    heuristics_matrix = penalized_score * density_factor
+    
+    # 6. Progressive Edge Pruning
+    # First pass: apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Second pass: prune edges with very low scores
+    for i in range(n):
+        row_scores = heuristics_matrix[i]
+        non_zero = row_scores[row_scores > 0]
+        
+        if len(non_zero) > 0:
+            threshold = np.percentile(non_zero, 25)  # Keep top 75% of non-zero edges
+            heuristics_matrix[i, row_scores < threshold] = 0
+    
+    # Ensure connectivity: each node must have at least 2 edges
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_idx = np.where(row > 0)[0]
+        
+        if len(nonzero_idx) < 2:
+            # Find top candidates by combined score
+            combined_scores = lookahead_scores[i] * (1.0 - regret_matrix[i])
+            top_candidates = np.argsort(combined_scores)[-2:]
+            
+            # Boost these edges
+            boost_factor = 1.3
+            for j in top_candidates:
+                heuristics_matrix[i, j] = np.max(row) * boost_factor if np.max(row) > 0 else boost_factor
+                heuristics_matrix[j, i] = heuristics_matrix[i, j]
+    
+    # 7. Final Processing
+    # Enforce symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1]
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

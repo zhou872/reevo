@@ -1,0 +1,162 @@
+```json
+{
+    "algorithm_features": ["Global-Regret Normalized Penalty", "Density-Adaptive MST Bonus", "Degree-Centrality Sparsification", "Inverse-Distance Base Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges with global statistics and adaptive strategies.
+    
+    Features:
+    1. Global-regret penalty: Normalizes local regret by global edge cost statistics
+    2. Density-adaptive MST bonus: Adjusts MST edge importance based on graph sparsity
+    3. Degree-centrality sparsification: Preserves edges based on node connectivity patterns
+    4. Inverse-distance base scoring: Foundation for edge attractiveness
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Create working copy with diagonal set to infinity
+    D = distance_matrix.copy().astype(float)
+    np.fill_diagonal(D, np.inf)
+    
+    # ======================
+    # 1. BASE INVERSE DISTANCE
+    # ======================
+    eps = np.percentile(D[D < np.inf], 5) * 0.01 if n > 2 else 1e-8
+    inv_dist = 1 / (D + eps)
+    
+    # ======================
+    # 2. DENSITY-ADAPTIVE MST BONUS
+    # ======================
+    # Calculate graph density (proportion of possible edges relative to complete graph)
+    # For TSP, graph is implicitly complete, but we measure effective density based on
+    # distance distribution
+    edge_cost_std = np.std(D[D < np.inf])
+    edge_cost_mean = np.mean(D[D < np.inf])
+    cost_variation = edge_cost_std / (edge_cost_mean + 1e-8)
+    
+    # MST bonus adapts to cost variation: higher variation means MST is more informative
+    mst_weight = minimum_spanning_tree(D)
+    mst_mask = (mst_weight.toarray() > 0)
+    
+    # Bonus decays from ~1.8 to ~1.2 based on graph characteristics
+    # Higher cost variation = stronger MST bonus
+    mst_bonus_value = 1.2 + 0.6 * np.tanh(cost_variation - 1.0)
+    bonus_matrix = np.ones_like(D)
+    bonus_matrix[mst_mask] = mst_bonus_value
+    
+    # ======================
+    # 3. GLOBAL-REGRET PENALTY
+    # ======================
+    regret_matrix = np.ones_like(D)
+    
+    # Precompute global statistics
+    valid_dists = D[D < np.inf]
+    global_mean = np.mean(valid_dists) if len(valid_dists) > 0 else 0
+    global_std = np.std(valid_dists) if len(valid_dists) > 0 else 1
+    
+    for i in range(n):
+        # Get distances from node i
+        dist_i = D[i].copy()
+        mask_i = dist_i < np.inf
+        
+        if mask_i.sum() >= 2:
+            # Local best and second-best
+            valid_dists_i = dist_i[mask_i]
+            sorted_i = np.sort(valid_dists_i)
+            best_i, second_best_i = sorted_i[:2]
+            local_regret_range = second_best_i - best_i + eps
+            
+            # Calculate regret for each edge from node i
+            for j in range(n):
+                if i != j and D[i, j] < np.inf:
+                    # Local regret component
+                    local_regret = (D[i, j] - best_i) / local_regret_range
+                    
+                    # Global normalization component
+                    # How much worse is this edge compared to global average?
+                    global_regret = (D[i, j] - global_mean) / (global_std + eps)
+                    
+                    # Combined regret penalty with global normalization
+                    # The 0.7/0.3 weighting emphasizes local optimality while
+                    # considering global context
+                    combined_regret = 0.7 * local_regret + 0.3 * abs(global_regret)
+                    
+                    # Exponential decay penalty
+                    regret_matrix[i, j] *= np.exp(-combined_regret)
+    
+    # ======================
+    # 4. COMBINED SCORING
+    # ======================
+    scores = inv_dist * bonus_matrix * regret_matrix
+    
+    # ======================
+    # 5. DEGREE-CENTRALITY SPARSIFICATION
+    # ======================
+    if n > 3:
+        # Calculate degree centrality from initial scores
+        degree_centrality = np.zeros(n)
+        for i in range(n):
+            # Count significant edges for each node
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            # Threshold at median of non-zero scores
+            threshold = np.median(row_scores[row_scores > -np.inf]) if np.any(row_scores > -np.inf) else 0
+            degree_centrality[i] = np.sum(row_scores > threshold)
+        
+        # Normalize degree centrality
+        if degree_centrality.max() > 0:
+            degree_centrality = degree_centrality / degree_centrality.max()
+        
+        # Dynamic k per node based on degree centrality
+        mask = np.zeros_like(scores, dtype=bool)
+        
+        for i in range(n):
+            # Base k ensures minimum connectivity
+            base_k = max(2, int(np.log2(n)))
+            
+            # Adjust k based on degree centrality
+            # Nodes with higher centrality keep more edges
+            centrality_factor = 0.5 + 0.5 * degree_centrality[i]
+            k = int(base_k * centrality_factor)
+            
+            # Ensure k doesn't exceed available edges
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            valid_edges = np.sum(row_scores > -np.inf)
+            k = min(k, valid_edges)
+            
+            if k > 0:
+                # Get top k edges for this node
+                top_k_idx = np.argpartition(row_scores, -k)[-k:]
+                mask[i, top_k_idx] = True
+        
+        # Make symmetric and ensure MST connectivity
+        mask = mask | mask.T | mst_mask
+        
+        # Apply sparsification
+        scores = scores * mask
+    
+    # ======================
+    # 6. FINAL NORMALIZATION
+    # ======================
+    # Normalize to [0, 1] range with softmax-style scaling
+    valid_scores = scores[scores > 0]
+    if len(valid_scores) > 0:
+        # Use 95th percentile to avoid outlier domination
+        score_max = np.percentile(valid_scores, 95)
+        if score_max > 0:
+            scores = scores / score_max
+            scores = np.clip(scores, 0, 1)
+    
+    np.fill_diagonal(scores, 0)
+    return scores
+```

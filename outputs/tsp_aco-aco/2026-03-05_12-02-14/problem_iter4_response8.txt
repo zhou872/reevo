@@ -1,0 +1,277 @@
+```json
+{
+    "algorithm_features": ["Nearest-Neighbor Path Construction", "Adaptive Weight Learning", "Betweenness Centrality Sparsification", "Multi-Metric Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial
+from scipy.sparse import csgraph
+import random
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection incorporating:
+    1. Path construction via nearest neighbor sampling
+    2. Adaptive weight learning based on node degree distribution
+    3. Graph-based edge betweenness approximation
+    4. Multi-metric fusion with learned weights
+    """
+    n = distance_matrix.shape[0]
+    np.random.seed(42)  # For reproducibility
+    
+    # 1. Path construction via nearest neighbor sampling
+    def build_nn_paths(num_paths=50):
+        """Build multiple nearest-neighbor paths with stochastic variations."""
+        path_counts = np.zeros((n, n))
+        
+        for _ in range(num_paths):
+            # Start from random node
+            start = np.random.randint(0, n)
+            visited = set([start])
+            current = start
+            
+            # Build path with stochastic nearest neighbor
+            for _ in range(n - 1):
+                # Get distances to unvisited nodes
+                mask = np.ones(n, dtype=bool)
+                mask[list(visited)] = False
+                available_distances = distance_matrix[current, :].copy()
+                available_distances[~mask] = np.inf
+                
+                # Stochastic selection: choose from top 3 nearest
+                if np.sum(np.isfinite(available_distances)) >= 3:
+                    # Get indices of 3 nearest unvisited nodes
+                    top3_idx = np.argpartition(available_distances, 3)[:3]
+                    # Weight by inverse distance (closer = higher probability)
+                    weights = 1 / (available_distances[top3_idx] + 1e-10)
+                    weights = weights / weights.sum()
+                    next_node = np.random.choice(top3_idx, p=weights)
+                else:
+                    # Fallback to nearest
+                    next_node = np.argmin(available_distances)
+                
+                # Record edge
+                path_counts[current, next_node] += 1
+                path_counts[next_node, current] += 1
+                visited.add(next_node)
+                current = next_node
+            
+            # Return to start
+            path_counts[current, start] += 1
+            path_counts[start, current] += 1
+        
+        # Normalize and smooth
+        if path_counts.max() > 0:
+            path_counts = path_counts / path_counts.max()
+        
+        # Apply logarithmic scaling to emphasize frequently used edges
+        path_counts = np.log1p(path_counts * 10) / np.log1p(10)
+        
+        return path_counts
+    
+    nn_path_matrix = build_nn_paths()
+    
+    # 2. Base reciprocal distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    
+    # Apply adaptive scaling based on distance distribution
+    distances_flat = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
+    if len(distances_flat) > 0:
+        median_dist = np.median(distances_flat)
+        # Scale reciprocal by distance relative to median
+        scaling = np.exp(-distance_matrix / (2 * median_dist))
+        reciprocal = reciprocal * scaling
+    
+    np.fill_diagonal(reciprocal, 0)
+    
+    # 3. Enhanced centrality with degree-based learning
+    # Compute node degrees in nearest neighbor graph
+    k_neighbors = max(3, n // 20)
+    nn_degrees = np.zeros(n)
+    for i in range(n):
+        sorted_idx = np.argsort(distance_matrix[i])[1:k_neighbors+1]
+        nn_degrees[i] = len(sorted_idx)
+    
+    # Adaptive centrality combining distance and connectivity
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Weight distances by node degrees
+        weights = nn_degrees / (nn_degrees.sum() + 1e-10)
+        weighted_dist = np.sum(weights * distance_matrix[i])
+        centrality[i] = 1 / (weighted_dist + 1e-10)
+    
+    # Normalize centrality
+    if centrality.max() > 0:
+        centrality = centrality / centrality.max()
+    
+    # Edge centrality matrix
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # 4. Edge betweenness approximation using random walks
+    def approximate_edge_betweenness(num_walks=100, walk_length=10):
+        """Approximate edge betweenness centrality using random walks."""
+        edge_visits = np.zeros((n, n))
+        
+        # Create transition probabilities based on reciprocal distance
+        transition_probs = reciprocal.copy()
+        np.fill_diagonal(transition_probs, 0)
+        row_sums = transition_probs.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        transition_probs = transition_probs / row_sums
+        
+        for _ in range(num_walks):
+            start = np.random.randint(0, n)
+            current = start
+            
+            for _ in range(walk_length):
+                if transition_probs[current].sum() == 0:
+                    break
+                    
+                # Sample next node
+                next_node = np.random.choice(n, p=transition_probs[current])
+                
+                # Record edge visit (undirected)
+                edge_visits[current, next_node] += 1
+                edge_visits[next_node, current] += 1
+                
+                current = next_node
+        
+        # Normalize betweenness scores
+        if edge_visits.max() > 0:
+            edge_visits = edge_visits / edge_visits.max()
+        
+        return edge_visits
+    
+    betweenness_matrix = approximate_edge_betweenness()
+    
+    # 5. MST-based indicators (dual: distance and reciprocal)
+    mst_indicators = np.zeros((n, n))
+    
+    try:
+        # MST on distance matrix (minimize total distance)
+        mst_dist = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_dist_indicator = (mst_dist > 0).astype(float)
+        
+        # MST on reciprocal matrix (maximize closeness)
+        mst_close = csgraph.minimum_spanning_tree(-reciprocal)
+        mst_close_indicator = (mst_close > 0).astype(float)
+        
+        # Combine both MSTs
+        mst_indicators = 0.6 * mst_dist_indicator + 0.4 * mst_close_indicator
+        
+        # Boost edges connecting high-centrality nodes
+        for i in range(n):
+            mst_neighbors = np.where(mst_indicators[i] > 0)[0]
+            if len(mst_neighbors) > 0:
+                boost = centrality[i] * centrality[mst_neighbors].mean()
+                mst_indicators[i, mst_neighbors] *= (1 + 0.5 * boost)
+    except:
+        pass  # Fallback: mst_indicators remains zeros
+    
+    # 6. Learn adaptive weights based on node degree distribution
+    degree_entropy = -np.sum(nn_degrees / nn_degrees.sum() * 
+                            np.log(nn_degrees / nn_degrees.sum() + 1e-10))
+    
+    # Normalize entropy to [0, 1]
+    max_entropy = np.log(n)
+    degree_balance = degree_entropy / max_entropy if max_entropy > 0 else 0.5
+    
+    # Weight adjustment based on degree balance
+    # More balanced degrees → emphasize path construction and betweenness
+    # Less balanced degrees → emphasize centrality and MST
+    
+    base_weights = {
+        'reciprocal': 0.15,
+        'centrality': 0.20,
+        'mst': 0.25,
+        'nn_path': 0.25,
+        'betweenness': 0.15
+    }
+    
+    # Adjust weights based on degree balance
+    balance_factor = degree_balance - 0.5  # Range: [-0.5, 0.5]
+    
+    adjusted_weights = {
+        'reciprocal': base_weights['reciprocal'] * (1 - 0.3 * balance_factor),
+        'centrality': base_weights['centrality'] * (1 + 0.4 * balance_factor),
+        'mst': base_weights['mst'] * (1 + 0.2 * balance_factor),
+        'nn_path': base_weights['nn_path'] * (1 - 0.5 * balance_factor),
+        'betweenness': base_weights['betweenness'] * (1 - 0.3 * balance_factor)
+    }
+    
+    # Normalize weights to sum to 1
+    weight_sum = sum(adjusted_weights.values())
+    for key in adjusted_weights:
+        adjusted_weights[key] /= weight_sum
+    
+    # 7. Combine all components with learned weights
+    combined = (
+        adjusted_weights['reciprocal'] * reciprocal +
+        adjusted_weights['centrality'] * centrality_matrix +
+        adjusted_weights['mst'] * mst_indicators +
+        adjusted_weights['nn_path'] * nn_path_matrix +
+        adjusted_weights['betweenness'] * betweenness_matrix
+    )
+    
+    # 8. Graph-based sparsification using betweenness-guided pruning
+    sparsified = np.zeros_like(combined)
+    
+    # Determine edges to keep per node based on betweenness
+    for i in range(n):
+        # Get candidate edges: top by combined score
+        row_combined = combined[i].copy()
+        row_combined[i] = -np.inf
+        
+        # Initial candidate set: top 25% or at least 5 edges
+        k_init = max(5, n // 4)
+        if k_init < n:
+            candidate_idx = np.argpartition(row_combined, -k_init)[-k_init:]
+        else:
+            candidate_idx = np.arange(n)
+            candidate_idx = candidate_idx[candidate_idx != i]
+        
+        # Score candidates by betweenness-weighted combination
+        candidate_scores = (
+            0.6 * row_combined[candidate_idx] +
+            0.4 * betweenness_matrix[i, candidate_idx]
+        )
+        
+        # Keep top edges based on node degree and betweenness
+        keep_k = max(3, min(10, int(np.sqrt(nn_degrees[i]))))
+        if keep_k < len(candidate_scores):
+            top_k_idx = candidate_idx[np.argpartition(candidate_scores, -keep_k)[-keep_k:]]
+        else:
+            top_k_idx = candidate_idx
+        
+        # Sort kept edges by score
+        sorted_indices = top_k_idx[np.argsort(candidate_scores[top_k_idx])[::-1]]
+        
+        # Apply adaptive exponential decay
+        for rank, j in enumerate(sorted_indices):
+            # Decay based on rank and betweenness
+            rank_decay = np.exp(-rank / (1.0 + 0.5 * betweenness_matrix[i, j]))
+            sparsified[i, j] = combined[i, j] * rank_decay
+    
+    # 9. Symmetrize with stochastic noise
+    symmetric = (sparsified + sparsified.T) / 2
+    
+    # Add controlled noise proportional to edge promise
+    noise_level = 0.02
+    noise = np.random.randn(n, n) * noise_level * np.abs(symmetric)
+    symmetric = symmetric + noise
+    symmetric = np.maximum(symmetric, 0)
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(symmetric, 0)
+    
+    # Final normalization
+    if symmetric.max() > 0:
+        symmetric = symmetric / symmetric.max()
+    
+    return symmetric
+```

@@ -1,0 +1,174 @@
+```json
+{
+    "algorithm_features": ["Multi-scale Path Affinity", "Neighborhood Regret Heuristic", "Adaptive Threshold Sparsification", "Reciprocal Distance Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with multi-scale path analysis.
+    
+    Key innovations:
+    1. Multi-scale path affinity (2-step and 3-step lookahead)
+    2. Neighborhood regret heuristic
+    3. Adaptive threshold-based sparsification
+    4. Enhanced reciprocal distance weighting with geometric mean
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        # Base case: return simple reciprocal for small instances
+        heur = np.zeros_like(distance_matrix)
+        np.fill_diagonal(distance_matrix, np.inf)
+        heur = 1 / distance_matrix
+        np.fill_diagonal(heur, 0)
+        np.fill_diagonal(distance_matrix, 0)
+        return heur
+    
+    # 1. Base reciprocal with geometric mean normalization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Geometric mean normalization per row
+    row_geomean = np.exp(np.mean(np.log(np.where(inv_dist > 0, inv_dist, 1)), axis=1))
+    norm_inv_dist = inv_dist / (row_geomean[:, np.newaxis] + 1e-12)
+    norm_inv_dist = np.nan_to_num(norm_inv_dist)
+    
+    # 2. Multi-scale path affinity
+    path_affinity = np.zeros((n, n))
+    
+    # 2-step path analysis (i -> k -> j)
+    for i in range(n):
+        for j in range(i+1, n):
+            # Consider all intermediate nodes k
+            other_nodes = [k for k in range(n) if k not in (i, j)]
+            if not other_nodes:
+                continue
+                
+            # Find best alternative path through k
+            best_2step = np.inf
+            for k in other_nodes:
+                path_length = distance_matrix[i, k] + distance_matrix[k, j]
+                if path_length < best_2step:
+                    best_2step = path_length
+            
+            # 3-step path analysis (i -> k -> l -> j) for top candidates
+            if n >= 10:
+                # Find top 5 intermediate nodes for 2-step paths
+                two_step_lengths = []
+                for k in other_nodes:
+                    two_step_lengths.append(distance_matrix[i, k] + distance_matrix[k, j])
+                top_k_indices = np.argsort(two_step_lengths)[:min(5, len(two_step_lengths))]
+                
+                best_3step = np.inf
+                for idx in top_k_indices:
+                    k = other_nodes[idx]
+                    remaining_nodes = [l for l in other_nodes if l != k]
+                    for l in remaining_nodes:
+                        path_length = (distance_matrix[i, k] + 
+                                     distance_matrix[k, l] + 
+                                     distance_matrix[l, j])
+                        if path_length < best_3step:
+                            best_3step = path_length
+                
+                # Combined path factor gives higher weight to edges with no good alternatives
+                direct_dist = distance_matrix[i, j]
+                min_alt_path = min(best_2step, best_3step) if n >= 10 else best_2step
+                if direct_dist > 0 and min_alt_path > 0:
+                    # Higher value when direct edge is much better than alternatives
+                    path_factor = np.exp((min_alt_path - direct_dist) / (direct_dist + 1e-12))
+                else:
+                    path_factor = 1.0
+            else:
+                # Only use 2-step for small instances
+                direct_dist = distance_matrix[i, j]
+                if direct_dist > 0 and best_2step > 0:
+                    path_factor = np.exp((best_2step - direct_dist) / (direct_dist + 1e-12))
+                else:
+                    path_factor = 1.0
+            
+            path_affinity[i, j] = path_affinity[j, i] = path_factor
+    
+    # 3. Neighborhood regret heuristic
+    regret_matrix = np.zeros((n, n))
+    
+    # For each node, find its k-nearest neighbors
+    k_neighbors = max(3, min(10, n // 3))
+    nearest_distances = np.zeros((n, k_neighbors))
+    
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        sorted_indices = np.argsort(row_dists)[:k_neighbors]
+        nearest_distances[i] = row_dists[sorted_indices]
+    
+    # Compute regret for each edge
+    for i in range(n):
+        for j in range(i+1, n):
+            # Regret of not taking edge (i,j) from i's perspective
+            if distance_matrix[i, j] <= nearest_distances[i, 0]:
+                regret_i = 0
+            else:
+                # Find where this edge ranks among i's neighbors
+                rank_i = np.searchsorted(nearest_distances[i], distance_matrix[i, j])
+                regret_i = nearest_distances[i, min(rank_i, k_neighbors-1)] - nearest_distances[i, 0]
+            
+            # Regret from j's perspective
+            if distance_matrix[j, i] <= nearest_distances[j, 0]:
+                regret_j = 0
+            else:
+                rank_j = np.searchsorted(nearest_distances[j], distance_matrix[j, i])
+                regret_j = nearest_distances[j, min(rank_j, k_neighbors-1)] - nearest_distances[j, 0]
+            
+            # Combined regret
+            regret = (regret_i + regret_j) / 2
+            regret_matrix[i, j] = regret_matrix[j, i] = np.exp(-regret / (np.mean(distance_matrix) + 1e-12))
+    
+    # 4. Minimum spanning tree reinforcement
+    mst_bonus = np.ones((n, n))
+    if n > 1:
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst > 0) | (mst.T > 0)
+        mst_bonus[mst_edges] = 1.5
+    
+    # 5. Combine factors
+    heuristics_matrix = (
+        0.4 * norm_inv_dist +      # Base reciprocal (40%)
+        0.3 * path_affinity +      # Path affinity (30%)
+        0.2 * regret_matrix +      # Regret heuristic (20%)
+        0.1 * mst_bonus            # MST reinforcement (10%)
+    )
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # 6. Adaptive threshold sparsification
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    # Determine adaptive threshold per node
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Use percentile-based threshold
+        valid_vals = row[row > -np.inf]
+        if len(valid_vals) > 0:
+            threshold = np.percentile(valid_vals, 75)  # Keep top 25%
+            
+            # Also keep edges that are in MST
+            mask = (row >= threshold) | (mst_bonus[i] > 1.0)
+            sparsified[i, mask] = heuristics_matrix[i, mask]
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # 7. Final normalization
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

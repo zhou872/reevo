@@ -1,0 +1,376 @@
+```json
+{
+    "algorithm_features": ["Spectral Gap Optimized Clustering", "Fiedler Vector Boundary Analysis", "Cross-Validated Ensemble Learning", "Distance-Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with spectral gap-optimized clustering, Fiedler vector analysis,
+    cross-validated ensemble learning, and adaptive sparsification.
+    
+    Core Innovations:
+    1. Spectral Gap Optimization: Automatically determines optimal cluster count via eigenvalue analysis
+    2. Fiedler Vector Boundary Scoring: Uses normalized Laplacian's second eigenvector for boundary detection
+    3. Cross-Validated Weight Learning: Optimizes component weights via k-fold validation on diverse tours
+    4. Distance-Adaptive Sparsification: Intelligently retains edges while preserving connectivity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # ==================== 1. PRELIMINARY COMPUTATIONS ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST for connectivity preservation
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. SPECTRAL GAP-OPTIMIZED CLUSTERING ====================
+    def spectral_gap_clustering() -> Tuple[np.ndarray, int]:
+        """Perform spectral clustering with automatic cluster count selection via eigenvalue gaps"""
+        if n < 4:
+            return np.ones((n, n)), 1
+        
+        # Convert distances to affinities (Gaussian kernel)
+        sigma = np.median(distance_matrix) * 0.5
+        affinity = np.exp(-distance_matrix**2 / (2 * sigma**2))
+        np.fill_diagonal(affinity, 0)
+        
+        # Compute normalized Laplacian
+        degree = np.sum(affinity, axis=1)
+        degree_sqrt_inv = 1.0 / np.sqrt(degree + 1e-10)
+        L_norm = np.eye(n) - degree_sqrt_inv[:, None] * affinity * degree_sqrt_inv
+        
+        # Compute eigenvalues (k smallest)
+        k_eigen = min(n, 15)
+        try:
+            eigenvalues = np.linalg.eigvalsh(L_norm)
+            eigenvalues_sorted = np.sort(eigenvalues)
+        except:
+            # Fallback for ill-conditioned matrices
+            eigenvalues_sorted = np.zeros(k_eigen)
+        
+        # Find optimal k via eigenvalue gaps
+        if len(eigenvalues_sorted) >= 3:
+            gaps = eigenvalues_sorted[1:] - eigenvalues_sorted[:-1]
+            # Look for the largest gap after the first small eigenvalues
+            search_range = min(10, len(gaps)-1)
+            if search_range > 0:
+                significant_gaps = gaps[1:search_range+1]
+                if len(significant_gaps) > 0:
+                    optimal_k = np.argmax(significant_gaps) + 2  # +2 because we skip first gap
+                    optimal_k = max(2, min(optimal_k, min(8, n//4 + 1)))
+                else:
+                    optimal_k = max(2, min(3, n//4 + 1))
+            else:
+                optimal_k = max(2, min(3, n//4 + 1))
+        else:
+            optimal_k = max(2, min(3, n//4 + 1))
+        
+        # Compute eigenvectors for the optimal_k smallest eigenvalues
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+            idx = np.argsort(eigenvalues)[:optimal_k]
+            spectral_embedding = eigenvectors[:, idx]
+        except:
+            # Fallback: use random embedding
+            spectral_embedding = np.random.randn(n, optimal_k)
+        
+        # Compute edge scores based on spectral similarity and distance
+        spectral_scores = np.ones_like(distance_matrix)
+        
+        # Normalize embedding rows
+        row_norms = np.linalg.norm(spectral_embedding, axis=1, keepdims=True)
+        normalized_embedding = spectral_embedding / (row_norms + 1e-10)
+        
+        # Compute cosine similarities
+        similarity_matrix = normalized_embedding @ normalized_embedding.T
+        np.fill_diagonal(similarity_matrix, 0)
+        
+        # Combine with distance attenuation
+        dist_median = np.median(distance_matrix)
+        dist_weight = np.exp(-distance_matrix / (2 * dist_median + 1e-8))
+        
+        spectral_scores = 0.5 * (1 + similarity_matrix) * dist_weight
+        np.fill_diagonal(spectral_scores, 0)
+        
+        return spectral_scores, optimal_k
+    
+    spectral_scores, n_clusters = spectral_gap_clustering()
+    
+    # ==================== 3. FIEDLER VECTOR BOUNDARY ANALYSIS ====================
+    def fiedler_boundary_scores() -> np.ndarray:
+        """Compute edge scores based on Fiedler vector for boundary detection"""
+        if n < 3:
+            return np.ones_like(distance_matrix)
+        
+        # Compute normalized Laplacian
+        degree = np.sum(distance_matrix, axis=1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            degree_sqrt_inv = 1.0 / np.sqrt(degree)
+        degree_sqrt_inv[np.isinf(degree_sqrt_inv)] = 0
+        
+        L_norm = np.eye(n) - degree_sqrt_inv[:, None] * distance_matrix * degree_sqrt_inv
+        
+        # Compute Fiedler vector (second smallest eigenvector)
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+            fiedler_vector = eigenvectors[:, 1]  # Second smallest eigenvalue
+        except:
+            # Fallback: random vector
+            fiedler_vector = np.random.randn(n)
+        
+        # Normalize Fiedler vector
+        fiedler_norm = np.linalg.norm(fiedler_vector)
+        if fiedler_norm > 0:
+            fiedler_vector = fiedler_vector / fiedler_norm
+        
+        # Score edges based on Fiedler vector values
+        boundary_scores = np.ones_like(distance_matrix)
+        
+        # Intra-cluster bonus: nodes with similar Fiedler values
+        fiedler_diff = np.abs(fiedler_vector[:, None] - fiedler_vector)
+        intra_cluster_sim = 1.0 / (1.0 + fiedler_diff)
+        
+        # Boundary penalty: edges connecting nodes with very different Fiedler values
+        # (likely connecting different clusters)
+        boundary_penalty = 1.0 - np.exp(-fiedler_diff**2 / 0.1)
+        
+        # Combine with distance weighting
+        dist_norm = distance_matrix / np.max(distance_matrix)
+        dist_decay = np.exp(-2 * dist_norm)
+        
+        boundary_scores = intra_cluster_sim * (1 - 0.3 * boundary_penalty) * dist_decay
+        np.fill_diagonal(boundary_scores, 0)
+        
+        return boundary_scores
+    
+    fiedler_scores = fiedler_boundary_scores()
+    
+    # ==================== 4. SIMPLIFIED REGRET COMPUTATION ====================
+    def compute_regret_scores() -> np.ndarray:
+        """Compute simplified regret scores without expensive beam search"""
+        regret_scores = np.zeros((n, n))
+        
+        for i in range(n):
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best alternative path through one intermediate node
+                min_alternative = float('inf')
+                for k in range(n):
+                    if k == i or k == j:
+                        continue
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    if alt_cost < min_alternative:
+                        min_alternative = alt_cost
+                
+                # Calculate regret
+                if min_alternative < float('inf'):
+                    regret = max(0, min_alternative - direct_cost)
+                    # Normalize by median distance
+                    scale = np.median(distance_matrix[np.triu_indices(n, 1)])
+                    regret_scores[i, j] = np.exp(-regret / (scale + 1e-8))
+        
+        return (regret_scores + regret_scores.T) / 2
+    
+    regret_scores = compute_regret_scores()
+    
+    # ==================== 5. CROSS-VALIDATED ENSEMBLE LEARNING ====================
+    def cross_validated_weight_learning(k_folds: int = 5) -> Tuple[float, float, float, float]:
+        """Learn optimal weights using k-fold cross-validation on diverse tours"""
+        if n < 10 or k_folds < 2:
+            return 0.4, 0.3, 0.2, 0.1  # Default weights
+        
+        # Generate diverse initial tours
+        def generate_diverse_tours(num_tours: int) -> List[List[int]]:
+            tours = []
+            
+            # Nearest neighbor tours from different starting points
+            for start in range(min(n, num_tours//2)):
+                visited = {start}
+                tour = [start]
+                current = start
+                
+                while len(visited) < n:
+                    dists = distance_matrix[current].copy()
+                    for v in visited:
+                        dists[v] = np.inf
+                    next_node = np.argmin(dists)
+                    tour.append(next_node)
+                    visited.add(next_node)
+                    current = next_node
+                
+                tour.append(start)  # Close the tour
+                tours.append(tour)
+            
+            # Random tours
+            for _ in range(num_tours - len(tours)):
+                tour = list(np.random.permutation(n))
+                tour.append(tour[0])
+                tours.append(tour)
+            
+            return tours
+        
+        def evaluate_component(component_scores: np.ndarray, tours: List[List[int]]) -> float:
+            """Evaluate a scoring component on given tours"""
+            total_score = 0
+            
+            for tour in tours:
+                # Calculate average component score for edges in the tour
+                tour_score = 0
+                valid_edges = 0
+                for k in range(len(tour) - 1):
+                    i, j = tour[k], tour[k + 1]
+                    if component_scores[i, j] > 0:
+                        tour_score += component_scores[i, j]
+                        valid_edges += 1
+                
+                if valid_edges > 0:
+                    total_score += tour_score / valid_edges
+            
+            return total_score / len(tours) if tours else 0
+        
+        # Generate base tours for cross-validation
+        base_tours = generate_diverse_tours(min(20, n * 2))
+        
+        # K-fold cross-validation
+        fold_size = max(1, len(base_tours) // k_folds)
+        component_performances = []
+        
+        for fold in range(k_folds):
+            test_start = fold * fold_size
+            test_end = min((fold + 1) * fold_size, len(base_tours))
+            
+            test_tours = base_tours[test_start:test_end]
+            train_tours = base_tours[:test_start] + base_tours[test_end:]
+            
+            if not train_tours or not test_tours:
+                continue
+            
+            # Evaluate components on training tours
+            train_scores = [
+                evaluate_component(spectral_scores, train_tours),
+                evaluate_component(fiedler_scores, train_tours),
+                evaluate_component(regret_scores, train_tours),
+                evaluate_component(inv_dist, train_tours)
+            ]
+            
+            component_performances.append(train_scores)
+        
+        if not component_performances:
+            return 0.4, 0.3, 0.2, 0.1
+        
+        # Average performances across folds
+        avg_performances = np.mean(component_performances, axis=0)
+        
+        # Softmax to get weights
+        exp_scores = np.exp(avg_performances - np.max(avg_performances))
+        weights = exp_scores / np.sum(exp_scores)
+        
+        return float(weights[0]), float(weights[1]), float(weights[2]), float(weights[3])
+    
+    w_spectral, w_fiedler, w_regret, w_inv = cross_validated_weight_learning()
+    
+    # ==================== 6. COMPOSITE SCORE CALCULATION ====================
+    # Weighted combination of all components
+    composite = (
+        w_spectral * spectral_scores +
+        w_fiedler * fiedler_scores +
+        w_regret * regret_scores +
+        w_inv * inv_dist
+    )
+    
+    # Boost MST edges for connectivity
+    mst_boost = 1.0 + 0.5 * mst_edges
+    composite *= mst_boost
+    
+    # ==================== 7. DISTANCE-ADAPTIVE SPARSIFICATION ====================
+    def adaptive_sparsification(scores: np.ndarray) -> np.ndarray:
+        """Intelligently retain promising edges while enforcing degree constraints"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always keep MST edges
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine adaptive degree limits
+        if n <= 10:
+            max_degree = 4
+        elif n <= 30:
+            max_degree = min(5, n // 3)
+        else:
+            max_degree = min(6, n // 4)
+        
+        current_degree = np.sum(sparsified > 0, axis=1)
+        
+        # Collect candidate edges not in MST
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    # Adjust score by distance penalty
+                    dist_penalty = np.exp(-distance_matrix[i, j] / np.median(distance_matrix))
+                    effective_score = scores[i, j] * dist_penalty
+                    candidates.append((effective_score, i, j))
+        
+        # Sort candidates by effective score
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Greedy selection with degree constraints
+        for _, i, j in candidates:
+            if current_degree[i] < max_degree and current_degree[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[j, i]
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparsified
+    
+    sparsified_scores = adaptive_sparsification(composite)
+    
+    # ==================== 8. FINAL PROCESSING ====================
+    # Ensure symmetry
+    symmetric_scores = (sparsified_scores + sparsified_scores.T) / 2
+    
+    # Final distance-based attenuation
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        dist_decay = np.exp(-distance_matrix / (0.4 * max_dist + 1e-8))
+        symmetric_scores *= dist_decay
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

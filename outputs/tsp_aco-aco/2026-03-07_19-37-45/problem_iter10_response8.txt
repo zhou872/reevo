@@ -1,0 +1,567 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Regret with k-Shortest Paths", "Graph Spectral Embedding", "Reinforcement-Based Weight Learning", "Predictive Candidate Sparsification"]
+}
+```
+
+```python
+import numpy as np
+import random
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with learned weight models, k-shortest path regret,
+    and graph spectral embeddings for spatial dependencies.
+    
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges.
+    """
+    
+    def analyze_instance(distance_matrix: np.ndarray) -> Dict:
+        """Comprehensive instance analysis with spectral properties."""
+        n = distance_matrix.shape[0]
+        if n == 0:
+            return {'n': 0}
+        
+        # Distance statistics
+        triu_idx = np.triu_indices(n, k=1)
+        distances = distance_matrix[triu_idx]
+        
+        stats = {
+            'n': n,
+            'mean_dist': np.mean(distances),
+            'std_dist': np.std(distances),
+            'cv_dist': np.std(distances) / (np.mean(distances) + 1e-8),
+            'min_dist': np.min(distances),
+            'max_dist': np.max(distances)
+        }
+        
+        # Spectral analysis for spatial structure
+        if n >= 4:
+            # Normalized Laplacian for connectivity analysis
+            W = np.exp(-distance_matrix / np.median(distances))
+            np.fill_diagonal(W, 0)
+            D = np.diag(np.sum(W, axis=1))
+            L = D - W
+            
+            # Compute few smallest eigenvalues (using power iteration approximation)
+            try:
+                eigvals = np.linalg.eigvalsh(L[:min(10, n), :min(10, n)])
+                stats['algebraic_connectivity'] = np.sort(eigvals[eigvals > 1e-8])[0] if len(eigvals) > 1 else 1.0
+            except:
+                stats['algebraic_connectivity'] = 1.0
+            
+            # Neighborhood consistency
+            k = min(5, n-1)
+            reciprocal_count = 0
+            for i in range(n):
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                neighbors = set(np.argsort(dists)[:k])
+                for j in neighbors:
+                    if i in set(np.argsort(distance_matrix[j])[:k]):
+                        reciprocal_count += 1
+            stats['reciprocity'] = reciprocal_count / (n * k + 1e-8)
+        
+        return stats
+    
+    def compute_graph_embeddings(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+        """Compute node embeddings using spectral graph methods."""
+        n = stats['n']
+        if n < 4:
+            return np.zeros((n, n))
+        
+        # Build affinity matrix
+        sigma = stats['mean_dist']
+        W = np.exp(-distance_matrix**2 / (2 * sigma**2))
+        np.fill_diagonal(W, 0)
+        
+        # Degree matrix
+        D = np.diag(np.sum(W, axis=1))
+        
+        try:
+            # Compute normalized Laplacian
+            D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-8))
+            L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+            
+            # Get eigenvectors for smallest eigenvalues (excluding 0)
+            eigvals, eigvecs = np.linalg.eigh(L_norm)
+            idx = np.argsort(eigvals)[1:4]  # Skip first zero eigenvalue
+            embeddings = eigvecs[:, idx]
+            
+            # Edge score based on embedding similarity
+            embedding_scores = np.zeros((n, n))
+            for i in range(n):
+                for j in range(i+1, n):
+                    sim = 1.0 / (1.0 + np.linalg.norm(embeddings[i] - embeddings[j]))
+                    embedding_scores[i, j] = embedding_scores[j, i] = sim
+            
+            return embedding_scores
+        except:
+            return np.ones((n, n))
+    
+    def compute_k_shortest_regret(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+        """Enhanced regret analysis using k-shortest path alternatives."""
+        n = stats['n']
+        regret_scores = np.ones((n, n))
+        
+        if n < 4:
+            return regret_scores
+        
+        # Adaptive parameters
+        k_paths = min(5, n//2)  # Number of alternative paths to consider
+        max_hops = min(3, max(2, n//10))
+        
+        # Precompute nearest neighbors
+        k_neighbors = min(15, n-1)
+        neighbor_lists = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            neighbors = np.argsort(dists)[:k_neighbors]
+            neighbor_lists.append(neighbors)
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                direct = distance_matrix[i, j]
+                
+                # Collect alternative paths
+                alternative_costs = []
+                
+                # 2-hop paths
+                for k in neighbor_lists[i][:10]:
+                    if k == j:
+                        continue
+                    if distance_matrix[k, j] < np.inf:
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        alternative_costs.append(alt_cost / 2)
+                
+                # 3-hop paths (if enough nodes)
+                if max_hops >= 3 and n >= 6:
+                    for k in neighbor_lists[i][:5]:
+                        if k == j:
+                            continue
+                        for l in neighbor_lists[k][:5]:
+                            if l in [i, j]:
+                                continue
+                            if distance_matrix[l, j] < np.inf:
+                                alt_cost = distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                                alternative_costs.append(alt_cost / 3)
+                
+                # Calculate regret scores for top k alternatives
+                if alternative_costs:
+                    alternative_costs.sort()
+                    top_k = alternative_costs[:k_paths]
+                    
+                    # Weighted regret score
+                    regrets = []
+                    weights = []
+                    for idx, cost in enumerate(top_k):
+                        regret = direct - cost
+                        if regret > 0:
+                            # Higher weight for better alternatives
+                            weight = np.exp(-idx * 0.5)
+                            regrets.append(regret * weight)
+                            weights.append(weight)
+                    
+                    if regrets and sum(weights) > 0:
+                        avg_regret = sum(regrets) / sum(weights)
+                        # Convert to score (exponential decay)
+                        score = np.exp(-avg_regret / (stats['mean_dist'] + 1e-8))
+                        regret_scores[i, j] = regret_scores[j, i] = score
+        
+        return regret_scores
+    
+    def build_learned_candidate_mask(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+        """Build candidate mask using learned patterns from instance analysis."""
+        n = stats['n']
+        
+        # Base candidate count
+        if n <= 10:
+            base_k = n - 1
+        else:
+            base_k = min(20, int(3 * np.log2(n) + 5))
+        
+        # Adjust based on instance structure
+        if 'reciprocity' in stats:
+            structure_factor = 1.0 + stats['reciprocity']
+            candidate_k = int(base_k * structure_factor)
+        else:
+            candidate_k = base_k
+        
+        candidate_k = min(candidate_k, n - 1)
+        
+        # Build candidate sets
+        candidate_mask = np.zeros((n, n), dtype=bool)
+        
+        # k-nearest neighbors
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            if candidate_k < n - 1:
+                indices = np.argpartition(dists, candidate_k)[:candidate_k]
+            else:
+                indices = np.arange(n)
+                indices = indices[indices != i]
+            candidate_mask[i, indices] = True
+        
+        # Add connections based on clustering tendency
+        if n >= 8:
+            # Identify potential cluster centers
+            centrality = compute_centrality(distance_matrix)
+            cluster_centers = np.argsort(centrality)[-min(3, n//4):]
+            
+            for center in cluster_centers:
+                dists = distance_matrix[center].copy()
+                dists[center] = np.inf
+                cluster_members = np.argsort(dists)[:min(5, n//3)]
+                for member in cluster_members:
+                    candidate_mask[center, member] = True
+                    candidate_mask[member, center] = True
+        
+        # Ensure symmetry and minimum connectivity
+        candidate_mask = candidate_mask | candidate_mask.T
+        np.fill_diagonal(candidate_mask, False)
+        
+        # Ensure each node has at least 3 candidates
+        for i in range(n):
+            if np.sum(candidate_mask[i]) < 3:
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                nearest = np.argsort(dists)[:3]
+                candidate_mask[i, nearest] = True
+                candidate_mask[nearest, i] = True
+        
+        return candidate_mask
+    
+    def compute_centrality(distance_matrix: np.ndarray) -> np.ndarray:
+        """Compute node centrality scores."""
+        n = distance_matrix.shape[0]
+        centrality = np.zeros(n)
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            centrality[i] = 1.0 / (np.mean(dists) + 1e-8)
+        
+        # Normalize
+        if np.max(centrality) > 0:
+            centrality = centrality / np.max(centrality)
+        
+        return centrality
+    
+    def compute_factors(distance_matrix: np.ndarray, stats: Dict) -> Dict:
+        """Compute all heuristic factors."""
+        n = stats['n']
+        factors = {}
+        
+        # 1. Inverse distance (normalized)
+        inv_dist = 1.0 / (distance_matrix + np.eye(n) * 1e-8)
+        np.fill_diagonal(inv_dist, 0)
+        if np.max(inv_dist) > 0:
+            inv_dist = inv_dist / np.max(inv_dist)
+        factors['inv_dist'] = inv_dist
+        
+        # 2. Enhanced regret with k-shortest paths
+        factors['regret'] = compute_k_shortest_regret(distance_matrix, stats)
+        
+        # 3. Graph spectral embeddings
+        factors['embedding'] = compute_graph_embeddings(distance_matrix, stats)
+        
+        # 4. MST-based scores
+        factors['mst'] = compute_mst_scores(distance_matrix)
+        
+        # 5. Centrality-based scores
+        factors['centrality'] = compute_centrality_scores(distance_matrix, stats)
+        
+        return factors
+    
+    def compute_mst_scores(distance_matrix: np.ndarray) -> np.ndarray:
+        """Compute MST edge importance scores."""
+        n = distance_matrix.shape[0]
+        mst_scores = np.ones((n, n))
+        
+        if n > 2:
+            try:
+                mst = minimum_spanning_tree(distance_matrix).toarray()
+                mst_edges = (mst + mst.T) > 0
+                
+                # Boost MST edges based on problem characteristics
+                boost = 1.5 + 0.2 * np.log(n + 1)
+                mst_scores[mst_edges] = boost
+                
+                # Additional boost for critical edges (high degree nodes)
+                degree = np.sum(mst_edges, axis=1)
+                for i in range(n):
+                    if degree[i] >= 3:  # Hub node
+                        neighbors = np.where(mst_edges[i])[0]
+                        for j in neighbors:
+                            mst_scores[i, j] = mst_scores[j, i] = 1.8
+            except:
+                pass
+        
+        np.fill_diagonal(mst_scores, 0)
+        return mst_scores
+    
+    def compute_centrality_scores(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+        """Compute edge scores based on node centrality."""
+        n = stats['n']
+        centrality = compute_centrality(distance_matrix)
+        centrality_scores = np.ones((n, n))
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                # Favor edges connecting central nodes to peripheral ones
+                score = 1.0 + abs(centrality[i] - centrality[j])
+                centrality_scores[i, j] = centrality_scores[j, i] = score
+        
+        # Normalize
+        if np.max(centrality_scores) > 0:
+            centrality_scores = centrality_scores / np.max(centrality_scores)
+        
+        return centrality_scores
+    
+    def optimize_weights_with_learning(distance_matrix: np.ndarray, factors: Dict, 
+                                      candidate_mask: np.ndarray, stats: Dict) -> Dict:
+        """Optimize factor weights using reinforcement learning principles."""
+        n = stats['n']
+        
+        if n < 8:
+            # Simple weights for small instances
+            return {
+                'w_inv': 1.0,
+                'w_regret': 0.8,
+                'w_embedding': 0.6,
+                'w_mst': 0.5,
+                'w_centrality': 0.4
+            }
+        
+        # Base weights from instance analysis
+        base_weights = {
+            'w_inv': 1.0,
+            'w_regret': 0.8 + 0.2 * stats.get('reciprocity', 0.5),
+            'w_embedding': 0.6,
+            'w_mst': max(0.3, 0.7 - 0.02 * n),
+            'w_centrality': 0.4
+        }
+        
+        # Normalize
+        total = sum(base_weights.values())
+        for key in base_weights:
+            base_weights[key] = base_weights[key] / total * 5
+        
+        # Reinforcement learning phase: evaluate weights on sample tours
+        best_weights = base_weights.copy()
+        best_score = -np.inf
+        
+        n_trials = min(30, 10 + n//5)
+        for _ in range(n_trials):
+            # Perturb weights
+            current_weights = {}
+            for key, value in base_weights.items():
+                perturbation = random.uniform(0.7, 1.3)
+                current_weights[key] = max(0.1, value * perturbation)
+            
+            # Evaluate on sample tours
+            score = evaluate_weight_config(distance_matrix, factors, 
+                                          current_weights, candidate_mask, stats)
+            
+            if score > best_score:
+                best_score = score
+                best_weights = current_weights.copy()
+        
+        return best_weights
+    
+    def evaluate_weight_config(distance_matrix: np.ndarray, factors: Dict, 
+                              weights: Dict, candidate_mask: np.ndarray, 
+                              stats: Dict) -> float:
+        """Evaluate weight configuration using sample tours."""
+        n = stats['n']
+        
+        # Generate sample tours
+        sample_tours = generate_sample_tours(distance_matrix, n_samples=min(10, n))
+        
+        # Compute heuristic with current weights
+        H_temp = combine_factors(factors, weights, candidate_mask)
+        
+        # Evaluate tours
+        scores = []
+        for tour in sample_tours:
+            tour_score = 0
+            tour_length = 0
+            
+            for k in range(n):
+                i, j = tour[k], tour[(k+1) % n]
+                if candidate_mask[i, j]:
+                    tour_score += H_temp[i, j]
+                tour_length += distance_matrix[i, j]
+            
+            if tour_length > 0:
+                scores.append(tour_score / tour_length)
+        
+        return np.mean(scores) if scores else 0.0
+    
+    def generate_sample_tours(distance_matrix: np.ndarray, n_samples: int) -> List:
+        """Generate diverse sample tours for evaluation."""
+        n = distance_matrix.shape[0]
+        tours = []
+        
+        # Random tours
+        for _ in range(n_samples // 2):
+            tour = list(np.random.permutation(n))
+            tours.append(tour)
+        
+        # Greedy tours
+        for _ in range(n_samples // 2):
+            start = random.randint(0, n-1)
+            tour = [start]
+            visited = set([start])
+            
+            current = start
+            for _ in range(n-1):
+                dists = distance_matrix[current].copy()
+                for v in visited:
+                    dists[v] = np.inf
+                
+                next_node = np.argmin(dists)
+                tour.append(next_node)
+                visited.add(next_node)
+                current = next_node
+            
+            tours.append(tour)
+        
+        return tours
+    
+    def combine_factors(factors: Dict, weights: Dict, candidate_mask: np.ndarray) -> np.ndarray:
+        """Combine factors using weighted geometric mean."""
+        n = factors['inv_dist'].shape[0]
+        H = np.zeros((n, n))
+        
+        # Extract factor matrices
+        inv_dist = factors['inv_dist']
+        regret = factors['regret']
+        embedding = factors['embedding']
+        mst = factors['mst']
+        centrality = factors['centrality']
+        
+        # Combine only for candidate edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if candidate_mask[i, j]:
+                    product = (
+                        (inv_dist[i, j] ** weights['w_inv']) *
+                        (regret[i, j] ** weights['w_regret']) *
+                        (embedding[i, j] ** weights['w_embedding']) *
+                        (mst[i, j] ** weights['w_mst']) *
+                        (centrality[i, j] ** weights['w_centrality'])
+                    )
+                    weight_sum = sum(weights.values())
+                    H[i, j] = H[j, i] = product ** (1.0 / weight_sum)
+        
+        np.fill_diagonal(H, 0)
+        return H
+    
+    def predictive_sparsification(H: np.ndarray, distance_matrix: np.ndarray,
+                                candidate_mask: np.ndarray, stats: Dict) -> np.ndarray:
+        """Apply predictive sparsification to focus on most promising edges."""
+        n = stats['n']
+        
+        # Ensure minimum connectivity
+        for i in range(n):
+            candidate_indices = np.where(candidate_mask[i])[0]
+            if len(candidate_indices) > 0:
+                candidate_scores = H[i, candidate_indices]
+                # Keep top candidates
+                keep_count = max(3, min(len(candidate_indices) // 2, 10))
+                if len(candidate_scores) > keep_count:
+                    threshold = np.partition(candidate_scores, -keep_count)[-keep_count]
+                    for j in candidate_indices:
+                        if H[i, j] < threshold:
+                            H[i, j] = 0
+        
+        # Apply sigmoid to emphasize strong candidates
+        non_zero = H[H > 0]
+        if len(non_zero) > 0:
+            median_val = np.median(non_zero)
+            H[H > 0] = 1.0 / (1.0 + np.exp(-8.0 * (H[H > 0] - median_val)))
+        
+        # Ensure symmetry
+        H = (H + H.T) / 2.0
+        np.fill_diagonal(H, 0)
+        
+        # Final normalization
+        max_val = np.max(H)
+        if max_val > 0:
+            H = H / max_val
+        
+        return H
+    
+    # ------------------- Main Execution -------------------
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # Step 1: Analyze instance
+    stats = analyze_instance(distance_matrix)
+    
+    # Step 2: Build learned candidate mask
+    candidate_mask = build_learned_candidate_mask(distance_matrix, stats)
+    
+    # Step 3: Compute factors
+    factors = compute_factors(distance_matrix, stats)
+    
+    # Step 4: Optimize weights with learning
+    weights = optimize_weights_with_learning(distance_matrix, factors, 
+                                           candidate_mask, stats)
+    
+    # Step 5: Combine factors
+    H = combine_factors(factors, weights, candidate_mask)
+    
+    # Step 6: Predictive sparsification
+    H = predictive_sparsification(H, distance_matrix, candidate_mask, stats)
+    
+    return H
+
+
+# Example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with various problem sizes
+    for n in [10, 25, 50]:
+        print(f"\nTesting with n = {n}")
+        
+        # Generate random distance matrix
+        points = np.random.rand(n, 2) * 100
+        from scipy.spatial.distance import pdist, squareform
+        dist_matrix = squareform(pdist(points, 'euclidean'))
+        
+        # Compute heuristics
+        H = heuristics_v2(dist_matrix)
+        
+        # Statistics
+        print(f"Shape: {H.shape}")
+        print(f"Non-zero entries: {np.count_nonzero(H)}")
+        print(f"Sparsity: {(H == 0).sum() / H.size:.1%}")
+        print(f"Mean non-zero: {np.mean(H[H > 0]):.4f}")
+        
+        # Verify symmetry
+        symmetric_diff = np.max(np.abs(H - H.T))
+        print(f"Max asymmetry: {symmetric_diff:.6f}")
+        
+        # Show top edges
+        if n <= 25:
+            triu_idx = np.triu_indices_from(H, k=1)
+            top_k = min(5, len(triu_idx[0]))
+            if top_k > 0:
+                values = H[triu_idx]
+                top_indices = np.argsort(values)[-top_k:][::-1]
+                
+                print("\nTop edges:")
+                for idx in top_indices:
+                    i, j = triu_idx[0][idx], triu_idx[1][idx]
+                    print(f"  ({i:2d}, {j:2d}): dist={dist_matrix[i,j]:6.2f}, score={H[i,j]:.4f}")
+```

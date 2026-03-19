@@ -1,0 +1,211 @@
+```json
+{
+    "algorithm_features": ["Adaptive Gaussian Kernel", "Two-Step Chain Regret", "Local Density Bandwidth", "Multiplicative Factor Composition"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic scoring with adaptive Gaussian kernel,
+    two-step nearest-neighbor chain regret, and local density adjustments.
+    
+    Key improvements over v1:
+    1. Adaptive Gaussian kernel with local bandwidth from nearest neighbors
+    2. Efficient two-step chain lookahead using nearest-neighbor precomputation
+    3. Lightweight density-based adjustments without complex nesting
+    4. Multiplicative composition for numerical stability
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores of same shape as input, with higher values indicating
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Handle trivial cases
+        if n == 0:
+            return np.zeros_like(distance_matrix)
+        if n == 1:
+            return np.zeros((1, 1))
+        # For 2 nodes, only one edge exists
+        result = np.zeros((2, 2))
+        result[0, 1] = result[1, 0] = 1.0
+        return result
+    
+    # Create working copy with infinity on diagonal
+    D = distance_matrix.copy().astype(float)
+    np.fill_diagonal(D, np.inf)
+    
+    # 1. Precompute nearest neighbors for efficiency
+    K = min(10, n - 1)  # Number of nearest neighbors to consider
+    neighbor_indices = np.argsort(D, axis=1)[:, :K]
+    
+    # 2. Adaptive Gaussian kernel with local density bandwidth
+    # Compute local bandwidth for each node based on nearest neighbors
+    local_bandwidths = np.zeros(n)
+    for i in range(n):
+        if K > 0:
+            # Use median distance to K nearest neighbors as bandwidth
+            neighbor_dists = D[i, neighbor_indices[i]]
+            local_bandwidths[i] = np.median(neighbor_dists[neighbor_dists < np.inf])
+        else:
+            local_bandwidths[i] = 1.0
+    
+    # Ensure positive bandwidths
+    local_bandwidths = np.maximum(local_bandwidths, 1e-10)
+    
+    # Compute Gaussian kernel with adaptive bandwidth
+    # For edge (i,j), use harmonic mean of individual bandwidths
+    bandwidth_matrix = np.zeros_like(D)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Harmonic mean of bandwidths for edge (i,j)
+                if local_bandwidths[i] > 0 and local_bandwidths[j] > 0:
+                    bandwidth_matrix[i, j] = 2.0 / (1.0/local_bandwidths[i] + 1.0/local_bandwidths[j])
+                else:
+                    bandwidth_matrix[i, j] = max(local_bandwidths[i], local_bandwidths[j])
+    
+    # Gaussian kernel computation
+    gaussian_scores = np.exp(-D**2 / (2 * bandwidth_matrix**2))
+    
+    # 3. MST edge bonus (multiplicative factor of 2)
+    mst = minimum_spanning_tree(D)
+    mst_edges = (mst.toarray() > 0)
+    mst_bonus = np.ones_like(D)
+    mst_bonus[mst_edges] = 2.0
+    
+    # 4. Two-step chain regret via efficient nearest-neighbor lookup
+    chain_regret = np.ones_like(D)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j or D[i, j] == np.inf:
+                continue
+                
+            # Find best two-step chain (i -> k -> j) through nearest neighbors
+            best_chain_cost = np.inf
+            
+            # Consider nearest neighbors of i and j as intermediate nodes
+            candidates = set(neighbor_indices[i].tolist() + neighbor_indices[j].tolist())
+            candidates.discard(i)
+            candidates.discard(j)
+            
+            for k in candidates:
+                if D[i, k] < np.inf and D[k, j] < np.inf:
+                    chain_cost = D[i, k] + D[k, j]
+                    if chain_cost < best_chain_cost:
+                        best_chain_cost = chain_cost
+            
+            if best_chain_cost < np.inf and best_chain_cost > 0:
+                # Calculate normalized regret: how much worse is direct edge than best chain
+                regret_ratio = D[i, j] / best_chain_cost
+                # Exponential decay: edges much worse than best chain get penalized
+                chain_regret[i, j] = np.exp(-max(0, regret_ratio - 1.0))
+            else:
+                # No viable chain found - edge might be critical
+                chain_regret[i, j] = 1.0
+    
+    # 5. Local density adjustment
+    # Compute local density scores (nodes in dense regions get slight bonus)
+    density_scores = np.ones(n)
+    k_density = min(5, n - 1)
+    
+    for i in range(n):
+        if k_density > 0:
+            # Average distance to k_density nearest neighbors
+            neighbor_dists = D[i, neighbor_indices[i, :k_density]]
+            avg_dist = np.mean(neighbor_dists[neighbor_dists < np.inf])
+            if avg_dist > 0:
+                # Nodes with closer neighbors get higher density scores
+                density_scores[i] = 1.0 / avg_dist
+    
+    # Normalize density scores
+    if density_scores.max() > density_scores.min():
+        density_scores = (density_scores - density_scores.min()) / (density_scores.max() - density_scores.min())
+        density_scores = 0.8 + 0.4 * density_scores  # Scale to [0.8, 1.2]
+    
+    # Apply density adjustment to edges
+    density_adjustment = np.ones_like(D)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if D[i, j] < np.inf:
+                # Geometric mean of node densities
+                density_adjustment[i, j] = density_adjustment[j, i] = np.sqrt(density_scores[i] * density_scores[j])
+    
+    # 6. Combine all factors multiplicatively
+    scores = gaussian_scores * mst_bonus * chain_regret * density_adjustment
+    
+    # 7. Intelligent sparsification
+    # Determine candidate set size adaptively
+    candidate_size = min(20, n - 1, max(3, int(np.sqrt(n))))
+    
+    # Initialize mask
+    mask = np.zeros_like(scores, dtype=bool)
+    
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        if n > candidate_size:
+            # Select top candidate_size edges per node
+            top_indices = np.argpartition(row_scores, -candidate_size)[-candidate_size:]
+        else:
+            # Include all edges for small graphs
+            top_indices = np.arange(n)
+            top_indices = top_indices[top_indices != i]
+        
+        mask[i, top_indices] = True
+    
+    # Ensure symmetry and include MST edges
+    mask = mask | mask.T | mst_edges
+    
+    # Apply sparsification
+    scores = scores * mask
+    
+    # 8. Final normalization and cleanup
+    np.fill_diagonal(scores, 0)
+    
+    # Normalize to [0, 1] range
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    return scores
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Simple test with random points
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero elements:", np.count_nonzero(heuristics))
+    print("Max value:", np.max(heuristics))
+    print("Min non-zero value:", heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 0)
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print("Matrix is symmetric:", is_symmetric)
+    
+    # Check MST edges are included
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst_edges = (mst + mst.T) > 0
+    mst_included = np.all(heuristics[mst_edges] > 0)
+    print("All MST edges have non-zero heuristics:", mst_included)
+```

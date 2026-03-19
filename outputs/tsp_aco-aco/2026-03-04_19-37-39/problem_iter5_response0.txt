@@ -1,0 +1,191 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "Top-m Sparsification", "Multi-Criteria Edge Selection", "Connectivity Guarantee"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with adaptive weighting
+    based on distance variability and intelligent sparsification.
+    
+    Key improvements:
+    1. Adaptive weight tuning based on coefficient of variation of distances
+    2. Top-m sparsification with problem-size-dependent parameter tuning
+    3. Multi-criteria edge selection combining inverse distance, nearest neighbors,
+       MST connectivity, and centrality measures
+    4. Guaranteed connectivity through MST preservation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== 1. ADAPTIVE WEIGHT TUNING BASED ON VARIABILITY ==========
+    # Compute coefficient of variation (std/mean) of distances
+    # Exclude diagonal and zeros for meaningful statistics
+    flat_dists = distance_matrix.flatten()
+    valid_dists = flat_dists[(flat_dists > 0) & ~np.isinf(flat_dists)]
+    
+    if len(valid_dists) > 1:
+        cv = np.std(valid_dists) / np.mean(valid_dists)
+    else:
+        cv = 0.5  # Default value
+    
+    # Adaptive weights based on coefficient of variation
+    # Higher CV means more variability, so we weight inverse distance more
+    if cv > 1.0:
+        # Highly variable distances: emphasize inverse distance
+        inv_dist_weight = 0.7
+        centrality_weight = 0.2
+        nn_boost = 1.2
+        mst_boost = 1.5
+    elif cv > 0.5:
+        # Moderately variable: balanced approach
+        inv_dist_weight = 0.5
+        centrality_weight = 0.3
+        nn_boost = 1.3
+        mst_boost = 1.8
+    else:
+        # Low variability: emphasize centrality and connectivity
+        inv_dist_weight = 0.3
+        centrality_weight = 0.5
+        nn_boost = 1.4
+        mst_boost = 2.0
+    
+    # Adjust weights based on problem size
+    size_factor = min(1.0, n / 100.0)  # Normalize by problem size
+    inv_dist_weight *= (1.0 - 0.2 * size_factor)
+    centrality_weight *= (1.0 + 0.1 * size_factor)
+    
+    # ========== 2. BASE COMPONENTS ==========
+    # Inverse distance with regularization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Nearest neighbors with adaptive k
+    k = max(2, min(5, n // 4))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        nn_mask[i, nn_indices] = True
+    nn_mask = nn_mask | nn_mask.T  # Make symmetric
+    
+    # Minimum spanning tree for connectivity guarantee
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # ========== 3. CENTRALITY MEASURE WITH ADAPTIVE SCALING ==========
+    # Compute node importance based on distance distribution
+    row_sums = np.sum(distance_matrix, axis=1) - np.diag(distance_matrix)
+    
+    # Adaptive centrality based on distance variability
+    if cv > 0.7:
+        # For high variability, use median to reduce outlier effects
+        centrality = 1 / (np.median(row_sums) + 1e-10)
+        centrality = np.ones(n) * centrality  # Uniform for high variability
+    else:
+        # For low variability, use individual node characteristics
+        avg_dist = row_sums / (n - 1)
+        # Clip extreme values (10th to 90th percentile)
+        lower_bound = np.percentile(avg_dist, 10)
+        upper_bound = np.percentile(avg_dist, 90)
+        robust_avg = np.clip(avg_dist, lower_bound, upper_bound)
+        centrality = 1 / (robust_avg + 1e-10)
+        
+        # Normalize with softmax
+        centrality = np.exp(centrality - np.max(centrality))
+        centrality = centrality / (np.sum(centrality) + 1e-10)
+    
+    # Edge potential as product of node centralities
+    edge_potential = np.outer(centrality, centrality)
+    np.fill_diagonal(edge_potential, 0)
+    
+    # ========== 4. ADAPTIVE COMBINATION ==========
+    heuristic_scores = np.zeros_like(distance_matrix)
+    
+    # Base combination with tuned weights
+    base_component = inv_dist_weight * inv_dist + centrality_weight * edge_potential
+    heuristic_scores = base_component.copy()
+    
+    # Boost for important edges
+    heuristic_scores[nn_mask] *= nn_boost
+    heuristic_scores[mst_mask] *= mst_boost
+    
+    # ========== 5. TOP-M SPARSIFICATION ==========
+    # Adaptive m parameter: max(3, min(8, n//3))
+    m = max(3, min(8, n // 3))
+    
+    # Create sparsity mask
+    sparsity_mask = np.zeros_like(heuristic_scores, dtype=bool)
+    
+    # For each node, keep top m edges by heuristic score
+    for i in range(n):
+        # Get scores for this node (excluding self)
+        node_scores = heuristic_scores[i].copy()
+        node_scores[i] = -np.inf  # Exclude self
+        
+        # Get indices of top m edges
+        if m < n - 1:
+            top_indices = np.argpartition(node_scores, -m)[-m:]
+        else:
+            top_indices = np.where(node_scores > -np.inf)[0]
+        
+        sparsity_mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Always include MST edges for connectivity guarantee
+    sparsity_mask = sparsity_mask | mst_mask
+    
+    # ========== 6. FINAL PROCESSING ==========
+    # Apply sparsification
+    heuristic_scores = heuristic_scores * sparsity_mask
+    
+    # Ensure each node has at least 2 connections (for Hamiltonian cycle)
+    for i in range(n):
+        connections = np.sum(sparsity_mask[i])
+        if connections < 2:
+            # Add best missing connections
+            node_scores = heuristic_scores[i].copy()
+            node_scores[i] = -np.inf
+            node_scores[sparsity_mask[i]] = -np.inf  # Already included
+            
+            needed = 2 - connections
+            if needed > 0:
+                best_indices = np.argsort(node_scores)[-needed:]
+                sparsity_mask[i, best_indices] = True
+                sparsity_mask[best_indices, i] = True
+    
+    # Reapply sparsification with updated mask
+    heuristic_scores = heuristic_scores * sparsity_mask
+    
+    # Final normalization
+    max_val = np.max(heuristic_scores)
+    if max_val > 0:
+        heuristic_scores = heuristic_scores / max_val
+    
+    # Zero out diagonal
+    np.fill_diagonal(heuristic_scores, 0)
+    
+    return heuristic_scores
+```

@@ -1,0 +1,166 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Boost", "Vectorized Local Patterns", "Adaptive Sparsification", "Hybrid Edge Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics combining lightweight MST insights with 
+    vectorized pattern analysis and adaptive sparsification.
+    
+    Key innovations:
+    1. Fast MST approximation for connectivity preservation
+    2. Vectorized computation of local triangle completion patterns
+    3. Adaptive edge scoring based on multiple complementary factors
+    4. Intelligent sparsification maintaining graph connectivity
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Matrix of edge promise indicators (same shape as input)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Dynamic parameter adaptation
+    k_nn = max(2, min(12, n // 6))  # Adaptive nearest neighbors
+    keep_per_node = max(3, min(10, n // 5))  # Target edge density
+    
+    # 2. Base inverse distance with safe handling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Row-normalize inverse distances
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    inv_dist_norm = inv_dist / row_sums
+    
+    # 3. Fast MST approximation (Christofides-inspired)
+    mst_factor = np.zeros_like(distance_matrix)
+    if n <= 2000:  # Limit for computational feasibility
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst > 0) | (mst.T > 0)
+            # Boost MST edges significantly
+            mst_factor[mst_mask] = 1.0
+        except:
+            # Fallback: use nearest neighbors as MST proxy
+            for i in range(n):
+                sorted_idx = np.argsort(distance_matrix[i])
+                mst_factor[i, sorted_idx[1:3]] = 0.5  # Connect to 2 closest
+    
+    # 4. Vectorized nearest neighbor factor
+    nn_factor = np.zeros_like(distance_matrix)
+    
+    # Get k_nn nearest neighbors for each node
+    # Use argpartition for efficiency with large n
+    if n > k_nn + 1:
+        # Get indices of k_nn+1 smallest distances (including self)
+        partitioned = np.argpartition(distance_matrix, k_nn + 1, axis=1)[:, :k_nn + 1]
+        
+        for i in range(n):
+            # Exclude self and assign weights by rank
+            neighbors = partitioned[i][partitioned[i] != i][:k_nn]
+            if len(neighbors) > 0:
+                # Exponential decay based on rank
+                ranks = np.arange(len(neighbors))
+                weights = np.exp(-ranks / 2.0)
+                nn_factor[i, neighbors] = weights
+    else:
+        # For very small n, mark all edges
+        nn_factor = np.ones_like(distance_matrix)
+        np.fill_diagonal(nn_factor, 0)
+    
+    # Symmetrize
+    nn_factor = np.maximum(nn_factor, nn_factor.T)
+    
+    # 5. Vectorized triangle completion factor
+    triangle_factor = np.zeros_like(distance_matrix)
+    
+    if n >= 4:
+        # Find moderately short edges (below 40th percentile for each node)
+        percentiles = np.percentile(distance_matrix, 40, axis=1, keepdims=True)
+        short_edges = distance_matrix <= percentiles
+        np.fill_diagonal(short_edges, False)
+        
+        # Count common short neighbors (vectorized)
+        common_short = short_edges @ short_edges.T
+        
+        # Normalize by possible maximum
+        max_common = n - 2
+        if max_common > 0:
+            triangle_factor = common_short.astype(float) / max_common
+    
+    # 6. Dynamic weight combination based on problem size
+    if n < 30:
+        weights = [0.25, 0.35, 0.20, 0.20]  # inv_dist, nn, triangle, mst
+    elif n < 150:
+        weights = [0.20, 0.30, 0.25, 0.25]
+    else:
+        weights = [0.15, 0.35, 0.30, 0.20]
+    
+    # Combine factors
+    combined = (
+        weights[0] * inv_dist_norm +
+        weights[1] * nn_factor +
+        weights[2] * triangle_factor +
+        weights[3] * mst_factor
+    )
+    
+    # 7. Adaptive sparsification with connectivity guarantee
+    sparsity_mask = np.zeros_like(combined, dtype=bool)
+    
+    for i in range(n):
+        # Get heuristic values for this node (excluding self)
+        node_vals = combined[i].copy()
+        node_vals[i] = -np.inf
+        
+        # Always include top keep_per_node edges
+        top_indices = np.argsort(node_vals)[-keep_per_node:]
+        sparsity_mask[i, top_indices] = True
+        
+        # Ensure MST edges are included if available
+        if np.any(mst_factor[i] > 0):
+            mst_neighbors = np.where(mst_factor[i] > 0)[0]
+            sparsity_mask[i, mst_neighbors] = True
+    
+    # Ensure symmetry and connectivity
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Additional connectivity check: ensure each node has at least 2 connections
+    for i in range(n):
+        connections = np.sum(sparsity_mask[i])
+        if connections < 2:
+            # Add nearest neighbors
+            sorted_idx = np.argsort(distance_matrix[i])
+            added = 0
+            for j in sorted_idx:
+                if j != i and not sparsity_mask[i, j]:
+                    sparsity_mask[i, j] = sparsity_mask[j, i] = True
+                    added += 1
+                    if connections + added >= 2:
+                        break
+    
+    # Apply sparsification
+    result = np.zeros_like(combined)
+    result[sparsity_mask] = combined[sparsity_mask]
+    
+    # Final symmetrization and diagonal zeroing
+    result = (result + result.T) / 2
+    np.fill_diagonal(result, 0)
+    
+    # 8. Soft normalization to [0, 1] range
+    max_val = result.max()
+    if max_val > 0:
+        result = result / max_val
+    
+    return result
+```

@@ -1,0 +1,353 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsification", "Centrality Fusion", "Entropy-based Exploration"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial
+from scipy.sparse import csgraph
+import heapq
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with optimized performance and adaptive learning.
+    
+    Key improvements:
+    1. Dynamic parameter adaptation based on graph characteristics
+    2. Scalable centrality approximation for large instances
+    3. Vectorized sparsification for efficiency
+    4. Learning-inspired weight adjustment
+    
+    Returns: Non-negative matrix normalized by row for stochastic edge sampling
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / np.maximum(distance_matrix, 1e-10)
+        np.fill_diagonal(result, 0)
+        row_sums = result.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return result / row_sums
+    
+    # ===== 1. GRAPH CHARACTERIZATION =====
+    # Efficient Euclidean score estimation
+    euclidean_score = estimate_euclidean_score(distance_matrix, n)
+    
+    # Distance statistics for adaptive parameters
+    dist_stats = compute_distance_statistics(distance_matrix)
+    
+    # ===== 2. BASE COMPONENTS =====
+    # 2.1 Inverse distance with adaptive epsilon
+    epsilon = max(1e-10, dist_stats['std'] * 0.01)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2.2 MST connectivity with fallback
+    mst_mask = compute_mst_mask(distance_matrix, n)
+    
+    # ===== 3. ADAPTIVE CENTRALITY FUSION =====
+    centrality_matrix = compute_centrality_matrix(distance_matrix, n, euclidean_score)
+    
+    # ===== 4. DYNAMIC WEIGHT LEARNING =====
+    weights = compute_adaptive_weights(euclidean_score, dist_stats, n)
+    
+    # ===== 5. COMBINE COMPONENTS =====
+    combined = (
+        weights['inv'] * inv_dist +
+        weights['mst'] * mst_mask.astype(float) * 2.0 +
+        weights['cent'] * centrality_matrix
+    )
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    # ===== 6. VECTORIZED ADAPTIVE SPARSIFICATION =====
+    sparsified = vectorized_sparsification(combined, distance_matrix, n, dist_stats)
+    
+    # ===== 7. FINAL PROCESSING =====
+    result = finalize_heuristic(sparsified, inv_dist, euclidean_score, dist_stats)
+    
+    return result
+
+
+def estimate_euclidean_score(distance_matrix: np.ndarray, n: int) -> float:
+    """Efficiently estimate how Euclidean the distance matrix is."""
+    if n < 3:
+        return 1.0
+    
+    sample_size = min(100, n)
+    indices = np.random.choice(n, sample_size, replace=False)
+    
+    # Vectorized triangle inequality check
+    violations = 0
+    total_checks = 0
+    
+    # Sample triplets
+    for i in range(sample_size):
+        for j in range(i + 1, sample_size):
+            for k in range(j + 1, sample_size):
+                a, b, c = indices[i], indices[j], indices[k]
+                # Check all permutations of triangle inequality
+                d_ab = distance_matrix[a, b]
+                d_ac = distance_matrix[a, c]
+                d_bc = distance_matrix[b, c]
+                
+                violations += int(d_ab > d_ac + d_bc + 1e-6)
+                violations += int(d_ac > d_ab + d_bc + 1e-6)
+                violations += int(d_bc > d_ab + d_ac + 1e-6)
+                total_checks += 3
+    
+    return 1.0 - violations / max(total_checks, 1)
+
+
+def compute_distance_statistics(distance_matrix: np.ndarray) -> dict:
+    """Compute statistics for adaptive parameter tuning."""
+    n = distance_matrix.shape[0]
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    return {
+        'mean': np.mean(distances) if len(distances) > 0 else 1.0,
+        'std': np.std(distances) if len(distances) > 0 else 1.0,
+        'cv': np.std(distances) / (np.mean(distances) + 1e-10) if len(distances) > 0 else 1.0,
+        'min': np.min(distances) if len(distances) > 0 else 1.0,
+        'max': np.max(distances) if len(distances) > 0 else 1.0
+    }
+
+
+def compute_mst_mask(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute MST mask with fallback for large graphs."""
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    try:
+        # For large graphs, use sparse representation if possible
+        if n > 1000:
+            # Sample-based MST approximation for very large graphs
+            sample_size = min(500, n)
+            sample_indices = np.random.choice(n, sample_size, replace=False)
+            sampled_dist = distance_matrix[np.ix_(sample_indices, sample_indices)]
+            
+            if np.any(np.isinf(sampled_dist)) or np.any(np.isnan(sampled_dist)):
+                return mst_mask
+                
+            mst_sampled = csgraph.minimum_spanning_tree(sampled_dist).toarray()
+            mst_sampled_mask = mst_sampled > 0
+            
+            # Map back to original indices (approximate)
+            for i in range(sample_size):
+                for j in range(sample_size):
+                    if mst_sampled_mask[i, j]:
+                        mst_mask[sample_indices[i], sample_indices[j]] = True
+                        mst_mask[sample_indices[j], sample_indices[i]] = True
+        else:
+            # Exact MST for moderate-sized graphs
+            mst = csgraph.minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = mst > 0
+    except Exception:
+        pass
+    
+    return mst_mask
+
+
+def compute_centrality_matrix(distance_matrix: np.ndarray, n: int, 
+                             euclidean_score: float) -> np.ndarray:
+    """Compute centrality matrix with scalable approximations."""
+    # Basic closeness centrality
+    row_sums = distance_matrix.sum(axis=1)
+    closeness_centrality = 1 / (row_sums + 1e-10)
+    
+    # Choose method based on graph size and Euclidean-ness
+    if n <= 300 or euclidean_score > 0.9:
+        # Use exact or approximate methods
+        if n <= 100:
+            # Floyd-Warshall for small graphs
+            shortest_paths = distance_matrix.copy()
+            for k in range(n):
+                through_k = shortest_paths[:, k:k+1] + shortest_paths[k:k+1, :]
+                shortest_paths = np.minimum(shortest_paths, through_k)
+            sp_sums = shortest_paths.sum(axis=1)
+        else:
+            # Landmark-based approximation for medium graphs
+            landmarks = min(20, n // 10)
+            landmark_indices = np.random.choice(n, landmarks, replace=False)
+            
+            # Compute distances to landmarks
+            landmark_dists = distance_matrix[:, landmark_indices]
+            sp_sums = landmark_dists.mean(axis=1) * n
+        
+        sp_centrality = 1 / (sp_sums + 1e-10)
+    else:
+        # For large non-Euclidean graphs, use simpler approximation
+        sp_centrality = closeness_centrality.copy()
+    
+    # Normalize and combine
+    closeness_norm = closeness_centrality / (closeness_centrality.max() + 1e-10)
+    sp_norm = sp_centrality / (sp_centrality.max() + 1e-10)
+    
+    # Dynamic combination based on Euclidean score
+    alpha = 0.5 + 0.3 * euclidean_score  # More weight to closeness for Euclidean graphs
+    combined_centrality = alpha * closeness_norm + (1 - alpha) * sp_norm
+    
+    # Create centrality matrix
+    centrality_matrix = np.outer(combined_centrality, combined_centrality)
+    
+    return centrality_matrix
+
+
+def compute_adaptive_weights(euclidean_score: float, dist_stats: dict, 
+                            n: int) -> dict:
+    """Compute adaptive weights based on graph characteristics."""
+    # Base weights
+    base_weights = {'inv': 0.4, 'mst': 0.3, 'cent': 0.3}
+    
+    # Adjust based on Euclidean score
+    if euclidean_score > 0.8:
+        # Euclidean graphs: emphasize MST and inverse distance
+        base_weights['inv'] += 0.1
+        base_weights['mst'] += 0.1
+        base_weights['cent'] -= 0.2
+    elif euclidean_score < 0.3:
+        # Non-Euclidean: emphasize centrality
+        base_weights['cent'] += 0.2
+        base_weights['inv'] -= 0.1
+        base_weights['mst'] -= 0.1
+    
+    # Adjust based on distance variation
+    cv = dist_stats['cv']
+    if cv > 1.5:
+        # High variation: emphasize centrality
+        base_weights['cent'] += 0.1
+        base_weights['inv'] -= 0.05
+        base_weights['mst'] -= 0.05
+    elif cv < 0.5:
+        # Low variation: emphasize MST
+        base_weights['mst'] += 0.1
+        base_weights['cent'] -= 0.1
+    
+    # Adjust for graph size
+    size_factor = min(1.0, n / 1000)
+    base_weights['cent'] *= (1.0 - 0.3 * size_factor)  # Less centrality for large graphs
+    base_weights['inv'] *= (1.0 + 0.2 * size_factor)   # More inverse distance for large graphs
+    
+    # Normalize
+    total = sum(base_weights.values())
+    return {k: v / total for k, v in base_weights.items()}
+
+
+def vectorized_sparsification(combined: np.ndarray, distance_matrix: np.ndarray,
+                            n: int, dist_stats: dict) -> np.ndarray:
+    """Vectorized adaptive sparsification with row-wise processing."""
+    sparsified = np.zeros_like(combined)
+    
+    # Base parameters
+    base_k = max(3, min(15, int(np.sqrt(n))))
+    cv = dist_stats['cv']
+    
+    # Adaptive k range
+    k_min = max(2, base_k // 2)
+    k_max = min(n - 1, int(base_k * min(3.0, 1.0 + cv)))
+    
+    # Process each row
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Find positive values
+        positive_mask = row > 0
+        if not positive_mask.any():
+            # Fallback: use closest neighbors
+            k = min(base_k, n - 1)
+            sorted_idx = np.argsort(distance_matrix[i])[1:k+1]
+            sparsified[i, sorted_idx] = 1.0
+            continue
+        
+        positive_indices = np.where(positive_mask)[0]
+        positive_values = row[positive_indices]
+        
+        # Calculate row statistics
+        row_mean = np.mean(positive_values)
+        row_std = np.std(positive_values)
+        row_cv = row_std / (row_mean + 1e-10)
+        
+        # Adaptive k for this row
+        k = int(base_k * np.clip(1.0 + row_cv, 0.5, 2.0))
+        k = min(max(k, k_min), k_max, len(positive_indices))
+        
+        # Calculate entropy for temperature
+        if len(positive_values) > 1:
+            probs = positive_values / (positive_values.sum() + 1e-10)
+            entropy = -np.sum(probs * np.log(probs + 1e-10))
+            max_entropy = np.log(len(positive_values))
+            rel_entropy = entropy / max_entropy if max_entropy > 0 else 0.5
+        else:
+            rel_entropy = 0.5
+        
+        # Temperature control
+        temperature = 0.5 + rel_entropy  # Range: 0.5 to 1.5
+        
+        # Stochastic selection with noise
+        scores = positive_values.copy()
+        noise_scale = 0.1 * temperature
+        noise = noise_scale * np.random.randn(len(scores))
+        noisy_scores = scores * (1.0 + noise)
+        
+        # Select top k
+        top_k_idx = np.argsort(noisy_scores)[-k:]
+        selected_indices = positive_indices[top_k_idx]
+        
+        # Apply exponential decay based on original scores
+        selected_values = positive_values[top_k_idx]
+        sorted_order = np.argsort(selected_values)[::-1]
+        ranks = np.arange(len(sorted_order))
+        
+        # Exponential decay
+        decay_factors = np.exp(-ranks / 1.5)
+        decayed_values = selected_values[sorted_order] * decay_factors
+        
+        # Assign to sparsified matrix
+        for idx, j in enumerate(selected_indices[sorted_order]):
+            sparsified[i, j] = decayed_values[idx]
+    
+    return sparsified
+
+
+def finalize_heuristic(sparsified: np.ndarray, inv_dist: np.ndarray,
+                      euclidean_score: float, dist_stats: dict) -> np.ndarray:
+    """Final processing and normalization."""
+    n = sparsified.shape[0]
+    
+    # Ensure symmetry
+    result = (sparsified + sparsified.T) / 2
+    
+    # Add adaptive exploration noise
+    cv = dist_stats['cv']
+    exploration_factor = 0.03 * (1.0 - euclidean_score) + 0.02 * min(cv, 2.0)
+    noise = exploration_factor * np.abs(np.random.randn(n, n))
+    np.fill_diagonal(noise, 0)
+    result = np.maximum(result + noise, 0)
+    
+    # Zero diagonal
+    np.fill_diagonal(result, 0)
+    
+    # Row normalization with fallback
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Use inverse distance as fallback for disconnected rows
+        fallback = inv_dist[zero_rows]
+        result[zero_rows] = fallback
+        row_sums[zero_rows] = fallback.sum(axis=1, keepdims=True)
+    
+    row_sums[row_sums == 0] = 1
+    result = result / row_sums
+    
+    return result
+```

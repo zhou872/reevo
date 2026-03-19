@@ -1,0 +1,199 @@
+```json
+{
+    "algorithm_features": ["MST-Based Edge Priority", "Degree-Constrained Sparsification", "Geometric Clustering Bonus", "Distance-Constrained Regret Penalty"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining multiple geometric and graph-theoretic factors.
+    Returns a sparse matrix where high values indicate promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return 1.0 / (distance_matrix + np.eye(n))
+    
+    heuristics = np.zeros((n, n))
+    np.fill_diagonal(heuristics, 0.0)
+    
+    # Factor 1: Inverse distance (baseline)
+    with np.errstate(divide='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    
+    # Factor 2: Minimum Spanning Tree edges get priority
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # Factor 3: Geometric clustering bonus
+    cluster_bonus = _compute_cluster_bonus(distance_matrix)
+    
+    # Factor 4: Node centrality penalty (regret-based)
+    regret_penalty = _compute_regret_penalty(distance_matrix)
+    
+    # Combined scoring
+    base_score = inv_dist * (1.0 + 0.5 * mst_mask) * (1.0 + cluster_bonus)
+    heuristics = base_score * (1.0 - 0.3 * regret_penalty)
+    
+    # Sparsification: Keep only promising edges
+    heuristics = _sparsify_edges(heuristics, distance_matrix, mst_mask)
+    
+    # Ensure symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2.0
+    np.fill_diagonal(heuristics, 0.0)
+    
+    return heuristics
+
+def _compute_mst_mask(dist_matrix: np.ndarray) -> np.ndarray:
+    """Binary mask for edges in the Minimum Spanning Tree using Prim's algorithm."""
+    n = dist_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=float)
+    
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    # Prim's algorithm
+    for _ in range(n - 1):
+        min_edge = None
+        min_dist = np.inf
+        
+        # Find minimum edge from visited to unvisited
+        for i in np.where(visited)[0]:
+            for j in np.where(~visited)[0]:
+                if dist_matrix[i, j] < min_dist:
+                    min_dist = dist_matrix[i, j]
+                    min_edge = (i, j)
+        
+        if min_edge:
+            i, j = min_edge
+            mst_mask[i, j] = 1.0
+            mst_mask[j, i] = 1.0
+            visited[j] = True
+    
+    return mst_mask
+
+def _compute_cluster_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Bonus for edges within dense clusters.
+    Uses KDTree for efficient nearest neighbor search.
+    """
+    n = dist_matrix.shape[0]
+    bonus = np.zeros((n, n))
+    
+    # Estimate point positions using multidimensional scaling (simplified)
+    # Use first few eigenvectors of the normalized distance matrix
+    from scipy.sparse.linalg import eigs
+    
+    # Double centering
+    row_mean = dist_matrix.mean(axis=1, keepdims=True)
+    col_mean = dist_matrix.mean(axis=0, keepdims=True)
+    grand_mean = dist_matrix.mean()
+    B = -0.5 * (dist_matrix - row_mean - col_mean + grand_mean)
+    
+    # Get 2D embedding (if possible)
+    try:
+        eigvals, eigvecs = eigs(B, k=min(3, n-2))
+        coords = eigvecs.real[:, :2] * np.sqrt(np.abs(eigvals[:2].real))
+        
+        # Build KDTree for spatial queries
+        tree = KDTree(coords)
+        
+        # Find k nearest neighbors for each point
+        k = min(10, n // 4)
+        distances, indices = tree.query(coords, k=k+1)  # +1 for self
+        
+        for i in range(n):
+            for idx in indices[i][1:]:  # Exclude self
+                if i < idx:
+                    # Bonus inversely proportional to rank in neighbor list
+                    rank = np.where(indices[i] == idx)[0][0]
+                    bonus_factor = 1.0 / (rank + 1)
+                    bonus[i, idx] = bonus_factor
+                    bonus[idx, i] = bonus_factor
+    except:
+        # Fallback: use distance-based clustering
+        for i in range(n):
+            # Find closest 20% of nodes
+            k = max(2, n // 5)
+            closest = np.argsort(dist_matrix[i])[1:k+1]  # Exclude self
+            for j in closest:
+                if i < j:
+                    rank = np.where(np.argsort(dist_matrix[i]) == j)[0][0]
+                    bonus_factor = 1.0 / (rank + 1)
+                    bonus[i, j] = bonus_factor
+                    bonus[j, i] = bonus_factor
+    
+    return bonus
+
+def _compute_regret_penalty(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Penalize edges that, if not taken, would force very poor alternatives.
+    High penalty for edges from nodes with few good connections.
+    """
+    n = dist_matrix.shape[0]
+    penalty = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get sorted distances from node i (excluding self)
+        sorted_dists = np.sort(dist_matrix[i])
+        sorted_dists = sorted_dists[sorted_dists > 0]
+        
+        if len(sorted_dists) >= 3:
+            # Regret: difference between 2nd best and 3rd best alternative
+            regret = sorted_dists[2] - sorted_dists[1]
+            max_regret = np.max(sorted_dists[2:]) - np.min(sorted_dists[1:-1])
+            
+            if max_regret > 0:
+                normalized_regret = regret / max_regret
+                # Distribute penalty to edges from this node
+                for j in range(n):
+                    if i != j:
+                        # Penalize edges that are not among the top alternatives
+                        rank = np.sum(dist_matrix[i] < dist_matrix[i, j]) - 1
+                        if rank >= 2:  # Not in top 2
+                            penalty[i, j] = normalized_regret * (rank / n)
+    
+    return penalty
+
+def _sparsify_edges(heuristics: np.ndarray, dist_matrix: np.ndarray, mst_mask: np.ndarray) -> np.ndarray:
+    """
+    Sparsify the heuristic matrix by keeping:
+    1. All MST edges
+    2. Top k edges per node (k based on node degree in MST)
+    3. Edges above adaptive threshold
+    """
+    n = heuristics.shape[0]
+    result = np.zeros((n, n))
+    
+    # Always keep MST edges
+    result[mst_mask == 1.0] = heuristics[mst_mask == 1.0]
+    
+    # Determine target sparsity
+    target_edges = min(3 * n, (n * (n - 1)) // 4)  # Aim for ~25% density
+    
+    # Keep strongest edges globally
+    flat_indices = np.argsort(heuristics.flatten())[::-1]
+    kept_edges = 0
+    
+    for idx in flat_indices:
+        if kept_edges >= target_edges:
+            break
+        
+        i = idx // n
+        j = idx % n
+        
+        if i != j and result[i, j] == 0:
+            # Additional constraint: don't add edges much longer than MST edges
+            mst_distances = dist_matrix[mst_mask == 1.0]
+            if len(mst_distances) > 0:
+                avg_mst_dist = np.mean(mst_distances)
+                if dist_matrix[i, j] < 3 * avg_mst_dist:  # Reasonable length bound
+                    result[i, j] = heuristics[i, j]
+                    kept_edges += 1
+    
+    return result
+```

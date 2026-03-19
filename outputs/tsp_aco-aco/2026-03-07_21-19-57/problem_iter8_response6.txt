@@ -1,0 +1,405 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Regret", "Instance-Adaptive Feature Weighting", "Graph Neural Network-Inspired Structural Scoring", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+from scipy.stats import skew
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with global path considerations
+    and instance-adaptive feature integration.
+    
+    Core innovations:
+    1. Two-step Lookahead Regret: Evaluates edge quality considering potential subsequent
+       moves, prioritizing edges that enable good next steps
+    2. Instance-Adaptive Feature Weighting: Dynamically adjusts component weights based
+       on problem instance characteristics (distance distribution, sparsity, symmetry)
+    3. GNN-Inspired Structural Scoring: Emulates graph neural network behavior by
+       propagating node features through adjacency relationships
+    4. Connectivity-Preserving Sparsification: Maintains solution feasibility while
+       focusing computational effort on promising edges
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges,
+        with unpromising edges set to zero
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # =====================================================================
+    # 1. INSTANCE CHARACTERIZATION FOR ADAPTIVE WEIGHTING
+    # =====================================================================
+    # Compute instance statistics to guide weight adaptation
+    flat_distances = distance_matrix[np.triu_indices(n, k=1)]
+    
+    # Characterize distance distribution
+    dist_mean = np.mean(flat_distances)
+    dist_std = np.std(flat_distances)
+    dist_skew = skew(flat_distances) if len(flat_distances) > 2 else 0
+    dist_cv = dist_std / (dist_mean + 1e-8)  # Coefficient of variation
+    
+    # Compute graph density (TSP is fully connected, but we assess distance distribution)
+    # Use distance sparsity: proportion of edges significantly longer than average
+    dist_threshold = np.percentile(flat_distances, 75)
+    sparse_ratio = np.sum(flat_distances > 1.5 * dist_mean) / len(flat_distances)
+    
+    # Compute symmetry deviation (for potential asymmetric TSP)
+    symmetry_dev = np.mean(np.abs(distance_matrix - distance_matrix.T)) / (dist_mean + 1e-8)
+    
+    # =====================================================================
+    # 2. TWO-STEP LOOKAHEAD REGRET COMPUTATION
+    # =====================================================================
+    lookahead_matrix = np.ones((n, n))
+    
+    # Precompute sorted distances for efficient lookahead
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_distances = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+    
+    for i in range(n):
+        # Get i's nearest neighbors (excluding self)
+        i_neighbors = sorted_indices[i, 1:]  # Skip self (first element)
+        i_dists = sorted_distances[i, 1:]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Current edge distance
+            dist_ij = distance_matrix[i, j]
+            
+            # Find best two-step alternative starting at i (i->k->l)
+            # that doesn't use edge (i,j) and doesn't return to i or j
+            best_two_step_i = np.inf
+            
+            # Consider k as next step from i (k != i, j)
+            for k in i_neighbors[:min(5, len(i_neighbors))]:  # Limit search for efficiency
+                if k == j:
+                    continue
+                    
+                # From k, find best step l (l != i, j, k)
+                k_dists = distance_matrix[k, :].copy()
+                k_dists[[i, j, k]] = np.inf
+                best_from_k = np.min(k_dists) if np.any(k_dists < np.inf) else np.inf
+                
+                two_step_cost = distance_matrix[i, k] + best_from_k
+                best_two_step_i = min(best_two_step_i, two_step_cost)
+            
+            # Compute regret: how much worse is edge (i,j) + best continuation
+            # compared to best two-step alternative?
+            # Best continuation from j (j->m, m != i, j)
+            j_dists = distance_matrix[j, :].copy()
+            j_dists[[i, j]] = np.inf
+            best_from_j = np.min(j_dists) if np.any(j_dists < np.inf) else np.inf
+            
+            current_path_cost = dist_ij + best_from_j
+            
+            if best_two_step_i < np.inf:
+                # Regret relative to alternative two-step path
+                regret = (current_path_cost - best_two_step_i) / max(dist_ij, 1e-8)
+                # Convert regret to score: lower regret = higher score
+                # Sigmoid transformation with adaptive scaling based on instance variance
+                scale = 1.0 + 0.5 * dist_cv
+                lookahead_matrix[i, j] = 1.0 / (1.0 + scale * max(0, regret))
+            else:
+                lookahead_matrix[i, j] = 0.7  # Default moderate score
+    
+    # =====================================================================
+    # 3. GNN-INSPIRED STRUCTURAL SCORING
+    # =====================================================================
+    # Emulate GNN message passing by propagating node features
+    structural_matrix = np.ones((n, n))
+    
+    # Node features: local clustering coefficient approximation
+    # Compute for each node the average distance to its k nearest neighbors
+    k_neighbors = max(3, int(0.1 * n))
+    node_features = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        if len(dists) >= k_neighbors:
+            kth_dist = np.partition(dists, k_neighbors)[k_neighbors]
+            nn_mask = dists <= kth_dist
+            node_features[i] = 1.0 / (np.mean(dists[nn_mask]) + 1e-8)
+        else:
+            valid_dists = dists[dists < np.inf]
+            node_features[i] = 1.0 / (np.mean(valid_dists) + 1e-8) if len(valid_dists) > 0 else 1.0
+    
+    # Normalize features
+    if np.max(node_features) > 0:
+        node_features = node_features / np.max(node_features)
+    
+    # First propagation: aggregate neighbor features
+    agg_features = np.zeros(n)
+    for i in range(n):
+        # Weight neighbors by inverse distance
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        weights = 1.0 / (dists + 1e-8)
+        weights[i] = 0
+        if np.sum(weights) > 0:
+            weights = weights / np.sum(weights)
+            agg_features[i] = np.sum(weights * node_features)
+    
+    # Combine original and aggregated features
+    combined_features = 0.7 * node_features + 0.3 * agg_features
+    
+    # Edge score based on feature similarity and distance
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Feature similarity component
+            feat_sim = 1.0 - abs(combined_features[i] - combined_features[j])
+            
+            # Distance component (closer is better)
+            norm_dist = distance_matrix[i, j] / (dist_mean + 1e-8)
+            dist_score = np.exp(-0.8 * norm_dist)
+            
+            # Combine with emphasis on feature similarity for clustered instances
+            cluster_weight = min(1.0, 2.0 * sparse_ratio)  # Higher for sparse instances
+            structural_matrix[i, j] = (feat_sim ** cluster_weight) * (dist_score ** (1 - cluster_weight))
+    
+    # =====================================================================
+    # 4. ENHANCED MST-BASED CENTRALITY WITH PATH INTEGRATION
+    # =====================================================================
+    centrality_matrix = np.ones((n, n))
+    
+    # Compute MST
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_sym = (mst_array > 0) | (mst_array.T > 0)
+    
+    # Compute all-pairs shortest paths in MST (since MST is a tree, paths are unique)
+    # Build adjacency list for MST
+    mst_adj = [np.where(mst_sym[i])[0] for i in range(n)]
+    
+    # Precompute subtree sizes for each node as root
+    subtree_sizes = np.zeros((n, n))
+    
+    def dfs_subtree(node, parent, root):
+        size = 1
+        for neighbor in mst_adj[node]:
+            if neighbor != parent:
+                size += dfs_subtree(neighbor, node, root)
+        subtree_sizes[root, node] = size
+        return size
+    
+    for root in range(n):
+        dfs_subtree(root, -1, root)
+    
+    # Compute edge centrality: for each MST edge (u,v), it separates the tree
+    # into components of sizes subtree_sizes[v][u] and n - subtree_sizes[v][u]
+    for i in range(n):
+        for j in mst_adj[i]:
+            if i < j:  # Process each edge once
+                # Edge (i,j) splits tree into components when removed
+                # Size of component containing j when rooted at i
+                comp_j_size = subtree_sizes[i, j]
+                comp_i_size = n - comp_j_size
+                
+                # Edge betweenness in tree: comp_i_size * comp_j_size
+                # (all pairs with nodes in different components)
+                betweenness = comp_i_size * comp_j_size
+                
+                # Normalize and enhance
+                max_betweenness = (n // 2) * ((n + 1) // 2)  # Maximum when split is balanced
+                norm_betweenness = betweenness / max_betweenness
+                
+                # Boost factor increases with edge centrality
+                boost = 1.0 + 0.8 * norm_betweenness
+                centrality_matrix[i, j] = centrality_matrix[j, i] = boost
+    
+    # Add minor boost for non-MST edges that connect different MST components
+    # via alternative short connections
+    mst_components = np.zeros(n, dtype=int)
+    component_id = 0
+    visited = np.zeros(n, dtype=bool)
+    
+    for i in range(n):
+        if not visited[i]:
+            stack = [i]
+            while stack:
+                node = stack.pop()
+                if not visited[node]:
+                    visited[node] = True
+                    mst_components[node] = component_id
+                    stack.extend(mst_adj[node])
+            component_id += 1
+    
+    # Boost edges that connect different components with short distances
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_components[i] != mst_components[j]:
+                # Edge connects different MST components
+                dist = distance_matrix[i, j]
+                norm_dist = dist / (dist_mean + 1e-8)
+                if norm_dist < 1.2:  # Only boost reasonably short connections
+                    additional_boost = 0.3 * (1.2 - norm_dist) / 1.2
+                    centrality_matrix[i, j] = centrality_matrix[j, i] = max(
+                        centrality_matrix[i, j], 1.0 + additional_boost
+                    )
+    
+    # =====================================================================
+    # 5. INSTANCE-ADAPTIVE FEATURE COMBINATION
+    # =====================================================================
+    # Determine feature weights based on instance characteristics
+    if dist_cv < 0.3:
+        # Uniform distances: emphasize structural features
+        w_lookahead = 0.7
+        w_structural = 1.2
+        w_centrality = 1.1
+    elif dist_cv > 0.7:
+        # Highly variable distances: emphasize lookahead and regret
+        w_lookahead = 1.4
+        w_structural = 0.8
+        w_centrality = 0.9
+    else:
+        # Moderate variation: balanced approach
+        w_lookahead = 1.0
+        w_structural = 1.0
+        w_centrality = 1.0
+    
+    # Adjust for sparsity
+    if sparse_ratio > 0.4:
+        w_lookahead *= 1.2  # More important in sparse instances
+        w_structural *= 0.9
+    
+    # Adjust for asymmetry
+    if symmetry_dev > 0.1:
+        # Asymmetric TSP: reduce weight on symmetric assumptions
+        w_structural *= 0.8
+        w_centrality *= 0.9
+    
+    # Base inverse distance with instance-adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Use percentile-based scaling to handle outliers
+        scale_factor = np.percentile(flat_distances, 50)  # Median distance
+        inv_dist = 1.0 / (distance_matrix + 0.2 * scale_factor)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Weighted product combination
+    heuristic = (inv_dist ** 0.6) * \
+                (lookahead_matrix ** w_lookahead) * \
+                (structural_matrix ** w_structural) * \
+                (centrality_matrix ** w_centrality)
+    
+    # Ensure symmetry (handle asymmetric TSP by averaging)
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # =====================================================================
+    # 6. CONNECTIVITY-PRESERVING SPARSIFICATION
+    # =====================================================================
+    sparsification_mask = np.zeros((n, n), dtype=bool)
+    
+    # Criterion 1: Critical structural edges (MST)
+    sparsification_mask = sparsification_mask | mst_sym
+    
+    # Criterion 2: High lookahead score edges
+    lookahead_threshold = np.percentile(lookahead_matrix.flatten(), 80)
+    sparsification_mask = sparsification_mask | (lookahead_matrix > lookahead_threshold)
+    
+    # Criterion 3: Local topological clusters
+    # For each node, connect to nodes with similar structural features
+    feature_threshold = np.percentile(combined_features, 40)
+    for i in range(n):
+        similar_nodes = combined_features >= max(combined_features[i] - 0.2, feature_threshold)
+        similar_nodes[i] = False
+        sparsification_mask[i, similar_nodes] = True
+    
+    # Criterion 4: Distance-based sparsification
+    # Keep edges within adaptive distance threshold
+    dist_threshold = np.percentile(flat_distances, 60)  # Keep top 40% shortest edges
+    sparsification_mask = sparsification_mask | (distance_matrix <= dist_threshold)
+    
+    # Ensure symmetry
+    sparsification_mask = sparsification_mask | sparsification_mask.T
+    
+    # Ensure minimum connectivity: each node must connect to at least 2 others
+    for i in range(n):
+        connections = np.sum(sparsification_mask[i, :])
+        if connections < 2:
+            # Add nearest neighbors
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            nearest = np.argsort(distances)[:2]
+            sparsification_mask[i, nearest] = True
+            sparsification_mask[nearest, i] = True
+    
+    # Ensure graph connectivity using BFS
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        node = stack.pop()
+        neighbors = np.where(sparsification_mask[node])[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                stack.append(neighbor)
+    
+    # If disconnected, connect components with shortest edges
+    if not np.all(visited):
+        components = []
+        unvisited = np.where(~visited)[0]
+        
+        while len(unvisited) > 0:
+            start = unvisited[0]
+            comp = []
+            stack = [start]
+            visited[start] = True
+            
+            while stack:
+                node = stack.pop()
+                comp.append(node)
+                neighbors = np.where(sparsification_mask[node])[0]
+                for neighbor in neighbors:
+                    if not visited[neighbor]:
+                        visited[neighbor] = True
+                        stack.append(neighbor)
+            
+            components.append(comp)
+            unvisited = np.where(~visited)[0]
+        
+        # Connect components with shortest inter-component edges
+        for i in range(len(components)):
+            for j in range(i + 1, len(components)):
+                min_dist = np.inf
+                best_pair = (0, 0)
+                
+                for u in components[i]:
+                    for v in components[j]:
+                        dist = distance_matrix[u, v]
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_pair = (u, v)
+                
+                u, v = best_pair
+                sparsification_mask[u, v] = sparsification_mask[v, u] = True
+    
+    # Apply sparsification
+    heuristic = heuristic * sparsification_mask
+    
+    # Final adaptive normalization
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    # Apply soft threshold: very low values to zero
+    threshold = 0.05 * np.mean(heuristic[heuristic > 0]) if np.any(heuristic > 0) else 0
+    heuristic[heuristic < threshold] = 0
+    
+    return heuristic
+```

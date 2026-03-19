@@ -1,0 +1,635 @@
+```json
+{
+    "algorithm_features": ["Graph Property Adaptation", "Scalable Approximations", "Reinforcement Learning Selection", "Multi-Feature Fusion"]
+}
+```
+
+```python
+import numpy as np
+import warnings
+from scipy import sparse
+from scipy.sparse import csgraph
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with reinforcement learning principles and optimized performance.
+    
+    Key improvements over v1:
+    1. Reinforcement learning inspired edge selection with Q-value estimation
+    2. Multi-resolution graph analysis for better scalability
+    3. Feature importance learning via gradient boosting principles
+    4. Adaptive exploration-exploitation balance
+    5. Memory-efficient operations for massive graphs
+    
+    Returns: Non-negative matrix normalized by row for stochastic edge sampling
+    """
+    np.random.seed(42)  # For reproducibility in stochastic components
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / np.maximum(distance_matrix, 1e-10)
+        np.fill_diagonal(result, 0)
+        row_sums = result.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return result / row_sums
+    
+    # ===== 1. GRAPH CHARACTERIZATION =====
+    graph_features = extract_graph_features(distance_matrix, n)
+    
+    # ===== 2. BASE COMPONENTS WITH IMPROVED SCALABILITY =====
+    inv_dist = compute_inverse_distance(distance_matrix, graph_features)
+    mst_mask = compute_mst_approximation(distance_matrix, n, graph_features)
+    centrality = compute_multi_scale_centrality(distance_matrix, n, graph_features)
+    
+    # ===== 3. REINFORCEMENT LEARNING INSPIRED Q-VALUE ESTIMATION =====
+    q_values = estimate_q_values(distance_matrix, inv_dist, mst_mask, centrality, graph_features)
+    
+    # ===== 4. ADAPTIVE FEATURE FUSION WITH GRADIENT BOOSTING PRINCIPLES =====
+    weights = learn_feature_weights(distance_matrix, [inv_dist, mst_mask, centrality, q_values], 
+                                   graph_features)
+    
+    # ===== 5. COMBINE WITH LEARNED WEIGHTS =====
+    combined = (
+        weights[0] * inv_dist +
+        weights[1] * mst_mask.astype(float) * 2.0 +
+        weights[2] * centrality +
+        weights[3] * q_values
+    )
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    # ===== 6. REINFORCEMENT LEARNING SELECTION WITH ADAPTIVE TEMPERATURE =====
+    sparsified = rl_sparsification(combined, distance_matrix, graph_features, weights)
+    
+    # ===== 7. FINAL PROCESSING WITH CONFIDENCE CALIBRATION =====
+    result = final_calibration(sparsified, distance_matrix, graph_features)
+    
+    return result
+
+def extract_graph_features(distance_matrix: np.ndarray, n: int) -> dict:
+    """Extract comprehensive graph features for adaptive parameter tuning."""
+    # Use triangular part for efficiency
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # Basic statistics
+    mean_dist = np.mean(distances) if len(distances) > 0 else 1.0
+    std_dist = np.std(distances) if len(distances) > 0 else 1.0
+    cv = std_dist / (mean_dist + 1e-10)
+    
+    # Euclidean score estimation (sampled for large graphs)
+    euclidean_score = estimate_euclidean_score_fast(distance_matrix, n)
+    
+    # Density and connectivity features
+    if n > 100:
+        # Sample for large graphs
+        sample_size = min(200, n)
+        indices = np.random.choice(n, sample_size, replace=False)
+        sampled_dist = distance_matrix[np.ix_(indices, indices)]
+        density = np.mean(sampled_dist > 0) if n > 0 else 0
+    else:
+        density = np.mean(distance_matrix > 0)
+    
+    # Local structure features (clustering coefficient approximation)
+    clustering = estimate_clustering_coefficient(distance_matrix, n)
+    
+    # Distance distribution skewness
+    if len(distances) > 0:
+        from scipy import stats
+        skewness = stats.skew(distances) if len(distances) > 1 else 0
+    else:
+        skewness = 0
+    
+    return {
+        'n': n,
+        'mean': mean_dist,
+        'std': std_dist,
+        'cv': cv,
+        'euclidean': euclidean_score,
+        'density': density,
+        'clustering': clustering,
+        'skewness': skewness,
+        'is_large': n > 1000,
+        'is_medium': 100 < n <= 1000,
+        'is_small': n <= 100
+    }
+
+def estimate_euclidean_score_fast(distance_matrix: np.ndarray, n: int) -> float:
+    """Fast Euclidean score estimation using triangle inequality sampling."""
+    if n < 3:
+        return 1.0
+    
+    sample_size = min(50, n)  # Reduced for speed
+    if n > 1000:
+        sample_size = min(20, n)
+    
+    indices = np.random.choice(n, sample_size, replace=False)
+    violations = 0
+    total_checks = 0
+    
+    # Optimized triangle check
+    for i_idx in range(sample_size):
+        i = indices[i_idx]
+        for j_idx in range(i_idx + 1, sample_size):
+            j = indices[j_idx]
+            for k_idx in range(j_idx + 1, sample_size):
+                k = indices[k_idx]
+                d_ij = distance_matrix[i, j]
+                d_ik = distance_matrix[i, k]
+                d_jk = distance_matrix[j, k]
+                
+                # Check all permutations efficiently
+                violations += int(d_ij > d_ik + d_jk + 1e-6)
+                violations += int(d_ik > d_ij + d_jk + 1e-6)
+                violations += int(d_jk > d_ij + d_ik + 1e-6)
+                total_checks += 3
+    
+    return 1.0 - violations / max(total_checks, 1)
+
+def estimate_clustering_coefficient(distance_matrix: np.ndarray, n: int) -> float:
+    """Estimate graph clustering coefficient (transitivity)."""
+    if n < 3:
+        return 0.5
+    
+    sample_size = min(100, n)
+    if n > 1000:
+        sample_size = min(30, n)
+    
+    indices = np.random.choice(n, sample_size, replace=False)
+    triangles = 0
+    triples = 0
+    
+    for i_idx in range(sample_size):
+        i = indices[i_idx]
+        # Find neighbors within reasonable distance
+        avg_dist = np.mean(distance_matrix[i])
+        neighbors = [j for j in range(n) if j != i and distance_matrix[i, j] < 1.5 * avg_dist]
+        
+        if len(neighbors) < 2:
+            continue
+            
+        for j_idx in range(len(neighbors)):
+            j = neighbors[j_idx]
+            for k_idx in range(j_idx + 1, len(neighbors)):
+                k = neighbors[k_idx]
+                triples += 1
+                # Check if triangle exists (all edges are reasonably short)
+                if (distance_matrix[j, k] < 1.5 * avg_dist and
+                    distance_matrix[i, j] < 1.5 * avg_dist and
+                    distance_matrix[i, k] < 1.5 * avg_dist):
+                    triangles += 1
+    
+    return triangles / max(triples, 1)
+
+def compute_inverse_distance(distance_matrix: np.ndarray, features: dict) -> np.ndarray:
+    """Compute inverse distance with adaptive smoothing."""
+    n = features['n']
+    
+    # Adaptive epsilon based on distance statistics
+    epsilon = max(1e-10, features['std'] * 0.005 * (1 + features['cv']))
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, epsilon)
+    
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Apply adaptive scaling based on graph properties
+    if features['euclidean'] > 0.7:
+        # Euclidean graphs: emphasize local structure
+        inv_dist = np.power(inv_dist, 1.2)
+    elif features['cv'] > 1.0:
+        # High variation: compress extreme values
+        inv_dist = np.log1p(inv_dist)
+    
+    # Row normalization
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    inv_dist = inv_dist / row_sums
+    
+    return inv_dist
+
+def compute_mst_approximation(distance_matrix: np.ndarray, n: int, features: dict) -> np.ndarray:
+    """Compute MST approximation with multi-resolution strategy."""
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    if n > 5000:
+        # Ultra-large graphs: use fast greedy approximation
+        return compute_greedy_mst_approximation(distance_matrix, n)
+    
+    try:
+        if features['is_large']:
+            # Large graphs: use landmark-based MST
+            landmarks = min(100, n // 20)
+            landmark_indices = np.random.choice(n, landmarks, replace=False)
+            
+            # Build MST on landmarks
+            landmark_dist = distance_matrix[np.ix_(landmark_indices, landmark_indices)]
+            mst_landmarks = csgraph.minimum_spanning_tree(landmark_dist).toarray()
+            mst_landmarks_mask = mst_landmarks > 0
+            
+            # Connect each node to nearest landmark's MST edges
+            for i in range(n):
+                if i in landmark_indices:
+                    continue
+                # Find nearest landmark
+                landmark_dists = distance_matrix[i, landmark_indices]
+                nearest_idx = np.argmin(landmark_dists)
+                nearest_landmark = landmark_indices[nearest_idx]
+                
+                # Connect to landmark's MST neighbors
+                for j in range(landmarks):
+                    if mst_landmarks_mask[nearest_idx, j]:
+                        mst_mask[i, landmark_indices[j]] = True
+                        mst_mask[landmark_indices[j], i] = True
+        else:
+            # Small/medium graphs: exact MST
+            mst = csgraph.minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = mst > 0
+    except Exception:
+        # Fallback: nearest neighbor connectivity
+        mst_mask = compute_nearest_neighbor_connectivity(distance_matrix, n)
+    
+    return mst_mask
+
+def compute_greedy_mst_approximation(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Fast greedy MST approximation for ultra-large graphs."""
+    mask = np.zeros((n, n), dtype=bool)
+    visited = np.zeros(n, dtype=bool)
+    
+    # Start from random node
+    start = np.random.randint(n)
+    visited[start] = True
+    heap = []
+    
+    # Initialize heap with edges from start node
+    for j in range(n):
+        if j != start:
+            heapq.heappush(heap, (distance_matrix[start, j], start, j))
+    
+    edges_added = 0
+    while heap and edges_added < n - 1:
+        dist, i, j = heapq.heappop(heap)
+        if visited[j]:
+            continue
+        
+        mask[i, j] = mask[j, i] = True
+        visited[j] = True
+        edges_added += 1
+        
+        # Add edges from the new node
+        for k in range(n):
+            if not visited[k] and k != j:
+                heapq.heappush(heap, (distance_matrix[j, k], j, k))
+    
+    return mask
+
+def compute_nearest_neighbor_connectivity(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Fallback connectivity based on nearest neighbors."""
+    mask = np.zeros((n, n), dtype=bool)
+    k = min(5, n - 1)
+    
+    for i in range(n):
+        # Find k nearest neighbors
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest = np.argpartition(distances, k)[:k]
+        mask[i, nearest] = True
+        mask[nearest, i] = True
+    
+    return mask
+
+def compute_multi_scale_centrality(distance_matrix: np.ndarray, n: int, features: dict) -> np.ndarray:
+    """Compute centrality using multi-resolution approach."""
+    # Basic closeness centrality (always computable)
+    row_sums = distance_matrix.sum(axis=1)
+    closeness = 1 / (row_sums + 1e-10)
+    
+    if features['is_small'] or features['euclidean'] > 0.9:
+        # Small graphs or very Euclidean: use exact shortest paths
+        shortest_paths = distance_matrix.copy()
+        for k in range(min(50, n)):  # Limited Floyd-Warshall
+            through_k = shortest_paths[:, k:k+1] + shortest_paths[k:k+1, :]
+            shortest_paths = np.minimum(shortest_paths, through_k)
+        
+        sp_centrality = 1 / (shortest_paths.sum(axis=1) + 1e-10)
+    elif features['is_large']:
+        # Large graphs: use landmark-based centrality
+        landmarks = min(30, n // 50)
+        landmark_indices = np.random.choice(n, landmarks, replace=False)
+        landmark_dists = distance_matrix[:, landmark_indices]
+        
+        # Multi-scale landmark distances
+        sp_centrality = 1 / (landmark_dists.mean(axis=1) * np.sqrt(n) + 1e-10)
+    else:
+        # Medium graphs: use random walk centrality approximation
+        sp_centrality = compute_random_walk_centrality(distance_matrix, n)
+    
+    # Normalize and combine
+    closeness_norm = closeness / (closeness.max() + 1e-10)
+    sp_norm = sp_centrality / (sp_centrality.max() + 1e-10)
+    
+    # Dynamic combination
+    if features['euclidean'] > 0.8:
+        alpha = 0.7  # Emphasize closeness for Euclidean graphs
+    elif features['density'] > 0.5:
+        alpha = 0.4  # Emphasize shortest paths for dense graphs
+    else:
+        alpha = 0.5
+    
+    combined_centrality = alpha * closeness_norm + (1 - alpha) * sp_norm
+    
+    # Create centrality matrix with degree correction
+    centrality_matrix = np.outer(combined_centrality, combined_centrality)
+    
+    # Adjust for local density variations
+    if features['clustering'] > 0.3:
+        # High clustering: enhance local connections
+        local_density = np.exp(-distance_matrix / (features['mean'] * 0.5))
+        centrality_matrix *= (1 + 0.5 * local_density)
+    
+    return centrality_matrix / (centrality_matrix.max() + 1e-10)
+
+def compute_random_walk_centrality(distance_matrix: np.ndarray, n: int, iterations: int = 20) -> np.ndarray:
+    """Approximate centrality using random walks."""
+    # Convert to transition probabilities (closer nodes are more likely)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Row normalize for transition matrix
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    P = inv_dist / row_sums
+    
+    # Initialize uniform distribution
+    pi = np.ones(n) / n
+    
+    # Power iteration
+    for _ in range(iterations):
+        pi = pi @ P
+    
+    # Centrality is stationary distribution
+    return pi
+
+def estimate_q_values(distance_matrix: np.ndarray, inv_dist: np.ndarray, 
+                     mst_mask: np.ndarray, centrality: np.ndarray, features: dict) -> np.ndarray:
+    """Estimate Q-values using reinforcement learning principles."""
+    n = features['n']
+    q_values = np.zeros((n, n))
+    
+    # State-action value approximation
+    # Q(s,a) = R(s,a) + γ * max_a' Q(s',a')
+    
+    # Immediate reward: combination of features
+    reward = (
+        0.4 * inv_dist +
+        0.3 * mst_mask.astype(float) +
+        0.3 * centrality
+    )
+    
+    # Discount factor based on graph properties
+    if features['euclidean'] > 0.8:
+        gamma = 0.9  # Euclidean graphs have more predictable structure
+    else:
+        gamma = 0.7  # Non-Euclidean: less predictable future
+    
+    # Estimate future value using one-step lookahead
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Future state is at node j
+            # Maximum expected future value from node j
+            future_values = []
+            
+            # Consider k best actions from j
+            k = min(10, n - 1)
+            j_values = reward[j].copy()
+            j_values[j] = -np.inf
+            j_values[i] = -np.inf  # Avoid going back immediately
+            
+            best_next = np.argpartition(-j_values, k)[:k]
+            for next_node in best_next:
+                if next_node != i and next_node != j:
+                    # Two-step lookahead value
+                    two_step_value = reward[j, next_node] + 0.5 * np.max(reward[next_node])
+                    future_values.append(two_step_value)
+            
+            if future_values:
+                future_value = np.mean(future_values)
+            else:
+                future_value = np.mean(reward[j])
+            
+            # Q-value estimate
+            q_values[i, j] = reward[i, j] + gamma * future_value
+    
+    # Normalize
+    max_q = q_values.max()
+    if max_q > 0:
+        q_values = q_values / max_q
+    
+    np.fill_diagonal(q_values, 0)
+    return q_values
+
+def learn_feature_weights(distance_matrix: np.ndarray, features: list, 
+                         graph_features: dict) -> np.ndarray:
+    """Learn feature weights using gradient boosting principles."""
+    n = graph_features['n']
+    
+    # Initialize weights based on graph characteristics
+    if graph_features['euclidean'] > 0.8:
+        base_weights = [0.35, 0.35, 0.2, 0.1]  # Emphasize inv_dist and MST for Euclidean
+    elif graph_features['cv'] > 1.5:
+        base_weights = [0.25, 0.25, 0.3, 0.2]  # Emphasize centrality for high variation
+    else:
+        base_weights = [0.3, 0.3, 0.25, 0.15]
+    
+    # Adjust based on graph size
+    if graph_features['is_large']:
+        base_weights = [w * np.array([1.2, 0.8, 0.7, 1.3]) for w in base_weights]
+    elif graph_features['is_small']:
+        base_weights = [w * np.array([0.9, 1.1, 1.0, 0.8]) for w in base_weights]
+    
+    # Diversity-based adjustment
+    feature_diversities = []
+    for feature in features:
+        if feature.ndim == 2:
+            # Flatten and compute entropy of non-zero values
+            flat = feature.flatten()
+            flat = flat[flat > 0]
+            if len(flat) > 1:
+                probs = flat / flat.sum()
+                entropy = -np.sum(probs * np.log(probs + 1e-10))
+                max_entropy = np.log(len(flat))
+                feature_diversities.append(entropy / max_entropy if max_entropy > 0 else 0.5)
+            else:
+                feature_diversities.append(0.5)
+    
+    # Boost weights of diverse features
+    if feature_diversities:
+        avg_diversity = np.mean(feature_diversities)
+        for i, diversity in enumerate(feature_diversities):
+            if diversity > avg_diversity:
+                base_weights[i] *= 1.1
+    
+    # Ensure weights sum to 1
+    total = sum(base_weights)
+    weights = [w / total for w in base_weights]
+    
+    return weights
+
+def rl_sparsification(heuristic_matrix: np.ndarray, distance_matrix: np.ndarray,
+                      features: dict, weights: list) -> np.ndarray:
+    """Sparsification using reinforcement learning selection principles."""
+    n = features['n']
+    sparsified = np.zeros_like(heuristic_matrix)
+    
+    # Adaptive parameters based on graph properties
+    if features['is_small']:
+        base_k = min(10, n - 1)
+        temperature_base = 0.5
+    elif features['is_large']:
+        base_k = max(3, int(np.log(n) * 2))
+        temperature_base = 1.2
+    else:
+        base_k = max(5, int(np.sqrt(n) * 0.8))
+        temperature_base = 0.8
+    
+    # Adaptive exploration-exploitation
+    exploration_factor = 0.1 * (1 - features['euclidean']) + 0.05 * features['cv']
+    
+    # Process each node
+    for i in range(n):
+        row = heuristic_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Adaptive k for this node
+        row_mean = np.mean(row[row > 0]) if np.any(row > 0) else 0
+        row_std = np.std(row[row > 0]) if np.sum(row > 0) > 1 else 1
+        
+        if row_std > 0:
+            confidence = row_mean / row_std
+            k = int(base_k * np.clip(1.0 + 0.5 * np.tanh(confidence), 0.5, 2.0))
+        else:
+            k = base_k
+        
+        k = max(2, min(k, n - 1))
+        
+        # Get candidate edges
+        candidates = [(j, row[j]) for j in range(n) if j != i and row[j] > 0]
+        
+        if not candidates:
+            # Fallback: nearest neighbors
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nearest = np.argpartition(distances, k)[:k]
+            for j in nearest:
+                sparsified[i, j] = 1.0 / (1.0 + distances[j] / features['mean'])
+            continue
+        
+        # Reinforcement learning selection: Upper Confidence Bound (UCB)
+        values = np.array([v for _, v in candidates])
+        indices = np.array([j for j, _ in candidates])
+        
+        # Compute UCB scores
+        if len(candidates) > 1:
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            
+            # Exploration bonus
+            exploration_bonus = exploration_factor * np.sqrt(np.log(len(candidates)) / (np.arange(len(candidates)) + 1))
+            
+            # UCB scores
+            ucb_scores = values + exploration_bonus
+            
+            # Softmax selection with adaptive temperature
+            row_entropy = -np.sum((values / values.sum()) * np.log(values / values.sum() + 1e-10))
+            max_entropy = np.log(len(values))
+            normalized_entropy = row_entropy / max_entropy if max_entropy > 0 else 0.5
+            
+            temperature = temperature_base * (1.0 + normalized_entropy)
+            
+            # Boltzmann exploration
+            exp_scores = np.exp(ucb_scores / temperature)
+            probs = exp_scores / exp_scores.sum()
+            
+            # Select top k with probabilities
+            if len(candidates) <= k:
+                selected_idx = np.arange(len(candidates))
+            else:
+                # Stochastic selection without replacement
+                selected_idx = np.random.choice(len(candidates), size=k, replace=False, p=probs)
+            
+            selected_indices = indices[selected_idx]
+            selected_values = values[selected_idx]
+            
+            # Assign values with confidence weighting
+            for j, val in zip(selected_indices, selected_values):
+                confidence = 1.0 / (1.0 + np.abs(val - mean_val) / (std_val + 1e-10))
+                sparsified[i, j] = val * confidence
+    
+    # Ensure symmetry and sparsity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+
+def final_calibration(heuristic_matrix: np.ndarray, distance_matrix: np.ndarray,
+                     features: dict) -> np.ndarray:
+    """Final calibration and normalization."""
+    n = features['n']
+    
+    # Ensure non-negativity
+    result = np.maximum(heuristic_matrix, 0)
+    
+    # Add small exploration noise
+    noise_level = 0.02 * (1 - features['euclidean']) + 0.01 * min(features['cv'], 3.0)
+    noise = noise_level * np.random.randn(n, n)
+    noise = (noise + noise.T) / 2  # Keep symmetry
+    np.fill_diagonal(noise, 0)
+    
+    result = np.maximum(result + noise, 0)
+    
+    # Local consistency smoothing
+    if n <= 500:  # Only for manageable sizes
+        smoothing_factor = 0.1 * features['clustering']
+        if smoothing_factor > 0:
+            # Average with neighbors of neighbors
+            for _ in range(2):  # Limited iterations
+                smoothed = result.copy()
+                for i in range(n):
+                    # Find strong connections
+                    strong_mask = result[i] > np.percentile(result[i], 70)
+                    if np.any(strong_mask):
+                        # Average with strong neighbors' connections
+                        neighbor_avg = np.mean(result[strong_mask], axis=0)
+                        smoothed[i] = (1 - smoothing_factor) * result[i] + smoothing_factor * neighbor_avg
+                result = smoothed
+    
+    # Zero diagonal and symmetry
+    np.fill_diagonal(result, 0)
+    result = (result + result.T) / 2
+    
+    # Row normalization with fallback
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Fallback to inverse distance
+        with np.errstate(divide='ignore', invalid='ignore'):
+            fallback = 1 / np.maximum(distance_matrix[zero_rows], features['mean'] * 0.1)
+        np.fill_diagonal(fallback, 0)
+        result[zero_rows] = fallback
+        row_sums[zero_rows] = fallback.sum(axis=1, keepdims=True)
+    
+    row_sums[row_sums == 0] = 1
+    result = result / row_sums
+    
+    return result
+```

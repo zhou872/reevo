@@ -1,0 +1,267 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Thresholds", "Cluster-Boundary Path Lookahead", "Normalized Spatial Harmonic Scoring", "Mutual Neighbor Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection with adaptive regret thresholds
+    and cluster-boundary path lookahead.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Adaptive regret penalization with global distribution awareness ===
+    # Compute global distance statistics for adaptive thresholding
+    dist_without_diag = distance_matrix.copy()
+    np.fill_diagonal(dist_without_diag, np.inf)
+    global_median = np.median(dist_without_diag[dist_without_diag < np.inf])
+    global_mad = np.median(np.abs(dist_without_diag - global_median))
+    
+    regret_boost = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dist_row = distance_matrix[i].copy()
+        dist_row[i] = np.inf
+        
+        sorted_idx = np.argsort(dist_row)
+        d1 = dist_row[sorted_idx[0]]
+        d2 = dist_row[sorted_idx[1]]
+        idx1 = sorted_idx[0]
+        
+        # Adaptive regret scaling based on local vs global distances
+        local_scale = max(epsilon, d1 / (global_median + epsilon))
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            alternative = d2 if j == idx1 else d1
+            
+            # Proportional regret with adaptive threshold
+            regret = max(0.0, (alternative - d_ij) / (d_ij + epsilon))
+            
+            # Adjust scaling based on how extreme the distances are relative to global
+            scale_factor = 2.0 * (1.0 + 0.5 * np.tanh((d_ij - global_median) / (global_mad + epsilon)))
+            
+            # Stronger boost for edges significantly better than alternatives
+            regret_boost[i, j] = 1.0 + scale_factor * regret * local_scale
+    
+    # === 3. Normalized spatial harmonic scoring with cluster detection ===
+    k_spatial = min(max(5, int(np.sqrt(n))), n - 1)
+    node_spatial = np.zeros(n)
+    node_variance = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if k_spatial > 0:
+            # Get k_spatial smallest distances
+            nearest_dists = np.partition(dists, k_spatial)[:k_spatial]
+            
+            # Harmonic mean for spatial consistency
+            with np.errstate(divide='ignore', invalid='ignore'):
+                node_spatial[i] = k_spatial / np.sum(1 / (nearest_dists + epsilon))
+            
+            # Variance for cluster tightness detection
+            if len(nearest_dists) > 1:
+                node_variance[i] = np.std(nearest_dists) / (np.mean(nearest_dists) + epsilon)
+            else:
+                node_variance[i] = 0
+    
+    # Combine node scores with cluster-awareness
+    spatial_scores = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Harmonic mean of endpoint spatial scores
+                if node_spatial[i] > 0 and node_spatial[j] > 0:
+                    spatial_scores[i, j] = 2 * node_spatial[i] * node_spatial[j] / \
+                                          (node_spatial[i] + node_spatial[j] + epsilon)
+                
+                # Penalty for edges crossing cluster boundaries
+                if node_variance[i] < 0.5 and node_variance[j] < 0.5:
+                    # Both nodes in tight clusters
+                    local_scale_i = node_spatial[i] / (global_median + epsilon)
+                    local_scale_j = node_spatial[j] / (global_median + epsilon)
+                    if distance_matrix[i, j] > 2 * min(node_spatial[i], node_spatial[j]):
+                        # Likely crossing cluster boundary - apply penalty
+                        boundary_factor = 0.7 + 0.3 * min(local_scale_i, local_scale_j)
+                        spatial_scores[i, j] *= boundary_factor
+    
+    # Normalize spatial scores to [0.5, 1.5] range
+    valid_scores = spatial_scores[spatial_scores > 0]
+    if len(valid_scores) > 0:
+        min_score, max_score = np.min(valid_scores), np.max(valid_scores)
+        if max_score > min_score:
+            spatial_scores = 0.5 + (spatial_scores - min_score) / (max_score - min_score)
+        else:
+            spatial_scores = np.ones_like(spatial_scores)
+    else:
+        spatial_scores = np.ones_like(spatial_scores)
+    
+    # === 4. Lightweight cluster-boundary path lookahead ===
+    k_mutual = max(3, int(np.sqrt(n)))
+    nn_indices = np.zeros((n, k_mutual), dtype=int)
+    
+    # Find k-nearest neighbors for each node
+    for i in range(n):
+        nearest = np.argpartition(distance_matrix[i], k_mutual + 1)[:k_mutual + 1]
+        nearest = nearest[nearest != i]
+        if len(nearest) > k_mutual:
+            nearest = nearest[:k_mutual]
+        nn_indices[i, :len(nearest)] = nearest
+    
+    # Build mutual nearest neighbor matrix
+    mutual_nn = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j_idx in range(k_mutual):
+            j = nn_indices[i, j_idx]
+            if j != i and np.any(nn_indices[j] == i):
+                mutual_nn[i, j] = True
+    
+    # Apply cluster-boundary path lookahead
+    path_factor = np.ones_like(distance_matrix)
+    if n > 3:
+        for i in range(n):
+            for j in range(n):
+                if i == j or mutual_nn[i, j]:
+                    continue
+                
+                # Only check edges that might be crossing cluster boundaries
+                if (node_variance[i] < 0.5 and node_variance[j] < 0.5 and 
+                    distance_matrix[i, j] > 1.5 * max(node_spatial[i], node_spatial[j])):
+                    
+                    # Look for intermediate nodes that are mutual neighbors to both
+                    candidates = []
+                    for k in range(n):
+                        if k == i or k == j:
+                            continue
+                        if mutual_nn[i, k] and mutual_nn[j, k]:
+                            candidates.append(k)
+                    
+                    if candidates:
+                        # Find best two-step path through candidate intermediate
+                        best_two_step = min(
+                            [distance_matrix[i, k] + distance_matrix[k, j] for k in candidates],
+                            default=np.inf
+                        )
+                        
+                        if best_two_step < np.inf:
+                            efficiency = distance_matrix[i, j] / (best_two_step + epsilon)
+                            if efficiency > 1.2:  # Direct path is significantly worse
+                                path_factor[i, j] = 0.8
+                            elif efficiency > 1.05:  # Direct path is somewhat worse
+                                path_factor[i, j] = 0.9
+    
+    # === 5. Mutual nearest neighbor reinforcement ===
+    mutual_boost = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j_idx in range(k_mutual):
+            j = nn_indices[i, j_idx]
+            if j != i and mutual_nn[i, j]:
+                # Boost based on spatial coherence and regret
+                spatial_coherence = spatial_scores[i, j]
+                regret_weight = 0.5 * (regret_boost[i, j] - 1.0)
+                mutual_boost[i, j] = 1.2 + 0.3 * spatial_coherence + regret_weight
+    
+    # === 6. MST-based edge prioritization ===
+    mst_boost = np.ones_like(distance_matrix)
+    if n > 2:
+        visited = np.zeros(n, dtype=bool)
+        visited[0] = True
+        min_edge = distance_matrix[0].copy()
+        min_edge[0] = np.inf
+        source = np.zeros(n, dtype=int)
+        
+        for _ in range(n - 1):
+            v = np.argmin(min_edge)
+            u = source[v]
+            
+            if u != v:
+                # Stronger boost for MST edges in dense regions
+                density_factor = 0.5 + 0.5 * (node_spatial[u] + node_spatial[v]) / (2 * global_median + epsilon)
+                mst_boost[u, v] = 1.0 + 1.5 * density_factor * spatial_scores[u, v]
+                mst_boost[v, u] = mst_boost[u, v]
+            
+            visited[v] = True
+            min_edge[v] = np.inf
+            
+            for w in range(n):
+                if not visited[w] and distance_matrix[v, w] < min_edge[w]:
+                    min_edge[w] = distance_matrix[v, w]
+                    source[w] = v
+    
+    # === 7. Multiplicative factor fusion ===
+    heuristics = inv_dist.copy()
+    heuristics *= regret_boost
+    heuristics *= spatial_scores
+    heuristics *= path_factor
+    heuristics *= mutual_boost
+    heuristics *= mst_boost
+    
+    # === 8. Intelligent sparsification ===
+    adaptive_k = min(15, max(3, n // 3))
+    
+    for i in range(n):
+        if adaptive_k >= n - 1:
+            continue
+            
+        row = heuristics[i].copy()
+        
+        # Always keep mutual nearest neighbors
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[mutual_nn[i]] = True
+        
+        # Keep top edges by spatial-regret combined score
+        combined_score = row * (1.0 + 0.3 * (regret_boost[i] - 1.0)) * spatial_scores[i]
+        non_self = [idx for idx in range(n) if idx != i]
+        
+        if adaptive_k > 0 and len(non_self) > adaptive_k:
+            top_k = min(adaptive_k, len(non_self))
+            top_indices = np.argpartition(combined_score[non_self], -top_k)[-top_k:]
+            keep_mask[np.array(non_self)[top_indices]] = True
+        
+        # Ensure minimal connectivity
+        if np.sum(keep_mask) < 2 and n > 2:
+            top2_indices = np.argsort(row[non_self])[-2:]
+            keep_mask[np.array(non_self)[top2_indices]] = True
+        
+        # Zero out unpromising edges
+        row[~keep_mask] = 0
+        heuristics[i] = row
+    
+    # === 9. Symmetrization and final normalization ===
+    # Geometric mean for balanced symmetry
+    symmetric_heuristics = np.sqrt(heuristics * heuristics.T + epsilon)
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Ensure non-negativity and scale to [0, 1]
+    symmetric_heuristics = np.maximum(symmetric_heuristics, 0)
+    max_val = np.max(symmetric_heuristics)
+    if max_val > epsilon:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+```

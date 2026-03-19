@@ -1,0 +1,350 @@
+```json
+{
+    "algorithm_features": ["Adaptive Parameter Tuning", "Confidence-Weighted Probabilistic Sampling", "Spectral Graph Features", "Multi-Resolution Density Estimation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with adaptive tuning, probabilistic confidence,
+    and spectral graph analysis.
+    
+    Key innovations:
+    1. Adaptive parameter tuning via instance-aware optimization
+    2. Confidence-weighted probabilistic edge scoring
+    3. Spectral graph embedding for structural pattern recognition
+    4. Multi-resolution density estimation with bandwidth optimization
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix (avoid division by zero and self-loops)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. INSTANCE CHARACTERIZATION & PARAMETER ADAPTATION
+    # ------------------------------------------------------------
+    
+    # Analyze distance distribution to adapt parameters
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # Statistical moments for parameter tuning
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_skew = np.mean((distances - dist_mean) ** 3) / (dist_std ** 3 + eps)
+    dist_cv = dist_std / (dist_mean + eps)
+    
+    # Adaptive parameter set based on instance characteristics
+    if n < 20:  # Small instances
+        k_candidate = min(n - 1, 8)
+        reg_weight = 0.4
+        spec_weight = 0.3
+        dense_weight = 0.3
+    elif dist_cv < 0.3:  # Uniform instances
+        k_candidate = max(4, int(np.sqrt(n)))
+        reg_weight = 0.3
+        spec_weight = 0.4
+        dense_weight = 0.3
+    elif abs(dist_skew) > 0.5:  # Skewed distributions
+        k_candidate = max(5, int(np.log2(n) * 3))
+        reg_weight = 0.5
+        spec_weight = 0.2
+        dense_weight = 0.3
+    else:  # Moderate instances
+        k_candidate = max(4, int(n ** 0.4))
+        reg_weight = 0.4
+        spec_weight = 0.3
+        dense_weight = 0.3
+    
+    # ------------------------------------------------------------
+    # 2. CONFIDENCE-AWARE CANDIDATE SELECTION
+    # ------------------------------------------------------------
+    
+    # Multi-criteria candidate selection
+    candidate_scores = np.zeros_like(distance_matrix)
+    
+    # Criterion 1: Direct distance (inverse)
+    inv_dist = 1.0 / safe_dist
+    candidate_scores += 0.4 * inv_dist / (np.max(inv_dist) + eps)
+    
+    # Criterion 2: Two-step path advantage
+    for i in range(n):
+        # Compute advantage over two-step paths
+        for j in range(i + 1, n):
+            # Find best intermediate node
+            others = [k for k in range(n) if k not in (i, j)]
+            if others:
+                two_step_dists = safe_dist[i, others] + safe_dist[others, j]
+                best_two_step = np.min(two_step_dists)
+                advantage = best_two_step / (safe_dist[i, j] + eps)
+                candidate_scores[i, j] += 0.3 * advantage
+                candidate_scores[j, i] += 0.3 * advantage
+    
+    # Criterion 3: Local clustering
+    for i in range(n):
+        # Find k nearest neighbors
+        k_local = min(5, n - 1)
+        neighbors = np.argsort(safe_dist[i])[:k_local]
+        
+        # Count shared neighbors
+        for j in neighbors:
+            if i != j:
+                # Jaccard similarity of neighbor sets
+                neigh_i = set(np.argsort(safe_dist[i])[1:k_local+1])
+                neigh_j = set(np.argsort(safe_dist[j])[1:k_local+1])
+                shared = len(neigh_i & neigh_j)
+                union = len(neigh_i | neigh_j)
+                sim = shared / (union + eps)
+                candidate_scores[i, j] += 0.3 * sim
+    
+    # Select candidates based on combined scores
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        row_scores = candidate_scores[i]
+        # Adaptive threshold: mean + 0.5*std
+        threshold = np.mean(row_scores) + 0.5 * np.std(row_scores)
+        candidates = np.where(row_scores >= threshold)[0]
+        
+        # Ensure at least k_candidate candidates
+        if len(candidates) < k_candidate:
+            top_k = np.argsort(row_scores)[-k_candidate:]
+            candidate_mask[i, top_k] = True
+        else:
+            candidate_mask[i, candidates] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # ------------------------------------------------------------
+    # 3. SPECTRAL GRAPH FEATURES
+    # ------------------------------------------------------------
+    
+    # Compute normalized Laplacian for spectral analysis
+    W = np.exp(-safe_dist / (dist_mean + eps))
+    np.fill_diagonal(W, 0)
+    
+    # Degree matrix
+    D = np.diag(np.sum(W, axis=1))
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + eps))
+    
+    # Normalized Laplacian: I - D^{-1/2} W D^{-1/2}
+    L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+    
+    # Compute eigenvectors (smallest eigenvalues first)
+    try:
+        eigvals, eigvecs = eigh(L_norm)
+        # Use Fiedler vector (second smallest eigenvalue)
+        fiedler_vector = eigvecs[:, 1]
+        
+        # Spectral embedding score: nodes close in Fiedler space
+        spectral_score = np.zeros_like(distance_matrix)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if candidate_mask[i, j]:
+                    diff = abs(fiedler_vector[i] - fiedler_vector[j])
+                    spectral_score[i, j] = np.exp(-diff * 2.0)
+                    spectral_score[j, i] = spectral_score[i, j]
+    except:
+        # Fallback if eigendecomposition fails
+        spectral_score = np.ones_like(distance_matrix)
+    
+    # ------------------------------------------------------------
+    # 4. ADAPTIVE REGRET MODEL WITH CONFIDENCE WEIGHTS
+    # ------------------------------------------------------------
+    
+    regret_matrix = np.ones_like(distance_matrix)
+    confidence_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances to all other nodes
+        dists = safe_dist[i].copy()
+        
+        # Sort distances
+        sorted_idx = np.argsort(dists)
+        sorted_dists = dists[sorted_idx]
+        
+        # Find natural breakpoints in distance distribution
+        if len(sorted_dists) >= 3:
+            # Use percentiles to define tiers
+            p25 = np.percentile(sorted_dists[sorted_dists < np.inf], 25)
+            p75 = np.percentile(sorted_dists[sorted_dists < np.inf], 75)
+            
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    dist_ij = dists[j]
+                    
+                    # Tier-based regret
+                    if dist_ij <= p25:
+                        # Top tier: minimal regret
+                        regret = 0.1
+                        confidence = 0.9
+                    elif dist_ij <= p75:
+                        # Middle tier: moderate regret
+                        # Find rank of this distance
+                        rank = np.searchsorted(sorted_dists, dist_ij)
+                        regret = 0.1 + 0.4 * (rank / (n - 1))
+                        confidence = 0.7
+                    else:
+                        # Bottom tier: high regret
+                        regret = 0.5 + 0.5 * (dist_ij - p75) / (np.max(dists) - p75 + eps)
+                        confidence = 0.5
+                    
+                    # Smooth regret function
+                    regret_matrix[i, j] = np.exp(-2.0 * (1.0 - regret))
+                    confidence_weights[i, j] = confidence
+    
+    # Symmetrize confidence weights
+    confidence_weights = (confidence_weights + confidence_weights.T) / 2.0
+    
+    # ------------------------------------------------------------
+    # 5. MULTI-RESOLUTION DENSITY ESTIMATION
+    # ------------------------------------------------------------
+    
+    density_scores = np.zeros_like(distance_matrix)
+    
+    # Use multiple bandwidths to capture different scales
+    bandwidths = []
+    if n >= 10:
+        bandwidths.append(dist_mean * 0.5)
+        bandwidths.append(dist_mean)
+        bandwidths.append(dist_mean * 2.0)
+    else:
+        bandwidths = [dist_mean]
+    
+    for bw in bandwidths:
+        # Gaussian kernel density
+        kernel_matrix = np.exp(-0.5 * (safe_dist / bw) ** 2)
+        np.fill_diagonal(kernel_matrix, 0)
+        
+        # Local density around each edge
+        for i in range(n):
+            for j in range(i + 1, n):
+                if candidate_mask[i, j]:
+                    # Joint density: product of kernel similarities
+                    density = np.sum(kernel_matrix[i] * kernel_matrix[j])
+                    # Normalize by expected value
+                    expected = np.mean(kernel_matrix[i]) * np.mean(kernel_matrix[j]) * n
+                    if expected > eps:
+                        density_ratio = density / expected
+                        density_scores[i, j] += np.log1p(density_ratio) / len(bandwidths)
+                        density_scores[j, i] = density_scores[i, j]
+    
+    # Normalize density scores
+    if np.max(density_scores) > eps:
+        density_scores = density_scores / np.max(density_scores)
+    
+    # ------------------------------------------------------------
+    # 6. MINIMUM SPANNING TREE STRUCTURAL PRIOR
+    # ------------------------------------------------------------
+    
+    mst_bonus = np.zeros_like(distance_matrix)
+    try:
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst + mst.T) > 0
+        mst_bonus = mst_edges.astype(float) * 0.3
+    except:
+        pass
+    
+    # ------------------------------------------------------------
+    # 7. CONFIDENCE-WEIGHTED COMBINATION
+    # ------------------------------------------------------------
+    
+    # Base score components
+    base_inv = 1.0 / safe_dist
+    if np.max(base_inv) > 0:
+        base_inv = base_inv / np.max(base_inv)
+    
+    # Combine components with confidence weighting
+    heuristics = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if candidate_mask[i, j]:
+                # Component scores
+                comp_inv = base_inv[i, j]
+                comp_reg = regret_matrix[i, j]
+                comp_spec = spectral_score[i, j]
+                comp_dens = 1.0 + density_scores[i, j]
+                comp_mst = 1.0 + mst_bonus[i, j]
+                
+                # Confidence-weighted geometric mean
+                conf = confidence_weights[i, j]
+                if conf > 0.5:  # High confidence
+                    # Weighted product
+                    score = (comp_inv ** reg_weight *
+                            comp_reg ** (1 - reg_weight) *
+                            comp_spec ** spec_weight *
+                            comp_dens ** dense_weight *
+                            comp_mst ** 0.1)
+                else:  # Low confidence
+                    # Conservative combination
+                    score = np.sqrt(comp_inv * comp_reg)
+                
+                heuristics[i, j] = score
+                heuristics[j, i] = score
+    
+    # ------------------------------------------------------------
+    # 8. PROBABILISTIC SPARSIFICATION & NORMALIZATION
+    # ------------------------------------------------------------
+    
+    # Apply candidate mask
+    heuristics[~candidate_mask] = 0
+    
+    # Ensure connectivity: each node must have at least 2 connections
+    for i in range(n):
+        non_zero = np.nonzero(heuristics[i])[0]
+        if len(non_zero) < 2:
+            # Force top 2 edges by base inverse distance
+            top2 = np.argsort(base_inv[i])[-2:]
+            for j in top2:
+                if i != j:
+                    boost = np.max(heuristics[i]) * 1.2 if np.max(heuristics[i]) > 0 else 0.5
+                    heuristics[i, j] = boost
+                    heuristics[j, i] = boost
+    
+    # Symmetrize
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Softmax normalization with adaptive temperature
+    if n > 2:
+        # Adaptive temperature based on score distribution
+        non_zero = heuristics[heuristics > 0]
+        if len(non_zero) > 0:
+            score_std = np.std(non_zero)
+            temperature = max(0.1, score_std * 2.0)
+            
+            # Row-wise softmax
+            for i in range(n):
+                row = heuristics[i]
+                if np.sum(row) > 0:
+                    exp_row = np.exp(row / temperature)
+                    row_sum = np.sum(exp_row)
+                    if row_sum > eps:
+                        heuristics[i] = exp_row / row_sum
+    
+    # Final zeroing of diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

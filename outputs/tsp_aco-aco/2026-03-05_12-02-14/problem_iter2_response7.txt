@@ -1,0 +1,317 @@
+```json
+{
+    "algorithm_features": ["Adaptive Heuristic Weighting", "Edge Betweenness Centrality", "Probabilistic Sparsification", "Dynamic Parameter Tuning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+from typing import Tuple, Dict, Any
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection with dynamic weight adaptation
+    and edge centrality measures.
+    
+    Features:
+    1. Dynamic weight adjustment based on problem characteristics
+    2. Edge betweenness centrality in MST (improved over node centrality)
+    3. Adaptive sparsification with probabilistic edge selection
+    4. Problem instance analysis for parameter tuning
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Trivial cases
+        result = np.zeros_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # Store original diagonal for restoration
+    orig_diag = np.diag(distance_matrix).copy()
+    np.fill_diagonal(distance_matrix, np.inf)
+    
+    # 1. Analyze problem instance characteristics
+    instance_features = analyze_problem_instance(distance_matrix, n)
+    
+    # 2. Compute base reciprocal distance (with safety)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1.0 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    
+    # 3. Compute Minimum Spanning Tree and extract features
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_indicator = (mst_array > 0).astype(float)
+    
+    # 4. Compute edge betweenness centrality in MST (improved centrality measure)
+    edge_betweenness = compute_mst_edge_betweenness(mst_array, n)
+    
+    # 5. Compute nearest neighbor connectivity
+    nn_connectivity = compute_nearest_neighbor_connectivity(distance_matrix, n)
+    
+    # 6. Dynamically adjust heuristic weights based on instance features
+    weights = compute_adaptive_weights(instance_features, n)
+    
+    # 7. Combine heuristics with dynamic weights
+    combined = (
+        weights['reciprocal'] * reciprocal +
+        weights['betweenness'] * edge_betweenness +
+        weights['mst'] * mst_indicator +
+        weights['nn'] * nn_connectivity
+    )
+    
+    # 8. Apply adaptive sparsification with probabilistic selection
+    sparsified = adaptive_sparsification(combined, distance_matrix, instance_features, n)
+    
+    # 9. Ensure symmetry and clean up
+    sparsified = (sparsified + sparsified.T) / 2  # Force symmetry
+    np.fill_diagonal(sparsified, 0)
+    
+    # Restore original diagonal
+    np.fill_diagonal(distance_matrix, orig_diag)
+    
+    return sparsified
+
+
+def analyze_problem_instance(distance_matrix: np.ndarray, n: int) -> Dict[str, Any]:
+    """
+    Analyze problem instance characteristics to adapt heuristic parameters.
+    """
+    # Extract upper triangle distances (excluding diagonal)
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # Compute statistics
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    dist_sparsity = np.sum(distances > 10 * dist_mean) / len(distances) if dist_mean > 0 else 0
+    
+    # Determine graph "regularity" based on distance distribution
+    sorted_dists = np.sort(distances)
+    uniformity = np.std(np.diff(sorted_dists)) / (np.mean(np.diff(sorted_dists)) + 1e-10)
+    
+    return {
+        'n': n,
+        'dist_mean': dist_mean,
+        'dist_cv': dist_cv,
+        'dist_sparsity': dist_sparsity,
+        'uniformity': uniformity,
+        'dist_std': dist_std
+    }
+
+
+def compute_mst_edge_betweenness(mst_array: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute edge betweenness centrality in the Minimum Spanning Tree.
+    
+    For each edge in MST, compute the number of shortest paths (in MST)
+    that pass through that edge.
+    """
+    edge_betweenness = np.zeros((n, n))
+    
+    # Convert MST to adjacency list for efficient traversal
+    mst_edges = np.argwhere(mst_array > 0)
+    
+    if len(mst_edges) == 0:
+        return edge_betweenness
+    
+    # For small graphs, compute exact betweenness
+    if n <= 50:
+        # Compute all pairs shortest paths in MST (which is a tree, so unique paths)
+        for i in range(n):
+            for j in range(i+1, n):
+                # Get path from i to j in MST (BFS in tree)
+                visited = [False] * n
+                parent = [-1] * n
+                queue = [i]
+                visited[i] = True
+                
+                while queue:
+                    current = queue.pop(0)
+                    if current == j:
+                        break
+                    
+                    # Get neighbors in MST
+                    neighbors = np.where(mst_array[current] > 0)[0]
+                    for neighbor in neighbors:
+                        if not visited[neighbor]:
+                            visited[neighbor] = True
+                            parent[neighbor] = current
+                            queue.append(neighbor)
+                
+                # Trace back path and increment edge betweenness
+                current = j
+                while parent[current] != -1:
+                    prev = parent[current]
+                    edge_betweenness[min(current, prev), max(current, prev)] += 1
+                    current = prev
+    
+    else:
+        # For larger graphs, use approximation: edges near center of MST have higher betweenness
+        # Compute distances from each node to all others in MST
+        mst_graph = csgraph.csgraph_from_dense(mst_array)
+        
+        for i in range(min(n, 100)):  # Sample nodes for efficiency
+            distances = csgraph.shortest_path(mst_graph, directed=False, indices=i)
+            finite_distances = distances[np.isfinite(distances)]
+            if len(finite_distances) > 0:
+                # Nodes with medium distances are often on many paths
+                for j in range(n):
+                    if i != j and np.isfinite(distances[j]):
+                        # Approximate betweenness contribution
+                        if distances[j] > 0:
+                            contribution = 1.0 / (1.0 + distances[j])
+                            # Distribute contribution along estimated path
+                            path_edges = min(int(distances[j]), 10)
+                            for k in range(path_edges):
+                                if j + k < n:
+                                    edge_betweenness[i, j+k] += contribution / (k+1)
+    
+    # Symmetrize and normalize
+    edge_betweenness = edge_betweenness + edge_betweenness.T
+    if edge_betweenness.max() > 0:
+        edge_betweenness = edge_betweenness / edge_betweenness.max()
+    
+    return edge_betweenness
+
+
+def compute_nearest_neighbor_connectivity(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute connectivity based on nearest neighbors with adaptive k.
+    """
+    nn_connectivity = np.zeros((n, n))
+    
+    # Adaptive k based on graph size
+    k = max(2, min(10, n // 5))
+    
+    for i in range(n):
+        # Get k nearest neighbors
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf  # Exclude self
+        nearest_indices = np.argpartition(distances, k)[:k]
+        
+        # Assign weights based on rank
+        sorted_indices = nearest_indices[np.argsort(distances[nearest_indices])]
+        for rank, j in enumerate(sorted_indices):
+            weight = np.exp(-rank / 2.0)  # Exponential decay with rank
+            nn_connectivity[i, j] = weight
+    
+    # Symmetrize
+    nn_connectivity = (nn_connectivity + nn_connectivity.T) / 2
+    
+    return nn_connectivity
+
+
+def compute_adaptive_weights(instance_features: Dict[str, Any], n: int) -> Dict[str, float]:
+    """
+    Dynamically compute heuristic weights based on problem characteristics.
+    """
+    # Base weights
+    weights = {
+        'reciprocal': 1.0,
+        'betweenness': 0.0,
+        'mst': 0.0,
+        'nn': 0.0
+    }
+    
+    # Adjust based on problem size
+    size_factor = np.log(n + 1) / np.log(50)  # Normalize around n=50
+    
+    # Adjust based on distance distribution
+    cv = instance_features['dist_cv']
+    uniformity = instance_features['uniformity']
+    
+    if cv < 0.3:
+        # Uniform distances - rely more on structure
+        weights['betweenness'] = 0.4 * size_factor
+        weights['mst'] = 0.3 * size_factor
+        weights['nn'] = 0.2 * size_factor
+        weights['reciprocal'] = 0.5  # Reduced weight for reciprocal
+    elif cv > 1.0:
+        # Highly variable distances - rely more on reciprocal
+        weights['reciprocal'] = 1.2
+        weights['betweenness'] = 0.2 * size_factor
+        weights['mst'] = 0.1 * size_factor
+        weights['nn'] = 0.3 * size_factor
+    else:
+        # Moderate variability - balanced approach
+        weights['reciprocal'] = 0.8
+        weights['betweenness'] = 0.3 * size_factor
+        weights['mst'] = 0.2 * size_factor
+        weights['nn'] = 0.25 * size_factor
+    
+    # Normalize weights
+    total = sum(weights.values())
+    if total > 0:
+        for key in weights:
+            weights[key] /= total
+    
+    return weights
+
+
+def adaptive_sparsification(combined: np.ndarray, distance_matrix: np.ndarray,
+                          instance_features: Dict[str, Any], n: int) -> np.ndarray:
+    """
+    Apply adaptive sparsification with probabilistic edge selection.
+    """
+    sparsified = np.zeros_like(combined)
+    
+    # Determine sparsity level adaptively
+    if n <= 20:
+        k_per_node = max(3, n // 2)
+        keep_prob = 0.8
+    elif n <= 100:
+        k_per_node = max(3, n // 4)
+        keep_prob = 0.6
+    else:
+        k_per_node = max(3, n // 10)
+        keep_prob = 0.4
+    
+    # Adjust based on distance uniformity
+    uniformity = instance_features['uniformity']
+    if uniformity < 0.5:
+        # More regular graph - be more selective
+        k_per_node = max(2, k_per_node - 1)
+        keep_prob *= 0.8
+    
+    for i in range(n):
+        # Get row and exclude self
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Get top candidates
+        if k_per_node < n - 1:
+            # Use argpartition for efficiency
+            top_k_idx = np.argpartition(row, -k_per_node)[-k_per_node:]
+        else:
+            top_k_idx = np.arange(n)
+            top_k_idx = top_k_idx[top_k_idx != i]
+        
+        # Sort top candidates
+        top_values = row[top_k_idx]
+        sorted_indices = top_k_idx[np.argsort(top_values)[::-1]]
+        
+        # Apply probabilistic selection with rank-based decay
+        for rank, j in enumerate(sorted_indices):
+            # Probability of keeping this edge
+            if np.random.random() < keep_prob * np.exp(-rank / 3.0):
+                # Apply exponential decay based on rank
+                decay = np.exp(-rank / 2.0)
+                
+                # Additional factor based on relative distance
+                if distance_matrix[i, j] > 0:
+                    dist_factor = 1.0 / (1.0 + np.log1p(distance_matrix[i, j]))
+                else:
+                    dist_factor = 1.0
+                
+                sparsified[i, j] = combined[i, j] * decay * dist_factor
+    
+    # Ensure symmetry by averaging
+    sparsified = (sparsified + sparsified.T) / 2
+    
+    return sparsified
+```

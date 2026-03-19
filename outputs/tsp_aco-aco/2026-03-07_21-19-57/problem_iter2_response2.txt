@@ -1,0 +1,300 @@
+```json
+{
+    "algorithm_features": ["Three-step Lookahead Scoring", "Graph Centrality Weights", "Dynamic Edge Sparsification", "Meta-Heuristic Weight Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy import stats
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with improved strategies.
+    
+    Key improvements over v1:
+    1. Three-step lookahead for better path continuity estimation
+    2. Graph centrality measures (closeness, betweenness approximation)
+    3. Meta-heuristic weight adaptation based on problem characteristics
+    4. Enhanced sparsification with dynamic thresholding
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n < 4:
+        # Base case for very small instances
+        heuristic = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # 1. Base inverse distance heuristic
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    base_heuristic = 1.0 / (safe_dist + 1e-10)
+    
+    # 2. Compute graph centrality measures
+    # Closeness centrality (inverse of average distance)
+    closeness = (n - 1) / (np.sum(safe_dist, axis=1) + 1e-10)
+    closeness_norm = closeness / np.max(closeness)
+    
+    # Approximate betweenness centrality using random walks
+    betweenness_approx = _approximate_betweenness(safe_dist, n)
+    betweenness_norm = betweenness_approx / np.max(betweenness_approx) if np.max(betweenness_approx) > 0 else betweenness_approx
+    
+    # Combine centrality measures
+    centrality_factor = 0.6 * closeness_norm + 0.4 * betweenness_norm
+    
+    # Isolation factor (inverse of centrality)
+    isolation_factor = 1.0 - centrality_factor
+    
+    # 3. Three-step lookahead scoring
+    lookahead_scores = _compute_three_step_lookahead(safe_dist, n)
+    
+    # 4. Cluster connectivity bonus using local density
+    density_bonus = _compute_density_bonus(safe_dist, n)
+    
+    # 5. Meta-heuristic weight adaptation
+    # Analyze problem characteristics to adjust weights
+    weight_base, weight_lookahead, weight_centrality, weight_isolation, weight_density = _adapt_weights(
+        safe_dist, n, base_heuristic, lookahead_scores, centrality_factor, isolation_factor
+    )
+    
+    # 6. Combine all factors with adaptive weights
+    heuristic = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Symmetric factors
+                iso_bonus = (isolation_factor[i] + isolation_factor[j]) / 2
+                cent_bonus = (centrality_factor[i] + centrality_factor[j]) / 2
+                
+                # Combine with geometric mean using adaptive weights
+                combined = (
+                    (base_heuristic[i, j] ** weight_base) *
+                    (lookahead_scores[i, j] ** weight_lookahead) *
+                    (cent_bonus ** weight_centrality) *
+                    (iso_bonus ** weight_isolation) *
+                    ((1 + density_bonus[i, j]) ** weight_density)
+                )
+                heuristic[i, j] = combined
+    
+    # 7. Enhanced sparsification with dynamic thresholds
+    heuristic = _dynamic_sparsification(heuristic, n, safe_dist)
+    
+    # 8. Final normalization
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    np.fill_diagonal(heuristic, 0)
+    return heuristic
+
+
+def _approximate_betweenness(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Approximate betweenness centrality using random shortest paths.
+    """
+    betweenness = np.zeros(n)
+    num_samples = min(50, n * (n - 1) // 2)
+    
+    for _ in range(num_samples):
+        # Sample two distinct nodes
+        i, j = np.random.choice(n, 2, replace=False)
+        
+        # Find approximate shortest path using greedy approach
+        path = [i]
+        current = i
+        visited = set([i])
+        
+        while current != j and len(visited) < n:
+            # Find nearest unvisited neighbor
+            mask = np.ones(n, dtype=bool)
+            mask[list(visited)] = False
+            if not np.any(mask):
+                break
+                
+            nearest = np.argmin(distance_matrix[current, mask])
+            nearest_idx = np.where(mask)[0][nearest]
+            path.append(nearest_idx)
+            visited.add(nearest_idx)
+            current = nearest_idx
+        
+        # Update betweenness counts for internal nodes in path
+        for node in path[1:-1]:  # Exclude start and end
+            betweenness[node] += 1
+    
+    return betweenness
+
+
+def _compute_three_step_lookahead(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute three-step lookahead scores for each edge.
+    """
+    lookahead_scores = np.zeros_like(distance_matrix)
+    
+    # Precompute nearest neighbors for each node
+    k_neighbors = min(5, n // 2)
+    nearest_neighbors = []
+    for i in range(n):
+        # Get k+1 nearest neighbors (including self)
+        neighbors = np.argsort(distance_matrix[i])[:k_neighbors + 1]
+        nearest_neighbors.append(set(neighbors[neighbors != i]))
+    
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Base cost: i -> j
+                base_cost = distance_matrix[i, j]
+                
+                # Find best third node (excluding i and j)
+                mask = np.ones(n, dtype=bool)
+                mask[[i, j]] = False
+                
+                if np.any(mask):
+                    # Consider k that are in nearest neighbors of j
+                    valid_ks = list(nearest_neighbors[j] - {i})
+                    if len(valid_ks) == 0:
+                        # Fall back to any node
+                        valid_ks = np.where(mask)[0]
+                    
+                    if len(valid_ks) > 0:
+                        # For each k, find best continuation
+                        best_continuation = float('inf')
+                        for k in valid_ks[:min(10, len(valid_ks))]:  # Limit for efficiency
+                            # k -> l (excluding i, j, k)
+                            mask_l = mask.copy()
+                            mask_l[k] = False
+                            if np.any(mask_l):
+                                best_l = np.min(distance_matrix[k, mask_l])
+                                continuation_cost = distance_matrix[j, k] + best_l
+                                best_continuation = min(best_continuation, continuation_cost)
+                        
+                        if best_continuation < float('inf'):
+                            lookahead_scores[i, j] = 1.0 / (base_cost + 0.5 * best_continuation + 1e-10)
+    
+    # Normalize rows
+    for i in range(n):
+        row = lookahead_scores[i]
+        if np.max(row) > 0:
+            lookahead_scores[i] = row / np.max(row)
+    
+    return lookahead_scores
+
+
+def _compute_density_bonus(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute density-based bonuses for edges connecting different density regions.
+    """
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute local density for each node
+    densities = np.zeros(n)
+    k_density = min(10, n // 4)
+    
+    for i in range(n):
+        # Average distance to k_density nearest neighbors
+        nearest_dists = np.sort(distance_matrix[i])[1:k_density+1]
+        densities[i] = 1.0 / (np.mean(nearest_dists) + 1e-10)
+    
+    # Normalize densities
+    if np.max(densities) > 0:
+        densities = densities / np.max(densities)
+    
+    # Assign bonus based on density difference
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                density_diff = abs(densities[i] - densities[j])
+                # Bonus for connecting different density regions
+                density_bonus[i, j] = 0.5 * density_diff
+    
+    return density_bonus
+
+
+def _adapt_weights(distance_matrix: np.ndarray, n: int,
+                   base_heuristic: np.ndarray, lookahead_scores: np.ndarray,
+                   centrality_factor: np.ndarray, isolation_factor: np.ndarray) -> tuple:
+    """
+    Adapt weights based on problem characteristics.
+    """
+    # Analyze distance distribution
+    flat_dist = distance_matrix[np.triu_indices(n, k=1)]
+    dist_std = np.std(flat_dist)
+    dist_mean = np.mean(flat_dist)
+    cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    
+    # Analyze spatial structure
+    base_variation = np.std(base_heuristic[base_heuristic > 0])
+    lookahead_variation = np.std(lookahead_scores[lookahead_scores > 0])
+    
+    # Default weights
+    w_base = 0.35
+    w_lookahead = 0.30
+    w_centrality = 0.15
+    w_isolation = 0.15
+    w_density = 0.05
+    
+    # Adjust based on problem characteristics
+    if cv > 0.5:  # Highly variable distances
+        w_base += 0.1
+        w_lookahead -= 0.05
+    elif cv < 0.2:  # Uniform distances
+        w_lookahead += 0.1
+        w_base -= 0.05
+    
+    if base_variation < 0.1:  # Base heuristic doesn't discriminate well
+        w_base = max(0.2, w_base - 0.1)
+        w_centrality += 0.05
+        w_isolation += 0.05
+    
+    if lookahead_variation > 0.3:  # Lookahead provides good discrimination
+        w_lookahead = min(0.4, w_lookahead + 0.05)
+    
+    # Normalize weights to sum to 1
+    total = w_base + w_lookahead + w_centrality + w_isolation + w_density
+    weights = (w_base, w_lookahead, w_centrality, w_isolation, w_density)
+    return tuple(w / total for w in weights)
+
+
+def _dynamic_sparsification(heuristic: np.ndarray, n: int, distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Apply dynamic sparsification based on local and global thresholds.
+    """
+    result = heuristic.copy()
+    
+    for i in range(n):
+        row = result[i]
+        
+        # Dynamic k based on node's connectivity pattern
+        avg_dist = np.mean(distance_matrix[i])
+        if avg_dist < np.percentile(distance_matrix, 25):
+            # Dense region - be more selective
+            k = max(2, int(np.sqrt(n) * 0.7))
+            percentile_thresh = 80
+        elif avg_dist > np.percentile(distance_matrix, 75):
+            # Sparse region - keep more connections
+            k = max(3, int(np.sqrt(n) * 1.3))
+            percentile_thresh = 65
+        else:
+            k = max(3, int(np.sqrt(n)))
+            percentile_thresh = 75
+        
+        # Apply dual threshold
+        if k < len(row):
+            top_k_thresh = np.partition(row, -k)[-k]
+            percentile_thresh_val = np.percentile(row, percentile_thresh)
+            threshold = max(top_k_thresh, percentile_thresh_val)
+            
+            mask = row < threshold
+            result[i, mask] = 0
+    
+    # Ensure symmetry for undirected TSP
+    result = np.maximum(result, result.T)
+    
+    return result
+```

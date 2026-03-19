@@ -1,0 +1,161 @@
+```json
+{
+    "algorithm_features": ["Adaptive Exponential Rank-Weighting", "Symmetry-Enforced Multi-Factor Sparsification", "Regret-Based Edge Penalization", "Coefficient of Variation Decay Control"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge evaluation with adaptive exponential rank weighting,
+    symmetry-enforced sparsification, and regret-based edge penalization.
+    
+    Features:
+    1. Symmetry-Enforced Multi-Factor Sparsification: Dynamic candidate lists with 
+       connectivity preservation and enforced symmetry.
+    2. Adaptive Exponential Rank-Weighting: Coefficient of variation of first 5 
+       nearest distances mapped via sigmoid to [0.3, 0.85] decay rate.
+    3. Regret-Based Edge Penalization: Penalizes edges by exponentiating the negative 
+       normalized difference between edge distance and second-best alternative.
+    4. Coefficient of Variation Decay Control: Adaptive decay rate based on local 
+       distance variability for more nuanced rank weighting.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Create safe distance matrix with diagonal set to infinity
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Multi-Factor Sparsification with Symmetry Enforcement
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Dynamic candidate count: O(sqrt(n)) but at least 4
+    k_candidate = max(4, int(np.sqrt(n) * 1.2))
+    
+    for i in range(n):
+        # Get k nearest neighbors as candidates
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Enforce symmetry in candidate mask
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # 2. Exponential Rank-Weighted Scoring with Coefficient of Variation
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances and sort them
+        dists = safe_dist[i].copy()
+        sorted_indices = np.argsort(dists)
+        sorted_dists = dists[sorted_indices]
+        
+        # Get first 5 nearest distances (excluding self)
+        top_k = min(5, n - 1)
+        if top_k > 1:
+            top_dists = sorted_dists[:top_k]
+            mean_top = np.mean(top_dists)
+            std_top = np.std(top_dists)
+            
+            # Coefficient of variation for adaptive decay
+            cv = std_top / (mean_top + eps)
+            
+            # Sigmoid mapping of CV to decay rate in [0.3, 0.85]
+            # Adjust sigmoid parameters for desired mapping
+            sigmoid_cv = 1 / (1 + np.exp(-10 * (cv - 0.3)))  # Steep sigmoid around 0.3
+            decay_rate = 0.3 + 0.55 * sigmoid_cv
+            decay_rate = np.clip(decay_rate, 0.3, 0.85)
+        else:
+            decay_rate = 0.7
+        
+        # Assign exponential rank weights
+        for rank, j in enumerate(sorted_indices):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # 3. Simplified Regret-Based Penalty
+    regret_penalty = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        
+        # Find best (closest) and second-best distances
+        # Handle cases where we might not have enough neighbors
+        if n >= 3:
+            # Get two smallest distances (excluding self)
+            sorted_dists = np.sort(dists)
+            best_dist = sorted_dists[0]
+            
+            # Ensure we have a valid second-best
+            if len(sorted_dists) > 1:
+                second_best = sorted_dists[1]
+            else:
+                second_best = best_dist * 1.5  # Fallback
+            
+            # Calculate normalized difference for each edge
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    edge_dist = dists[j]
+                    
+                    # Compute normalized difference
+                    if abs(second_best - best_dist) > eps:
+                        norm_diff = (edge_dist - best_dist) / (second_best - best_dist + eps)
+                    else:
+                        norm_diff = (edge_dist - best_dist) / (mean_top + eps)
+                    
+                    # Apply exponential penalty
+                    regret_penalty[i, j] = np.exp(-max(0, norm_diff))
+                elif i != j:
+                    regret_penalty[i, j] = 0.0  # Zero for non-candidates
+        else:
+            # For very small graphs, use simple inverse weighting
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    regret_penalty[i, j] = 1.0
+    
+    # 4. Combine factors with base inverse distance
+    # Base inverse distance (normalized)
+    inv_dist = 1.0 / safe_dist
+    mean_dist = np.mean(safe_dist[safe_dist < np.inf])
+    inv_dist = inv_dist * mean_dist / 2.0  # Scale appropriately
+    
+    # Combine: base * rank_weights * regret_penalty
+    heuristics_matrix = inv_dist * rank_weights * regret_penalty
+    
+    # 5. Apply candidate mask (sparsification)
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # 6. Ensure minimum connectivity (each node must have at least 2 edges)
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_count = np.count_nonzero(row)
+        
+        if nonzero_count < 2:
+            # Find top edges by combined score
+            scores = heuristics_matrix[i].copy()
+            scores[i] = -np.inf  # Exclude self
+            
+            # Ensure we have enough candidates
+            needed = 2 - nonzero_count
+            if needed > 0:
+                top_indices = np.argsort(scores)[-needed:]
+                for idx in top_indices:
+                    if scores[idx] <= 0:
+                        # Set a small positive value
+                        heuristics_matrix[i, idx] = np.max(heuristics_matrix) * 0.01
+                        heuristics_matrix[idx, i] = np.max(heuristics_matrix) * 0.01
+    
+    # 7. Enforce symmetry and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

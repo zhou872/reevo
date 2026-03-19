@@ -1,0 +1,464 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret Beam Search", "Ant Colony Pheromone Reinforcement", "Node Structural Embedding", "Approximate MST Sparsification"]
+}
+```
+
+```python
+import numpy as np
+import warnings
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from collections import defaultdict
+import heapq
+
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with graph neural network inspired embeddings,
+    enhanced pheromone simulation with local search, and scalable approximations.
+    
+    Core innovations:
+    1. Structural node embeddings via fast graph walks
+    2. Enhanced pheromone with 2-opt local search improvements
+    3. Multi-step regret analysis with adaptive beam search
+    4. Approximate MST with sparsification for large instances
+    
+    Returns:
+        Heuristic matrix [0,1] where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix
+    dmat = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(dmat, np.inf)
+    eps = 1e-12
+    
+    # ========== INSTANCE CHARACTERIZATION ==========
+    flat_dist = dmat[np.isfinite(dmat)]
+    if len(flat_dist) == 0:
+        return np.zeros_like(distance_matrix)
+    
+    dist_mean = np.mean(flat_dist)
+    dist_std = np.std(flat_dist)
+    dist_q25, dist_q75 = np.percentile(flat_dist, [25, 75])
+    iqr = dist_q75 - dist_q25
+    
+    # Classification
+    is_uniform = dist_std / (dist_mean + eps) < 0.25
+    is_clustered = iqr / (dist_mean + eps) > 0.6
+    compactness = dist_std / (dist_mean + eps)
+    
+    # Dynamic parameter adaptation
+    if n < 100:
+        lookahead = 3
+        beam_width = 10
+        k_candidate = min(20, n-1)
+        mst_approx = False
+    elif n < 1000:
+        lookahead = 2
+        beam_width = 7
+        k_candidate = min(15, n-1)
+        mst_approx = (n > 500)
+    else:
+        lookahead = 2
+        beam_width = 5
+        k_candidate = min(10, n-1)
+        mst_approx = True
+    
+    if is_clustered:
+        lookahead = min(lookahead + 1, 4)
+        beam_width = max(beam_width, 8)
+    
+    # ========== GRAPH NEURAL NETWORK INSPIRED EMBEDDINGS ==========
+    # Fast structural embeddings via random walks
+    embed_dim = min(16, max(4, n // 50))
+    node_embeddings = np.zeros((n, embed_dim))
+    
+    if n > 10:
+        # Build k-NN graph for walk-based embeddings
+        k_nn = min(15, n-1)
+        nn_indices = np.argsort(dmat, axis=1)[:, 1:k_nn+1]
+        
+        # Generate random walks
+        n_walks = min(100, n * 5)
+        walk_length = min(10, n)
+        
+        for walk_idx in range(n_walks):
+            start = np.random.randint(n)
+            walk = [start]
+            current = start
+            
+            for step in range(walk_length - 1):
+                if len(nn_indices[current]) == 0:
+                    break
+                # Transition probability proportional to inverse distance
+                candidates = nn_indices[current]
+                probs = 1.0 / (dmat[current, candidates] + eps)
+                probs = probs / probs.sum()
+                next_node = np.random.choice(candidates, p=probs)
+                walk.append(next_node)
+                current = next_node
+            
+            # Update embeddings based on co-occurrence
+            for i, node in enumerate(walk):
+                context = walk[max(0, i-2):min(len(walk), i+3)]
+                for ctx_node in context:
+                    if node != ctx_node:
+                        feature_idx = hash((node, ctx_node)) % embed_dim
+                        node_embeddings[node, feature_idx] += 1.0
+                        node_embeddings[ctx_node, feature_idx] += 0.5
+        
+        # Normalize embeddings
+        row_norms = np.linalg.norm(node_embeddings, axis=1, keepdims=True)
+        row_norms[row_norms == 0] = 1
+        node_embeddings = node_embeddings / row_norms
+    
+    # Compute edge embeddings
+    edge_embed_scores = np.zeros_like(dmat)
+    for i in range(n):
+        for j in range(i+1, n):
+            if np.isinf(dmat[i, j]):
+                continue
+            # Combine node embeddings
+            sim = np.dot(node_embeddings[i], node_embeddings[j])
+            edge_embed_scores[i, j] = edge_embed_scores[j, i] = max(0, sim)
+    
+    if np.max(edge_embed_scores) > 0:
+        edge_embed_scores = edge_embed_scores / np.max(edge_embed_scores)
+    
+    # ========== ENHANCED PHEROMONE SIMULATION WITH LOCAL SEARCH ==========
+    pheromone = np.ones_like(dmat)
+    np.fill_diagonal(pheromone, 0)
+    
+    n_tours = min(7, max(3, n // 50))
+    
+    def two_opt_improvement(tour, max_iter=100):
+        """Fast 2-opt local search improvement."""
+        improved = True
+        iter_count = 0
+        
+        while improved and iter_count < max_iter:
+            improved = False
+            best_gain = 0
+            best_i = best_j = -1
+            
+            # Check only promising swaps (neighbors in distance)
+            for i in range(len(tour)):
+                for k in range(1, min(10, len(tour)-i-1)):
+                    j = i + k
+                    if j >= len(tour) - 1:
+                        continue
+                    
+                    a1, a2 = tour[i], tour[i+1]
+                    b1, b2 = tour[j], tour[j+1]
+                    
+                    # Calculate gain from swapping
+                    old_segment = dmat[a1, a2] + dmat[b1, b2]
+                    new_segment = dmat[a1, b1] + dmat[a2, b2]
+                    gain = old_segment - new_segment
+                    
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_i, best_j = i, j
+                        improved = True
+            
+            if improved and best_gain > eps:
+                # Perform the swap
+                tour[best_i+1:best_j+1] = tour[best_i+1:best_j+1][::-1]
+                iter_count += 1
+            else:
+                break
+        
+        return tour
+    
+    for tour_idx in range(n_tours):
+        # Construct initial tour with randomized nearest neighbor
+        start = tour_idx % n
+        unvisited = list(range(n))
+        unvisited.remove(start)
+        tour = [start]
+        current = start
+        
+        while unvisited:
+            # Get k nearest unvisited neighbors
+            k = min(5, len(unvisited))
+            candidates = unvisited
+            dists = dmat[current, candidates]
+            nearest_idx = np.argpartition(dists, min(k, len(dists)-1))[:k]
+            
+            # Stochastic selection
+            if len(nearest_idx) > 1:
+                inv_dists = 1.0 / (dists[nearest_idx] + eps)
+                probs = inv_dists / inv_dists.sum()
+                next_idx = np.random.choice(nearest_idx, p=probs)
+            else:
+                next_idx = nearest_idx[0]
+            
+            next_node = candidates[next_idx]
+            tour.append(next_node)
+            unvisited.remove(next_node)
+            current = next_node
+        
+        # Apply local search improvement for small to medium instances
+        if n < 1000:
+            tour = two_opt_improvement(tour)
+        
+        # Calculate tour length
+        tour_length = 0
+        for i in range(len(tour)):
+            j = (i + 1) % len(tour)
+            tour_length += dmat[tour[i], tour[j]]
+        
+        # Enhanced pheromone update: better tours deposit more
+        quality = 1.0 / (tour_length + eps)
+        decay = 0.8  # Evaporation factor
+        
+        for i in range(len(tour)):
+            j = (i + 1) % len(tour)
+            pheromone[tour[i], tour[j]] = (decay * pheromone[tour[i], tour[j]] + 
+                                          quality * (1 - decay))
+            pheromone[tour[j], tour[i]] = pheromone[tour[i], tour[j]]
+    
+    # Normalize pheromone
+    pheromone_max = np.max(pheromone)
+    if pheromone_max > 0:
+        pheromone = pheromone / pheromone_max
+    
+    # ========== MULTI-STEP REGRET WITH ADAPTIVE BEAM SEARCH ==========
+    regret_scores = np.zeros_like(dmat)
+    
+    # Precompute neighbor information
+    k_neighbors = min(k_candidate * 3, n - 1)
+    neighbor_indices = np.argsort(dmat, axis=1)[:, 1:k_neighbors+1]
+    
+    for i in range(min(n, 500)):  # Limit to first 500 nodes for large instances
+        if np.all(np.isinf(dmat[i])):
+            continue
+        
+        for j_idx, j in enumerate(neighbor_indices[i][:k_candidate]):
+            if i == j or np.isinf(dmat[i, j]):
+                continue
+            
+            direct_cost = dmat[i, j]
+            
+            # Beam search for alternative paths
+            beam = [(-direct_cost, j, [i, j], direct_cost)]  # (negative_score, node, path, cost)
+            best_alt_cost = np.inf
+            
+            for step in range(lookahead - 1):
+                new_beam = []
+                
+                for neg_score, node, path, cost in beam:
+                    # Get candidate continuations
+                    candidates = neighbor_indices[node]
+                    # Filter visited (allow return to i only at last step)
+                    if step == lookahead - 2:
+                        mask = ~np.isin(candidates, path[:-1])
+                    else:
+                        mask = ~np.isin(candidates, path)
+                    
+                    valid_cands = candidates[mask]
+                    
+                    if len(valid_cands) == 0:
+                        continue
+                    
+                    # Score alternatives
+                    cand_costs = dmat[node, valid_cands]
+                    cand_scores = - (cost + cand_costs)  # Negative for max-heap
+                    
+                    # Add to new beam
+                    for idx, cand in enumerate(valid_cands):
+                        new_path = path + [cand]
+                        new_cost = cost + cand_costs[idx]
+                        new_beam.append((cand_scores[idx], cand, new_path, new_cost))
+                
+                if not new_beam:
+                    break
+                
+                # Keep top beam_width candidates
+                new_beam.sort(reverse=True)
+                beam = new_beam[:beam_width]
+            
+            # Extract best alternative cost
+            if beam:
+                best_neg_score, _, _, best_alt_cost = max(beam, key=lambda x: x[0])
+                if best_alt_cost < np.inf and direct_cost > 0:
+                    regret = (direct_cost - best_alt_cost) / (direct_cost + eps)
+                    regret_scores[i, j] = max(0, regret)
+    
+    # Symmetrize regret scores
+    regret_scores = np.maximum(regret_scores, regret_scores.T)
+    regret_boost = 1.0 + np.tanh(regret_scores * 3.0)
+    
+    # ========== APPROXIMATE MST WITH SPARSIFICATION ==========
+    structural_bonus = np.zeros_like(dmat)
+    
+    def approximate_mst(nodes, sample_size=1000):
+        """Approximate MST using random sampling for large instances."""
+        if n <= sample_size:
+            # Compute exact MST
+            mst = minimum_spanning_tree(dmat).toarray()
+            return (mst + mst.T) > 0
+        else:
+            # Sample-based approximation
+            sample = np.random.choice(n, min(sample_size, n), replace=False)
+            sample_dmat = dmat[np.ix_(sample, sample)]
+            sample_mst = minimum_spanning_tree(sample_dmat).toarray()
+            
+            # Map back to full graph using nearest neighbors
+            mst_edges = np.zeros_like(dmat, dtype=bool)
+            for i in range(len(sample)):
+                for j in range(i+1, len(sample)):
+                    if sample_mst[i, j] > 0:
+                        mst_edges[sample[i], sample[j]] = True
+                        mst_edges[sample[j], sample[i]] = True
+            
+            # Add connections for unsampled nodes
+            unsampled = set(range(n)) - set(sample)
+            for node in unsampled:
+                # Connect to nearest sampled node
+                nearest = sample[np.argmin(dmat[node, sample])]
+                mst_edges[node, nearest] = True
+                mst_edges[nearest, node] = True
+            
+            return mst_edges
+    
+    if not mst_approx or n <= 10000:
+        try:
+            mst_edges = approximate_mst(n)
+            structural_bonus += mst_edges * 0.4
+        except:
+            pass
+    
+    # Add cluster connectivity bonus
+    if n > 20 and n <= 5000:
+        # Identify clusters via fast greedy modularity
+        threshold = np.percentile(flat_dist, 30)
+        cluster_id = -np.ones(n, dtype=int)
+        cluster_count = 0
+        
+        for i in range(n):
+            if cluster_id[i] == -1:
+                # Start new cluster
+                cluster_id[i] = cluster_count
+                stack = [i]
+                
+                while stack:
+                    node = stack.pop()
+                    # Find close neighbors not yet clustered
+                    close_neighbors = np.where((dmat[node] < threshold) & 
+                                              (cluster_id == -1))[0]
+                    for neighbor in close_neighbors:
+                        cluster_id[neighbor] = cluster_count
+                        stack.append(neighbor)
+                
+                cluster_count += 1
+        
+        # Bonus for intra-cluster edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if cluster_id[i] == cluster_id[j] and cluster_id[i] != -1:
+                    bonus = 0.3 / (1 + abs(i - j) / 10.0)
+                    structural_bonus[i, j] += bonus
+                    structural_bonus[j, i] += bonus
+    
+    # ========== COMBINE COMPONENTS WITH ADAPTIVE WEIGHTS ==========
+    # Base inverse distance with adaptive normalization
+    scale = np.median(flat_dist)
+    inv_dist = scale / (dmat + scale * 0.05)
+    
+    # Rank-based filtering
+    rank_weights = np.zeros_like(dmat)
+    for i in range(n):
+        sorted_idx = np.argsort(dmat[i])[1:k_candidate+1]
+        for rank, j in enumerate(sorted_idx):
+            decay = np.exp(-rank / max(1, k_candidate / 3))
+            rank_weights[i, j] = decay
+    
+    # Adaptive component weights
+    if is_uniform:
+        embed_weight = 0.2
+        pheromone_weight = 0.35
+        regret_weight = 0.35
+        structure_weight = 0.1
+    elif is_clustered:
+        embed_weight = 0.15
+        pheromone_weight = 0.25
+        regret_weight = 0.25
+        structure_weight = 0.35
+    else:
+        embed_weight = 0.2
+        pheromone_weight = 0.3
+        regret_weight = 0.3
+        structure_weight = 0.2
+    
+    # Combine all components
+    heuristics_matrix = (
+        inv_dist * rank_weights * 
+        (1.0 + edge_embed_scores * embed_weight) *
+        (1.0 + pheromone * pheromone_weight) *
+        regret_boost *
+        (1.0 + structural_bonus * structure_weight)
+    )
+    
+    # ========== INTELLIGENT SPARSIFICATION ==========
+    edges_per_node = max(3, min(k_candidate, int(np.sqrt(n)) + 3))
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        if np.all(scores <= 0):
+            # Fallback to nearest neighbors
+            top_idx = np.argsort(dmat[i])[1:edges_per_node+1]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Keep top edges
+            threshold = np.partition(scores, -edges_per_node)[-edges_per_node]
+            candidate_mask[i, scores >= threshold] = True
+    
+    # Ensure connectivity and symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Force minimum degree of 2
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < 2:
+            nearest = np.argsort(dmat[i])[1:3]
+            candidate_mask[i, nearest] = True
+            candidate_mask[nearest, i] = True
+    
+    # Apply mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # ========== FINAL PROCESSING ==========
+    # Symmetrize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # Row-wise softmax normalization
+    for i in range(n):
+        row = heuristics_matrix[i]
+        if np.sum(row) > eps:
+            # Adaptive temperature
+            nonzeros = row[row > eps]
+            if len(nonzeros) > 1:
+                temp = max(0.3, np.std(nonzeros))
+                exp_row = np.exp(row / temp)
+                row_sum = np.sum(exp_row)
+                if row_sum > eps:
+                    heuristics_matrix[i] = exp_row / row_sum
+    
+    # Global normalization
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    heuristics_matrix = np.clip(heuristics_matrix, 0.0, 1.0)
+    
+    return heuristics_matrix
+```

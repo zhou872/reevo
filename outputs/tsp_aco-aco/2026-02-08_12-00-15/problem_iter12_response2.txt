@@ -1,0 +1,191 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge selection heuristics with enhanced logarithmic scaling,
+    dynamic percentile sparsification, multi-category overlap boosting, and
+    deterministic triangle connectivity analysis.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Enhanced base heuristic with logarithmic dampening
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    # Use log(1 + d) to reduce extreme distance disparities
+    base_heuristic = 1.0 / (np.log1p(safe_dist) + 1e-10)
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. MST with variable bonus based on edge centrality
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Compute edge centrality in MST: edges connecting high-degree nodes get higher bonus
+    mst_degrees = mst_mask.sum(axis=1)
+    mst_edge_centrality = np.zeros_like(distance_matrix, dtype=float)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_mask[i, j]:
+                centrality = (mst_degrees[i] + mst_degrees[j]) / (2 * (n - 1))
+                # Bonus between 1.8 and 2.5 based on centrality
+                mst_edge_centrality[i, j] = mst_edge_centrality[j, i] = 1.8 + 0.7 * centrality
+    
+    # 3. Enhanced logarithmic nearest neighbor with rank-based decay
+    # Adaptive k: scale with log(n) but also consider problem density
+    k = max(3, int(np.log2(n)) + 3)
+    k = min(k, n - 1)
+    
+    nn_heuristic = np.zeros_like(distance_matrix, dtype=float)
+    nn_strength = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        distances = safe_dist[i].copy()
+        sorted_indices = np.argsort(distances)
+        
+        # Logarithmic rank decay with base e for smoother falloff
+        for rank, j in enumerate(sorted_indices[:k + 1], 1):
+            if j == i or rank > k:
+                continue
+            # Exponential decay: e^(-rank/k) gives smoother falloff
+            decay = np.exp(-rank / (k / 2))
+            nn_heuristic[i, j] = decay
+            nn_strength[i, j] = 1.0 / rank  # Additional strength measure
+    
+    nn_heuristic = np.maximum(nn_heuristic, nn_heuristic.T)
+    nn_strength = np.maximum(nn_strength, nn_strength.T)
+    
+    # 4. Deterministic triangle connectivity analysis
+    triangle_boost = np.zeros_like(distance_matrix, dtype=float)
+    if n >= 3:
+        # For each edge (i,j), examine the best triangle completion
+        for i in range(n):
+            for j in range(i + 1, n):
+                if base_heuristic[i, j] == 0:
+                    continue
+                    
+                # Find top triangle completions
+                k_mask = np.ones(n, dtype=bool)
+                k_mask[[i, j]] = False
+                
+                if np.sum(k_mask) > 0:
+                    # Score triangle completions by harmonic mean of the two other edges
+                    edge_scores = (base_heuristic[i, k_mask] * base_heuristic[j, k_mask])
+                    # Use log transform to reduce impact of outliers
+                    if edge_scores.size > 0:
+                        top_score = np.max(edge_scores) if edge_scores.max() > 0 else 0
+                        triangle_boost[i, j] = triangle_boost[j, i] = np.log1p(top_score)
+    
+    # Normalize triangle boost
+    if triangle_boost.max() > 0:
+        triangle_boost = triangle_boost / triangle_boost.max()
+    
+    # 5. Multi-category overlap boosting with tiered rewards
+    # Define multiple categories with different thresholds
+    category_masks = []
+    
+    # Category 1: MST edges
+    category_masks.append(mst_mask)
+    
+    # Category 2: Strong nearest neighbors (top 40% by strength)
+    nn_strength_threshold = np.percentile(nn_strength[nn_strength > 0], 60)
+    strong_nn_mask = nn_strength >= nn_strength_threshold
+    category_masks.append(strong_nn_mask)
+    
+    # Category 3: Top triangle completions
+    triangle_threshold = np.percentile(triangle_boost[triangle_boost > 0], 70) if np.any(triangle_boost > 0) else 0
+    strong_triangle_mask = triangle_boost >= triangle_threshold
+    category_masks.append(strong_triangle_mask)
+    
+    # Category 4: Top base heuristic edges
+    base_threshold = np.percentile(base_heuristic[base_heuristic > 0], 75)
+    strong_base_mask = base_heuristic >= base_threshold
+    category_masks.append(strong_base_mask)
+    
+    # Count overlaps and create tiered bonuses
+    overlap_count = np.sum(category_masks, axis=0)
+    tiered_bonus = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Tier 1: 3+ categories overlap (high confidence)
+    tiered_bonus[overlap_count >= 3] = 2.0
+    # Tier 2: 2 categories overlap
+    tiered_bonus[(overlap_count == 2) & (tiered_bonus == 0)] = 1.5
+    # Tier 3: MST edges alone
+    tiered_bonus[(overlap_count == 1) & mst_mask & (tiered_bonus == 0)] = 1.3
+    
+    # 6. Combine all factors with adaptive weighting
+    heuristics = base_heuristic.copy()
+    
+    # Apply MST bonus with centrality weighting
+    heuristics[mst_mask] *= mst_edge_centrality[mst_mask]
+    
+    # Add nearest neighbor contribution (multiplicative and additive)
+    heuristics *= (1.0 + nn_heuristic * 0.8)
+    heuristics += nn_strength * 0.3
+    
+    # Apply triangle connectivity boost
+    heuristics *= (1.0 + triangle_boost * 0.4)
+    
+    # Apply tiered overlap bonuses multiplicatively
+    heuristics[tiered_bonus > 0] *= tiered_bonus[tiered_bonus > 0]
+    
+    # 7. Dynamic percentile sparsification with density awareness
+    sparsified = np.zeros_like(heuristics)
+    
+    # Compute edge density factor
+    density_factor = n * (n - 1) / 2  # Maximum possible edges
+    actual_density = np.sum(base_heuristic > 0) / 2
+    
+    if actual_density > 0:
+        density_ratio = actual_density / density_factor
+        
+        # Adjust sparsification based on problem density
+        if density_ratio > 0.5:  # Dense problem
+            keep_percentile = 75
+        elif density_ratio > 0.2:  # Medium density
+            keep_percentile = 70
+        else:  # Sparse problem
+            keep_percentile = 65
+            
+        # Additional adjustment based on problem size
+        size_adjustment = min(10, n // 10)
+        keep_percentile = min(85, keep_percentile + size_adjustment)
+        
+        # Keep edges above percentile threshold
+        for i in range(n):
+            row_values = heuristics[i].copy()
+            valid_values = row_values[row_values > 0]
+            
+            if len(valid_values) > 1:
+                threshold = np.percentile(valid_values, keep_percentile)
+                sparsified[i] = np.where(row_values >= threshold, row_values, 0)
+            elif len(valid_values) == 1:
+                sparsified[i] = np.where(row_values > 0, row_values, 0)
+    
+    # Always preserve MST edges
+    sparsified[mst_mask] = np.maximum(sparsified[mst_mask], heuristics[mst_mask])
+    
+    # 8. Symmetrize and final normalization
+    sparsified = (sparsified + sparsified.T) / 2
+    np.fill_diagonal(sparsified, 0.0)
+    
+    # Normalize with softmax-style scaling for better distribution
+    max_val = sparsified.max()
+    if max_val > 0:
+        # Use sigmoid-like scaling to emphasize differences in top values
+        scaled = sparsified / max_val
+        # Apply gentle sigmoid: f(x) = x^0.9 preserves order while compressing range
+        sparsified = np.power(scaled, 0.9)
+    
+    return sparsified
+```

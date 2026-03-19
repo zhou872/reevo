@@ -1,0 +1,264 @@
+```json
+{
+    "algorithm_features": ["Density-Adaptive Sparsification", "Centrality-Augmented MST Boosting", "Multiplicative Edge Priority Scoring", "Two-Hop Alternative Analysis"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with:
+    1. Density-adaptive sparsification based on local clustering
+    2. Centrality-augmented MST boosting for hub identification
+    3. Multiplicative scoring emphasizing edges strong across all criteria
+    4. Efficient two-hop alternative path analysis
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for more promising edges.
+        Matrix is sparse, symmetric, and row-normalized.
+    """
+    n = len(distance_matrix)
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. Density-Adaptive Sparsification ====================
+    # Compute local density metrics for each node
+    density_adjusted_k = np.zeros(n, dtype=int)
+    if n > 3:
+        # Compute pairwise distances and local density
+        for i in range(n):
+            # Get distances excluding self
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            
+            # Compute density metric: variance of log distances to nearest neighbors
+            k_base = max(3, int(np.log2(n)))
+            k_nearest = min(k_base, n-1)
+            nearest_dists = np.partition(distances, k_nearest)[:k_nearest]
+            
+            # Avoid log(0) or negative distances
+            nearest_dists = np.maximum(nearest_dists, 1e-10)
+            
+            # Higher variance indicates more varied neighborhood -> need more connections
+            log_dists = np.log(nearest_dists)
+            density_variance = np.var(log_dists)
+            
+            # Adjust k based on density variance
+            # Higher variance -> more neighbors to capture diverse distances
+            density_factor = 1.0 + 2.0 * np.tanh(density_variance)
+            density_adjusted_k[i] = max(3, int(k_base * density_factor))
+    else:
+        density_adjusted_k[:] = max(3, n-1)
+    
+    # Build adjacency mask with density-adaptive k
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        k_i = min(density_adjusted_k[i], n-1)
+        if k_i < n - 1:
+            nn_indices = np.argpartition(distances, k_i)[:k_i]
+        else:
+            nn_indices = np.arange(n)
+            nn_indices = nn_indices[nn_indices != i]
+        
+        adjacency_mask[i, nn_indices] = True
+    
+    # Ensure symmetry and remove self-connections
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Base Inverse Distance Scoring ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        mask_i = adjacency_mask[i]
+        if np.any(mask_i):
+            inv_vals = 1.0 / (distance_matrix[i, mask_i] + 1e-10)
+            neighbor_count = np.sum(mask_i)
+            inv_dist[i, mask_i] = inv_vals / neighbor_count
+    
+    # Symmetrize scores
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    
+    # ==================== 3. Two-Hop Path Analysis ====================
+    two_hop_score = np.zeros_like(distance_matrix)
+    
+    # Precompute nearest neighbors using adaptive k for efficiency
+    nearest_neighbors = []
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        k_i = min(density_adjusted_k[i], n-1)
+        nn_indices = np.argpartition(distances, k_i)[:k_i]
+        nearest_neighbors.append(nn_indices)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                direct_dist = distance_matrix[i, j]
+                
+                # Find minimum two-hop path through nearest neighbors
+                min_two_hop = np.inf
+                
+                # Check neighbors of i
+                for k in nearest_neighbors[i]:
+                    if k != j:
+                        two_hop_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                        min_two_hop = min(min_two_hop, two_hop_dist)
+                
+                # Check neighbors of j
+                for k in nearest_neighbors[j]:
+                    if k != i:
+                        two_hop_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                        min_two_hop = min(min_two_hop, two_hop_dist)
+                
+                # Compute advantage ratio if valid two-hop path exists
+                if min_two_hop < np.inf and direct_dist > 1e-10:
+                    ratio = min_two_hop / direct_dist
+                    # Sigmoid transformation emphasizing significant advantages
+                    advantage = np.tanh(ratio - 1)  # Negative when direct is worse
+                    two_hop_score[i, j] = two_hop_score[j, i] = 1.0 + advantage  # Range: [0, 2]
+    
+    # Normalize two-hop scores to [0, 1] range
+    mask_indices = adjacency_mask & (two_hop_score > 0)
+    if np.any(mask_indices):
+        min_val = np.min(two_hop_score[mask_indices])
+        max_val = np.max(two_hop_score[mask_indices])
+        if max_val > min_val:
+            two_hop_score[mask_indices] = (two_hop_score[mask_indices] - min_val) / (max_val - min_val)
+    
+    # ==================== 4. Centrality-Augmented MST Boosting ====================
+    mst_boost = np.ones_like(distance_matrix, dtype=float)
+    
+    if n > 2:
+        # Compute MST using Prim's algorithm for efficiency
+        visited = np.zeros(n, dtype=bool)
+        min_edge = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        min_edge[0] = 0
+        
+        for _ in range(n):
+            u = -1
+            min_val = np.inf
+            for i in range(n):
+                if not visited[i] and min_edge[i] < min_val:
+                    min_val = min_edge[i]
+                    u = i
+            
+            if u == -1:
+                break
+                
+            visited[u] = True
+            
+            if parent[u] != -1:
+                # Base MST edge boost
+                mst_boost[u, parent[u]] = 1.5
+                mst_boost[parent[u], u] = 1.5
+            
+            # Update distances to unvisited nodes
+            for v in range(n):
+                if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                    min_edge[v] = distance_matrix[u, v]
+                    parent[v] = u
+        
+        # Compute centrality measures for MST nodes
+        # Degree centrality in MST
+        mst_degree = np.zeros(n)
+        mst_edges = np.where(np.triu(mst_boost) > 1.0)
+        
+        for i in range(len(mst_edges[0])):
+            u, v = mst_edges[0][i], mst_edges[1][i]
+            mst_degree[u] += 1
+            mst_degree[v] += 1
+        
+        # Augment MST boost based on centrality
+        if np.max(mst_degree) > 0:
+            normalized_centrality = mst_degree / np.max(mst_degree)
+            
+            # Apply centrality-based boost to MST edges
+            for i in range(len(mst_edges[0])):
+                u, v = mst_edges[0][i], mst_edges[1][i]
+                centrality_factor = 0.5 * (normalized_centrality[u] + normalized_centrality[v])
+                
+                # Stronger boost for edges connecting central nodes
+                centrality_boost = 1.0 + 0.5 * centrality_factor
+                mst_boost[u, v] *= centrality_boost
+                mst_boost[v, u] = mst_boost[u, v]
+        
+        # Also boost edges connecting to central MST nodes (neighbors in original graph)
+        centrality_threshold = np.median(normalized_centrality)
+        central_nodes = np.where(normalized_centrality > centrality_threshold)[0]
+        
+        for node in central_nodes:
+            # Boost edges from central nodes to their nearest neighbors
+            mask = adjacency_mask[node]
+            if np.any(mask):
+                mst_boost[node, mask] = np.maximum(mst_boost[node, mask], 1.2)
+                mst_boost[mask, node] = mst_boost[node, mask]
+    
+    # ==================== 5. Multiplicative Edge Priority Scoring ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply adjacency mask
+    mask_indices = np.where(adjacency_mask)
+    
+    if len(mask_indices[0]) > 0:
+        i_indices, j_indices = mask_indices
+        
+        # Get component scores
+        base_scores = inv_dist[mask_indices]
+        two_hop_scores = two_hop_score[mask_indices]
+        mst_boosts = mst_boost[mask_indices]
+        
+        # Multiplicative combination emphasizing edges strong across all aspects
+        # Add small epsilon to avoid zero multiplication
+        epsilon = 1e-10
+        combined_scores = (base_scores + epsilon) * (two_hop_scores + epsilon) * (mst_boosts + epsilon)
+        
+        # Apply scores
+        heuristics[i_indices, j_indices] = combined_scores
+    
+    # Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # ==================== 6. Final Processing ====================
+    # Set diagonal to zero
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final adaptive sparsification: keep top edges per node based on density-adjusted k
+    for i in range(n):
+        row = heuristics[i].copy()
+        nonzero_mask = row > 0
+        
+        if np.sum(nonzero_mask) > density_adjusted_k[i]:
+            # Keep only top density_adjusted_k[i] edges
+            threshold = np.partition(row, -density_adjusted_k[i])[-density_adjusted_k[i]]
+            row[row < threshold] = 0
+            heuristics[i] = row
+    
+    # Re-normalize after final sparsification
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

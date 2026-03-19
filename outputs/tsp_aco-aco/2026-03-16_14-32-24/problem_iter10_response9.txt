@@ -1,0 +1,245 @@
+```json
+{
+    "algorithm_features": ["2-Step Lookahead Regret", "Adaptive Rank Decay", "K-Nearest Neighbor Pruning", "Local Structure Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with 2-step lookahead regret, adaptive rank decay,
+    strategic k-NN pruning, and local structure bonuses.
+    
+    Key Innovations:
+    1. 2-step lookahead regret: Evaluates alternative paths without heavy beam search
+    2. Adaptive rank decay: Dynamically adjusts weighting based on local variance
+    3. K-nearest neighbor pruning: Intelligent edge filtering with connectivity constraints
+    4. Local structure bonuses: Rewards edges that form natural clusters or triangles
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Prepare safe distance matrix
+    safe_dist = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ========== ADAPTIVE PARAMETERS ==========
+    # Dynamic k-nearest neighbor parameter
+    k_nn = max(3, min(int(np.log2(n) * 3), n - 1))
+    
+    # ========== 2-STEP LOOKAHEAD REGRET ==========
+    regret_matrix = np.zeros_like(safe_dist)
+    
+    # Precompute nearest neighbors for efficient lookahead
+    if n > 3:
+        # Get k nearest neighbors for each node
+        k_regret = min(k_nn * 2, n - 1)
+        neighbor_indices = np.argsort(safe_dist, axis=1)[:, 1:k_regret+1]
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if safe_dist[i, j] == np.inf:
+                    continue
+                
+                # Find best 2-step alternative path i -> k -> j
+                alt_costs = []
+                
+                # Check common neighbors
+                common_k = np.intersect1d(neighbor_indices[i], neighbor_indices[j], 
+                                        assume_unique=True)
+                common_k = common_k[(common_k != i) & (common_k != j)]
+                
+                if len(common_k) > 0:
+                    # Consider top 3 common neighbors
+                    k_vals = common_k[:min(3, len(common_k))]
+                    for k in k_vals:
+                        alt_cost = safe_dist[i, k] + safe_dist[k, j]
+                        alt_costs.append(alt_cost)
+                
+                # Also consider neighbors of neighbors
+                if len(alt_costs) < 3 and k_regret > 1:
+                    # Check neighbors of i
+                    for k in neighbor_indices[i][:min(3, k_regret)]:
+                        if k == j:
+                            continue
+                        # Find connection from k to j among k's neighbors
+                        if j in neighbor_indices[k][:min(3, k_regret)]:
+                            alt_cost = safe_dist[i, k] + safe_dist[k, j]
+                            alt_costs.append(alt_cost)
+                
+                # Calculate regret
+                if alt_costs:
+                    best_alt = min(alt_costs)
+                    direct_cost = safe_dist[i, j]
+                    
+                    # Normalized regret: (alternative - direct) / direct
+                    # Negative regret means alternative is better
+                    norm_regret = max(0, (best_alt - direct_cost) / (direct_cost + eps))
+                    
+                    # Convert to edge priority (higher regret = lower priority)
+                    regret_matrix[i, j] = np.exp(-norm_regret * 2.0)
+                    regret_matrix[j, i] = regret_matrix[i, j]
+                else:
+                    # No good alternative found
+                    regret_matrix[i, j] = 0.8
+                    regret_matrix[j, i] = 0.8
+    
+    # ========== ADAPTIVE RANK WEIGHTING ==========
+    rank_weights = np.zeros_like(safe_dist)
+    
+    for i in range(n):
+        # Sort distances for node i
+        sorted_indices = np.argsort(safe_dist[i])
+        sorted_dists = safe_dist[i, sorted_indices]
+        
+        # Calculate adaptive decay based on local variance
+        # Use first 5 distances to assess local structure
+        k_adaptive = min(5, n - 1)
+        if k_adaptive > 1:
+            local_dists = sorted_dists[1:k_adaptive+1]
+            mean_dist = np.mean(local_dists)
+            std_dist = np.std(local_dists)
+            
+            if mean_dist > eps:
+                # Higher variance → faster decay (prioritize nearest neighbors)
+                cv = std_dist / mean_dist
+                decay_rate = 0.4 + 0.5 * (1 - np.exp(-cv * 2))
+                decay_rate = np.clip(decay_rate, 0.4, 0.9)
+            else:
+                decay_rate = 0.7
+        else:
+            decay_rate = 0.7
+        
+        # Apply exponential decay by rank
+        for rank, j in enumerate(sorted_indices):
+            if i != j and rank < k_nn:
+                weight = decay_rate ** rank
+                rank_weights[i, j] = weight
+    
+    # ========== LOCAL STRUCTURE BONUS ==========
+    structure_bonus = np.zeros_like(safe_dist)
+    
+    if n > 3:
+        # Threshold for local connections
+        dist_25th = np.percentile(safe_dist[safe_dist < np.inf], 25)
+        
+        # 1. Triangle closure bonus
+        for i in range(n):
+            # Find local neighbors
+            local_mask = safe_dist[i] < dist_25th * 1.5
+            local_indices = np.where(local_mask)[0]
+            local_indices = local_indices[local_indices != i]
+            
+            if len(local_indices) >= 2:
+                for j in local_indices:
+                    # Check if i and j share common neighbors
+                    common_neighbors = np.intersect1d(
+                        np.where(safe_dist[i] < dist_25th * 2)[0],
+                        np.where(safe_dist[j] < dist_25th * 2)[0],
+                        assume_unique=True
+                    )
+                    common_neighbors = common_neighbors[(common_neighbors != i) & 
+                                                       (common_neighbors != j)]
+                    
+                    if len(common_neighbors) > 0:
+                        # Bonus proportional to number of shared neighbors
+                        bonus = min(0.3, len(common_neighbors) * 0.1)
+                        structure_bonus[i, j] += bonus
+                        structure_bonus[j, i] += bonus
+        
+        # 2. Minimum Spanning Tree bonus (lightweight)
+        if n <= 2000:
+            try:
+                mst = minimum_spanning_tree(safe_dist).toarray()
+                mst_mask = (mst + mst.T) > 0
+                structure_bonus[mst_mask] += 0.15
+            except:
+                pass
+        
+        # 3. Degree balancing bonus
+        for i in range(n):
+            local_degree = np.sum(safe_dist[i] < dist_25th * 2)
+            if local_degree < 3:
+                # Give bonus to connect isolated nodes
+                for j in range(n):
+                    if i != j and safe_dist[i, j] < np.inf:
+                        structure_bonus[i, j] += 0.1
+                        structure_bonus[j, i] += 0.1
+    
+    # ========== BASE SCORE CALCULATION ==========
+    # Inverse distance with rank weighting
+    inv_dist = 1.0 / (safe_dist + eps * 10)
+    
+    # Combine components
+    base_score = inv_dist * rank_weights * regret_matrix
+    heuristics_matrix = base_score * (1.0 + structure_bonus)
+    
+    # ========== STRATEGIC PRUNING ==========
+    # Keep only top k edges per node
+    candidate_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        if np.all(scores <= 0):
+            # Fallback to nearest neighbors
+            top_idx = np.argsort(safe_dist[i])[1:k_nn+1]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Keep top k_nn edges
+            top_k = min(k_nn, np.sum(scores > 0))
+            if top_k > 0:
+                if n > 100:
+                    # Efficient selection for larger instances
+                    threshold = np.partition(scores, -top_k)[-top_k]
+                    candidate_mask[i, scores >= threshold] = True
+                else:
+                    top_idx = np.argsort(scores)[-top_k:]
+                    candidate_mask[i, top_idx] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # Ensure minimum degree of 2 for connectivity
+    for i in range(n):
+        connections = np.sum(candidate_mask[i])
+        if connections < 2:
+            # Add nearest neighbors to reach minimum degree
+            needed = 2 - connections
+            all_indices = np.arange(n)
+            available = np.setdiff1d(all_indices, 
+                                   np.append(np.where(candidate_mask[i])[0], i))
+            if len(available) > 0:
+                dist_to_available = safe_dist[i, available]
+                closest_idx = np.argsort(dist_to_available)[:needed]
+                for idx in closest_idx:
+                    j = available[idx]
+                    candidate_mask[i, j] = True
+                    candidate_mask[j, i] = True
+    
+    # Apply pruning
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # ========== FINAL NORMALIZATION ==========
+    # Symmetrize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Row-wise normalization
+    row_max = np.max(heuristics_matrix, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    heuristics_matrix = heuristics_matrix / row_max
+    
+    # Global scaling to [0, 1]
+    overall_max = np.max(heuristics_matrix)
+    if overall_max > 0:
+        heuristics_matrix = heuristics_matrix / overall_max
+    
+    return heuristics_matrix
+```

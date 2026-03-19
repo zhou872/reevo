@@ -1,0 +1,316 @@
+```json
+{
+    "algorithm_features": ["Adaptive Local Regret", "Centrality-Aware Edge Weighting", "Spatial Cluster Density Estimation", "Dynamic Candidate Set Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with centrality-aware regret modeling,
+    adaptive spatial analysis, and dynamic candidate selection.
+    
+    Features:
+    1. Adaptive Local Regret: Multi-level regret analysis with dynamic thresholds
+    2. Centrality-Aware Edge Weighting: Betweenness approximation for hub identification
+    3. Spatial Cluster Density Estimation: Multi-scale density scoring with adaptive kernels
+    4. Dynamic Candidate Set Sparsification: Instance-aware connectivity preservation
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Prepare safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # Instance analysis for adaptive parameters
+    valid_dists = safe_dist[safe_dist < np.inf]
+    if len(valid_dists) == 0:
+        return np.zeros_like(distance_matrix)
+    
+    mean_dist = np.mean(valid_dists)
+    std_dist = np.std(valid_dists)
+    cv = std_dist / (mean_dist + eps)  # Coefficient of variation
+    
+    # Adaptive parameter selection
+    if n <= 50:
+        k_candidate = min(15, n-1)
+        regret_levels = 3
+        centrality_samples = min(20, n)
+    elif n <= 200:
+        k_candidate = min(12, n-1)
+        regret_levels = 2
+        centrality_samples = min(15, n)
+    else:
+        k_candidate = min(8 + int(np.sqrt(n)/2), n-1)
+        regret_levels = 2
+        centrality_samples = min(10, n)
+    
+    # Increase candidate size for more uniform instances
+    if cv < 0.3:
+        k_candidate = min(k_candidate + 3, n-1)
+    
+    # 1. Base inverse distance with instance-aware scaling
+    inv_dist = 1.0 / (safe_dist + 0.1 * mean_dist)
+    
+    # 2. Adaptive rank weighting with distance distribution consideration
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get sorted distances
+        sorted_indices = np.argsort(safe_dist[i])
+        sorted_dists = safe_dist[i, sorted_indices]
+        
+        # Adaptive decay based on distance distribution
+        if len(sorted_dists) > 2:
+            # Use top k distances to determine decay
+            top_k = min(10, len(sorted_dists) - 1)
+            top_dists = sorted_dists[1:top_k+1]
+            
+            if np.max(top_dists) > eps:
+                # More aggressive decay for uniform distributions
+                dist_ratio = np.std(top_dists) / (np.mean(top_dists) + eps)
+                decay = 0.3 + 0.4 * dist_ratio  # Range: 0.3-0.7
+            else:
+                decay = 0.5
+        else:
+            decay = 0.5
+        
+        # Assign weights with exponential decay
+        for rank, j in enumerate(sorted_indices):
+            if i != j:
+                rank_weights[i, j] = decay ** rank
+    
+    # 3. Multi-level regret analysis
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        
+        # Sort distances to find regret thresholds
+        sorted_dists = np.sort(dists)
+        if len(sorted_dists) < 2:
+            continue
+        
+        # Define regret thresholds at different percentiles
+        thresholds = []
+        for level in range(1, regret_levels + 1):
+            percentile = level * 100 / (regret_levels + 1)
+            idx = int(percentile * len(sorted_dists) / 100)
+            thresholds.append(sorted_dists[min(idx, len(sorted_dists)-1)])
+        
+        best_dist = sorted_dists[0]
+        
+        # Calculate multi-level regret for each edge
+        for j in range(n):
+            if i == j or np.isinf(dists[j]):
+                continue
+            
+            edge_dist = dists[j]
+            
+            # Find which threshold this edge exceeds
+            regret_level = 0
+            for t, threshold in enumerate(thresholds):
+                if edge_dist <= threshold:
+                    regret_level = t
+                    break
+            else:
+                regret_level = len(thresholds)
+            
+            # Calculate normalized regret
+            if regret_level == 0:
+                # Minimal regret for edges near optimal
+                regret = 0.05 * (edge_dist - best_dist) / (thresholds[0] + eps)
+            else:
+                # Progressive regret for worse edges
+                if regret_level < len(thresholds):
+                    base_thresh = thresholds[regret_level - 1]
+                    next_thresh = thresholds[regret_level]
+                    regret = 0.2 * regret_level + 0.8 * (edge_dist - base_thresh) / (next_thresh - base_thresh + eps)
+                else:
+                    # Worst edges
+                    base_thresh = thresholds[-1]
+                    regret = 0.2 * (regret_level + 1) + 0.8 * min(1.0, (edge_dist - base_thresh) / (np.max(dists) + eps))
+            
+            regret_matrix[i, j] = np.clip(regret, 0, 1)
+    
+    # Convert regret to penalty (higher regret = lower score)
+    regret_penalty = np.exp(-2.0 * regret_matrix)
+    
+    # 4. Approximate betweenness centrality
+    centrality = np.zeros(n)
+    
+    # Simple approximation: count shortest paths through each node
+    # Use random sampling for efficiency
+    for _ in range(centrality_samples):
+        if n > 2:
+            # Sample two distinct nodes
+            nodes = np.random.choice(n, 2, replace=False)
+            start, end = nodes[0], nodes[1]
+            
+            # Find shortest path using Dijkstra-like approximation
+            # (simplified for efficiency)
+            unvisited = set(range(n))
+            distances = np.full(n, np.inf)
+            distances[start] = 0
+            
+            for _ in range(min(10, n)):  # Limited steps for efficiency
+                if len(unvisited) == 0:
+                    break
+                
+                # Find node with smallest distance
+                current = min(unvisited, key=lambda x: distances[x])
+                unvisited.remove(current)
+                
+                # Update neighbors
+                for neighbor in range(n):
+                    if neighbor != current and not np.isinf(safe_dist[current, neighbor]):
+                        new_dist = distances[current] + safe_dist[current, neighbor]
+                        if new_dist < distances[neighbor]:
+                            distances[neighbor] = new_dist
+    
+    # Centrality as inverse of average distance to other nodes
+    for i in range(n):
+        valid_dists = [d for d in distances if d < np.inf and d > 0]
+        if valid_dists:
+            centrality[i] = 1.0 / (np.mean(valid_dists) + eps)
+    
+    # Normalize centrality
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # 5. Multi-scale spatial density analysis
+    density_scores = np.zeros_like(distance_matrix)
+    
+    # Adaptive bandwidth selection
+    bandwidths = np.zeros(n)
+    for i in range(n):
+        # Use median distance to k-nearest neighbors
+        k = min(5, n-1)
+        if k > 0:
+            k_nearest = np.partition(safe_dist[i], k)[:k+1]
+            k_nearest = k_nearest[k_nearest > 0]
+            if len(k_nearest) > 0:
+                bandwidths[i] = np.median(k_nearest)
+            else:
+                bandwidths[i] = mean_dist
+        else:
+            bandwidths[i] = mean_dist
+    
+    # Compute density for each edge
+    for i in range(n):
+        for j in range(i+1, n):
+            if np.isinf(safe_dist[i, j]):
+                continue
+            
+            # Adaptive kernel width
+            bandwidth = np.sqrt(bandwidths[i] * bandwidths[j])
+            sigma = bandwidth / 2.0
+            
+            # Gaussian kernel density estimation
+            if sigma > eps:
+                # Measure local density around edge endpoints
+                density_i = np.exp(-0.5 * (safe_dist[i] / sigma) ** 2)
+                density_j = np.exp(-0.5 * (safe_dist[j] / sigma) ** 2)
+                
+                # Joint density (excluding endpoints)
+                joint_density = np.sum(density_i * density_j) - 2.0
+                
+                if joint_density > 0:
+                    # Bonus for dense regions, penalty for sparse ones
+                    density_scores[i, j] = 0.2 * np.log1p(joint_density)
+                else:
+                    density_scores[i, j] = -0.1
+    
+    # Make symmetric
+    density_scores = np.maximum(density_scores, density_scores.T)
+    
+    # 6. Minimum Spanning Tree bias (for structure)
+    mst_bias = np.zeros_like(distance_matrix)
+    if n <= 1000:  # Computational limit
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst + mst.T) > 0
+            mst_bias = mst_edges * 0.25
+        except:
+            pass
+    
+    # 7. Combine components with centrality weighting
+    base_score = inv_dist * rank_weights
+    
+    # Centrality-aware weighting: edges between central nodes get bonus
+    centrality_bonus = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if not np.isinf(safe_dist[i, j]):
+                # Bonus proportional to product of centralities
+                centrality_bonus[i, j] = 0.3 * centrality[i] * centrality[j]
+    
+    centrality_bonus = np.maximum(centrality_bonus, centrality_bonus.T)
+    
+    # Combine all factors
+    heuristics_matrix = (base_score * regret_penalty * 
+                        (1.0 + density_scores) * 
+                        (1.0 + centrality_bonus) * 
+                        (1.0 + mst_bias))
+    
+    # 8. Dynamic candidate set sparsification
+    # Adaptive edges per node based on instance characteristics
+    edges_per_node = max(3, min(k_candidate, int(np.sqrt(n)) + 2))
+    
+    # For uniform instances, keep more edges
+    if cv < 0.3:
+        edges_per_node = min(edges_per_node + 2, n-1)
+    
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        if np.all(scores <= 0):
+            # Fallback to nearest neighbors
+            top_idx = np.argsort(safe_dist[i])[1:edges_per_node+1]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Keep top edges based on score
+            top_idx = np.argpartition(scores, -edges_per_node)[-edges_per_node:]
+            candidate_mask[i, top_idx] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < 2:
+            # Add nearest neighbors for connectivity
+            nearest = np.argsort(safe_dist[i])[1:3]
+            candidate_mask[i, nearest] = True
+            candidate_mask[nearest, i] = True
+    
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # 9. Final processing
+    # Symmetrize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Row-wise normalization
+    row_max = np.max(heuristics_matrix, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    heuristics_matrix = heuristics_matrix / row_max
+    
+    # Global normalization to [0, 1]
+    overall_max = np.max(heuristics_matrix)
+    if overall_max > 0:
+        heuristics_matrix = heuristics_matrix / overall_max
+    
+    return heuristics_matrix
+```

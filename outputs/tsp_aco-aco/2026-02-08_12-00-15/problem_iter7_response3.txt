@@ -1,0 +1,143 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristics with triangle inequality penalties,
+    logarithmic boosting, and adaptive sparsification.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base heuristic: inverse distance with safety
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    base_heuristic = 1.0 / safe_dist
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. Minimum Spanning Tree bonus (vectorized)
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_bonus = 2.0
+    
+    # 3. Nearest neighbor bonus (adaptive k)
+    k = max(2, min(8, n // 3))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Vectorized nearest neighbor computation
+    for i in range(n):
+        sorted_indices = np.argsort(safe_dist[i])
+        # Skip the first element (self, which is inf)
+        valid_neighbors = sorted_indices[1:min(k+1, n)]
+        nn_mask[i, valid_neighbors] = True
+    
+    # Symmetrize nearest neighbor mask
+    nn_mask = nn_mask | nn_mask.T
+    nn_bonus = 1.5
+    
+    # 4. Triangle inequality penalty
+    tri_penalty = np.ones_like(distance_matrix)
+    if n >= 3:
+        # Vectorized triangle inequality check
+        # For each edge (i,j), check if there exists k such that
+        # d(i,k) + d(k,j) < d(i,j) * (1 + epsilon)
+        epsilon = 0.1
+        
+        # Compute all possible triangle sums efficiently
+        for i in range(n):
+            # d(i,k) + d(k,j) for all k
+            ik = safe_dist[i, :].reshape(-1, 1)  # column vector
+            kj = safe_dist[:, :]  # matrix
+            tri_sums = ik + kj  # shape (n, n)
+            
+            # Compare with d(i,j) for each j
+            ij = safe_dist[i, :]
+            violation_ratio = tri_sums / (ij.reshape(1, -1) + 1e-10)
+            
+            # Find minimum violation for each j
+            min_violation = np.min(violation_ratio, axis=0)
+            
+            # Apply penalty if violation < 1 + epsilon
+            penalty_mask = min_violation < (1 + epsilon)
+            tri_penalty[i, penalty_mask] = 0.7 + 0.3 * (min_violation[penalty_mask] / (1 + epsilon))
+    
+    # Symmetrize triangle penalty
+    tri_penalty = (tri_penalty + tri_penalty.T) / 2
+    np.fill_diagonal(tri_penalty, 1.0)
+    
+    # 5. Combine all factors multiplicatively
+    heuristics = base_heuristic.copy()
+    heuristics[mst_mask] *= mst_bonus
+    heuristics[nn_mask] *= nn_bonus
+    heuristics *= tri_penalty
+    
+    # 6. Adaptive sparsification based on problem size
+    # Keep more edges for smaller problems, fewer for larger
+    if n <= 10:
+        keep_per_node = n - 1  # Keep all edges for very small problems
+    elif n <= 50:
+        keep_per_node = max(5, n // 3)
+    else:
+        keep_per_node = max(10, n // 5)
+    
+    # Create sparsity mask
+    sparsity_mask = np.zeros_like(heuristics, dtype=bool)
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = -np.inf  # Exclude diagonal
+        
+        # Keep top 'keep_per_node' edges per node
+        top_indices = np.argpartition(-row, min(keep_per_node, n-1))[:keep_per_node]
+        sparsity_mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # 7. Logarithmic boosting of top edges
+    # Boost edges in the top percentiles
+    flat_heuristics = heuristics[sparsity_mask]
+    if len(flat_heuristics) > 0:
+        # Compute percentiles for boosting
+        p75 = np.percentile(flat_heuristics, 75)
+        p90 = np.percentile(flat_heuristics, 90)
+        
+        # Apply logarithmic boosting
+        boost_matrix = np.ones_like(heuristics)
+        mask_75 = (heuristics >= p75) & sparsity_mask
+        mask_90 = (heuristics >= p90) & sparsity_mask
+        
+        # Boost edges in top 25% with log factor
+        if np.any(mask_75):
+            boost_matrix[mask_75] += 0.5 * np.log1p(heuristics[mask_75] / p75)
+        
+        # Extra boost for top 10%
+        if np.any(mask_90):
+            boost_matrix[mask_90] += 0.3 * np.log1p(heuristics[mask_90] / p90)
+        
+        heuristics *= boost_matrix
+    
+    # Apply sparsity mask
+    heuristics = heuristics * sparsity_mask
+    
+    # 8. Final normalization
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Ensure exact symmetry (numerical stability)
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0.0)
+    
+    return heuristics
+```

@@ -1,0 +1,321 @@
+```json
+{
+    "algorithm_features": ["K-opt Gain Estimation", "Spectral Clustering Guidance", "Reinforcement-Inspired Weight Tuning", "Multi-Scale Centrality Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.sparse.csgraph import connected_components
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with enhanced features.
+    
+    Features:
+    1. K-opt gain estimation (2-opt and 3-opt) for local search sensitivity
+    2. Spectral clustering-based edge promotion and penalty
+    3. Reinforcement-inspired weight adaptation using instance pattern recognition
+    4. Multi-scale centrality fusion combining degree, betweenness, and cluster centrality
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges for inclusion in optimal tours.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. INSTANCE PATTERN ANALYSIS FOR ADAPTIVE WEIGHTS ===
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # Compute instance descriptors for weight adaptation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = mst.toarray()
+    mst_vals = mst_edges[mst_edges > 0]
+    mst_cv = np.std(mst_vals) / (np.mean(mst_vals) + 1e-12) if len(mst_vals) > 0 else 0
+    
+    # Adaptive weights based on instance patterns (reinforcement-inspired)
+    # Pattern 1: Regular grid-like instances favor MST more
+    mst_weight = 1.6 + 0.6 * np.tanh(2 - dist_cv)
+    
+    # Pattern 2: Clustered instances favor cluster-based heuristics
+    cluster_weight = 0.8 + 0.4 * np.tanh(dist_cv - 0.5)
+    
+    # Pattern 3: Irregular instances favor k-opt sensitivity
+    kopt_weight = 0.7 + 0.5 * np.tanh(mst_cv)
+    
+    # === 2. BASE INVERSE DISTANCE WITH LOGARITHMIC COMPRESSION ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Logarithmic compression for better dynamic range
+    inv_dist = np.log1p(inv_dist * 10)
+    
+    # === 3. SPECTRAL CLUSTERING-BASED EDGE GUIDANCE ===
+    # Perform hierarchical clustering on distance matrix
+    condensed_dist = squareform(distance_matrix)
+    Z = linkage(condensed_dist, method='average')
+    
+    # Determine optimal cluster count using silhouette-like criterion
+    max_clusters = min(10, n // 3)
+    cluster_labels = fcluster(Z, t=max_clusters, criterion='maxclust')
+    unique_clusters = np.unique(cluster_labels)
+    k_optimal = len(unique_clusters)
+    
+    # Create cluster membership matrix
+    cluster_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cluster_labels[i] == cluster_labels[j]:
+                # Intra-cluster edges: promote based on cluster density
+                cluster_size = np.sum(cluster_labels == cluster_labels[i])
+                density_factor = 1.0 / (1.0 + np.exp(-cluster_size / 5))
+                cluster_matrix[i, j] = density_factor * cluster_weight
+            else:
+                # Inter-cluster edges: penalize unless they connect nearby clusters
+                # Compute average distance between clusters
+                mask_i = cluster_labels == cluster_labels[i]
+                mask_j = cluster_labels == cluster_labels[j]
+                inter_dist = distance_matrix[mask_i][:, mask_j]
+                avg_inter_dist = np.mean(inter_dist)
+                penalty = np.exp(-avg_inter_dist / (2 * dist_mean))
+                cluster_matrix[i, j] = penalty * (cluster_weight * 0.5)
+    
+    cluster_matrix = cluster_matrix + cluster_matrix.T
+    
+    # === 4. ENHANCED REGRET PENALIZATION WITH ADAPTIVE CURVATURE ===
+    regret_penalty = np.ones((n, n))
+    
+    for i in range(n):
+        # Get distances and sort
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        others = np.where(mask)[0]
+        
+        if len(others) >= 3:
+            dists = distance_matrix[i, others]
+            sorted_idx = np.argsort(dists)
+            sorted_dists = dists[sorted_idx]
+            
+            # Compute adaptive curvature based on distance gaps
+            if sorted_dists[0] > 0:
+                # First gap (closest to second closest)
+                first_gap = (sorted_dists[1] - sorted_dists[0]) / sorted_dists[0]
+                # Second gap
+                second_gap = (sorted_dists[2] - sorted_dists[1]) / sorted_dists[0] if len(sorted_dists) > 2 else 0
+                avg_gap = (first_gap + second_gap) / 2
+                
+                # Adaptive curvature: exponential response to gaps
+                curvature = 1.0 + 2.0 / (1.0 + np.exp(-5 * avg_gap))
+                local_regret = 1.2 * curvature
+            else:
+                local_regret = 1.2
+            
+            # Apply rank-based penalty with exponential decay
+            for rank, global_idx in enumerate(others[sorted_idx]):
+                decay = np.exp(-local_regret * rank / (len(others) ** 0.5))
+                regret_penalty[i, global_idx] = decay
+    
+    # Geometric mean for symmetry
+    regret_penalty = np.sqrt(regret_penalty * regret_penalty.T)
+    
+    # === 5. K-OPT GAIN ESTIMATION (2-OPT AND 3-OPT) ===
+    kopt_sensitivity = np.ones((n, n))
+    
+    for i in range(n):
+        # Find top k neighbors for k-opt estimation
+        k = min(5, n - 1)
+        mask_i = np.ones(n, dtype=bool)
+        mask_i[i] = False
+        i_neighbors = np.argsort(distance_matrix[i])[1:k+1]
+        
+        for j in range(i + 1, n):
+            if j == i:
+                continue
+                
+            mask_j = np.ones(n, dtype=bool)
+            mask_j[j] = False
+            j_neighbors = np.argsort(distance_matrix[j])[1:k+1]
+            
+            current_edge = distance_matrix[i, j]
+            
+            # 2-OPT gain estimation
+            alt_pairs = []
+            for k_i in i_neighbors:
+                if k_i != j:
+                    for k_j in j_neighbors:
+                        if k_j != i and k_j != k_i:
+                            gain = (distance_matrix[i, k_i] + distance_matrix[j, k_j]) - current_edge
+                            if gain > 0:
+                                alt_pairs.append(gain)
+            
+            # 3-OPT gain estimation (simplified)
+            triples = []
+            for a in i_neighbors[:3]:
+                if a != j:
+                    for b in j_neighbors[:3]:
+                        if b != i and b != a:
+                            # Find node c not equal to i, j, a, b
+                            others = [x for x in range(n) if x not in [i, j, a, b]][:2]
+                            for c in others:
+                                # Estimate 3-opt gain using triangle inequality approximation
+                                current = current_edge + distance_matrix[a, b]
+                                alternative = distance_matrix[i, a] + distance_matrix[j, c] + distance_matrix[b, c]
+                                gain = alternative - current
+                                if gain > 0:
+                                    triples.append(gain)
+            
+            # Combine gains
+            all_gains = alt_pairs + triples
+            if all_gains:
+                max_gain = np.max(all_gains)
+                gain_norm = min(max_gain / dist_mean, 3.0)
+                kopt_sensitivity[i, j] = 1.0 + 0.4 * np.tanh(gain_norm * kopt_weight)
+    
+    kopt_sensitivity = np.maximum(kopt_sensitivity, kopt_sensitivity.T)
+    
+    # === 6. MULTI-SCALE CENTRALITY FUSION ===
+    # Degree centrality (local scale)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        degree_centrality = 1 / np.mean(distance_matrix + np.eye(n) * 1e-12, axis=1)
+    degree_centrality = degree_centrality / np.max(degree_centrality)
+    
+    # Betweenness centrality proxy (global scale)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    betweenness = np.zeros(n)
+    for i in range(n):
+        mst_neighbors = np.where(mst_mask[i])[0]
+        betweenness[i] = len(mst_neighbors) / (n - 1)
+    
+    # Cluster centrality (meso scale)
+    cluster_centrality = np.zeros(n)
+    for cluster_id in unique_clusters:
+        cluster_nodes = np.where(cluster_labels == cluster_id)[0]
+        if len(cluster_nodes) > 1:
+            # Compute intra-cluster centrality
+            intra_dists = distance_matrix[cluster_nodes][:, cluster_nodes]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                cluster_cent = 1 / np.mean(intra_dists + np.eye(len(cluster_nodes)) * 1e-12, axis=1)
+            cluster_cent = cluster_cent / np.max(cluster_cent) if np.max(cluster_cent) > 0 else cluster_cent
+            
+            # Assign to nodes
+            for idx, node in enumerate(cluster_nodes):
+                # Combine with inter-cluster connectivity
+                inter_mask = cluster_labels != cluster_id
+                if np.any(inter_mask):
+                    inter_dists = distance_matrix[node, inter_mask]
+                    inter_factor = 1 / (1 + np.mean(inter_dists) / dist_mean)
+                    cluster_centrality[node] = 0.7 * cluster_cent[idx] + 0.3 * inter_factor
+                else:
+                    cluster_centrality[node] = cluster_cent[idx]
+    
+    # Normalize cluster centrality
+    if cluster_centrality.max() > cluster_centrality.min():
+        cluster_centrality = (cluster_centrality - cluster_centrality.min()) / (cluster_centrality.max() - cluster_centrality.min())
+    
+    # Fuse centrality measures with adaptive weights
+    centrality = (0.4 * degree_centrality + 0.3 * betweenness + 0.3 * cluster_centrality)
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # Apply non-linear transformation
+    centrality_matrix = centrality_matrix ** 1.2
+    
+    # === 7. REINFORCEMENT-INSPIRED WEIGHT TUNING ===
+    # Dynamic adjustment based on instance characteristics
+    instance_type = "clustered" if dist_cv > 0.8 else "uniform" if dist_cv < 0.3 else "mixed"
+    
+    if instance_type == "clustered":
+        # Emphasize cluster-based heuristics
+        cluster_matrix *= 1.3
+        centrality_matrix *= 1.1
+    elif instance_type == "uniform":
+        # Emphasize MST and regret
+        mst_weight *= 1.2
+        regret_penalty = regret_penalty ** 0.8
+    else:  # mixed
+        # Balanced approach with slight emphasis on k-opt
+        kopt_sensitivity *= 1.15
+    
+    # === 8. COMBINE ALL FACTORS ===
+    heuristics = inv_dist.copy()
+    
+    # Apply multiplicative factors
+    heuristics *= regret_penalty
+    heuristics *= centrality_matrix
+    heuristics *= kopt_sensitivity
+    heuristics *= (1 + cluster_matrix)  # Additive cluster component
+    
+    # Boost MST edges
+    heuristics[mst_mask] *= mst_weight
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 9. ADAPTIVE SPARSIFICATION WITH CLUSTER AWARENESS ===
+    sparsity_factor = 0.5 + 0.3 * np.tanh(12/n - 0.6)
+    
+    if sparsity_factor > 0.3:
+        # Different thresholds for intra vs inter-cluster edges
+        intra_mask = np.zeros((n, n), dtype=bool)
+        inter_mask = np.zeros((n, n), dtype=bool)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_labels[i] == cluster_labels[j]:
+                    intra_mask[i, j] = True
+                else:
+                    inter_mask[i, j] = True
+        
+        intra_mask = intra_mask | intra_mask.T
+        inter_mask = inter_mask | inter_mask.T
+        
+        # Zero diagonals
+        np.fill_diagonal(intra_mask, False)
+        np.fill_diagonal(inter_mask, False)
+        
+        # Apply different sparsity thresholds
+        if np.any(intra_mask):
+            intra_vals = heuristics[intra_mask]
+            if len(intra_vals) > 0:
+                intra_threshold = np.percentile(intra_vals, sparsity_factor * 40)
+                heuristics[intra_mask & (heuristics < intra_threshold)] = 0
+        
+        if np.any(inter_mask):
+            inter_vals = heuristics[inter_mask]
+            if len(inter_vals) > 0:
+                inter_threshold = np.percentile(inter_vals, sparsity_factor * 60)
+                heuristics[inter_mask & (heuristics < inter_threshold)] = 0
+    
+    # === 10. FINAL PROCESSING ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Smoothing pass to reduce noise
+    for i in range(n):
+        row = heuristics[i].copy()
+        if np.sum(row > 0) > 2:
+            median_val = np.median(row[row > 0])
+            row[row > 0] = np.sqrt(row[row > 0] * median_val)
+            heuristics[i] = row
+    
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

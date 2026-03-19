@@ -1,0 +1,207 @@
+```json
+{
+    "algorithm_features": ["Proportional Regret Penalization", "Multiplicative Factor Fusion", "Normalized Spatial Harmonic Scoring", "Adaptive Graph Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection with proportional regret penalization
+    and normalized spatial harmonic scoring.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Proportional regret penalization ===
+    # Compute for each edge (i,j): max(0, (alternative - d_ij) / d_ij)
+    # where alternative is the best distance from i to any node except j
+    regret_boost = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances from i to all others, with self as inf
+        dist_row = distance_matrix[i].copy()
+        dist_row[i] = np.inf
+        
+        # Find two smallest distances and their indices
+        sorted_idx = np.argsort(dist_row)
+        d1 = dist_row[sorted_idx[0]]  # smallest (nearest)
+        d2 = dist_row[sorted_idx[1]]  # second smallest
+        idx1 = sorted_idx[0]  # index of nearest
+        
+        # For each j ≠ i, compute alternative distance
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            # Alternative is second nearest if j is the nearest, else first nearest
+            alternative = d2 if j == idx1 else d1
+            # Proportional regret: (alternative - d_ij) / d_ij
+            regret = max(0.0, (alternative - d_ij) / (d_ij + epsilon))
+            # Boost factor: 1 + 2*regret (scaled to give meaningful differentiation)
+            regret_boost[i, j] = 1.0 + 2.0 * regret
+    
+    # === 3. Normalized spatial harmonic scoring ===
+    # Compute for each node a spatial score based on harmonic mean of nearest distances
+    k_spatial = min(7, n - 1)
+    node_spatial = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        # Get k_spatial smallest distances
+        nearest_dists = np.partition(dists, k_spatial)[:k_spatial]
+        # Harmonic mean (emphasizes consistently small distances)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            node_spatial[i] = k_spatial / np.sum(1 / (nearest_dists + epsilon))
+    
+    # Combine node scores for edges using harmonic mean
+    spatial_scores = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Harmonic mean of endpoint spatial scores
+                if node_spatial[i] > 0 and node_spatial[j] > 0:
+                    spatial_scores[i, j] = 2 * node_spatial[i] * node_spatial[j] / \
+                                          (node_spatial[i] + node_spatial[j] + epsilon)
+    
+    # Normalize spatial scores to [0.5, 1.5] range
+    valid_scores = spatial_scores[spatial_scores > 0]
+    if len(valid_scores) > 0:
+        min_score, max_score = np.min(valid_scores), np.max(valid_scores)
+        if max_score > min_score:
+            spatial_scores = 0.5 + (spatial_scores - min_score) / (max_score - min_score)
+        else:
+            spatial_scores = np.ones_like(spatial_scores)
+    else:
+        spatial_scores = np.ones_like(spatial_scores)
+    
+    # === 4. Mutual nearest neighbor boost ===
+    k_mutual = max(3, int(np.sqrt(n)))
+    mutual_boost = np.ones_like(distance_matrix)
+    
+    # Find k-nearest neighbors for each node
+    nn_indices = np.zeros((n, k_mutual), dtype=int)
+    for i in range(n):
+        # Get indices of k+1 smallest distances (including self)
+        nearest = np.argpartition(distance_matrix[i], k_mutual + 1)[:k_mutual + 1]
+        nearest = nearest[nearest != i]  # remove self
+        if len(nearest) > k_mutual:
+            nearest = nearest[:k_mutual]
+        nn_indices[i, :len(nearest)] = nearest
+    
+    # Apply boost for mutual nearest neighbors
+    for i in range(n):
+        for j_idx in range(k_mutual):
+            j = nn_indices[i, j_idx]
+            if j == 0 and i == 0 and n > 1:
+                continue
+            if j != i and np.any(nn_indices[j] == i):
+                # Strong boost for mutual connections, weighted by regret
+                mutual_boost[i, j] = 1.5 + 0.5 * (regret_boost[i, j] - 1.0)
+    
+    # === 5. MST-based edge prioritization ===
+    mst_boost = np.ones_like(distance_matrix)
+    if n > 2:
+        # Compute MST using Prim's algorithm
+        visited = np.zeros(n, dtype=bool)
+        visited[0] = True
+        min_edge = distance_matrix[0].copy()
+        min_edge[0] = np.inf
+        source = np.zeros(n, dtype=int)
+        
+        for _ in range(n - 1):
+            # Find minimum edge connecting tree to new vertex
+            v = np.argmin(min_edge)
+            u = source[v]
+            
+            # Boost MST edges by spatial score
+            boost_val = 1.0 + spatial_scores[u, v]
+            mst_boost[u, v] = boost_val
+            mst_boost[v, u] = boost_val
+            
+            # Mark vertex as visited
+            visited[v] = True
+            min_edge[v] = np.inf
+            
+            # Update min_edge for unvisited vertices
+            for w in range(n):
+                if not visited[w] and distance_matrix[v, w] < min_edge[w]:
+                    min_edge[w] = distance_matrix[v, w]
+                    source[w] = v
+    
+    # === 6. Multiplicative factor fusion ===
+    heuristics = inv_dist.copy()
+    heuristics *= regret_boost
+    heuristics *= spatial_scores
+    heuristics *= mutual_boost
+    heuristics *= mst_boost
+    
+    # === 7. Adaptive sparsification ===
+    # Keep only top promising edges for each node
+    adaptive_k = min(12, max(3, n // 4))
+    
+    for i in range(n):
+        if adaptive_k >= n - 1:
+            continue
+            
+        row = heuristics[i].copy()
+        
+        # Always keep mutual nearest neighbors
+        keep_mask = np.zeros(n, dtype=bool)
+        for j_idx in range(k_mutual):
+            j = nn_indices[i, j_idx]
+            if j != i and np.any(nn_indices[j] == i):
+                keep_mask[j] = True
+        
+        # Keep top adaptive_k edges by heuristic score
+        if adaptive_k > 0:
+            # Get indices of top adaptive_k values (excluding self)
+            non_self = [idx for idx in range(n) if idx != i]
+            top_k = min(adaptive_k, len(non_self))
+            if top_k > 0:
+                top_indices = np.argpartition(row[non_self], -top_k)[-top_k:]
+                keep_mask[np.array(non_self)[top_indices]] = True
+        
+        # Ensure at least 2 edges are kept
+        if np.sum(keep_mask) < 2 and n > 2:
+            non_self = [idx for idx in range(n) if idx != i]
+            top2_indices = np.argsort(row[non_self])[-2:]
+            keep_mask[np.array(non_self)[top2_indices]] = True
+        
+        # Zero out unpromising edges
+        row[~keep_mask] = 0
+        heuristics[i] = row
+    
+    # === 8. Symmetrization and final normalization ===
+    # Take maximum of both directions (with slight preference for mutual decisions)
+    symmetric_heuristics = np.maximum(heuristics, heuristics.T * 0.9)
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Ensure non-negativity and scale to [0, 1]
+    symmetric_heuristics = np.maximum(symmetric_heuristics, 0)
+    max_val = np.max(symmetric_heuristics)
+    if max_val > epsilon:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+```

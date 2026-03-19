@@ -1,0 +1,212 @@
+```json
+{
+    "algorithm_features": ["Two-Step Lookahead Regret", "Cluster Density Bonus", "Sparsified Nearest-Neighbor Masking", "Distance-Inverse Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection combining multiple factors:
+    1. Two-step lookahead regret estimation
+    2. Cluster density bonuses for edges within dense regions
+    3. Sparsification via adaptive nearest-neighbor masking
+    4. Inverse distance weighting with normalization
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        return 1 / (distance_matrix + 1e-10)
+    
+    # Prevent division by zero and self-connections
+    np.fill_diagonal(distance_matrix, np.inf)
+    
+    # 1. Two-step lookahead regret estimation
+    regret_scores = _compute_regret_scores(distance_matrix)
+    
+    # 2. Cluster density bonuses
+    density_bonuses = _compute_density_bonuses(distance_matrix)
+    
+    # 3. Base inverse distance with normalization
+    inv_dist = 1 / (distance_matrix + 1e-10)
+    inv_dist = inv_dist / np.max(inv_dist) if np.max(inv_dist) > 0 else inv_dist
+    
+    # 4. Combine factors with weighted aggregation
+    combined = 0.4 * inv_dist + 0.3 * regret_scores + 0.3 * density_bonuses
+    
+    # 5. Adaptive sparsification via nearest-neighbor masking
+    sparsified = _adaptive_sparsify(combined, distance_matrix)
+    
+    return sparsified
+
+def _compute_regret_scores(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute regret-based scores using two-step lookahead."""
+    n = distance_matrix.shape[0]
+    regret_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get distances from node i
+        dist_i = distance_matrix[i].copy()
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # First-step: cost of edge (i,j)
+            direct_cost = distance_matrix[i, j]
+            
+            # Second-step: minimum cost from j to any other node (excluding i)
+            mask = np.ones(n, dtype=bool)
+            mask[[i, j]] = False
+            if np.any(mask):
+                second_step = np.min(distance_matrix[j, mask])
+            else:
+                second_step = 0
+            
+            # Alternative: best two-step path through another node k
+            alt_costs = []
+            for k in range(n):
+                if k in (i, j):
+                    continue
+                alt_cost = distance_matrix[i, k]
+                if alt_cost < np.inf:
+                    # Minimum from k to any node except i and j
+                    mask_k = np.ones(n, dtype=bool)
+                    mask_k[[i, j, k]] = False
+                    if np.any(mask_k):
+                        alt_cost += np.min(distance_matrix[k, mask_k])
+                    else:
+                        alt_cost += distance_matrix[k, j]
+                alt_costs.append(alt_cost)
+            
+            # Regret: difference between alternative and current path
+            regret = np.min(alt_costs) - (direct_cost + second_step) if alt_costs else 0
+            regret_matrix[i, j] = max(regret, 0)  # Only positive regret is beneficial
+    
+    # Normalize
+    if np.max(regret_matrix) > 0:
+        regret_matrix = regret_matrix / np.max(regret_matrix)
+    
+    return regret_matrix
+
+def _compute_density_bonuses(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute bonuses for edges within dense clusters."""
+    n = distance_matrix.shape[0]
+    bonuses = np.zeros((n, n))
+    
+    if n < 5:
+        return bonuses
+    
+    # Use KDTree for efficient nearest neighbor queries
+    try:
+        # Create coordinates from distance matrix (approximate)
+        # Using MDS-like approximation for clustering
+        from sklearn.manifold import MDS
+        mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
+        coords = mds.fit_transform(distance_matrix)
+        tree = KDTree(coords)
+    except:
+        # Fallback: use distance-based clustering
+        coords = None
+    
+    # Adaptive neighborhood size
+    k = min(max(3, n // 10), 10)
+    
+    for i in range(n):
+        # Find k nearest neighbors
+        if coords is not None:
+            _, nn_indices = tree.query(coords[i], k=k+1)
+            nn_indices = nn_indices[1:]  # Exclude self
+        else:
+            # Fallback: use distance matrix directly
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nn_indices = np.argsort(dists)[:k]
+        
+        # Local density around node i
+        local_dists = distance_matrix[i, nn_indices]
+        density_i = 1 / (np.mean(local_dists) + 1e-10)
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Check if j is in i's neighborhood
+            if j in nn_indices:
+                # Local density around node j
+                dists_j = distance_matrix[j].copy()
+                dists_j[j] = np.inf
+                nn_j = np.argsort(dists_j)[:k]
+                local_dists_j = distance_matrix[j, nn_j]
+                density_j = 1 / (np.mean(local_dists_j) + 1e-10)
+                
+                # Bonus proportional to geometric mean of densities
+                bonus = np.sqrt(density_i * density_j)
+                bonuses[i, j] = bonus
+    
+    # Normalize
+    if np.max(bonuses) > 0:
+        bonuses = bonuses / np.max(bonuses)
+    
+    return bonuses
+
+def _adaptive_sparsify(score_matrix: np.ndarray, 
+                      distance_matrix: np.ndarray) -> np.ndarray:
+    """Sparsify matrix by keeping only promising edges."""
+    n = score_matrix.shape[0]
+    sparsified = np.zeros((n, n))
+    
+    # Adaptive threshold: keep top edges per node
+    edges_per_node = max(2, min(5, n // 4))
+    
+    for i in range(n):
+        # Get scores for this node
+        node_scores = score_matrix[i].copy()
+        node_scores[i] = -np.inf  # Exclude self
+        
+        # Threshold: keep top edges_per_node scores
+        if n > edges_per_node:
+            threshold = np.sort(node_scores)[-edges_per_node]
+            mask = node_scores >= threshold
+        else:
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+        
+        # Apply mask
+        sparsified[i, mask] = score_matrix[i, mask]
+        
+        # Additionally keep very short edges (distance in bottom 20%)
+        if n > 5:
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            dist_threshold = np.percentile(dists[dists < np.inf], 20)
+            short_edges = distance_matrix[i] <= dist_threshold
+            short_edges[i] = False
+            sparsified[i, short_edges] = np.maximum(
+                sparsified[i, short_edges], 
+                score_matrix[i, short_edges]
+            )
+    
+    # Ensure symmetry (optional, depends on TSP symmetry)
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+
+# Example usage guard
+if __name__ == "__main__":
+    # Test with a random distance matrix
+    np.random.seed(42)
+    n = 10
+    test_matrix = np.random.rand(n, n) * 10
+    test_matrix = (test_matrix + test_matrix.T) / 2
+    np.fill_diagonal(test_matrix, 0)
+    
+    result = heuristics_v2(test_matrix)
+    print(f"Heuristics matrix shape: {result.shape}")
+    print(f"Non-zero entries: {np.count_nonzero(result)} / {n*n}")
+    print(f"Max value: {np.max(result):.4f}")
+    print(f"Min non-zero value: {np.min(result[result > 0]):.4f}")
+```

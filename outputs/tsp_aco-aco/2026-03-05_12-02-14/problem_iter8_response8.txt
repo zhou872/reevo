@@ -1,0 +1,408 @@
+```json
+{
+    "algorithm_features": ["Adaptive Heuristic Ensemble", "Lightweight Solution Sampling", "Graph Property Analysis", "Reinforcement Learning Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial, stats
+from typing import Tuple, Optional
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with lightweight reinforcement learning from sampled solutions
+    and optimized centrality approximations for large graphs.
+    
+    Key innovations:
+    1. Solution-guided heuristic adaptation using fast constructive heuristics
+    2. Optimized centrality approximations with landmark sampling for large graphs
+    3. Dynamic component weighting based on sampled solution quality
+    4. Memory-efficient edge quality tracking
+    
+    Returns: Row-normalized heuristic matrix suitable for stochastic sampling
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / np.maximum(distance_matrix, 1e-10)
+        np.fill_diagonal(result, 0)
+        row_sums = result.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return result / row_sums
+    
+    # ===== 1. GRAPH PROPERTY ANALYSIS =====
+    # Fast graph characterization with sampling for large instances
+    triu_indices = np.triu_indices(n, k=1)
+    if len(triu_indices[0]) > 0:
+        distances = distance_matrix[triu_indices]
+        avg_dist = np.median(distances)
+        std_dist = np.std(distances)
+        density_factor = np.clip(std_dist / (avg_dist + 1e-10), 0.3, 3.0)
+        
+        # Estimate triangle inequality compliance
+        if n > 10:
+            samples = min(20, n // 2)
+            idx = np.random.choice(n, samples, replace=False)
+            submatrix = distance_matrix[np.ix_(idx, idx)]
+            # Quick triangle inequality check
+            violations = 0
+            total = 0
+            # Vectorized check for efficiency
+            for i in range(samples):
+                for j in range(i+1, samples):
+                    d_ij = submatrix[i, j]
+                    others = np.delete(np.arange(samples), [i, j])
+                    if len(others) > 0:
+                        d_ik = submatrix[i, others]
+                        d_kj = submatrix[others, j]
+                        violations += np.sum(d_ij > d_ik + d_kj + 1e-6)
+                        total += len(others)
+            euclidean_score = 1.0 - (violations / (total + 1e-10))
+        else:
+            euclidean_score = 0.5
+    else:
+        density_factor = 1.0
+        euclidean_score = 0.5
+    
+    # ===== 2. BASE HEURISTIC COMPONENTS =====
+    # 2.1 Inverse distance (proximity)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2.2 MST connectivity
+    mst_mask = np.zeros((n, n), dtype=bool)
+    try:
+        if n <= 10000:  # Practical limit for dense MST
+            mst = sparse.csgraph.minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = mst > 0
+    except:
+        pass
+    
+    # 2.3 Optimized centrality computation
+    centrality = compute_optimized_centrality(distance_matrix, n, euclidean_score)
+    
+    # ===== 3. LIGHTWEIGHT SOLUTION SAMPLING =====
+    # Generate diverse candidate solutions for learning
+    candidate_solutions = generate_candidate_solutions(distance_matrix, n)
+    
+    # Extract edge statistics from good solutions
+    edge_quality = analyze_solution_edges(distance_matrix, candidate_solutions, n)
+    
+    # ===== 4. ADAPTIVE COMPONENT WEIGHTING =====
+    # Dynamic weights based on solution quality correlation
+    weights = compute_adaptive_weights(
+        distance_matrix, inv_dist, mst_mask, centrality,
+        edge_quality, euclidean_score, density_factor, n
+    )
+    
+    # ===== 5. ENHANCED HEURISTIC COMBINATION =====
+    # Combine with solution-guided adjustments
+    combined = weights[0] * inv_dist + \
+               weights[1] * mst_mask.astype(float) * (1.0 + 0.5 * euclidean_score) + \
+               weights[2] * centrality
+    
+    # Add solution-based edge quality signals
+    solution_boost = 1.0 + 0.3 * edge_quality
+    combined = combined * solution_boost
+    
+    # ===== 6. ADAPTIVE EDGE SPARSIFICATION =====
+    sparsified = adaptive_sparsification(combined, distance_matrix, n, density_factor)
+    
+    # ===== 7. FINAL REFINEMENT =====
+    # Ensure symmetry
+    result = (sparsified + sparsified.T) / 2
+    
+    # Add minimal exploration bias based on solution diversity
+    if len(candidate_solutions) > 1:
+        exploration = 0.01 * (1.0 - np.mean([s[1] for s in candidate_solutions[:5]]))
+        noise = exploration * np.random.randn(n, n)
+        np.fill_diagonal(noise, 0)
+        mask = result > 0
+        result[mask] = np.maximum(result[mask] + noise[mask], 0)
+    
+    # Row normalization with fallback
+    np.fill_diagonal(result, 0)
+    row_sums = result.sum(axis=1, keepdims=True)
+    
+    if np.any(row_sums == 0):
+        # Fallback to inverse distance
+        fallback = inv_dist.copy()
+        np.fill_diagonal(fallback, 0)
+        row_sums = fallback.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        result = fallback / row_sums
+    else:
+        result = result / row_sums
+    
+    return result
+
+def compute_optimized_centrality(distance_matrix: np.ndarray, n: int, 
+                                 euclidean_score: float) -> np.ndarray:
+    """Compute centrality with optimized approximations for large graphs."""
+    if n <= 300:
+        # Exact computation for small graphs
+        try:
+            # Floyd-Warshall for exact shortest paths
+            dist = distance_matrix.copy()
+            np.fill_diagonal(dist, 0)
+            
+            for k in range(n):
+                dist_k = dist[:, k:k+1]
+                dist = np.minimum(dist, dist_k + dist_k.T)
+            
+            # Closeness centrality
+            row_sums = dist.sum(axis=1)
+            centrality_vals = 1.0 / (row_sums + 1e-10)
+            centrality_vals = centrality_vals / (centrality_vals.max() + 1e-10)
+        except:
+            # Fallback to row sum centrality
+            row_sums = distance_matrix.sum(axis=1)
+            centrality_vals = 1.0 / (row_sums + 1e-10)
+            centrality_vals = centrality_vals / (centrality_vals.max() + 1e-10)
+    else:
+        # Landmark-based approximation for large graphs
+        num_landmarks = min(50, n // 10)
+        if num_landmarks < 3:
+            num_landmarks = min(3, n)
+        
+        landmarks = np.random.choice(n, num_landmarks, replace=False)
+        
+        # Compute distances to landmarks
+        landmark_distances = distance_matrix[:, landmarks]
+        
+        # Use harmonic mean of inverse distances as centrality
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_landmark_dists = 1 / np.maximum(landmark_distances, 1e-10)
+        inv_landmark_dists[:, landmarks] = 0  # Don't count self
+        
+        if euclidean_score > 0.7:
+            # Euclidean-like: use mean of inverse distances
+            centrality_vals = np.mean(inv_landmark_dists, axis=1)
+        else:
+            # Non-Euclidean: emphasize closer landmarks
+            weights = np.exp(-landmark_distances / np.median(landmark_distances))
+            centrality_vals = np.average(inv_landmark_dists, axis=1, weights=weights)
+        
+        # Normalize
+        if centrality_vals.max() > 0:
+            centrality_vals = centrality_vals / centrality_vals.max()
+    
+    # Create centrality matrix with adaptive interaction
+    centrality_matrix = np.outer(centrality_vals, centrality_vals)
+    
+    # Adjust based on Euclidean score
+    if euclidean_score < 0.3:
+        # Non-Euclidean: reduce long-range connections
+        centrality_matrix = np.sqrt(centrality_matrix + 1e-10)
+    
+    return centrality_matrix
+
+def generate_candidate_solutions(distance_matrix: np.ndarray, n: int, 
+                                num_solutions: int = 10) -> list:
+    """Generate diverse candidate solutions using fast heuristics."""
+    solutions = []
+    
+    # 1. Greedy solutions from different starting points
+    start_points = np.random.choice(n, min(num_solutions, n), replace=False)
+    
+    for start in start_points:
+        try:
+            # Greedy nearest neighbor
+            visited = np.zeros(n, dtype=bool)
+            tour = [start]
+            visited[start] = True
+            
+            current = start
+            total_dist = 0.0
+            
+            while len(tour) < n:
+                # Find nearest unvisited
+                mask = ~visited
+                if not np.any(mask):
+                    break
+                
+                # Add stochastic element
+                distances = distance_matrix[current, mask]
+                if len(distances) == 0:
+                    break
+                
+                # Softmin selection
+                if len(distances) > 1:
+                    probs = np.exp(-distances / np.mean(distances))
+                    probs = probs / probs.sum()
+                    next_idx = np.random.choice(np.where(mask)[0], p=probs)
+                else:
+                    next_idx = np.where(mask)[0][0]
+                
+                total_dist += distance_matrix[current, next_idx]
+                tour.append(next_idx)
+                visited[next_idx] = True
+                current = next_idx
+            
+            # Return to start
+            if len(tour) == n:
+                total_dist += distance_matrix[tour[-1], tour[0]]
+                solutions.append((tour, total_dist))
+        except:
+            continue
+    
+    # 2. Random solution for diversity
+    if len(solutions) < num_solutions:
+        try:
+            tour = np.random.permutation(n).tolist()
+            total_dist = 0
+            for i in range(n):
+                total_dist += distance_matrix[tour[i], tour[(i+1)%n]]
+            solutions.append((tour, total_dist))
+        except:
+            pass
+    
+    # Sort by quality
+    solutions.sort(key=lambda x: x[1])
+    return solutions[:num_solutions]
+
+def analyze_solution_edges(distance_matrix: np.ndarray, solutions: list, 
+                          n: int) -> np.ndarray:
+    """Analyze edge frequencies and qualities in candidate solutions."""
+    edge_quality = np.zeros((n, n))
+    
+    if not solutions:
+        return edge_quality
+    
+    # Best solution length for normalization
+    best_len = solutions[0][1]
+    
+    for tour, length in solutions:
+        # Weight by solution quality
+        weight = best_len / (length + 1e-10)
+        weight = np.clip(weight, 0.5, 2.0)
+        
+        # Mark edges in tour
+        for i in range(len(tour)):
+            j = (i + 1) % len(tour)
+            u, v = tour[i], tour[j]
+            edge_quality[u, v] += weight
+            edge_quality[v, u] += weight
+    
+    # Normalize
+    if edge_quality.max() > 0:
+        edge_quality = edge_quality / edge_quality.max()
+    
+    return edge_quality
+
+def compute_adaptive_weights(distance_matrix: np.ndarray, inv_dist: np.ndarray,
+                            mst_mask: np.ndarray, centrality: np.ndarray,
+                            edge_quality: np.ndarray, euclidean_score: float,
+                            density_factor: float, n: int) -> np.ndarray:
+    """Compute adaptive weights for heuristic components."""
+    # Base weights from graph properties
+    base_weights = np.array([
+        0.5 * euclidean_score,  # Inverse distance
+        0.3 * density_factor,   # MST
+        0.2 * (2.0 - euclidean_score)  # Centrality
+    ])
+    
+    # Adjust based on edge quality correlation
+    if edge_quality.max() > 0:
+        # Compute correlation of each component with good edges
+        high_quality_mask = edge_quality > np.percentile(edge_quality[edge_quality > 0], 70)
+        
+        if np.sum(high_quality_mask) > 0:
+            correlations = []
+            for component in [inv_dist, mst_mask.astype(float), centrality]:
+                if component.max() > 0:
+                    corr = np.corrcoef(component[high_quality_mask].flatten(),
+                                      edge_quality[high_quality_mask].flatten())[0, 1]
+                    correlations.append(np.clip(corr, 0, 1))
+                else:
+                    correlations.append(0.5)
+            
+            # Use correlations to adjust weights
+            if not np.all(np.isnan(correlations)):
+                corr_weights = np.array(correlations)
+                if corr_weights.sum() > 0:
+                    corr_weights = corr_weights / corr_weights.sum()
+                    
+                    # Blend with base weights
+                    blend_factor = min(0.6, len(high_quality_mask) / (n * n))
+                    weights = (1 - blend_factor) * base_weights + blend_factor * corr_weights
+                    weights = weights / weights.sum()
+                    return weights
+    
+    # Fallback to normalized base weights
+    return base_weights / base_weights.sum()
+
+def adaptive_sparsification(combined: np.ndarray, distance_matrix: np.ndarray,
+                           n: int, density_factor: float) -> np.ndarray:
+    """Perform adaptive edge sparsification with exploration control."""
+    sparsified = np.zeros_like(combined)
+    
+    # Base k using log scaling for better large graph handling
+    base_k = max(2, min(int(np.log(n) * 3), n - 1))
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Dynamic k based on row characteristics
+        positive_mask = row > 0
+        if np.sum(positive_mask) > 1:
+            positive_vals = row[positive_mask]
+            cv = np.std(positive_vals) / (np.mean(positive_vals) + 1e-10)
+            
+            # Adjust k based on variability and density
+            k = int(base_k * (1.0 + 0.3 * np.tanh(cv - 1.0) + 0.2 * density_factor))
+            k = min(max(k, 2), n - 1)
+        else:
+            k = min(base_k, n - 1)
+        
+        # Select candidates
+        if np.sum(row > 0) <= k:
+            candidates = np.where(row > 0)[0]
+            if len(candidates) == 0:
+                # Fallback to nearest neighbors
+                sorted_idx = np.argsort(distance_matrix[i])[1:k+1]
+                sparsified[i, sorted_idx] = 1.0 / (distance_matrix[i, sorted_idx] + 1e-10)
+                continue
+        else:
+            # Softmax selection with temperature
+            positive_idx = np.where(row > 0)[0]
+            positive_vals = row[positive_idx]
+            
+            # Adaptive temperature
+            if len(positive_vals) > 1:
+                norm_vals = positive_vals / positive_vals.sum()
+                entropy = -np.sum(norm_vals * np.log(norm_vals + 1e-10))
+                max_entropy = np.log(len(positive_vals))
+                if max_entropy > 0:
+                    temperature = 0.3 + 1.0 * (entropy / max_entropy)
+                else:
+                    temperature = 1.0
+            else:
+                temperature = 1.0
+            
+            # Sample with softmax probabilities
+            exp_vals = np.exp(positive_vals / temperature)
+            probs = exp_vals / exp_vals.sum()
+            
+            # Ensure we get at least k candidates
+            sample_size = min(len(positive_idx), k * 2)
+            candidates = np.random.choice(positive_idx, size=sample_size, 
+                                         p=probs, replace=False)
+            candidates = np.unique(candidates)[:k]
+        
+        # Apply values with rank-based decay
+        if len(candidates) > 0:
+            candidate_vals = row[candidates]
+            sorted_indices = np.argsort(candidate_vals)[::-1]
+            sorted_candidates = candidates[sorted_indices]
+            
+            for rank, j in enumerate(sorted_candidates):
+                # Gentle exponential decay
+                decay = np.exp(-rank / max(2.0, k/3))
+                sparsified[i, j] = combined[i, j] * decay
+    
+    return sparsified
+```

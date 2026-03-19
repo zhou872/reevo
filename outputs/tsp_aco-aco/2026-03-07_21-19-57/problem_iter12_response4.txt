@@ -1,0 +1,416 @@
+```json
+{
+    "algorithm_features": ["Lightweight Instance Analysis", "Sequential Path-Based Lookahead", "Regret-Density-Connectivity Fusion", "Diversity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with lightweight instance analysis and path-aware scoring.
+    
+    Core improvements over v1:
+    1. Lightweight Instance Analysis: Fast instance characterization with 3 metrics
+       that adapt component weights without overfitting
+    2. Sequential Path-Based Lookahead: Considers path context by evaluating how
+       edges fit into potential 2-edge paths
+    3. Regret-Density-Connectivity Fusion: Combines opportunity cost, spatial
+       clustering, and structural importance in a balanced way
+    4. Diversity-Preserving Sparsification: Maintains edge diversity while ensuring
+       graph connectivity and solution flexibility
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # =====================================================================
+    # 1. LIGHTWEIGHT INSTANCE ANALYSIS (3 metrics)
+    # =====================================================================
+    # Extract non-diagonal distances
+    non_diag = distance_matrix[~np.eye(n, dtype=bool)]
+    
+    # Metric 1: Normalized spread (coefficient of variation)
+    spread = np.std(non_diag) / (np.mean(non_diag) + 1e-8)
+    
+    # Metric 2: Sparsity ratio (long edges proportion)
+    q75 = np.percentile(non_diag, 75)
+    q25 = np.percentile(non_diag, 25)
+    iqr = q75 - q25
+    sparsity = np.sum(non_diag > q75 + 1.5 * iqr) / len(non_diag)
+    
+    # Metric 3: Connectivity gradient (nearest vs overall distances)
+    # Compute average distance to 2 nearest neighbors for each node
+    nn_dists = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nn_dists.append(np.mean(np.partition(dists, 2)[:2]))
+    connectivity = np.mean(nn_dists) / (np.mean(non_diag) + 1e-8)
+    
+    # Derive component weights from instance metrics
+    # Base weights with instance-aware adjustments
+    regret_weight = 0.35 + 0.1 * spread  # More weight on regret for spread-out instances
+    density_weight = 0.25 - 0.05 * sparsity  # Less weight on density for sparse instances
+    path_weight = 0.20 + 0.1 * connectivity  # More weight on path for connected instances
+    structural_weight = 0.20  # Fixed weight for MST and connectivity
+    
+    # Normalize weights to sum to 1
+    total = regret_weight + density_weight + path_weight + structural_weight
+    regret_weight /= total
+    density_weight /= total
+    path_weight /= total
+    structural_weight /= total
+    
+    # =====================================================================
+    # 2. REGRET-BASED OPPORTUNITY COST (enhanced symmetry)
+    # =====================================================================
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Get top 3 distances for better alternative assessment
+        sorted_idx = np.argsort(dists)
+        best_dist = dists[sorted_idx[0]]
+        second_best = dists[sorted_idx[1]] if n > 2 else best_dist
+        
+        for rank, j in enumerate(sorted_idx):
+            if i == j:
+                continue
+                
+            current_dist = dists[j]
+            
+            # Compute regret from both perspectives
+            # Regret at i: opportunity cost of not taking best edge from i
+            if best_dist > 0:
+                regret_i = (second_best - current_dist) / best_dist
+            else:
+                regret_i = 1.0
+            
+            # Regret at j (computed similarly)
+            dists_j = distance_matrix[j].copy()
+            dists_j[j] = np.inf
+            best_j = np.min(dists_j)
+            sorted_j = np.argsort(dists_j)
+            second_best_j = dists_j[sorted_j[1]] if n > 2 else best_j
+            
+            if best_j > 0:
+                regret_j = (second_best_j - current_dist) / best_j
+            else:
+                regret_j = 1.0
+            
+            # Combined symmetric regret
+            combined_regret = 1.0 + 0.5 * (max(0, regret_i) + max(0, regret_j))
+            
+            # Rank penalty with slower decay for top edges
+            rank_penalty = rank / (n - 1) if n > 1 else 0
+            rank_factor = np.exp(-2 * rank_penalty)
+            
+            regret_matrix[i, j] = combined_regret * rank_factor
+    
+    # =====================================================================
+    # 3. ADAPTIVE DENSITY CLUSTERING (exponential similarity)
+    # =====================================================================
+    # Compute local density using k-nearest neighbors (adaptive k)
+    k_density = max(3, min(8, n // 4))
+    densities = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Use median of k nearest as density measure
+        if n > k_density:
+            kth = np.partition(dists, k_density)[k_density]
+            neighbor_mask = dists <= kth
+            neighbor_dists = dists[neighbor_mask]
+        else:
+            neighbor_dists = dists[dists < np.inf]
+        
+        if len(neighbor_dists) > 0:
+            # Robust density: reciprocal of median distance
+            densities[i] = 1.0 / (np.median(neighbor_dists) + 1e-8)
+        else:
+            densities[i] = 1.0
+    
+    # Normalize densities to [0, 1]
+    if np.max(densities) > np.min(densities):
+        densities = (densities - np.min(densities)) / (np.max(densities) - np.min(densities))
+    
+    # Create density similarity matrix
+    density_matrix = np.ones((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            diff = abs(densities[i] - densities[j])
+            # Exponential similarity: strong bonus for similar densities
+            similarity = np.exp(-4.0 * diff)
+            bonus = 1.0 + 0.6 * similarity  # Higher bonus than v1
+            density_matrix[i, j] = density_matrix[j, i] = bonus
+    
+    # =====================================================================
+    # 4. SEQUENTIAL PATH-BASED LOOKAHEAD
+    # =====================================================================
+    path_matrix = np.ones((n, n))
+    
+    # Pre-compute sorted distances for each node
+    sorted_indices = np.zeros((n, n-1), dtype=int)
+    sorted_dists = np.zeros((n, n-1))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        idx = np.argsort(dists)
+        sorted_indices[i] = idx
+        sorted_dists[i] = dists[idx]
+    
+    # Path-aware scoring
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist_ij = distance_matrix[i, j]
+            
+            # Look ahead 1 step from both endpoints
+            # Best continuation from j (excluding i)
+            best_continuation = float('inf')
+            
+            # Consider top 3 alternatives from j (excluding i)
+            for idx in range(min(3, n-1)):
+                k = sorted_indices[j, idx]
+                if k == i:
+                    continue
+                # Score of path i->j->k
+                path_score = dist_ij + distance_matrix[j, k]
+                if path_score < best_continuation:
+                    best_continuation = path_score
+            
+            # Compare to alternative path i->k->l (best 2-edge alternative)
+            best_alternative = float('inf')
+            
+            # Consider top 2 alternatives from i (excluding j)
+            alt_count = 0
+            for idx_i in range(min(2, n-1)):
+                k = sorted_indices[i, idx_i]
+                if k == j:
+                    continue
+                
+                # Consider best continuation from k (excluding i and j)
+                for idx_k in range(min(2, n-1)):
+                    l = sorted_indices[k, idx_k]
+                    if l == i or l == j:
+                        continue
+                    
+                    alt_score = distance_matrix[i, k] + distance_matrix[k, l]
+                    if alt_score < best_alternative:
+                        best_alternative = alt_score
+                    break  # Only consider best continuation from each k
+                
+                alt_count += 1
+                if alt_count >= 2:
+                    break
+            
+            # Path advantage: how much better is i->j-> continuation?
+            if best_continuation < float('inf') and best_alternative < float('inf'):
+                if best_alternative > 0:
+                    path_advantage = best_alternative / (best_continuation + 1e-8)
+                    # Cap the advantage to reasonable range
+                    path_advantage = min(2.0, max(0.5, path_advantage))
+                    path_matrix[i, j] = path_advantage
+                else:
+                    path_matrix[i, j] = 1.0
+            else:
+                path_matrix[i, j] = 1.0
+    
+    # Symmetrize path matrix
+    path_matrix = (path_matrix + path_matrix.T) / 2
+    
+    # =====================================================================
+    # 5. STRUCTURAL IMPORTANCE (MST + Connectivity)
+    # =====================================================================
+    structural_matrix = np.ones((n, n))
+    
+    # MST edges get a boost
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        structural_matrix[mst_mask] = 1.3  # Slightly higher than v1
+    except:
+        mst_mask = np.zeros((n, n), dtype=bool)
+    
+    # Connectivity bonus for edges that bridge different density regions
+    # Compute node clusters via simple thresholding
+    if n > 5:
+        cluster_centers = []
+        cluster_assignments = np.zeros(n, dtype=int)
+        
+        # Simple clustering: nodes with density > median are in one group
+        density_median = np.median(densities)
+        for i in range(n):
+            cluster_assignments[i] = 0 if densities[i] <= density_median else 1
+        
+        # Bonus for edges connecting different clusters
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_assignments[i] != cluster_assignments[j]:
+                    # Additional boost for inter-cluster edges
+                    structural_matrix[i, j] = structural_matrix[j, i] = max(
+                        structural_matrix[i, j], 1.15
+                    )
+    
+    # =====================================================================
+    # 6. COMBINE COMPONENTS WITH INSTANCE-AWARE WEIGHTS
+    # =====================================================================
+    # Base component: inverse distance with instance-adaptive regularization
+    mean_dist = np.mean(non_diag)
+    reg = 0.05 * mean_dist * (1.0 + spread)  # More regularization for spread-out instances
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Apply weights to component matrices (multiplicative combination)
+    weighted_components = (
+        np.power(regret_matrix, regret_weight) *
+        np.power(density_matrix, density_weight) *
+        np.power(path_matrix, path_weight) *
+        np.power(structural_matrix, structural_weight) *
+        inv_dist  # Inverse distance as base
+    )
+    
+    # Ensure symmetry
+    weighted_components = (weighted_components + weighted_components.T) / 2
+    np.fill_diagonal(weighted_components, 0)
+    
+    # =====================================================================
+    # 7. DIVERSITY-PRESERVING SPARSIFICATION
+    # =====================================================================
+    # Determine adaptive edge retention parameters
+    if n <= 10:
+        min_edges = max(3, n // 2)
+        max_edges = n - 1
+    else:
+        base_edges = int(np.sqrt(n)) + 2
+        min_edges = max(4, base_edges)
+        max_edges = min(2 * base_edges, n - 1)
+    
+    # Multi-criteria edge selection
+    keep_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    keep_mask = keep_mask | mst_mask
+    
+    # Include edges based on multiple criteria
+    for i in range(n):
+        # Criterion 1: Top by combined score
+        scores = weighted_components[i].copy()
+        scores[i] = -np.inf
+        top_by_score = np.argsort(scores)[-max_edges:]
+        keep_mask[i, top_by_score] = True
+        
+        # Criterion 2: High regret edges (top 3)
+        regrets = regret_matrix[i].copy()
+        regrets[i] = -np.inf
+        top_regrets = np.argsort(regrets)[-3:]
+        keep_mask[i, top_regrets] = True
+        
+        # Criterion 3: Diverse distance ranges (ensuring both near and mid-range edges)
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Include nearest edge
+        nearest = np.argmin(dists)
+        keep_mask[i, nearest] = True
+        
+        # Include an edge from middle distance range (if exists)
+        if n > 5:
+            median_idx = np.argsort(dists)[len(dists) // 2]
+            keep_mask[i, median_idx] = True
+    
+    # Ensure symmetry
+    keep_mask = keep_mask | keep_mask.T
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connections = np.sum(keep_mask[i])
+        if connections < min_edges:
+            # Add closest nodes not already included
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Sort by distance
+            candidates = np.argsort(dists)
+            added = 0
+            for j in candidates:
+                if not keep_mask[i, j] and j != i:
+                    keep_mask[i, j] = keep_mask[j, i] = True
+                    added += 1
+                    if connections + added >= min_edges:
+                        break
+    
+    # Final connectivity check via BFS
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        node = stack.pop()
+        neighbors = np.where(keep_mask[node])[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                stack.append(neighbor)
+    
+    # Connect any disconnected components with best heuristic edges
+    while not np.all(visited):
+        unvisited = np.where(~visited)[0]
+        visited_nodes = np.where(visited)[0]
+        
+        # Find best edge between visited and unvisited components
+        best_score = -np.inf
+        best_pair = (visited_nodes[0], unvisited[0])
+        
+        for v in visited_nodes:
+            for u in unvisited:
+                score = weighted_components[v, u]
+                if score > best_score:
+                    best_score = score
+                    best_pair = (v, u)
+        
+        # Add the connecting edge
+        v, u = best_pair
+        keep_mask[v, u] = keep_mask[u, v] = True
+        visited[u] = True
+        stack.append(u)
+    
+    # Apply mask
+    heuristic = weighted_components * keep_mask
+    
+    # =====================================================================
+    # 8. FINAL NORMALIZATION PER NODE
+    # =====================================================================
+    for i in range(n):
+        row = heuristic[i]
+        mask = row > 0
+        if np.sum(mask) > 0:
+            # Softmax normalization per node
+            row_vals = row[mask]
+            # Temperature scaling based on row variance
+            row_std = np.std(row_vals)
+            row_mean = np.mean(row_vals)
+            temperature = 1.0 + row_std / (row_mean + 1e-8)
+            
+            # Apply temperature-scaled softmax
+            scaled = row_vals / temperature
+            scaled = scaled - np.max(scaled)  # For numerical stability
+            exp_vals = np.exp(scaled)
+            heuristic[i, mask] = exp_vals / np.sum(exp_vals)
+    
+    # Final symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

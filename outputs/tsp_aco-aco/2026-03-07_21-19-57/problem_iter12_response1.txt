@@ -1,0 +1,359 @@
+```json
+{
+    "algorithm_features": ["Adaptive Parameter Scaling", "Global Subtour Constraint Approximation", "Weighted Additive Combination", "Multi-Scale Density Similarity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with adaptive scaling,
+    global constraint approximation, and weighted additive combination.
+    
+    Core innovations over v1:
+    1. Adaptive Parameter Scaling: Automatically adjusts heuristic parameters
+       based on problem size and spatial distribution characteristics
+    2. Global Subtour Constraint Approximation: Penalizes edges that might
+       create undesirable long connections in optimal tours
+    3. Weighted Additive Combination: Uses learned weights to combine multiple
+       heuristic components for finer edge discrimination
+    4. Multi-Scale Density Similarity: Analyzes local and global density
+       patterns at multiple scales for better cluster identification
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize adaptive scaling parameters
+    adaptive_params = compute_adaptive_parameters(distance_matrix, n)
+    
+    # Compute multiple heuristic components
+    components = compute_heuristic_components(distance_matrix, n, adaptive_params)
+    
+    # Combine components with learned weights
+    combined_heuristic = weighted_additive_combination(components, n, adaptive_params)
+    
+    # Apply intelligent sparsification
+    heuristic = intelligent_sparsification(combined_heuristic, distance_matrix, n, adaptive_params)
+    
+    return heuristic
+
+def compute_adaptive_parameters(distance_matrix: np.ndarray, n: int) -> dict:
+    """Compute adaptive parameters based on problem characteristics."""
+    params = {}
+    
+    # Problem size scaling factor
+    params['size_factor'] = min(1.0, 10.0 / n)
+    
+    # Compute distance statistics
+    flat_distances = distance_matrix[np.triu_indices(n, k=1)]
+    params['median_dist'] = np.median(flat_distances)
+    params['iqr_dist'] = np.percentile(flat_distances, 75) - np.percentile(flat_distances, 25)
+    params['distance_cv'] = np.std(flat_distances) / (np.mean(flat_distances) + 1e-8)
+    
+    # Cluster density indicator
+    avg_nn_distances = []
+    k_nn = max(3, int(0.1 * n))
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        if len(distances) > k_nn:
+            kth_smallest = np.partition(distances, k_nn)[k_nn]
+            nearest_dists = distances[distances <= kth_smallest]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        avg_nn_distances.append(np.mean(nearest_dists) if len(nearest_dists) > 0 else 1.0)
+    
+    params['cluster_tightness'] = np.std(avg_nn_distances) / (np.mean(avg_nn_distances) + 1e-8)
+    
+    return params
+
+def compute_heuristic_components(distance_matrix: np.ndarray, n: int, params: dict) -> dict:
+    """Compute multiple heuristic components."""
+    components = {}
+    
+    # 1. RANK-BASED REGRET INCENTIVE (Improved with adaptive decay)
+    rank_component = np.ones((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        sorted_indices = np.argsort(distances)
+        sorted_distances = distances[sorted_indices]
+        
+        if sorted_distances[0] < np.inf:
+            best_dist = sorted_distances[0]
+            # Adaptive decay rate based on distance distribution
+            decay_rate = 0.8 + 0.2 * np.tanh(params['distance_cv'])
+            
+            for rank_idx, j in enumerate(sorted_indices):
+                if i == j:
+                    continue
+                if rank_idx == 0:
+                    rank_component[i, j] = 1.5
+                else:
+                    # Exponential decay with rank and distance ratio
+                    dist_ratio = (distances[j] - best_dist) / (best_dist + 1e-8)
+                    rank_penalty = np.exp(-decay_rate * rank_idx)
+                    dist_penalty = 1.0 / (1.0 + dist_ratio * params['size_factor'])
+                    rank_component[i, j] = rank_penalty * dist_penalty
+    
+    # 2. MULTI-SCALE DENSITY SIMILARITY
+    density_component = np.ones((n, n))
+    
+    # Compute densities at multiple scales
+    scales = [int(0.05 * n), int(0.1 * n), int(0.2 * n)]
+    scales = [max(2, s) for s in scales if s >= 2]
+    
+    multi_scale_densities = []
+    for scale in scales:
+        scale_densities = np.zeros(n)
+        for i in range(n):
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            if len(distances) > scale:
+                kth_smallest = np.partition(distances, scale)[scale]
+                nearest_dists = distances[distances <= kth_smallest]
+            else:
+                nearest_dists = distances[distances < np.inf]
+            
+            if len(nearest_dists) > 0:
+                scale_densities[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+            else:
+                scale_densities[i] = 1.0
+        
+        # Normalize
+        if np.max(scale_densities) > 0:
+            scale_densities = scale_densities / np.max(scale_densities)
+        multi_scale_densities.append(scale_densities)
+    
+    # Combine multi-scale densities
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            similarity_scores = []
+            for scale_idx, scale_densities in enumerate(multi_scale_densities):
+                density_diff = abs(scale_densities[i] - scale_densities[j])
+                # Adaptive bonus strength based on cluster tightness
+                bonus_strength = 0.3 + 0.3 * np.tanh(1.0 - params['cluster_tightness'])
+                scale_weight = 1.0 / (scale_idx + 1)  # Give more weight to finer scales
+                similarity_scores.append(scale_weight * (1.0 + bonus_strength * np.exp(-2.0 * density_diff)))
+            
+            density_component[i, j] = np.mean(similarity_scores)
+    
+    # 3. MINIMUM SPANNING TREE WITH GLOBAL CONSTRAINT
+    mst_component = np.ones((n, n))
+    
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Compute MST edge importance score
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            if mst_mask[i, j]:
+                # MST edge boost
+                mst_component[i, j] = 1.3
+            else:
+                # Penalty for non-MST edges based on how much longer they are than MST alternatives
+                # This approximates global subtour constraints
+                dist_ij = distance_matrix[i, j]
+                
+                # Find shortest path between i and j in MST
+                from scipy.sparse.csgraph import dijkstra
+                mst_graph = mst.toarray()
+                mst_graph = mst_graph + mst_graph.T  # Make symmetric
+                
+                path_lengths = dijkstra(mst_graph, directed=False)
+                mst_path_dist = path_lengths[i, j]
+                
+                if mst_path_dist < np.inf:
+                    # Penalize edges that are significantly longer than MST path
+                    penalty_ratio = dist_ij / (mst_path_dist + 1e-8)
+                    mst_component[i, j] = 1.0 / (1.0 + 0.2 * max(0, penalty_ratio - 1.0))
+                else:
+                    mst_component[i, j] = 1.0
+    
+    # 4. SPATIAL PROXIMITY WITH ADAPTIVE THRESHOLDING
+    proximity_component = np.ones((n, n))
+    
+    # Compute adaptive thresholds
+    avg_nn_dist = np.zeros(n)
+    k_prox = max(3, int(0.1 * n))
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        if len(distances) > k_prox:
+            k_smallest = np.partition(distances, k_prox)[:k_prox]
+            avg_nn_dist[i] = np.mean(k_smallest[k_smallest < np.inf])
+        else:
+            valid_dists = distances[distances < np.inf]
+            avg_nn_dist[i] = np.mean(valid_dists) if len(valid_dists) > 0 else 1.0
+    
+    # Adaptive threshold multiplier based on distance distribution
+    threshold_mult = 1.5 + 0.5 * np.tanh(params['distance_cv'])
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist_ij = distance_matrix[i, j]
+            threshold = threshold_mult * min(avg_nn_dist[i], avg_nn_dist[j])
+            
+            if dist_ij <= threshold:
+                # Bonus for being within adaptive threshold
+                bonus = 1.0 + 0.3 * (1.0 - dist_ij / (threshold + 1e-8))
+                proximity_component[i, j] = bonus
+            else:
+                # Progressive penalty for exceeding threshold
+                excess_ratio = dist_ij / (threshold + 1e-8)
+                penalty = 0.7 * np.exp(-0.1 * (excess_ratio - 1.0))
+                proximity_component[i, j] = penalty
+    
+    # 5. INVERSE DISTANCE (Base component)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 0.05 * np.mean(distance_matrix[distance_matrix > 0]))
+        inv_dist[np.diag_indices(n)] = 0
+    
+    components = {
+        'rank': rank_component,
+        'density': density_component,
+        'mst': mst_component,
+        'proximity': proximity_component,
+        'inv_dist': inv_dist
+    }
+    
+    return components
+
+def weighted_additive_combination(components: dict, n: int, params: dict) -> np.ndarray:
+    """Combine heuristic components with adaptive weights."""
+    # Base weights with size adaptation
+    base_weights = {
+        'rank': 0.25,
+        'density': 0.20,
+        'mst': 0.15,
+        'proximity': 0.20,
+        'inv_dist': 0.20
+    }
+    
+    # Adjust weights based on problem characteristics
+    if params['cluster_tightness'] > 0.3:
+        # Emphasize density component for clustered instances
+        base_weights['density'] *= 1.3
+        base_weights['rank'] *= 0.9
+    
+    if params['distance_cv'] > 0.5:
+        # Emphasize MST and proximity for non-uniform distributions
+        base_weights['mst'] *= 1.2
+        base_weights['proximity'] *= 1.1
+    
+    # Normalize weights
+    total_weight = sum(base_weights.values())
+    for key in base_weights:
+        base_weights[key] /= total_weight
+    
+    # Initialize combined heuristic
+    combined = np.zeros((n, n))
+    
+    # Weighted additive combination
+    for key, weight in base_weights.items():
+        # Normalize component to [0,1] range
+        comp = components[key].copy()
+        comp_min, comp_max = comp.min(), comp.max()
+        if comp_max - comp_min > 1e-8:
+            comp_norm = (comp - comp_min) / (comp_max - comp_min)
+        else:
+            comp_norm = comp
+        
+        # Apply weight and add to combined
+        combined += weight * comp_norm
+    
+    # Ensure symmetry
+    combined = np.maximum(combined, combined.T)
+    
+    return combined
+
+def intelligent_sparsification(heuristic: np.ndarray, distance_matrix: np.ndarray, 
+                              n: int, params: dict) -> np.ndarray:
+    """Apply intelligent sparsification to the heuristic matrix."""
+    # Compute MST for structural preservation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Initialize sparsification mask
+    final_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    final_mask = final_mask | mst_mask
+    
+    # Adaptive sparsification parameters
+    top_k_percent = min(0.25, 0.1 + 0.15 * params['size_factor'])  # More edges for smaller problems
+    min_edges_per_node = max(2, int(3 * params['size_factor']))
+    
+    # Multi-criteria edge selection
+    for i in range(n):
+        # Criterion 1: Top combined heuristic edges
+        node_heuristics = heuristic[i, :].copy()
+        node_heuristics[i] = -np.inf
+        
+        top_k = max(min_edges_per_node, int(top_k_percent * n))
+        top_indices = np.argpartition(node_heuristics, -top_k)[-top_k:]
+        final_mask[i, top_indices] = True
+        final_mask[top_indices, i] = True
+        
+        # Criterion 2: Spatial proximity with adaptive threshold
+        # Compute local distance statistics
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        if len(distances) > 3:
+            kth_smallest = np.partition(distances, 3)[3]
+            threshold = 2.0 * kth_smallest
+        else:
+            threshold = 2.0 * np.min(distances[distances < np.inf])
+        
+        within_threshold = distance_matrix[i, :] <= threshold
+        within_threshold[i] = False
+        final_mask[i, within_threshold] = True
+        final_mask[within_threshold, i] = True
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(final_mask[i, :])[0]
+        connected = connected[connected != i]
+        if len(connected) < min_edges_per_node:
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            # Add closest nodes not already connected
+            candidates = np.argsort(distances)
+            added = 0
+            for j in candidates:
+                if j != i and not final_mask[i, j] and added < (min_edges_per_node - len(connected)):
+                    final_mask[i, j] = True
+                    final_mask[j, i] = True
+                    added += 1
+    
+    # Apply sparsification mask
+    heuristic_sparse = heuristic * final_mask
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristic_sparse)
+    if max_val > 0:
+        heuristic_sparse = heuristic_sparse / max_val
+    
+    return heuristic_sparse
+```

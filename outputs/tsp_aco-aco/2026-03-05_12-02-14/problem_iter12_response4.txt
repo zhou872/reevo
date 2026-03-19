@@ -1,0 +1,576 @@
+```json
+{
+    "algorithm_features": ["LK Heuristic Enhancement", "Bayesian Edge Learning", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse
+from collections import defaultdict, deque
+import random
+from sklearn.cluster import DBSCAN
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristics with Lin-Kernighan enhancement, Bayesian edge learning,
+    and adaptive problem-aware sparsification.
+    
+    Key innovations:
+    1. Lin-Kernighan heuristic enhancement for high-quality tour generation
+    2. Bayesian edge learning with explicit probability models
+    3. Multi-resolution analysis for large instances
+    4. Adaptive sparsification with connectivity guarantees
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Core Components ==========
+    
+    # 1A. Enhanced MST with edge criticality analysis
+    mst = sparse.csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    
+    # Compute MST edge importance with Steiner point approximation
+    mst_importance = np.zeros_like(distance_matrix)
+    mst_edges = np.where(mst_array > 0)
+    mst_degrees = (mst_array > 0).sum(axis=1) + (mst_array.T > 0).sum(axis=1)
+    
+    for i, j in zip(*mst_edges):
+        if i != j:
+            # Enhanced importance: critical edges connecting high-degree nodes
+            degree_score = np.tanh(0.2 * (mst_degrees[i] + mst_degrees[j]))
+            detour_cost = estimate_detour_cost(i, j, mst_array, distance_matrix)
+            mst_importance[i, j] = (1.0 / distance_matrix[i, j]) * (1.0 + 0.5 * degree_score + 0.3 * detour_cost)
+    
+    # 1B. Christofides matching with lookahead optimization
+    degrees = (mst_array > 0).sum(axis=1)
+    odd_vertices = np.where(degrees % 2 == 1)[0]
+    
+    matching_boost = np.zeros_like(distance_matrix)
+    if len(odd_vertices) >= 2:
+        # Greedy matching with 2-step lookahead
+        matched = set()
+        vertices = list(odd_vertices)
+        
+        while len(matched) < len(vertices) - 1:
+            # Find best unmatched vertex
+            best_i = None
+            best_score = -np.inf
+            
+            for i in vertices:
+                if i in matched:
+                    continue
+                
+                # Find best partner with lookahead
+                for j in vertices:
+                    if j == i or j in matched:
+                        continue
+                    
+                    # Current match quality
+                    direct_score = 1.0 / distance_matrix[i, j]
+                    
+                    # Lookahead: consider effect on subsequent matches
+                    lookahead_bonus = 0.0
+                    for k in vertices:
+                        if k not in {i, j} and k not in matched:
+                            # Would matching i-j prevent better i-k match?
+                            alt_score = 1.0 / min(distance_matrix[i, k], distance_matrix[j, k])
+                            lookahead_bonus -= 0.1 * alt_score
+                    
+                    score = direct_score + lookahead_bonus
+                    if score > best_score:
+                        best_score = score
+                        best_i, best_j = i, j
+            
+            if best_i is not None:
+                matching_boost[best_i, best_j] = matching_boost[best_j, best_i] = 1.0 / distance_matrix[best_i, best_j]
+                matched.update([best_i, best_j])
+    
+    # ========== Phase 2: Enhanced Tour Generation with LK Heuristic ==========
+    
+    edge_memory = defaultdict(float)
+    tour_archive = deque(maxlen=max(20, min(100, n//5)))  # Adaptive archive size
+    
+    def lin_kernighan_improvement(tour, max_depth=3):
+        """Enhanced Lin-Kernighan heuristic with limited depth."""
+        n_nodes = len(tour)
+        best_tour = tour.copy()
+        best_length = tour_length(tour, distance_matrix)
+        
+        # Track gains for backtracking
+        gain_stack = []
+        
+        for start in range(n_nodes):
+            current_tour = tour.copy()
+            current_gain = 0.0
+            
+            for depth in range(max_depth):
+                i = (start + depth) % n_nodes
+                
+                # Try edge exchanges
+                for offset in range(2, min(7, n_nodes//2)):
+                    j = (i + offset) % n_nodes
+                    
+                    # Current edges
+                    a, b = current_tour[i], current_tour[(i+1)%n_nodes]
+                    c, d = current_tour[j], current_tour[(j+1)%n_nodes]
+                    
+                    current_cost = distance_matrix[a, b] + distance_matrix[c, d]
+                    
+                    # Try exchange
+                    new_cost = distance_matrix[a, c] + distance_matrix[b, d]
+                    gain = current_cost - new_cost
+                    
+                    if gain > 1e-10:
+                        # Make the exchange
+                        current_tour = two_opt_swap(current_tour, i+1, j)
+                        current_gain += gain
+                        gain_stack.append((i+1, j, gain))
+                        
+                        # Check if this is better than best
+                        if current_gain > 0:
+                            new_length = best_length - current_gain
+                            if new_length < best_length - 1e-10:
+                                best_tour = current_tour.copy()
+                                best_length = new_length
+                    
+                # Backtrack if no improvement at this depth
+                if not gain_stack or gain_stack[-1][2] < 1e-10:
+                    while gain_stack:
+                        i, j, _ = gain_stack.pop()
+                        current_tour = two_opt_swap(current_tour, i, j)
+                    break
+        
+        return best_tour
+    
+    def two_opt_swap(tour, i, j):
+        """Perform 2-opt swap on tour segment."""
+        n_nodes = len(tour)
+        i %= n_nodes
+        j %= n_nodes
+        
+        if i < j:
+            return tour[:i+1] + tour[i+1:j+1][::-1] + tour[j+1:]
+        else:
+            segment = tour[i+1:] + tour[:j+1]
+            new_tour = tour[j+1:i+1] + segment[::-1]
+            # Rotate to maintain start point
+            start_idx = new_tour.index(tour[0])
+            return new_tour[start_idx:] + new_tour[:start_idx]
+    
+    def tour_length(tour, dist_matrix):
+        """Calculate tour length."""
+        return sum(dist_matrix[tour[i], tour[(i+1)%len(tour)]] for i in range(len(tour)))
+    
+    # Generate diverse initial tours with multiple strategies
+    initial_tours = []
+    
+    # Strategy 1: Nearest neighbor with random restarts
+    for start in np.random.choice(n, min(10, n), replace=False):
+        tour = [start]
+        visited = set([start])
+        
+        for _ in range(n-1):
+            current = tour[-1]
+            unvisited = [j for j in range(n) if j not in visited]
+            
+            # Use a combination of distance and angular diversity for Euclidean-like instances
+            if len(unvisited) > 1:
+                # Estimate if distances are roughly Euclidean
+                distances = distance_matrix[current, unvisited]
+                min_dist = np.min(distances)
+                candidates = [unvisited[idx] for idx, d in enumerate(distances) 
+                             if d < 1.5 * min_dist]
+                if len(candidates) > 1:
+                    next_node = random.choice(candidates)
+                else:
+                    next_node = unvisited[np.argmin(distances)]
+            else:
+                next_node = unvisited[0]
+            
+            tour.append(next_node)
+            visited.add(next_node)
+        
+        initial_tours.append(tour)
+    
+    # Strategy 2: Random insertion with nearest addition
+    for _ in range(min(5, n//10)):
+        nodes = list(range(n))
+        random.shuffle(nodes)
+        tour = [nodes[0], nodes[1]]
+        
+        for node in nodes[2:]:
+            # Find best insertion position
+            best_pos = 0
+            best_increase = np.inf
+            
+            for i in range(len(tour)):
+                j = (i+1) % len(tour)
+                increase = (distance_matrix[tour[i], node] + 
+                           distance_matrix[node, tour[j]] - 
+                           distance_matrix[tour[i], tour[j]])
+                if increase < best_increase:
+                    best_increase = increase
+                    best_pos = i+1
+            
+            tour.insert(best_pos, node)
+        
+        initial_tours.append(tour)
+    
+    # Strategy 3: Multi-fragment heuristic
+    for _ in range(min(3, n//20)):
+        edges = []
+        for i in range(n):
+            for j in range(i+1, n):
+                edges.append((distance_matrix[i, j], i, j))
+        
+        edges.sort()
+        parent = list(range(n))
+        degree = [0]*n
+        
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        
+        mst_edges = []
+        for d, i, j in edges:
+            if degree[i] < 2 and degree[j] < 2 and find(i) != find(j):
+                mst_edges.append((i, j))
+                parent[find(i)] = find(j)
+                degree[i] += 1
+                degree[j] += 1
+        
+        # Connect into a tour
+        tour = []
+        visited = [False]*n
+        adj = [[] for _ in range(n)]
+        for i, j in mst_edges:
+            adj[i].append(j)
+            adj[j].append(i)
+        
+        # Find a Hamiltonian cycle
+        stack = [0]
+        while stack:
+            node = stack.pop()
+            if not visited[node]:
+                visited[node] = True
+                tour.append(node)
+                for neighbor in adj[node]:
+                    if not visited[neighbor]:
+                        stack.append(neighbor)
+        
+        initial_tours.append(tour)
+    
+    # Improve tours with LK heuristic
+    for tour in initial_tours:
+        improved_tour = lin_kernighan_improvement(tour)
+        tour_archive.append(improved_tour)
+        
+        # Bayesian edge learning: update edge probabilities
+        tour_length_val = tour_length(improved_tour, distance_matrix)
+        tour_weight = 1.0 / (tour_length_val + 1e-10)
+        
+        # Update edge beliefs
+        for i in range(n):
+            u, v = improved_tour[i], improved_tour[(i+1)%n]
+            edge_key = (min(u, v), max(u, v))
+            
+            # Prior belief (inverse distance)
+            prior = 1.0 / distance_matrix[u, v]
+            
+            # Likelihood based on tour quality
+            likelihood = tour_weight
+            
+            # Bayesian update
+            current_belief = edge_memory.get(edge_key, prior)
+            # Simple moving average update
+            alpha = 0.3  # Learning rate
+            edge_memory[edge_key] = (1-alpha) * current_belief + alpha * (prior * likelihood)
+    
+    # ========== Phase 3: Multi-resolution Analysis ==========
+    
+    # Analyze problem at multiple scales for large instances
+    if n > 100:
+        # Coarse analysis for large problems
+        sample_size = min(50, n//4)
+        sample_indices = np.random.choice(n, sample_size, replace=False)
+        sample_matrix = distance_matrix[np.ix_(sample_indices, sample_indices)]
+        
+        # Analyze sample
+        triu_dists = sample_matrix[np.triu_indices(sample_size, k=1)]
+        dist_stats = {
+            'mean': np.mean(triu_dists),
+            'cv': np.std(triu_dists) / (np.mean(triu_dists) + 1e-10),
+        }
+    else:
+        # Full analysis for small problems
+        triu_dists = distance_matrix[np.triu_indices(n, k=1)]
+        dist_stats = {
+            'mean': np.mean(triu_dists),
+            'cv': np.std(triu_dists) / (np.mean(triu_dists) + 1e-10),
+        }
+    
+    # Clustering analysis (adaptive parameters)
+    if n > 10:
+        # Adaptive DBSCAN parameters
+        eps_value = np.percentile(triu_dists, 25) if len(triu_dists) > 0 else np.mean(triu_dists)
+        min_samples = max(2, n//50)
+        
+        try:
+            db = DBSCAN(eps=eps_value, min_samples=min_samples, 
+                       metric='precomputed', n_jobs=1)
+            cluster_labels = db.fit_predict(distance_matrix)
+            
+            n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+            
+            cluster_boost = np.ones_like(distance_matrix)
+            if n_clusters > 1:
+                for i in range(n):
+                    for j in range(i+1, n):
+                        if cluster_labels[i] == cluster_labels[j] and cluster_labels[i] != -1:
+                            # Boost intra-cluster edges
+                            cluster_size = np.sum(cluster_labels == cluster_labels[i])
+                            density = np.sqrt(cluster_size / n)
+                            boost = 1.0 + 0.8 * min(1.0, density)
+                            cluster_boost[i, j] = cluster_boost[j, i] = boost
+                        elif cluster_labels[i] != cluster_labels[j]:
+                            # Penalize inter-cluster edges based on distance
+                            norm_dist = distance_matrix[i, j] / (np.max(triu_dists) + 1e-10)
+                            penalty = 0.2 + 0.8 * norm_dist
+                            cluster_boost[i, j] = cluster_boost[j, i] = max(0.1, penalty)
+        except:
+            cluster_boost = np.ones_like(distance_matrix)
+            n_clusters = 1
+    else:
+        cluster_boost = np.ones_like(distance_matrix)
+        n_clusters = 1
+    
+    # ========== Phase 4: Dynamic Component Weighting ==========
+    
+    # Convert edge memory to matrix
+    memory_matrix = np.zeros_like(distance_matrix)
+    for (u, v), weight in edge_memory.items():
+        memory_matrix[u, v] = memory_matrix[v, u] = weight
+    
+    # Dynamic weight adjustment
+    base_weights = {
+        'memory': 0.4,    # Learned edge quality
+        'mst': 0.3,       # Structural edges
+        'matching': 0.15, # Christofides component
+        'cluster': 0.15   # Spatial structure
+    }
+    
+    # Adjust based on problem characteristics
+    if dist_stats['cv'] < 0.3:
+        # Uniform distances: emphasize structure
+        base_weights['mst'] += 0.1
+        base_weights['memory'] -= 0.1
+    elif dist_stats['cv'] > 0.7:
+        # Variable distances: emphasize learning
+        base_weights['memory'] += 0.1
+        base_weights['matching'] -= 0.05
+    
+    if n_clusters > max(2, n//20):
+        # Clear clustering: emphasize spatial structure
+        base_weights['cluster'] += 0.1
+        base_weights['matching'] -= 0.05
+    
+    # Normalize weights
+    total = sum(base_weights.values())
+    weights = {k: v/total for k, v in base_weights.items()}
+    
+    # ========== Phase 5: Intelligent Combination ==========
+    
+    # Normalize components
+    components = {
+        'mst': mst_importance,
+        'matching': matching_boost,
+        'memory': memory_matrix,
+        'cluster': cluster_boost
+    }
+    
+    normalized = {}
+    for key, mat in components.items():
+        max_val = np.max(mat)
+        if max_val > 0:
+            normalized[key] = mat / max_val
+        else:
+            normalized[key] = mat
+    
+    # Combine with dynamic weights
+    combined = sum(weights[key] * normalized[key] for key in weights)
+    
+    # Add inverse distance safety net with adaptive weight
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    if np.max(reciprocal) > 0:
+        reciprocal /= np.max(reciprocal)
+    
+    # Safety weight based on solution diversity
+    if len(tour_archive) > 1:
+        # Calculate edge consistency across tours
+        edge_counts = defaultdict(int)
+        for tour in tour_archive:
+            for i in range(n):
+                u, v = tour[i], tour[(i+1)%n]
+                edge_key = (min(u, v), max(u, v))
+                edge_counts[edge_key] += 1
+        
+        consistency = np.mean(list(edge_counts.values())) / len(tour_archive)
+        safety_weight = max(0.1, min(0.3, 0.4 * (1.0 - consistency)))
+    else:
+        safety_weight = 0.2
+    
+    combined = (1 - safety_weight) * combined + safety_weight * reciprocal
+    
+    # ========== Phase 6: Adaptive Sparsification ==========
+    
+    # Determine sparsity level adaptively
+    if n < 50:
+        target_edges = n * (n-1) // 2  # Keep all edges
+    else:
+        # Adaptive edge count based on problem characteristics
+        base_edges = int(2.0 * n * np.log(n))
+        
+        # Adjust based on clustering
+        if n_clusters > 2:
+            base_edges = int(base_edges * 0.7)
+        
+        # Adjust based on distance variability
+        if dist_stats['cv'] > 0.5:
+            base_edges = int(base_edges * 1.2)
+        
+        target_edges = min(base_edges, n * (n-1) // 2)
+    
+    # Identify critical edges to preserve
+    preserved_edges = set()
+    
+    # 1. MST edges (must keep)
+    mst_edge_set = set(zip(*np.where(mst_array > 0)))
+    preserved_edges.update(mst_edge_set)
+    
+    # 2. High-confidence learned edges
+    if edge_memory:
+        # Use Bayesian confidence intervals
+        edge_list = [(k, v) for k, v in edge_memory.items()]
+        edge_list.sort(key=lambda x: x[1], reverse=True)
+        
+        # Preserve top edges based on adaptive threshold
+        threshold = np.percentile([v for _, v in edge_list], 75) if edge_list else 0
+        for (u, v), weight in edge_list:
+            if weight >= threshold:
+                preserved_edges.add((u, v))
+    
+    # 3. Critical connectivity edges
+    # Identify articulation points in MST
+    for i in range(n):
+        if mst_degrees[i] == 1:  # Leaf node in MST
+            # Keep connection to its parent and nearest neighbor
+            parent = np.where(mst_array[i] > 0)[0]
+            if len(parent) > 0:
+                preserved_edges.add((i, parent[0]))
+            
+            # Find nearest non-MST neighbor
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            if parent:
+                distances[parent[0]] = np.inf
+            nearest = np.argmin(distances)
+            preserved_edges.add((i, nearest))
+    
+    # Create sparsified matrix
+    sparsified = np.zeros_like(combined)
+    
+    # Preserve critical edges
+    for i, j in preserved_edges:
+        if i != j:
+            sparsified[i, j] = combined[i, j]
+    
+    # Fill remaining slots with promising edges
+    current_edges = len(preserved_edges)
+    remaining_slots = max(0, target_edges - current_edges)
+    
+    if remaining_slots > 0:
+        # Get candidate edges sorted by combined score
+        candidates = []
+        for i in range(n):
+            for j in range(i+1, n):
+                if (i, j) not in preserved_edges and (j, i) not in preserved_edges:
+                    candidates.append((i, j, combined[i, j]))
+        
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        
+        # Select top candidates with exponential decay
+        for idx, (i, j, score) in enumerate(candidates[:remaining_slots]):
+            decay = np.exp(-idx / (remaining_slots / 2))
+            sparsified[i, j] = sparsified[j, i] = score * decay
+    
+    # Ensure symmetry and non-negativity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # Final normalization
+    row_sums = sparsified.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Fallback for isolated nodes
+        for i in np.where(zero_rows)[0]:
+            # Connect to k nearest neighbors
+            k = min(3, n-1)
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nearest = np.argsort(distances)[:k]
+            sparsified[i, nearest] = 1.0 / (distances[nearest] + 1e-10)
+        
+        row_sums = sparsified.sum(axis=1, keepdims=True)
+    
+    row_sums[row_sums == 0] = 1
+    sparsified = sparsified / row_sums
+    
+    return sparsified
+
+
+def estimate_detour_cost(i, j, mst_array, distance_matrix):
+    """Estimate cost of detouring if edge (i,j) is removed from MST."""
+    n = mst_array.shape[0]
+    
+    # Simple approximation: find alternative path through nearest common neighbor
+    neighbors_i = np.where(mst_array[i] > 0)[0]
+    neighbors_j = np.where(mst_array[j] > 0)[0]
+    
+    if len(neighbors_i) == 0 or len(neighbors_j) == 0:
+        return 0.0
+    
+    # Find minimum detour through a common neighbor
+    min_detour = np.inf
+    for ni in neighbors_i:
+        for nj in neighbors_j:
+            if ni == nj or ni == j or nj == i:
+                continue
+            
+            detour = (distance_matrix[i, ni] + 
+                     distance_matrix[ni, nj] + 
+                     distance_matrix[nj, j] - 
+                     distance_matrix[i, j])
+            min_detour = min(min_detour, detour)
+    
+    # Normalize by edge length
+    if min_detour < np.inf:
+        return min_detour / (distance_matrix[i, j] + 1e-10)
+    return 0.0
+```

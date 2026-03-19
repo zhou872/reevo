@@ -1,0 +1,347 @@
+```json
+{
+    "algorithm_features": ["Graph Embedding Diffusion", "Probabilistic Multi-Scale Regret", "Adaptive Parameter Meta-Learning", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from scipy.optimize import minimize_scalar
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with probabilistic embeddings and meta-learned optimization.
+    
+    Core Innovations:
+    1. Graph Embedding Diffusion: Multi-hop probabilistic node embeddings using
+       distance-weighted random walks to capture structural similarities
+    2. Probabilistic Multi-Scale Regret: Bayesian-style regret analysis modeling
+       uncertainty in alternative paths across multiple scales
+    3. Adaptive Parameter Meta-Learning: Gradient-free optimization of heuristic
+       parameters using reinforcement-inspired objective functions
+    4. Connectivity-Preserving Sparsification: Topological edge pruning maintaining
+       essential connectivity through spectral graph analysis
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between n nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Handle trivial cases
+        if n == 0:
+            return np.zeros_like(distance_matrix)
+        if n == 1:
+            return np.zeros((1, 1))
+        result = np.zeros((2, 2))
+        result[0, 1] = result[1, 0] = 1.0
+        return result
+    
+    # Preprocess distance matrix
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # ========== 1. META-LEARNED PARAMETER OPTIMIZATION ==========
+    # Extract problem statistics
+    triu_indices = np.triu_indices(n, k=1)
+    distances_flat = dist[triu_indices]
+    
+    mean_dist = np.mean(distances_flat)
+    std_dist = np.std(distances_flat)
+    cv_dist = std_dist / (mean_dist + 1e-12)
+    sparsity = np.sum(dist < np.inf) / (n * (n - 1)) if n > 1 else 1.0
+    
+    # Define parameter optimization objective
+    def parameter_objective(params):
+        """Objective function for parameter optimization using reinforcement-inspired metrics"""
+        alpha, beta, gamma, delta = params
+        
+        # Base components
+        inv_dist = 1 / (dist + 1e-12)
+        
+        # Regret component
+        neighbor_dist = np.partition(dist, 1, axis=1)[:, 1]
+        regret_scores = neighbor_dist[:, None] / (dist + 1e-12)
+        
+        # Entropy-based uncertainty quantification
+        k_neighbors = min(5, n - 1)
+        if k_neighbors > 0:
+            entropy_scores = np.zeros_like(dist)
+            for i in range(n):
+                neighbor_dists = dist[i]
+                valid_mask = neighbor_dists < np.inf
+                if np.sum(valid_mask) > 1:
+                    probs = 1 / (neighbor_dists[valid_mask] + 1e-12)
+                    probs = probs / probs.sum()
+                    ent = entropy(probs)
+                    entropy_scores[i, valid_mask] = np.exp(-ent)
+        
+        # Combined score
+        combined = (
+            alpha * inv_dist +
+            beta * regret_scores +
+            gamma * entropy_scores
+        )
+        
+        # Apply MST boost
+        mst = minimum_spanning_tree(dist)
+        mst_mask = (mst.toarray() + mst.toarray().T) > 0
+        combined[mst_mask] *= delta
+        
+        # Evaluate objective: maximize discriminative power
+        non_zero = combined[combined > 0]
+        if len(non_zero) > 0:
+            obj_score = np.std(non_zero) * np.mean(non_zero[mst_mask] if np.any(mst_mask) else 1)
+        else:
+            obj_score = 0
+        
+        return -obj_score  # Minimize negative objective
+    
+    # Optimize parameters using gradient-free optimization
+    from scipy.optimize import differential_evolution
+    
+    bounds = [(0.1, 2.0), (0.1, 2.0), (0.1, 1.0), (1.2, 3.0)]
+    if n > 5:  # Only run optimization for non-trivial cases
+        try:
+            result = differential_evolution(
+                parameter_objective,
+                bounds,
+                maxiter=20,
+                popsize=min(15, n),
+                seed=42
+            )
+            alpha_opt, beta_opt, gamma_opt, delta_opt = result.x
+        except:
+            alpha_opt, beta_opt, gamma_opt, delta_opt = 1.0, 0.8, 0.3, 2.0
+    else:
+        alpha_opt, beta_opt, gamma_opt, delta_opt = 1.0, 0.8, 0.3, 2.0
+    
+    # ========== 2. GRAPH EMBEDDING DIFFUSION ==========
+    # Create probabilistic transition matrix
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist_norm = 1 / (dist + 1e-12)
+        row_sums = inv_dist_norm.sum(axis=1, keepdims=True)
+        transition_matrix = np.where(row_sums > 0, inv_dist_norm / row_sums, 0)
+    
+    # Multi-step random walk embeddings
+    n_steps = min(4, int(np.log2(n)) + 1)
+    embeddings = np.eye(n)
+    
+    for step in range(n_steps):
+        # Perform random walk diffusion
+        embeddings = embeddings @ transition_matrix
+        
+        # Add self-attention mechanism
+        if step > 0:
+            sim_matrix = embeddings @ embeddings.T
+            sim_norm = np.sqrt((embeddings**2).sum(axis=1, keepdims=True))
+            sim_norm = sim_norm @ sim_norm.T + 1e-12
+            sim_matrix = sim_matrix / sim_norm
+            
+            # Update embeddings with similarity-weighted aggregation
+            attention_weights = np.exp(sim_matrix) / np.exp(sim_matrix).sum(axis=1, keepdims=True)
+            embeddings = 0.7 * embeddings + 0.3 * (attention_weights @ embeddings)
+    
+    # Compute embedding-based edge scores
+    embedding_norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embedding_scores = (embeddings @ embeddings.T) / (embedding_norms @ embedding_norms.T + 1e-12)
+    embedding_scores = (embedding_scores + 1) / 2  # Scale to [0,1]
+    
+    # ========== 3. PROBABILISTIC MULTI-SCALE REGRET ==========
+    regret_scores = np.ones_like(dist)
+    
+    # Level 1: Immediate neighbor regret with uncertainty
+    for i in range(n):
+        valid_mask = dist[i] < np.inf
+        if np.sum(valid_mask) >= 2:
+            valid_dists = dist[i, valid_mask]
+            sorted_indices = np.argsort(valid_dists)
+            
+            # Compute probabilistic regret
+            for idx, j in enumerate(np.where(valid_mask)[0]):
+                if i == j:
+                    continue
+                
+                d_ij = dist[i, j]
+                
+                # Compute probability that alternative is better
+                alternatives = valid_dists[sorted_indices[:min(5, len(sorted_indices))]]
+                alternatives = alternatives[alternatives != d_ij]
+                
+                if len(alternatives) > 0:
+                    # Bayesian-style probability calculation
+                    best_alt = alternatives[0]
+                    sigma = np.std(alternatives[:min(3, len(alternatives))])
+                    
+                    if sigma > 0:
+                        z_score = (d_ij - best_alt) / (sigma + 1e-12)
+                        prob_better = 1 / (1 + np.exp(z_score))  # Logistic CDF approximation
+                        regret_scores[i, j] = prob_better
+    
+    # Level 2: Cluster-level probabilistic regret
+    if n >= 8:
+        # Adaptive clustering based on distance percentiles
+        percentiles = np.percentile(dist[triu_indices], [33, 66]) if len(triu_indices[0]) > 0 else [0, 0]
+        
+        for threshold in percentiles:
+            # Create probabilistic cluster assignments
+            cluster_affinity = np.exp(-dist / (threshold + 1e-12))
+            np.fill_diagonal(cluster_affinity, 0)
+            
+            # Compute cluster centers (weighted by affinity)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if dist[i, j] < np.inf:
+                        # Find alternative paths through different clusters
+                        k_options = np.where((cluster_affinity[i] > 0.5) & 
+                                            (cluster_affinity[:, j] > 0.5))[0]
+                        k_options = k_options[k_options != i]
+                        k_options = k_options[k_options != j]
+                        
+                        if len(k_options) > 0:
+                            alt_costs = dist[i, k_options] + dist[k_options, j]
+                            if len(alt_costs) > 0:
+                                best_alt = np.min(alt_costs)
+                                if best_alt < dist[i, j]:
+                                    # Update regret with cluster-level information
+                                    regret_ratio = dist[i, j] / best_alt
+                                    regret_scores[i, j] = min(regret_scores[i, j], 
+                                                              np.exp(-(regret_ratio - 1)))
+                                    regret_scores[j, i] = regret_scores[i, j]
+    
+    # ========== 4. COMPONENT INTEGRATION ==========
+    # Base inverse distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = np.where(dist < np.inf, 1 / (dist + 1e-12), 0)
+    
+    # Apply meta-learned parameters
+    base_scores = (
+        alpha_opt * inv_dist +
+        beta_opt * regret_scores +
+        gamma_opt * embedding_scores
+    )
+    
+    # MST reinforcement with learned multiplier
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() + mst.toarray().T) > 0
+    base_scores[mst_mask] *= delta_opt
+    
+    # ========== 5. CONNECTIVITY-PRESERVING SPARSIFICATION ==========
+    # Spectral analysis for connectivity preservation
+    final_scores = np.zeros_like(base_scores)
+    
+    # Compute Laplacian-based importance scores
+    degree = np.sum(base_scores > 0, axis=1)
+    degree_matrix = np.diag(degree)
+    laplacian = degree_matrix - base_scores
+    
+    # Compute Fiedler vector (second smallest eigenvector) approximation
+    try:
+        from scipy.sparse.linalg import eigsh
+        if n >= 3:
+            eigenvalues, eigenvectors = eigsh(laplacian, k=2, which='SM')
+            fiedler_vector = eigenvectors[:, 1]
+            
+            # Use Fiedler vector to identify critical edges
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if base_scores[i, j] > 0:
+                        # Edge importance based on Fiedler vector difference
+                        fiedler_diff = abs(fiedler_vector[i] - fiedler_vector[j])
+                        connectivity_importance = 1 / (1 + fiedler_diff)
+                        final_scores[i, j] = final_scores[j, i] = (
+                            base_scores[i, j] * connectivity_importance
+                        )
+        else:
+            final_scores = base_scores.copy()
+    except:
+        final_scores = base_scores.copy()
+    
+    # Adaptive degree constraint
+    target_degrees = np.zeros(n, dtype=int)
+    for i in range(n):
+        # Determine optimal degree based on local density
+        local_dists = dist[i][dist[i] < np.inf]
+        if len(local_dists) > 0:
+            density = 1 / (np.mean(local_dists) + 1e-12)
+            target_degrees[i] = min(max(3, int(np.log2(n) * density)), n - 1)
+        else:
+            target_degrees[i] = min(3, n - 1)
+    
+    # Apply degree-based sparsification
+    for i in range(n):
+        row_scores = final_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        if target_degrees[i] < n - 1:
+            # Keep top-k edges plus MST neighbors
+            top_indices = np.argpartition(row_scores, -target_degrees[i])[-target_degrees[i]:]
+            mst_neighbors = np.where(mst_mask[i])[0]
+            keep_indices = np.union1d(top_indices, mst_neighbors)
+            
+            # Create mask
+            mask = np.zeros(n, dtype=bool)
+            mask[keep_indices] = True
+            
+            # Apply sparsification
+            final_scores[i, ~mask] = 0
+            final_scores[~mask, i] = 0
+    
+    # Ensure MST edges are always included
+    final_scores[mst_mask] = np.maximum(final_scores[mst_mask], 
+                                       np.percentile(final_scores[final_scores > 0], 90) 
+                                       if np.any(final_scores > 0) else 1.0)
+    
+    # ========== 6. FINAL REFINEMENT ==========
+    np.fill_diagonal(final_scores, 0)
+    
+    # Symmetrize
+    final_scores = (final_scores + final_scores.T) / 2
+    
+    # Smooth normalization using softmax per row
+    row_max = final_scores.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    final_scores = final_scores / row_max
+    
+    # Global normalization to [0, 1]
+    max_val = final_scores.max()
+    if max_val > 0:
+        final_scores = final_scores / max_val
+    
+    # Apply sigmoid activation for better discrimination
+    final_scores = 1 / (1 + np.exp(-6 * (final_scores - 0.5)))
+    
+    return final_scores
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test with random points
+    np.random.seed(42)
+    n = 40
+    points = np.random.rand(n, 2)
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero edges:", np.count_nonzero(heuristics))
+    print("Max heuristic value:", np.max(heuristics))
+    print("Matrix symmetric:", np.allclose(heuristics, heuristics.T, atol=1e-10))
+    
+    # Verify MST edges are prioritized
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_heuristics = heuristics[mst_mask]
+    print(f"MST edges heuristic range: [{np.min(mst_heuristics):.4f}, {np.max(mst_heuristics):.4f}]")
+    print(f"MST edges mean heuristic: {np.mean(mst_heuristics):.4f}")
+    print(f"Non-MST edges mean heuristic: {np.mean(heuristics[~mst_mask & (heuristics > 0)]):.4f}")
+```

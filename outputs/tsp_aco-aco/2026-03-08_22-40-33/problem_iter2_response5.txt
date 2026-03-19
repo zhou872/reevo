@@ -1,0 +1,199 @@
+```json
+{
+    "algorithm_features": ["Two-Step Lookahead Path Completion", "Adaptive Sparsification", "Structural Centrality Weighting", "Edge Rank Confidence Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with lookahead strategies.
+    
+    Features:
+    1. Two-Step Lookahead Path Completion: Estimates completion cost after edge selection
+    2. Adaptive Sparsification: Dynamically adjusts connection density based on instance
+    3. Structural Centrality Weighting: Combines multiple centrality measures
+    4. Edge Rank Confidence Scoring: Uses tournament ranking of edges by multiple criteria
+    
+    Returns: Matrix of same shape as input with edge promise scores [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # Helper: Two-step lookahead estimation for edge (i,j)
+    def estimate_completion_cost(i, j, dist_mat):
+        """Estimate cost to complete tour after including edge (i,j)"""
+        remaining_nodes = np.array([k for k in range(n) if k not in (i, j)])
+        if len(remaining_nodes) == 0:
+            return 0
+        
+        # Estimate minimum connection cost to remaining nodes
+        min_to_i = np.min(dist_mat[i, remaining_nodes])
+        min_to_j = np.min(dist_mat[j, remaining_nodes])
+        
+        # Estimate Hamiltonian path completion through remaining nodes
+        if len(remaining_nodes) > 1:
+            # Create submatrix for remaining nodes
+            sub_indices = np.ix_(remaining_nodes, remaining_nodes)
+            sub_dist = dist_mat[sub_indices]
+            
+            # Approximate minimum spanning tree cost for remaining nodes
+            if len(remaining_nodes) > 2:
+                mst = minimum_spanning_tree(sub_dist)
+                mst_cost = mst.sum()
+            else:
+                mst_cost = sub_dist[0, 1] if len(remaining_nodes) == 2 else 0
+        else:
+            mst_cost = 0
+        
+        # Return to start approximation (connect ends back to remaining node if needed)
+        return min_to_i + min_to_j + mst_cost
+    
+    # 1. Basic distance normalization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    inv_dist = np.nan_to_num(inv_dist, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Normalize inverse distances
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # 2. Minimum Spanning Tree structure (using efficient Prim's)
+    mst_bonus = np.zeros((n, n))
+    if n > 1:
+        visited = np.zeros(n, dtype=bool)
+        min_dist = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        
+        # Start from node 0
+        min_dist[0] = 0
+        
+        for _ in range(n):
+            # Find unvisited node with minimum distance
+            unvisited = np.where(~visited)[0]
+            if len(unvisited) == 0:
+                break
+            u = unvisited[np.argmin(min_dist[unvisited])]
+            visited[u] = True
+            
+            # Update MST bonus for edge
+            if parent[u] != -1:
+                mst_bonus[u, parent[u]] = 1.0
+                mst_bonus[parent[u], u] = 1.0
+            
+            # Update distances to neighbors
+            for v in range(n):
+                if not visited[v] and distance_matrix[u, v] < min_dist[v]:
+                    min_dist[v] = distance_matrix[u, v]
+                    parent[v] = u
+    
+    # 3. Multiple centrality measures
+    closeness = np.zeros(n)
+    betweenness = np.zeros(n)
+    
+    for i in range(n):
+        # Closeness centrality: inverse of average distance
+        if np.sum(distance_matrix[i]) > 0:
+            closeness[i] = (n - 1) / np.sum(distance_matrix[i])
+        
+        # Betweenness approximation: count of shortest paths passing through
+        for j in range(n):
+            if i == j:
+                continue
+            for k in range(j + 1, n):
+                if i == k:
+                    continue
+                # Check if i is on the direct path between j and k
+                direct = distance_matrix[j, k]
+                via_i = distance_matrix[j, i] + distance_matrix[i, k]
+                if abs(via_i - direct) < 1e-10:  # i is on a shortest path
+                    betweenness[i] += 1
+    
+    # Normalize centrality measures
+    if np.max(closeness) > 0:
+        closeness = closeness / np.max(closeness)
+    if np.max(betweenness) > 0:
+        betweenness = betweenness / np.max(betweenness)
+    
+    # Combined centrality
+    centrality = 0.6 * closeness + 0.4 * betweenness
+    
+    # 4. Edge tournament ranking by multiple criteria
+    edge_scores = np.zeros((n, n, 4))  # 4 criteria
+    
+    # Criterion 1: Direct distance (already in inv_dist)
+    edge_scores[:, :, 0] = inv_dist
+    
+    # Criterion 2: MST inclusion
+    edge_scores[:, :, 1] = mst_bonus
+    
+    # Criterion 3: Centrality product
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                edge_scores[i, j, 2] = centrality[i] * centrality[j]
+    
+    # Criterion 4: Lookahead estimation
+    for i in range(n):
+        for j in range(i + 1, n):
+            if distance_matrix[i, j] > 0:
+                completion_cost = estimate_completion_cost(i, j, distance_matrix)
+                total_estimate = distance_matrix[i, j] + completion_cost
+                if total_estimate > 0:
+                    edge_scores[i, j, 3] = 1.0 / (1.0 + total_estimate / np.mean(distance_matrix))
+                    edge_scores[j, i, 3] = edge_scores[i, j, 3]
+    
+    # 5. Rank edges by each criterion and combine
+    heuristics_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Get rankings for this edge across criteria
+            ranks = []
+            for criterion in range(4):
+                all_values = edge_scores[:, :, criterion].flatten()
+                sorted_indices = np.argsort(all_values)[::-1]  # descending
+                edge_index = i * n + j
+                rank = np.where(sorted_indices == edge_index)[0][0] / (n * n - 1)
+                ranks.append(1.0 - rank)  # Higher rank -> higher score
+            
+            # Weighted combination of rank scores
+            weights = [0.3, 0.2, 0.2, 0.3]  # Lookahead gets highest weight
+            combined_rank = sum(w * r for w, r in zip(weights, ranks))
+            
+            # Base score from criteria values
+            base_score = np.prod([1.0 + edge_scores[i, j, k] for k in range(4)]) ** (1/4)
+            
+            heuristics_matrix[i, j] = base_score * combined_rank
+    
+    # 6. Adaptive sparsification
+    # Determine sparsity based on instance characteristics
+    avg_dist = np.mean(distance_matrix)
+    std_dist = np.std(distance_matrix)
+    density_factor = min(0.7, max(0.2, 0.5 * (avg_dist / (std_dist + 1e-10))))
+    
+    # Keep top connections adaptively
+    positive_scores = heuristics_matrix[heuristics_matrix > 0]
+    if len(positive_scores) > 0:
+        threshold = np.percentile(positive_scores, 100 * (1 - density_factor))
+        heuristics_matrix[heuristics_matrix < threshold] = 0
+    
+    # 7. Symmetrize and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

@@ -1,0 +1,204 @@
+```json
+{
+    "algorithm_features": ["Adaptive Multi-component Weighting", "Inter-cluster Penalization with MST Partitioning", "Two-step Lookahead via Path Completion Estimates", "Dynamic Instance-based Parameter Tuning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with adaptive instance-based tuning,
+    inter-cluster penalty, and lookahead path completion estimates.
+    
+    Args:
+        distance_matrix: Symmetric square matrix of pairwise distances between nodes.
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Work on a copy with infinite diagonal
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Instance feature extraction for dynamic weight tuning
+    # Compute statistical features of the distance matrix
+    triu_vals = dist[np.triu_indices(n, 1)]
+    mean_dist = np.mean(triu_vals)
+    std_dist = np.std(triu_vals)
+    cv_dist = std_dist / (mean_dist + 1e-12)  # Coefficient of variation
+    
+    # Compute nearest neighbor statistics
+    nearest_dists = np.partition(dist, 1, axis=1)[:, 1]
+    mean_nearest = np.mean(nearest_dists)
+    nearest_cv = np.std(nearest_dists) / (mean_nearest + 1e-12)
+    
+    # 2. Dynamic weight computation based on instance characteristics
+    # Base weights adapt to instance size and variability
+    size_factor = np.log10(n) / np.log10(50)  # Normalized around n=50
+    variability_factor = cv_dist * 0.5 + 0.5  # Range ~0.5-1.5
+    
+    # Component weights that adapt to instance features
+    w_inv = 0.4 * (1.0 + 0.3 * variability_factor)  # More weight when distances vary
+    w_regret = 0.3 * (1.0 - 0.2 * size_factor)  # Less regret weight for larger instances
+    w_iso = 0.2 * (1.0 + 0.4 * nearest_cv)  # More isolation weight when nearest neighbors vary
+    
+    # 3. Base heuristic components
+    with np.errstate(divide='ignore'):
+        inv_dist = 1.0 / dist
+    inv_dist[np.isinf(inv_dist)] = 0
+    
+    # Regret weighting (difference between best and second-best edges)
+    nearest_two = np.partition(dist, 2, axis=1)[:, :2]
+    regret = (nearest_two[:, 1] - nearest_two[:, 0]) / (nearest_two[:, 0] + 1e-12)
+    regret_matrix = regret[:, None] + regret[None, :]
+    
+    # Node isolation (average distance to all other nodes)
+    node_isolation = np.mean(dist, axis=1)
+    isolation_factor = (node_isolation[:, None] + node_isolation[None, :]) / 2
+    
+    # 4. Two-step lookahead via path completion estimates
+    # For each edge (i,j), estimate minimum completion cost through a third node k
+    lookahead_bonus = np.zeros_like(dist)
+    
+    # Precompute nearest neighbors for each node (excluding self)
+    k_lookahead = min(5, n - 1)
+    nearest_indices = np.argpartition(dist, k_lookahead, axis=1)[:, :k_lookahead]
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Estimate minimum additional cost if we use edge (i,j)
+            # Consider best connections from i and j to other nodes
+            i_neighbors = [idx for idx in nearest_indices[i] if idx != j]
+            j_neighbors = [idx for idx in nearest_indices[j] if idx != i]
+            
+            if i_neighbors and j_neighbors:
+                # Find best pair that completes a potential 3-node path
+                best_extra = np.inf
+                for k_i in i_neighbors[:3]:  # Check top 3 neighbors of i
+                    for k_j in j_neighbors[:3]:  # Check top 3 neighbors of j
+                        if k_i != k_j:
+                            extra_cost = dist[i, k_i] + dist[k_j, j]
+                            best_extra = min(best_extra, extra_cost)
+                
+                if np.isfinite(best_extra):
+                    # Normalize by average distance and convert to bonus
+                    lookahead_score = mean_dist / (best_extra + 1e-12)
+                    lookahead_bonus[i, j] = lookahead_bonus[j, i] = lookahead_score
+    
+    # Normalize lookahead bonus
+    max_lookahead = np.max(lookahead_bonus)
+    if max_lookahead > 0:
+        lookahead_bonus /= max_lookahead
+    
+    # 5. Combine components with adaptive weights
+    # Normalize component weights to sum to 1
+    weight_sum = w_inv + w_regret + w_iso
+    w_inv /= weight_sum
+    w_regret /= weight_sum
+    w_iso /= weight_sum
+    
+    heuristics = (
+        w_inv * inv_dist +
+        w_regret * regret_matrix * inv_dist +
+        w_iso * inv_dist / isolation_factor +
+        0.15 * lookahead_bonus  # Fixed weight for lookahead component
+    )
+    
+    # 6. MST-based clustering with inter-cluster penalty
+    mst = minimum_spanning_tree(dist).toarray()
+    mst_sym = np.maximum(mst, mst.T)
+    
+    # Form clusters by removing longest MST edges
+    k_clusters = max(2, int(np.sqrt(n)))
+    if n > 3:
+        edges = np.argwhere(mst_sym > 0)
+        weights = mst_sym[mst_sym > 0]
+        
+        if len(weights) >= k_clusters - 1:
+            # Remove (k_clusters-1) longest edges to create clusters
+            sorted_idx = np.argsort(weights)[::-1]
+            edges_to_remove = edges[sorted_idx[:k_clusters - 1]]
+            
+            mst_clustered = mst_sym.copy()
+            mst_clustered[edges_to_remove[:, 0], edges_to_remove[:, 1]] = 0
+            mst_clustered[edges_to_remove[:, 1], edges_to_remove[:, 0]] = 0
+            
+            # Find connected components
+            n_components, labels = connected_components(
+                mst_clustered, directed=False, return_labels=True
+            )
+            
+            # Boost intra-cluster edges and penalize inter-cluster edges
+            same_cluster = labels[:, None] == labels[None, :]
+            np.fill_diagonal(same_cluster, False)
+            
+            # Dynamic penalty/bonus factors based on cluster quality
+            cluster_sizes = np.bincount(labels)
+            avg_cluster_size = np.mean(cluster_sizes)
+            size_variance = np.std(cluster_sizes) / (avg_cluster_size + 1e-12)
+            
+            # Stronger intra-cluster bonus for balanced clusters
+            intra_bonus = 0.25 * (1.0 - 0.3 * size_variance)
+            # Stronger inter-cluster penalty for imbalanced clusters
+            inter_penalty = 0.2 * (1.0 + 0.4 * size_variance)
+            
+            heuristics *= (1.0 + intra_bonus * same_cluster)
+            heuristics *= (1.0 - inter_penalty * (~same_cluster & (np.triu(np.ones((n, n)), 1) > 0)))
+    
+    # 7. Local neighborhood emphasis with adaptive radius
+    # Neighborhood size adapts to instance size
+    k_neighbors = max(3, n // 8 + int(2 * variability_factor))
+    nearest_mask = np.zeros_like(dist, dtype=bool)
+    
+    for i in range(n):
+        indices = np.argsort(dist[i])[:k_neighbors]
+        nearest_mask[i, indices] = True
+    
+    heuristics *= (1.0 + 0.2 * nearest_mask)
+    
+    # 8. Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # 9. Adaptive sparsification with instance-aware thresholds
+    mask = np.zeros_like(heuristics, dtype=bool)
+    
+    # Global threshold adapts to heuristic distribution
+    non_zero_heuristics = heuristics[heuristics > 0]
+    if len(non_zero_heuristics) > 0:
+        # Higher percentile for more variable instances
+        percentile = 50 + 15 * min(1.0, cv_dist)
+        global_threshold = np.percentile(non_zero_heuristics, percentile)
+        global_mask = heuristics > global_threshold
+        
+        # Local thresholds per node
+        local_threshold = 0.65 * np.max(heuristics, axis=1, keepdims=True)
+        local_mask = heuristics > local_threshold
+        
+        mask = global_mask | local_mask
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        if np.sum(mask[i]) < 2:
+            indices = np.argsort(heuristics[i])[-2:]
+            mask[i, indices] = True
+            mask[indices, i] = True
+    
+    # Apply mask and zero diagonal
+    heuristics = heuristics * mask
+    np.fill_diagonal(heuristics, 0)
+    
+    # 10. Final instance-adaptive normalization
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        # Use soft normalization that preserves relative differences
+        heuristics = np.tanh(heuristics / (max_val + 1e-12) * 2.0)
+    
+    return heuristics
+```

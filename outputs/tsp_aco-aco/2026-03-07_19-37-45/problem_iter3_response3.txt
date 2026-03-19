@@ -1,0 +1,247 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Regret Estimation", "Degree-Aware Penalization", "Adaptive Sparse Computation", "Two-Hop Lookahead Penalty"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining regret-based scoring,
+    degree-aware penalization, two-step lookahead, and two-hop penalty.
+    Returns a matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Compute base regret scores and candidate edges
+    regret_scores = _compute_regret_scores(distance_matrix)
+    candidate_mask = _build_candidate_mask(distance_matrix)
+    
+    # Step 2: Degree-aware penalization
+    degree_penalties = _compute_degree_penalties(regret_scores, candidate_mask)
+    
+    # Step 3: Two-step lookahead regret estimation
+    two_step_regret = _compute_two_step_regret(distance_matrix, candidate_mask)
+    
+    # Step 4: Two-hop lookahead penalty
+    two_hop_penalty = _compute_two_hop_penalty(distance_matrix, candidate_mask)
+    
+    # Step 5: Combine factors adaptively
+    H = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Base inverse distance
+                inv_dist = 1 / (distance_matrix[i, j] + 1e-8)
+                
+                # Combine factors (multiplicative combination works well)
+                combined = (
+                    inv_dist *
+                    regret_scores[i, j] *
+                    degree_penalties[i, j] *
+                    np.exp(two_step_regret[i, j]) *
+                    (1.0 - two_hop_penalty[i, j])
+                )
+                H[i, j] = H[j, i] = combined
+    
+    # Step 6: Post-process and sparsify
+    H = _post_process_and_sparsify(H, distance_matrix, candidate_mask)
+    
+    return H
+
+def _compute_regret_scores(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute normalized regret scores for each edge."""
+    n = distance_matrix.shape[0]
+    regret = np.ones((n, n))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Find best and second-best distances
+        sorted_idx = np.argsort(dists)
+        if len(sorted_idx) >= 2:
+            best_dist = dists[sorted_idx[0]]
+            second_best = dists[sorted_idx[1]]
+            
+            # Normalized regret for not taking best edge
+            base_regret = (second_best - best_dist) / (best_dist + 1e-8)
+            
+            for j in range(n):
+                if j != i:
+                    # Edge-specific regret (higher for edges far from optimal)
+                    edge_regret = max(0, dists[j] - best_dist) / (best_dist + 1e-8)
+                    # Invert so low regret → high score
+                    regret[i, j] = 1.0 / (1.0 + edge_regret + 0.1 * base_regret)
+    
+    # Symmetrize and zero diagonal
+    regret = (regret + regret.T) / 2
+    np.fill_diagonal(regret, 0)
+    return regret
+
+def _build_candidate_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Build adaptive candidate edge mask for efficiency."""
+    n = distance_matrix.shape[0]
+    
+    # Adaptive number of candidates based on instance size
+    base_k = min(15, max(5, int(np.log2(n) * 4)))
+    
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Select k-nearest neighbors
+        k = min(base_k, n - 1)
+        if k < len(dists):
+            indices = np.argpartition(dists, k)[:k]
+        else:
+            indices = np.arange(n)
+            indices = indices[indices != i]
+        
+        candidate_mask[i, indices] = True
+        
+        # Add random connections for exploration
+        if n > 10:
+            other_nodes = np.setdiff1d(np.arange(n), np.append(indices, i))
+            if len(other_nodes) > 0:
+                n_random = min(3, len(other_nodes))
+                random_indices = np.random.choice(other_nodes, n_random, replace=False)
+                candidate_mask[i, random_indices] = True
+    
+    # Make symmetric
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    return candidate_mask
+
+def _compute_degree_penalties(regret_scores: np.ndarray, candidate_mask: np.ndarray) -> np.ndarray:
+    """Penalize edges connected to nodes with many promising connections."""
+    n = regret_scores.shape[0]
+    penalties = np.ones((n, n))
+    
+    # Count promising connections per node
+    connection_counts = np.zeros(n)
+    for i in range(n):
+        # Only count edges with reasonable regret scores
+        good_edges = candidate_mask[i] & (regret_scores[i] > 0.3)
+        connection_counts[i] = np.sum(good_edges)
+    
+    # Normalize counts
+    if np.max(connection_counts) > 0:
+        normalized_counts = connection_counts / np.max(connection_counts)
+    else:
+        normalized_counts = np.zeros(n)
+    
+    # Apply penalty inversely proportional to connection counts
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Penalize if either node has many good connections
+                penalty_factor = np.sqrt(
+                    (1.0 / (1.0 + normalized_counts[i])) *
+                    (1.0 / (1.0 + normalized_counts[j]))
+                )
+                penalties[i, j] = penalties[j, i] = penalty_factor
+    
+    return penalties
+
+def _compute_two_step_regret(distance_matrix: np.ndarray, candidate_mask: np.ndarray) -> np.ndarray:
+    """Estimate regret using two-step lookahead paths."""
+    n = distance_matrix.shape[0]
+    regret_scores = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if not candidate_mask[i, j]:
+                continue
+                
+            # Find best two-step alternative path i->k->j
+            min_two_step = np.inf
+            for k in range(n):
+                if k != i and k != j and candidate_mask[i, k] and candidate_mask[k, j]:
+                    two_step_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    min_two_step = min(min_two_step, two_step_cost)
+            
+            if np.isfinite(min_two_step):
+                direct_cost = distance_matrix[i, j]
+                # Regret: negative if direct is better, positive if two-step is better
+                regret = (min_two_step - direct_cost) / (direct_cost + 1e-8)
+                # Scale to [-1, 1] range
+                regret_scores[i, j] = regret_scores[j, i] = np.clip(regret, -1.0, 1.0)
+    
+    return regret_scores
+
+def _compute_two_hop_penalty(distance_matrix: np.ndarray, candidate_mask: np.ndarray) -> np.ndarray:
+    """Penalize direct edges if two-hop paths are significantly shorter."""
+    n = distance_matrix.shape[0]
+    penalties = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if not candidate_mask[i, j]:
+                continue
+                
+            # Find minimum two-hop path cost
+            min_two_hop = np.inf
+            for k in range(n):
+                if k != i and k != j and candidate_mask[i, k] and candidate_mask[k, j]:
+                    two_hop_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    min_two_hop = min(min_two_hop, two_hop_cost)
+            
+            if np.isfinite(min_two_hop):
+                direct_cost = distance_matrix[i, j]
+                # Apply penalty if two-hop is significantly shorter
+                if min_two_hop < direct_cost * 0.7:  # 30% shorter
+                    penalties[i, j] = penalties[j, i] = 0.3
+                elif min_two_hop < direct_cost * 0.9:  # 10% shorter
+                    penalties[i, j] = penalties[j, i] = 0.1
+    
+    return penalties
+
+def _post_process_and_sparsify(H: np.ndarray, distance_matrix: np.ndarray, 
+                              candidate_mask: np.ndarray) -> np.ndarray:
+    """Post-process heuristic matrix and sparsify."""
+    n = H.shape[0]
+    
+    # Ensure minimum connectivity for each node
+    min_edges = min(3, n - 1)
+    for i in range(n):
+        non_zero = np.nonzero(H[i])[0]
+        if len(non_zero) < min_edges:
+            # Add nearest neighbors
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nearest = np.argsort(dists)[:min_edges]
+            for j in nearest:
+                if H[i, j] == 0:
+                    H[i, j] = H[j, i] = 1 / (distance_matrix[i, j] + 1e-8)
+    
+    # Adaptive sparsification: keep top edges per node
+    for i in range(n):
+        row_vals = H[i].copy()
+        row_vals[i] = -np.inf  # Ignore diagonal
+        
+        # Adaptive threshold based on distribution
+        positive_vals = row_vals[row_vals > 0]
+        if len(positive_vals) > 5:
+            threshold = np.percentile(positive_vals, 30)  # Keep top 70%
+            H[i, row_vals < threshold] = 0
+    
+    # Symmetrize
+    H = np.maximum(H, H.T)
+    np.fill_diagonal(H, 0)
+    
+    # Normalize
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    return H
+```

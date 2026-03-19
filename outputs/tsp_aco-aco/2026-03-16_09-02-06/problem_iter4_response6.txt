@@ -1,0 +1,198 @@
+```json
+{
+    "algorithm_features": ["Dynamic Percentile Thresholding", "Lightweight Regret Scoring", "Ensemble Sparsification", "Density-Adaptive Edge Selection"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with dynamic percentile thresholds,
+    lightweight regret scoring, and ensemble sparsification.
+    
+    Key innovations:
+    1. Dynamic Percentile Thresholding: Adjusts percentile cutoffs based on 
+       node density to be more selective in dense regions
+    2. Lightweight Regret: Uses nearest-neighbor differentials for efficient
+       regret computation without pairwise comparisons
+    3. Ensemble Sparsification: Combines multiple sparsification strategies
+       adaptively based on problem characteristics
+    4. Density-Adaptive Edge Selection: Adjusts connection counts based on
+       local node density
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix) if n == 0 else 1 / (distance_matrix + np.eye(n))
+    
+    # 1. Base scoring with inverse distance
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    inv_dist = 1 / (dist + 1e-10)
+    
+    # 2. MST bonus (critical structural edges)
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    mst_bonus = mst_mask.astype(float) * 1.0 + 1.0  # 2.0 for MST, 1.0 otherwise
+    
+    # 3. Lightweight regret using nearest-neighbor differentials
+    # Find k nearest neighbors for each node
+    k_regret = min(4, n - 1)
+    regret_matrix = np.ones_like(inv_dist)
+    
+    if k_regret >= 2:
+        for i in range(n):
+            # Get distances to all other nodes
+            row = dist[i].copy()
+            row[i] = np.inf
+            
+            # Find k nearest neighbors
+            if n - 1 > k_regret:
+                kth_idx = np.argpartition(row, k_regret)[k_regret]
+                kth_dist = row[kth_idx]
+            else:
+                kth_dist = np.max(row[row < np.inf])
+            
+            # Calculate regret for each edge (i,j)
+            for j in range(n):
+                if i != j:
+                    # Regret is normalized difference from kth nearest neighbor
+                    regret = max(0, dist[i, j] - kth_dist) / (kth_dist + 1e-10)
+                    # Apply sigmoid transformation to keep in [0,1]
+                    regret_matrix[i, j] = 1.0 / (1.0 + np.exp(5 * regret - 2))
+    
+    # 4. Density-adaptive percentile thresholds
+    # Compute local density for each node
+    density = np.zeros(n)
+    k_density = min(5, n - 1)
+    
+    for i in range(n):
+        if n > 1:
+            # Get distances to k nearest neighbors
+            row = dist[i].copy()
+            row[i] = np.inf
+            if n - 1 > k_density:
+                k_nearest = np.partition(row, k_density)[:k_density + 1]
+            else:
+                k_nearest = row[row < np.inf]
+            
+            if len(k_nearest) > 0:
+                density[i] = 1.0 / np.mean(k_nearest[k_nearest > 0])
+    
+    # Normalize density to [0.5, 1.5] range
+    if np.max(density) > 0:
+        density_norm = 0.5 + (density / np.max(density))
+    else:
+        density_norm = np.ones(n)
+    
+    # Dynamic percentile thresholds based on density
+    base_percentile = 0.3  # Base 30th percentile
+    dynamic_percentiles = base_percentile / density_norm
+    
+    # 5. Mutual top-percentile penalization with dynamic thresholds
+    penalty = np.ones_like(inv_dist)
+    
+    # For each node, identify edges in its dynamic top percentile
+    top_mask = np.zeros_like(inv_dist, dtype=bool)
+    for i in range(n):
+        row = inv_dist[i].copy()
+        row[i] = -np.inf
+        
+        # Dynamic k based on density-adjusted percentile
+        k_dynamic = max(1, int(dynamic_percentiles[i] * (n - 1)))
+        if k_dynamic > 0:
+            threshold = np.partition(row, -k_dynamic)[-k_dynamic]
+            top_mask[i] = row >= threshold
+    
+    # Penalize edges that are NOT in dynamic top percentile for BOTH endpoints
+    mutual_poor = (~top_mask) & (~top_mask.T)
+    penalty[mutual_poor] = 0.1
+    
+    # 6. Combine scoring components
+    scores = inv_dist * mst_bonus * regret_matrix * penalty
+    
+    # 7. Ensemble sparsification strategy
+    # 7a. Density-adaptive degree sparsification
+    base_k = max(2, int(np.sqrt(n)))
+    adaptive_k = np.clip(base_k * density_norm, 2, min(15, n - 1)).astype(int)
+    
+    degree_mask = np.zeros_like(scores, dtype=bool)
+    for i in range(n):
+        row = scores[i].copy()
+        row[i] = -np.inf
+        if adaptive_k[i] > 0:
+            top_idx = np.argpartition(row, -adaptive_k[i])[-adaptive_k[i]:]
+            degree_mask[i, top_idx] = True
+    
+    # Symmetrize degree mask
+    degree_mask = degree_mask | degree_mask.T
+    
+    # 7b. Global elite preservation
+    upper_tri = np.triu_indices(n, k=1)
+    if len(upper_tri[0]) > 0:
+        # Dynamic global percentile based on problem size
+        global_percentile = max(90, 95 - n // 10)  # More selective for larger problems
+        elite_threshold = np.percentile(scores[upper_tri], global_percentile)
+        global_mask = scores >= elite_threshold
+    else:
+        global_mask = np.zeros_like(scores, dtype=bool)
+    
+    # 7c. MST connectivity guarantee
+    # 7d. Final ensemble mask
+    final_mask = degree_mask | global_mask | mst_mask
+    
+    # Apply ensemble sparsification
+    scores = scores * final_mask
+    
+    # 8. Refinement: Boost edges that appear in multiple masks
+    ensemble_strength = degree_mask.astype(int) + global_mask.astype(int) + mst_mask.astype(int)
+    boost_factor = 1.0 + 0.2 * (ensemble_strength - 1)  # +20% per additional mask
+    scores = scores * boost_factor
+    
+    # 9. Final normalization and cleanup
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+
+# Example usage
+if __name__ == "__main__":
+    # Test with a simple example
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero elements:", np.count_nonzero(heuristics))
+    print("Max value:", np.max(heuristics))
+    print("Min non-zero value:", heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 0)
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print("Matrix is symmetric:", is_symmetric)
+    
+    # Check connectivity through non-zero edges
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    graph = csr_matrix(heuristics > 0)
+    n_components, _ = connected_components(graph, directed=False)
+    print("Number of connected components:", n_components)
+```

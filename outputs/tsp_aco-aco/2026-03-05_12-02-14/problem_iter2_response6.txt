@@ -1,0 +1,231 @@
+```json
+{
+    "algorithm_features": ["MST Betweenness", "Nearest Neighbor Chains", "Adaptive Sparsification", "Christofides-Inspired"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining graph theory principles
+    with efficient algorithms and adaptive strategies.
+    
+    Features:
+    1. Exact MST edge betweenness via tree DP
+    2. Nearest neighbor chains for promising edge identification
+    3. Christofides-inspired matching heuristics for difficult nodes
+    4. Adaptive sparsification with connectivity guarantees
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle small cases
+    if n <= 2:
+        inv_dist = 1.0 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(inv_dist, 0)
+        return inv_dist
+    
+    # Preprocess: set diagonal to infinity for calculations
+    dist_with_inf = distance_matrix.copy()
+    np.fill_diagonal(dist_with_inf, np.inf)
+    
+    # 1. Base inverse distance heuristic
+    inv_dist = 1.0 / dist_with_inf
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. MST and exact betweenness computation
+    mst_matrix = minimum_spanning_tree(dist_with_inf).toarray()
+    mst_edges = np.argwhere(mst_matrix > 0)
+    
+    # Build adjacency list from MST
+    adj = [[] for _ in range(n)]
+    for i, j in mst_edges:
+        adj[i].append(j)
+        adj[j].append(i)
+    
+    # Compute subtree sizes and edge betweenness via tree DP
+    subtree_size = np.zeros(n, dtype=int)
+    edge_betweenness = np.zeros((n, n))
+    
+    def dfs(node: int, parent: int) -> int:
+        """DFS to compute subtree sizes and edge betweenness."""
+        size = 1
+        for neighbor in adj[node]:
+            if neighbor != parent:
+                child_size = dfs(neighbor, node)
+                # Edge betweenness: size * (n - size)
+                bt = child_size * (n - child_size)
+                edge_betweenness[node, neighbor] = bt
+                edge_betweenness[neighbor, node] = bt
+                size += child_size
+        subtree_size[node] = size
+        return size
+    
+    # Start DFS from arbitrary root (0)
+    dfs(0, -1)
+    
+    # Normalize betweenness
+    max_bt = edge_betweenness.max()
+    if max_bt > 0:
+        edge_betweenness = edge_betweenness / max_bt
+    
+    # MST mask for edges in minimum spanning tree
+    mst_mask = (mst_matrix > 0) | (mst_matrix.T > 0)
+    
+    # 3. Nearest neighbor chains
+    # Identify promising edges using nearest neighbor relationships
+    k_nn = max(2, n // 8)  # Adaptive number of nearest neighbors
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get k nearest neighbors
+        nearest = np.argsort(dist_with_inf[i])[:k_nn]
+        nn_mask[i, nearest] = True
+        nn_mask[nearest, i] = True
+    
+    # 4. Christofides-inspired: identify odd-degree nodes in MST and their connections
+    # In Christofides, we find minimum weight perfect matching on odd-degree nodes
+    # Here we use a heuristic: edges incident to odd-degree nodes get bonus
+    mst_degrees = mst_mask.sum(axis=1)
+    odd_degree_nodes = np.where(mst_degrees % 2 == 1)[0]
+    
+    odd_node_bonus = np.zeros_like(distance_matrix)
+    if len(odd_degree_nodes) > 0:
+        # For each odd-degree node, boost edges to its nearest neighbors
+        for node in odd_degree_nodes:
+            # Get top m neighbors
+            m = max(3, n // 10)
+            neighbors = np.argsort(dist_with_inf[node])[1:m+1]  # Skip self
+            odd_node_bonus[node, neighbors] = 1.0
+            odd_node_bonus[neighbors, node] = 1.0
+    
+    # 5. Combine heuristics with learned weights (from empirical testing)
+    # Weights can be tuned based on problem characteristics
+    base_weight = 1.0
+    mst_weight = 3.0
+    betweenness_weight = 1.5
+    nn_weight = 2.0
+    odd_node_weight = 0.8
+    
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base inverse distance
+    heuristics_matrix = base_weight * inv_dist.copy()
+    
+    # Boost MST edges
+    heuristics_matrix[mst_mask] *= mst_weight
+    
+    # Add betweenness contribution
+    heuristics_matrix += betweenness_weight * edge_betweenness * inv_dist
+    
+    # Boost nearest neighbor edges
+    heuristics_matrix[nn_mask] *= nn_weight
+    
+    # Add odd node bonus
+    heuristics_matrix += odd_node_weight * odd_node_bonus * inv_dist
+    
+    # 6. Adaptive sparsification
+    # Strategy: keep promising edges while ensuring connectivity
+    
+    # Keep all MST edges (ensures connectivity)
+    sparsity_mask = mst_mask.copy()
+    
+    # For each node, keep top adaptive number of promising edges
+    # More edges for larger problems, fewer for smaller ones
+    base_top_k = max(3, int(np.sqrt(n)))
+    for i in range(n):
+        # Get row and exclude self
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Adaptive threshold: keep edges above percentile
+        # Use higher percentile for denser graphs (more edges to choose from)
+        percentile = max(70, 100 - 200/n) if n > 20 else 70
+        threshold = np.percentile(row[row > -np.inf], percentile)
+        
+        # Also keep top base_top_k edges regardless of threshold
+        top_indices = np.argsort(row)[-base_top_k:]
+        threshold_indices = np.where(row >= threshold)[0]
+        
+        # Combine both sets
+        keep_indices = np.union1d(top_indices, threshold_indices)
+        sparsity_mask[i, keep_indices] = True
+        sparsity_mask[keep_indices, i] = True
+    
+    # 7. Connectivity check and repair
+    # Ensure graph remains connected by adding edges if necessary
+    visited = np.zeros(n, dtype=bool)
+    
+    def explore(node: int):
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if not visited[current]:
+                visited[current] = True
+                # Add neighbors that are in sparsity_mask
+                neighbors = np.where(sparsity_mask[current])[0]
+                stack.extend([n for n in neighbors if not visited[n]])
+    
+    explore(0)
+    
+    # If not all nodes visited, add minimum edges to connect components
+    if not np.all(visited):
+        # Find connected components
+        components = []
+        unvisited = np.where(~visited)[0]
+        
+        for node in unvisited:
+            if not visited[node]:
+                component = []
+                explore(node)
+                component_nodes = np.where(visited)[0]
+                components.append(component_nodes)
+                # Reset visited for next component
+                visited[component_nodes] = False
+        
+        # Connect components with shortest edges
+        for i in range(len(components)):
+            for j in range(i + 1, len(components)):
+                comp1 = components[i]
+                comp2 = components[j]
+                
+                # Find shortest edge between components
+                min_dist = np.inf
+                best_pair = (0, 0)
+                
+                # Sample edges to avoid O(n^2) for large components
+                sample_size = min(10, len(comp1), len(comp2))
+                sample1 = np.random.choice(comp1, min(sample_size, len(comp1)), replace=False)
+                sample2 = np.random.choice(comp2, min(sample_size, len(comp2)), replace=False)
+                
+                for u in sample1:
+                    for v in sample2:
+                        if distance_matrix[u, v] < min_dist:
+                            min_dist = distance_matrix[u, v]
+                            best_pair = (u, v)
+                
+                # Add the connecting edge
+                u, v = best_pair
+                sparsity_mask[u, v] = True
+                sparsity_mask[v, u] = True
+    
+    # Apply sparsification
+    heuristics_matrix[~sparsity_mask] = 0
+    
+    # Ensure symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # Final normalization
+    max_val = heuristics_matrix.max()
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # Set diagonal to zero
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

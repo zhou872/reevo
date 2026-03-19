@@ -1,0 +1,399 @@
+```json
+{
+    "algorithm_features": ["Three-Step Regret Lookahead", "Entropy-Weighted Component Fusion", "Variance-Adaptive Sparsification", "Geometric Mean Integration"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with three-step regret lookahead,
+    entropy-weighted component fusion, and variance-adaptive mechanisms.
+    
+    Core innovations:
+    1. Three-Step Regret Lookahead: Evaluates edge quality by considering three-step
+       alternative paths to better anticipate future selection consequences
+    2. Entropy-Weighted Component Fusion: Dynamically weights heuristic components
+       based on their information content to handle noisy distance distributions
+    3. Variance-Adaptive Sparsification: Adjusts edge pruning thresholds based on
+       global and local distance variance patterns
+    4. Geometric Mean Integration: Combines multiple evidence sources multiplicatively
+       to emphasize edges with consistently high scores across all metrics
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # 1. GLOBAL STATISTICS PREPARATION
+    non_diag_mask = ~np.eye(n, dtype=bool)
+    global_distances = distance_matrix[non_diag_mask]
+    global_mean = np.mean(global_distances)
+    global_std = np.std(global_distances)
+    global_cv = global_std / (global_mean + 1e-8)
+    
+    # Size-based adaptation factor
+    size_factor = min(1.0, n / 150.0)
+    
+    # 2. COMPONENT MATRIX INITIALIZATION
+    # Core components
+    inv_dist = np.zeros((n, n))
+    rank_matrix = np.ones((n, n))
+    density_matrix = np.ones((n, n))
+    regret_matrix = np.ones((n, n))
+    proximity_matrix = np.ones((n, n))
+    
+    np.fill_diagonal(inv_dist, 0)
+    np.fill_diagonal(rank_matrix, 0)
+    np.fill_diagonal(density_matrix, 0)
+    np.fill_diagonal(regret_matrix, 0)
+    np.fill_diagonal(proximity_matrix, 0)
+    
+    # 3. INVERSE DISTANCE WITH ENTROPY-AWARE REGULARIZATION
+    # Use entropy of distance distribution to set regularization
+    dist_entropy = entropy(np.histogram(global_distances, bins=min(20, n))[0] + 1e-8)
+    reg_factor = 0.01 * global_mean * (1.0 + 0.5 * dist_entropy)
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg_factor)
+    
+    # 4. THREE-STEP REGRET LOOKAHEAD MECHANISM
+    # Precompute sorted distances and indices
+    sorted_indices = np.zeros((n, n-1), dtype=int)
+    sorted_distances = np.zeros((n, n-1))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        idx = np.argsort(distances)
+        sorted_indices[i] = idx[:n-1]
+        sorted_distances[i] = distances[idx[:n-1]]
+    
+    # Compute three-step regret for each edge
+    for i in range(n):
+        # Get best one-step, two-step, and three-step alternatives from i
+        best_1step = sorted_distances[i, 0]
+        best_2step = np.inf
+        best_3step = np.inf
+        
+        # Compute best two-step and three-step paths
+        for k_idx in range(min(5, n-1)):
+            k = sorted_indices[i, k_idx]
+            if k == i:
+                continue
+                
+            # Two-step: i -> k -> best from k (excluding i)
+            k_dist = distance_matrix[i, k]
+            
+            # Find best from k (excluding i)
+            for m_idx in range(min(3, n-1)):
+                m = sorted_indices[k, m_idx]
+                if m != i and m != k:
+                    two_step_cost = k_dist + distance_matrix[k, m]
+                    best_2step = min(best_2step, two_step_cost)
+                    
+                    # Three-step: i -> k -> m -> best from m (excluding i, k)
+                    for l_idx in range(min(2, n-1)):
+                        l = sorted_indices[m, l_idx]
+                        if l not in [i, k, m]:
+                            three_step_cost = two_step_cost + distance_matrix[m, l]
+                            best_3step = min(best_3step, three_step_cost)
+                    break
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            cost_ij = distance_matrix[i, j]
+            
+            # One-step regret
+            regret_1step = 1.0 + (cost_ij - best_1step) / (best_1step + 1e-8)
+            
+            # Two-step regret (if we choose edge i->j, what's the best from j?)
+            best_from_j = np.inf
+            for k_idx in range(min(3, n-1)):
+                k = sorted_indices[j, k_idx]
+                if k != i and k != j:
+                    best_from_j = distance_matrix[j, k]
+                    break
+            
+            if best_from_j < np.inf:
+                two_step_with_ij = cost_ij + best_from_j
+                regret_2step = 1.0 + (two_step_with_ij - best_2step) / (best_2step + 1e-8)
+            else:
+                regret_2step = regret_1step
+            
+            # Three-step regret
+            regret_3step = 1.0
+            if best_3step < np.inf and best_from_j < np.inf:
+                # Best three-step path starting with i->j
+                best_3step_with_ij = np.inf
+                for k_idx in range(min(2, n-1)):
+                    k = sorted_indices[j, k_idx]
+                    if k in [i, j]:
+                        continue
+                    
+                    jk_dist = distance_matrix[j, k]
+                    
+                    for l_idx in range(min(2, n-1)):
+                        l = sorted_indices[k, l_idx]
+                        if l not in [i, j, k]:
+                            three_step_cost = cost_ij + jk_dist + distance_matrix[k, l]
+                            best_3step_with_ij = min(best_3step_with_ij, three_step_cost)
+                            break
+                
+                if best_3step_with_ij < np.inf:
+                    regret_3step = 1.0 + (best_3step_with_ij - best_3step) / (best_3step + 1e-8)
+            
+            # Combined regret (weighted by step)
+            regret_combined = (0.4 * regret_1step + 0.35 * regret_2step + 0.25 * regret_3step)
+            regret_matrix[i, j] = 1.0 / (regret_combined + 0.1)
+    
+    # 5. ENTROPY-WEIGHTED LOCAL DENSITY ESTIMATION
+    # Compute local density with adaptive neighborhood size
+    base_k = max(3, int(0.15 * n))
+    k = min(base_k + int(7 * global_cv), n-1)
+    
+    local_density = np.zeros(n)
+    density_entropies = np.zeros(n)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        if n > k:
+            # Get k-nearest neighbors
+            kth_dist = np.partition(distances, k)[k]
+            nearest_mask = distances <= kth_dist
+            nearest_dists = distances[nearest_mask]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        
+        if len(nearest_dists) > 1:
+            # Compute local density
+            local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+            
+            # Compute entropy of local distance distribution
+            hist, _ = np.histogram(nearest_dists, bins=min(10, len(nearest_dists)))
+            density_entropies[i] = entropy(hist + 1e-8)
+        else:
+            local_density[i] = 1.0
+            density_entropies[i] = 1.0
+    
+    # Use entropy to weight density similarity
+    avg_density_entropy = np.mean(density_entropies)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            density_diff = abs(local_density[i] - local_density[j])
+            
+            # Entropy-aware similarity: higher entropy (more uncertainty) reduces confidence
+            entropy_factor = 1.0 - 0.3 * (density_entropies[i] + density_entropies[j]) / (2 * avg_density_entropy + 1e-8)
+            entropy_factor = np.clip(entropy_factor, 0.5, 1.2)
+            
+            # Variance-adaptive scaling
+            scale = 2.0 / (1.0 + global_cv) * entropy_factor
+            
+            density_matrix[i, j] = 1.0 + 0.6 * np.exp(-scale * density_diff)
+    
+    # 6. RANK-BASED PRIORITY WITH ENTROPY CONSIDERATION
+    # Compute rank distribution entropy for each node
+    rank_entropies = np.zeros(n)
+    
+    for i in range(n):
+        if n > 3:
+            # Use first 5 ranks for entropy calculation
+            top_ranks = min(5, n-1)
+            rank_probs = 1.0 / (np.arange(top_ranks) + 2.0)
+            rank_probs = rank_probs / np.sum(rank_probs)
+            rank_entropies[i] = entropy(rank_probs)
+        else:
+            rank_entropies[i] = 1.0
+    
+    avg_rank_entropy = np.mean(rank_entropies)
+    
+    for i in range(n):
+        best_dist = sorted_distances[i, 0] if n > 1 else 1.0
+        
+        for rank_idx in range(n-1):
+            j = sorted_indices[i, rank_idx]
+            
+            if rank_idx == 0:
+                base_score = 1.8 - 0.25 * size_factor
+            else:
+                current_dist = distance_matrix[i, j]
+                if best_dist > 0:
+                    base_score = best_dist / (current_dist + 1e-8)
+                else:
+                    base_score = 1.0
+            
+            # Adjust by rank entropy: lower entropy (more skewed ranks) gives higher confidence
+            entropy_adjust = 1.0 + 0.2 * (1.0 - rank_entropies[i] / (avg_rank_entropy + 1e-8))
+            rank_matrix[i, j] = base_score * entropy_adjust
+    
+    # 7. PROXIMITY WITH VARIANCE-ADAPTIVE THRESHOLDS
+    # Compute local variance statistics
+    local_vars = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        valid_dists = distances[distances < np.inf]
+        if len(valid_dists) > 1:
+            local_vars[i] = np.var(valid_dists)
+        else:
+            local_vars[i] = global_std
+    
+    for i in range(n):
+        # Adaptive threshold based on local variance
+        var_factor = 1.0 + 0.5 * (local_vars[i] / (global_std + 1e-8))
+        threshold = (1.4 + 0.4 * global_cv) * var_factor * global_mean
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist = distance_matrix[i, j]
+            dist_ratio = dist / (threshold + 1e-8)
+            
+            if dist_ratio <= 1.0:
+                # Within threshold: bonus
+                proximity_matrix[i, j] = 1.0 + 0.5 * (1.0 - dist_ratio)
+            else:
+                # Beyond threshold: penalty
+                proximity_matrix[i, j] = np.exp(1.0 - dist_ratio)
+    
+    # 8. ENTROPY-WEIGHTED COMPONENT FUSION
+    # Compute component entropies
+    components = {
+        'inv_dist': inv_dist,
+        'rank': rank_matrix,
+        'density': density_matrix,
+        'regret': regret_matrix,
+        'proximity': proximity_matrix
+    }
+    
+    component_entropies = {}
+    for name, matrix in components.items():
+        # Flatten upper triangle for entropy calculation
+        triu_vals = matrix[np.triu_indices(n, k=1)]
+        if len(triu_vals) > 10:
+            hist, _ = np.histogram(triu_vals, bins=min(15, len(triu_vals)))
+            component_entropies[name] = entropy(hist + 1e-8)
+        else:
+            component_entropies[name] = 1.0
+    
+    # Base weights adjusted by component entropy
+    # Lower entropy = more informative = higher weight
+    base_weights = {
+        'inv_dist': 1.0 - 0.2 * size_factor,
+        'rank': 0.8 + 0.2 * size_factor,
+        'density': 0.6 - 0.3 * size_factor,
+        'regret': 0.5 + 0.3 * size_factor,
+        'proximity': 0.7 - 0.2 * size_factor
+    }
+    
+    # Adjust weights by inverse entropy
+    entropy_weights = {}
+    for name in base_weights.keys():
+        entropy_weights[name] = base_weights[name] / (component_entropies[name] + 0.5)
+    
+    # Normalize weights
+    total_weight = sum(entropy_weights.values())
+    if total_weight > 0:
+        for name in entropy_weights.keys():
+            entropy_weights[name] /= total_weight
+    
+    # 9. GEOMETRIC MEAN INTEGRATION
+    # Use weighted geometric mean to emphasize consistency
+    combined = np.ones((n, n))
+    for name, weight in entropy_weights.items():
+        # Add small epsilon to avoid zeros
+        combined *= np.power(components[name] + 1e-8, weight)
+    
+    # 10. MINIMUM SPANNING TREE BOOST
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost = np.where(mst_mask, 1.3 - 0.15 * size_factor, 1.0)
+        combined *= mst_boost
+    except:
+        pass  # Continue without MST boost if computation fails
+    
+    # Ensure symmetry and zero diagonal
+    combined = (combined + combined.T) / 2.0
+    np.fill_diagonal(combined, 0)
+    
+    # 11. VARIANCE-ADAPTIVE SPARSIFICATION
+    # Determine sparsity based on distance variance
+    if global_cv < 0.3:
+        # Low variance: more edges needed
+        keep_fraction = 0.35 - 0.1 * size_factor
+    elif global_cv < 0.7:
+        # Medium variance
+        keep_fraction = 0.25 - 0.08 * size_factor
+    else:
+        # High variance: fewer edges
+        keep_fraction = 0.18 - 0.06 * size_factor
+    
+    keep_fraction = max(0.1, min(0.4, keep_fraction))
+    
+    # Create sparsification mask
+    keep_mask = np.zeros((n, n), dtype=bool)
+    
+    # Keep MST edges
+    if 'mst_mask' in locals():
+        keep_mask = keep_mask | mst_mask
+    
+    # Keep top edges by heuristic value
+    n_keep = max(3, int(keep_fraction * n * (n-1) / 2))
+    
+    if n_keep > 0:
+        # Flatten upper triangle
+        triu_indices = np.triu_indices(n, k=1)
+        heuristic_vals = combined[triu_indices]
+        
+        if len(heuristic_vals) > n_keep:
+            threshold = np.partition(heuristic_vals, -n_keep)[-n_keep]
+            top_mask = combined >= threshold
+            
+            # Ensure each node has at least 2 connections
+            for i in range(n):
+                node_top = np.where(top_mask[i, :])[0]
+                node_top = node_top[node_top != i]
+                if len(node_top) < 2:
+                    # Add best missing connections
+                    node_vals = combined[i, :].copy()
+                    node_vals[i] = -np.inf
+                    best_indices = np.argsort(node_vals)[-2:]
+                    for j in best_indices:
+                        if j != i and not top_mask[i, j]:
+                            top_mask[i, j] = True
+                            top_mask[j, i] = True
+            
+            keep_mask = keep_mask | top_mask
+    
+    # Apply sparsification
+    sparsified = combined * keep_mask
+    
+    # 12. FINAL NORMALIZATION
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

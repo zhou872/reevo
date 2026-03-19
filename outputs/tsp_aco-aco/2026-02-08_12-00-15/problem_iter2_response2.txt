@@ -1,0 +1,163 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection using multiplicative combination of factors,
+    geometric consistency checks, and structural sparsification.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Handle diagonal elements
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # Base factor: reciprocal of distance
+    base_factor = 1.0 / safe_dist
+    
+    # Factor 1: Nearest neighbor connectivity
+    k_neighbors = max(2, min(5, n // 4))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get k+1 nearest neighbors (including self)
+        nearest_indices = np.argpartition(safe_dist[i], k_neighbors + 1)[:k_neighbors + 1]
+        # Remove self and keep only k neighbors
+        nearest_indices = nearest_indices[nearest_indices != i][:k_neighbors]
+        nn_mask[i, nearest_indices] = True
+    
+    # Make symmetric
+    nn_mask = nn_mask | nn_mask.T
+    
+    # Factor 2: Minimum spanning tree
+    mst = minimum_spanning_tree(safe_dist)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Factor 3: Triangle inequality consistency
+    triangle_factor = np.ones_like(distance_matrix)
+    
+    # For efficiency, compute all-pairs shortest paths
+    # (since we have complete graph with triangle inequality, distances are already shortest)
+    # Check for significant violations of triangle inequality
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Find the best detour through any third node
+                # Vectorized computation
+                detours = safe_dist[i, :] + safe_dist[:, j]
+                # Exclude i and j from being intermediate nodes
+                detours[[i, j]] = np.inf
+                min_detour = np.min(detours)
+                
+                if safe_dist[i, j] > 1.8 * min_detour:
+                    triangle_factor[i, j] = 0.1  # Strong penalty
+                elif safe_dist[i, j] > 1.4 * min_detour:
+                    triangle_factor[i, j] = 0.3  # Medium penalty
+                elif safe_dist[i, j] > 1.2 * min_detour:
+                    triangle_factor[i, j] = 0.7  # Mild penalty
+    
+    # Factor 4: Geometric clustering
+    cluster_factor = np.ones_like(distance_matrix)
+    
+    if n >= 4:
+        # Compute approximate convex hull to identify boundary points
+        # Find point with minimum average distance to others (center)
+        avg_distances = np.mean(safe_dist, axis=1)
+        center_idx = np.argmin(avg_distances)
+        
+        # Points far from center are likely on the boundary
+        dist_to_center = safe_dist[center_idx, :]
+        if np.max(dist_to_center) > 0:
+            norm_dist = dist_to_center / np.max(dist_to_center)
+            is_boundary = norm_dist > 0.8  # Top 20% farthest points
+            
+            # Bonus for edges connecting boundary points
+            # Boundary points should connect to form the outer hull
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        if is_boundary[i] and is_boundary[j]:
+                            # Both on boundary - encourage connection
+                            cluster_factor[i, j] = 1.5
+                        elif is_boundary[i] or is_boundary[j]:
+                            # One on boundary, one interior
+                            cluster_factor[i, j] = 1.2
+                        # Both interior stays at 1.0
+    
+    # Combine factors multiplicatively
+    combined_heuristic = base_factor * triangle_factor * cluster_factor
+    
+    # Apply structural masks (MST and nearest neighbors get priority)
+    structural_mask = nn_mask | mst_mask
+    
+    # Additional sparsification: keep top edges for each node
+    # but ensure connectivity by keeping MST edges
+    edge_keep_factor = 0.3  # Keep top 30% of edges per node
+    
+    # For each node, select top edges based on combined heuristic
+    top_edge_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        row_heuristic = combined_heuristic[i].copy()
+        row_heuristic[i] = -np.inf  # Exclude self
+        
+        # Always keep MST and nearest neighbor edges
+        keep_indices = np.where(structural_mask[i])[0]
+        
+        # Add additional top edges
+        if n - len(keep_indices) > 1:  # If there are edges not in structural mask
+            remaining_indices = np.setdiff1d(np.arange(n), np.append(keep_indices, i))
+            if len(remaining_indices) > 0:
+                remaining_heuristics = row_heuristic[remaining_indices]
+                if len(remaining_heuristics) > 0:
+                    # Number of additional edges to keep
+                    num_additional = max(1, int(edge_keep_factor * n))
+                    top_additional = np.argsort(-remaining_heuristics)[:num_additional]
+                    keep_indices = np.concatenate([keep_indices, remaining_indices[top_additional]])
+        
+        top_edge_mask[i, keep_indices] = True
+    
+    # Make symmetric
+    top_edge_mask = top_edge_mask | top_edge_mask.T
+    
+    # Apply final mask
+    result = combined_heuristic * top_edge_mask
+    
+    # Ensure geometric consistency: penalize edges that create very acute angles
+    # by checking if an edge is much longer than both adjacent edges in potential triangles
+    if n >= 3:
+        for i in range(n):
+            for j in range(n):
+                if i != j and result[i, j] > 0:
+                    # Find third nodes that connect to both i and j
+                    common_neighbors = np.where(top_edge_mask[i] & top_edge_mask[j])[0]
+                    common_neighbors = common_neighbors[common_neighbors != i]
+                    common_neighbors = common_neighbors[common_neighbors != j]
+                    
+                    if len(common_neighbors) >= 2:
+                        # Check triangle quality
+                        violations = 0
+                        for k in common_neighbors:
+                            # Check if edge ij is the longest in triangle ijk
+                            edges = [safe_dist[i, j], safe_dist[i, k], safe_dist[j, k]]
+                            if safe_dist[i, j] == max(edges) and safe_dist[i, j] > 1.5 * min(edges):
+                                violations += 1
+                        
+                        # If edge ij is the longest in most triangles, penalize it
+                        if violations >= len(common_neighbors) / 2:
+                            result[i, j] *= 0.5
+    
+    # Normalize to make values comparable
+    non_zero_vals = result[result > 0]
+    if len(non_zero_vals) > 0:
+        max_val = np.max(non_zero_vals)
+        if max_val > 0:
+            result = result / max_val
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(result, 0)
+    
+    return result
+```

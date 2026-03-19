@@ -1,0 +1,180 @@
+```json
+{
+    "algorithm_features": ["Adaptive Nearest Neighbors", "Mutual Prominence Filtering", "Density-Aware Sparsification", "Connectivity Preservation"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with adaptive parameter tuning.
+    
+    Key improvements over v1:
+    1. Dynamically adapts neighborhood sizes based on distance distribution
+    2. Uses continuous mutual prominence scoring
+    3. Adaptive sparsification that preserves connectivity
+    4. More robust handling of various instance types
+    
+    Returns:
+        np.ndarray: Heuristic matrix of same shape as distance_matrix,
+                   with higher values indicating more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # 1. Base heuristic: reciprocal of distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1 / distance_matrix
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # 2. Adaptive neighborhood size for clustering
+    # Use statistical properties of distances to set k
+    avg_distances = np.mean(distance_matrix, axis=1)
+    k_base = int(np.sqrt(n))
+    k_adaptive = np.clip(k_base + (avg_distances > np.median(avg_distances)).astype(int), 
+                         3, n//2)
+    
+    # 3. Compute local clustering coefficients with adaptive neighborhoods
+    cluster_scores = np.zeros(n)
+    for i in range(n):
+        k = k_adaptive[i]
+        # Get k nearest neighbors (excluding self)
+        neighbor_indices = np.argsort(distance_matrix[i])[1:k+1]
+        
+        if len(neighbor_indices) < 2:
+            cluster_scores[i] = 0
+            continue
+        
+        # Count connections among neighbors that are below the median distance
+        connections = 0
+        total_pairs = 0
+        for a_idx, a in enumerate(neighbor_indices):
+            for b in neighbor_indices[a_idx+1:]:
+                # Use adaptive threshold: median of the two nodes' distances
+                threshold = np.median([distance_matrix[a], distance_matrix[b]])
+                if distance_matrix[a, b] < threshold:
+                    connections += 1
+                total_pairs += 1
+        
+        cluster_scores[i] = connections / max(total_pairs, 1)
+    
+    # 4. Compute mutual prominence with continuous scoring
+    # First, compute normalized ranks for each node
+    rank_matrix = np.zeros((n, n))
+    for i in range(n):
+        row = distance_matrix[i]
+        # Compute number of nodes with distance less than current
+        # Efficient implementation using sorting
+        sorted_indices = np.argsort(row)
+        # Convert to ranks (0 for closest, 1 for farthest, excluding self)
+        ranks = np.zeros(n)
+        for pos, idx in enumerate(sorted_indices):
+            if idx == i:
+                ranks[idx] = 0  # Self gets rank 0
+            else:
+                # Normalize rank to [0, 1] excluding self
+                ranks[idx] = (pos - 1) / (n - 2) if n > 2 else 0
+        rank_matrix[i] = ranks
+    
+    # 5. Compute combined scores
+    combined_scores = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] <= 0:
+                continue
+            
+            # Base score
+            base = base_heuristic[i, j]
+            
+            # Clustering synergy
+            cluster_synergy = 1.0 + 0.3 * (cluster_scores[i] + cluster_scores[j])
+            
+            # Continuous mutual prominence factor
+            # Give higher weight to edges where both nodes rank each other highly
+            rank_i = rank_matrix[i, j]
+            rank_j = rank_matrix[j, i]
+            
+            # Use harmonic mean of (1 - rank) for continuous scoring
+            prominence = 2 * (1 - rank_i) * (1 - rank_j) / ((1 - rank_i) + (1 - rank_j) + 1e-12)
+            prominence_factor = 1.0 + 1.5 * prominence
+            
+            # Combine factors
+            combined_scores[i, j] = base * cluster_synergy * prominence_factor
+            combined_scores[j, i] = combined_scores[i, j]
+    
+    # 6. Adaptive sparsification
+    # Determine sparsity level based on instance size and distance distribution
+    m_base = max(3, int(np.log2(n)))
+    
+    # Adjust m based on distance variance (dense vs sparse instances)
+    distance_variance = np.var(distance_matrix[np.triu_indices(n, 1)])
+    m_scale = 1.0 + 0.5 * np.tanh(distance_variance / (np.mean(distance_matrix) + 1e-12))
+    m = int(m_base * m_scale)
+    
+    sparse_heuristic = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get top m edges for node i
+        row = combined_scores[i].copy()
+        row[i] = 0  # Ignore self
+        if np.sum(row > 0) == 0:
+            continue
+            
+        # Use percentile-based threshold for adaptive selection
+        if np.sum(row > 0) > m:
+            threshold = np.partition(row, -m)[-m]
+            top_indices = np.where(row >= threshold)[0]
+        else:
+            top_indices = np.where(row > 0)[0]
+        
+        # Keep mutual connections
+        for j in top_indices:
+            if j == i:
+                continue
+                
+            # Check if i is in top (2*m) for j
+            j_row = combined_scores[j].copy()
+            j_row[j] = 0
+            if np.sum(j_row > 0) > 2*m:
+                j_threshold = np.partition(j_row, -2*m)[-2*m]
+                j_top_indices = np.where(j_row >= j_threshold)[0]
+            else:
+                j_top_indices = np.where(j_row > 0)[0]
+            
+            if i in j_top_indices:
+                sparse_heuristic[i, j] = combined_scores[i, j]
+    
+    # 7. Ensure connectivity and stability
+    # Each node should have at least 2 connections
+    for i in range(n):
+        non_zero = np.sum(sparse_heuristic[i] > 0)
+        if non_zero < 2:
+            # Find the 2 best edges from combined_scores that aren't already included
+            candidate_scores = combined_scores[i].copy()
+            candidate_scores[i] = 0
+            candidate_scores[sparse_heuristic[i] > 0] = 0  # Already included
+            
+            if np.sum(candidate_scores > 0) > 0:
+                # Add the best remaining edges with reduced weight
+                top_candidates = np.argsort(candidate_scores)[-2:]
+                for j in top_candidates:
+                    if candidate_scores[j] > 0 and sparse_heuristic[i, j] == 0:
+                        sparse_heuristic[i, j] = candidate_scores[j] * 0.3
+                        sparse_heuristic[j, i] = candidate_scores[j] * 0.3
+    
+    # 8. Final normalization
+    max_val = np.max(sparse_heuristic)
+    if max_val > 0:
+        sparse_heuristic = sparse_heuristic / max_val
+    
+    return sparse_heuristic
+```

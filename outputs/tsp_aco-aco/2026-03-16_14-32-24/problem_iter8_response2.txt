@@ -1,0 +1,392 @@
+```json
+{
+    "algorithm_features": ["Christofides-Augmented MST", "Articulation-Point Connectivity Scoring", "Regret-Gap Weighting", "Adaptive Instance Profiling"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics integrating Christofides-augmented MST,
+    articulation-point connectivity analysis, and adaptive instance profiling.
+    
+    Core Innovations:
+    1. Christofides-Augmented MST: Combines MST edges with greedy matching for global structure
+    2. Articulation-Point Connectivity Scoring: Identifies critical bridge edges via biconnected components
+    3. Regret-Gap Weighting: Uses distance gaps rather than ranks for more nuanced regret
+    4. Adaptive Instance Profiling: Dynamically adjusts parameters based on instance statistics
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix with diagonal removed
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. ADAPTIVE INSTANCE PROFILING
+    # ------------------------------------------------------------
+    triu_indices = np.triu_indices(n, k=1)
+    distances = safe_dist[triu_indices]
+    
+    # Compute comprehensive instance characteristics
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + eps)
+    
+    # Compute skewness and kurtosis (Fisher-Pearson)
+    if len(distances) > 1:
+        skew = np.mean(((distances - dist_mean) / dist_std) ** 3) if dist_std > eps else 0
+        kurt = np.mean(((distances - dist_mean) / dist_std) ** 4) - 3 if dist_std > eps else 0
+    else:
+        skew = kurt = 0
+    
+    # Dynamic parameter adaptation based on instance profile
+    if n < 20:
+        k_candidate = min(n - 1, 6)
+        regret_power = 0.8
+        global_weight = 0.4
+        use_articulation = True
+    else:
+        # Complex instances (high skew/kurtosis) need more global guidance
+        if abs(skew) > 1.0 or abs(kurt) > 2.0:
+            k_candidate = max(5, int(np.sqrt(n) * 1.2))
+            regret_power = 0.7
+            global_weight = 0.5
+            use_articulation = n <= 200  # Limit for articulation point analysis
+        # Uniform instances
+        elif dist_cv < 0.3:
+            k_candidate = max(4, int(np.sqrt(n) * 0.8))
+            regret_power = 0.5
+            global_weight = 0.3
+            use_articulation = n <= 300
+        # Typical instances
+        else:
+            k_candidate = max(4, int(n ** 0.4))
+            regret_power = 0.9
+            global_weight = 0.25
+            use_articulation = n <= 250
+    
+    # ------------------------------------------------------------
+    # 2. CHRISTOFIDES-AUGMENTED MST HEURISTIC
+    # ------------------------------------------------------------
+    global_prior = np.zeros_like(distance_matrix)
+    
+    if n <= 1000:  # Practical limit for MST operations
+        try:
+            # Build MST using Prim's algorithm (O(n^2))
+            mst = np.zeros((n, n), dtype=bool)
+            in_mst = np.zeros(n, dtype=bool)
+            min_edge = np.full(n, np.inf)
+            parent = np.full(n, -1)
+            
+            # Start from node 0
+            min_edge[0] = 0
+            
+            for _ in range(n):
+                # Find minimum edge connecting to MST
+                u = np.argmin(min_edge)
+                min_edge[u] = np.inf
+                in_mst[u] = True
+                
+                if parent[u] != -1:
+                    mst[u, parent[u]] = True
+                    mst[parent[u], u] = True
+                
+                # Update min_edge for remaining vertices
+                for v in range(n):
+                    if not in_mst[v] and safe_dist[u, v] < min_edge[v]:
+                        min_edge[v] = safe_dist[u, v]
+                        parent[v] = u
+            
+            # Identify odd-degree vertices in MST
+            mst_degrees = mst.sum(axis=1)
+            odd_vertices = np.where(mst_degrees % 2 == 1)[0]
+            
+            # Greedy matching on odd-degree vertices (simplified Christofides)
+            if len(odd_vertices) >= 2:
+                odd_dist_submatrix = safe_dist[np.ix_(odd_vertices, odd_vertices)]
+                np.fill_diagonal(odd_dist_submatrix, np.inf)
+                
+                matched = np.zeros(len(odd_vertices), dtype=bool)
+                
+                # Sort all edges between odd vertices
+                edge_list = []
+                for idx_i, i in enumerate(odd_vertices):
+                    for idx_j, j in enumerate(odd_vertices[idx_i+1:], idx_i+1):
+                        edge_list.append((safe_dist[i, j], idx_i, idx_j))
+                
+                edge_list.sort(key=lambda x: x[0])
+                
+                # Greedy matching
+                for dist, idx_i, idx_j in edge_list:
+                    if not matched[idx_i] and not matched[idx_j]:
+                        i, j = odd_vertices[idx_i], odd_vertices[idx_j]
+                        global_prior[i, j] = 0.3
+                        global_prior[j, i] = 0.3
+                        matched[idx_i] = matched[idx_j] = True
+            
+            # Boost MST edges based on their role
+            mst_edges = np.where(mst)
+            for i, j in zip(*mst_edges):
+                if i < j:
+                    # Give stronger boost to MST edges in sparse regions
+                    local_density = np.mean(np.sort(safe_dist[i])[:min(5, n-1)])
+                    density_factor = 1.0 + 0.5 * np.exp(-local_density / (dist_mean + eps))
+                    boost = 0.2 * density_factor
+                    global_prior[i, j] = max(global_prior[i, j], boost)
+                    global_prior[j, i] = global_prior[i, j]
+                    
+        except Exception:
+            # Fallback: simple inverse distance
+            global_prior = 1.0 / (safe_dist + eps)
+            np.fill_diagonal(global_prior, 0)
+    
+    # Normalize global prior if non-zero
+    if np.max(global_prior) > eps:
+        global_prior = global_prior / np.max(global_prior)
+    
+    # ------------------------------------------------------------
+    # 3. ARTICULATION-POINT CONNECTIVITY SCORING
+    # ------------------------------------------------------------
+    connectivity_bonus = np.zeros_like(distance_matrix)
+    
+    if use_articulation and n >= 4 and n <= 250:
+        try:
+            # Build candidate graph from top-k edges
+            candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+            k_artic = min(5, int(np.sqrt(n)))
+            
+            for i in range(n):
+                neighbors = np.argsort(safe_dist[i])[:k_artic]
+                candidate_mask[i, neighbors] = True
+            
+            candidate_mask = candidate_mask | candidate_mask.T
+            
+            # Find articulation points using DFS (Tarjan's algorithm)
+            visited = np.zeros(n, dtype=bool)
+            disc = np.zeros(n, dtype=int)
+            low = np.zeros(n, dtype=int)
+            parent_arr = -np.ones(n, dtype=int)
+            time = [0]
+            articulation = np.zeros(n, dtype=bool)
+            
+            def dfs_articulation(u):
+                visited[u] = True
+                disc[u] = low[u] = time[0]
+                time[0] += 1
+                children = 0
+                
+                for v in range(n):
+                    if v != u and candidate_mask[u, v]:
+                        if not visited[v]:
+                            parent_arr[v] = u
+                            children += 1
+                            dfs_articulation(v)
+                            low[u] = min(low[u], low[v])
+                            
+                            # u is articulation point if:
+                            # 1. Root with >1 child, or
+                            # 2. Non-root and low[v] >= disc[u]
+                            if parent_arr[u] == -1 and children > 1:
+                                articulation[u] = True
+                            if parent_arr[u] != -1 and low[v] >= disc[u]:
+                                articulation[u] = True
+                        elif v != parent_arr[u]:
+                            low[u] = min(low[u], disc[v])
+            
+            for i in range(n):
+                if not visited[i]:
+                    dfs_articulation(i)
+            
+            # Give bonus to edges incident to articulation points
+            for i in range(n):
+                if articulation[i]:
+                    # Boost edges from articulation point to its nearest neighbors
+                    neighbors = np.argsort(safe_dist[i])[:min(4, n-1)]
+                    for j in neighbors:
+                        if i != j:
+                            # Bonus inversely proportional to distance
+                            dist_ratio = safe_dist[i, j] / (dist_mean + eps)
+                            bonus = 0.15 * np.exp(-dist_ratio)
+                            connectivity_bonus[i, j] += bonus
+                            connectivity_bonus[j, i] += bonus
+            
+            # Normalize connectivity bonus
+            if np.max(connectivity_bonus) > eps:
+                connectivity_bonus = connectivity_bonus / np.max(connectivity_bonus)
+                
+        except Exception:
+            # Skip articulation point analysis if fails
+            pass
+    
+    # ------------------------------------------------------------
+    # 4. REGRET-GAP WEIGHTED SCORING
+    # ------------------------------------------------------------
+    # Base inverse distance with robust normalization
+    median_dist = np.median(distances)
+    inv_dist = median_dist / (safe_dist + eps)
+    
+    # Regret matrix using distance gaps (not just ranks)
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        sorted_dists = np.sort(dists)
+        
+        if len(sorted_dists) >= 3:
+            # Find gaps between consecutive distances
+            gaps = np.diff(sorted_dists)
+            if len(gaps) > 0:
+                avg_gap = np.mean(gaps[gaps > eps])
+            else:
+                avg_gap = dist_mean / n
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                    
+                edge_dist = dists[j]
+                rank = np.searchsorted(sorted_dists, edge_dist)
+                
+                if rank == 0:
+                    regret = 0.0
+                else:
+                    # Calculate gap-based regret
+                    gap_to_best = edge_dist - sorted_dists[0]
+                    
+                    if avg_gap > eps:
+                        normalized_gap = gap_to_best / avg_gap
+                        # Soft regret function
+                        regret = 0.2 * (1 - np.exp(-normalized_gap * regret_power))
+                    else:
+                        # Fallback to rank-based
+                        regret = min(0.5, 0.1 * rank)
+                
+                # Additional penalty for very distant edges
+                if edge_dist > 2 * dist_mean:
+                    excess = (edge_dist - 2 * dist_mean) / (dist_mean + eps)
+                    regret += 0.3 * min(1.0, excess)
+                
+                regret_matrix[i, j] = min(0.9, regret)
+    
+    # Apply regret penalty
+    regret_penalty = 1.0 - regret_matrix
+    
+    # ------------------------------------------------------------
+    # 5. INTEGRATED SCORING WITH ADAPTIVE WEIGHTS
+    # ------------------------------------------------------------
+    # Base score components
+    base_score = inv_dist * regret_penalty
+    
+    # Apply connectivity bonus if available
+    if np.max(connectivity_bonus) > eps:
+        base_score = base_score * (1.0 + 0.3 * connectivity_bonus)
+    
+    # Incorporate global prior with adaptive weight
+    integrated_score = base_score * (1.0 + global_weight * global_prior)
+    
+    # ------------------------------------------------------------
+    # 6. ADAPTIVE CANDIDATE SELECTION
+    # ------------------------------------------------------------
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        scores = integrated_score[i].copy()
+        scores[i] = -np.inf
+        
+        # Determine number of candidates adaptively
+        if n <= 20:
+            k_actual = min(k_candidate, n-1)
+        else:
+            # Adjust based on node's isolation
+            avg_dist_i = np.mean(safe_dist[i])
+            isolation_factor = avg_dist_i / (dist_mean + eps)
+            k_actual = int(k_candidate * (0.8 + 0.4 * np.tanh(isolation_factor - 1)))
+            k_actual = max(2, min(k_actual, n-1))
+        
+        # Select top candidates
+        if np.all(scores == -np.inf):
+            neighbors = np.argsort(safe_dist[i])[:k_actual]
+            candidate_mask[i, neighbors] = True
+        else:
+            threshold = np.partition(scores, -k_actual)[-k_actual]
+            candidate_mask[i, scores >= threshold] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Apply candidate mask
+    heuristics = integrated_score * candidate_mask
+    
+    # ------------------------------------------------------------
+    # 7. CONNECTIVITY ENFORCEMENT
+    # ------------------------------------------------------------
+    min_edges = min(2, n-1)
+    for i in range(n):
+        row = heuristics[i]
+        nonzero_count = np.sum(row > eps)
+        
+        if nonzero_count < min_edges:
+            # Find promising edges not yet selected
+            scores = base_score[i].copy()
+            scores[i] = -np.inf
+            scores[row > eps] = -np.inf
+            
+            additional = min_edges - nonzero_count
+            if additional > 0 and np.any(scores > -np.inf):
+                top_additional = np.argsort(-scores)[:additional]
+                boost_value = np.max(heuristics[heuristics > eps]) if np.any(heuristics > eps) else 0.6
+                
+                for j in top_additional:
+                    if scores[j] > -np.inf:
+                        heuristics[i, j] = boost_value
+                        heuristics[j, i] = boost_value
+    
+    # ------------------------------------------------------------
+    # 8. FINAL PROCESSING
+    # ------------------------------------------------------------
+    # Ensure symmetry and zero diagonal
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-wise softmax with adaptive temperature
+    if n > 2:
+        for i in range(n):
+            row = heuristics[i]
+            if np.sum(row) > eps:
+                # Temperature based on row variation
+                non_zero = row[row > eps]
+                if len(non_zero) >= 2:
+                    row_range = np.max(non_zero) - np.min(non_zero)
+                    temperature = max(0.2, row_range * 1.5)
+                else:
+                    temperature = 1.0
+                
+                exp_row = np.exp(row / temperature)
+                row_sum = np.sum(exp_row)
+                if row_sum > eps:
+                    heuristics[i] = exp_row / row_sum
+    
+    # Final cleanup
+    np.fill_diagonal(heuristics, 0)
+    heuristics = np.clip(heuristics, 0.0, 1.0)
+    
+    return heuristics
+```

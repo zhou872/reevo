@@ -1,0 +1,186 @@
+```json
+{
+    "algorithm_features": ["Dynamic Weight Tuning", "Regret-based Edge Adjustment", "Hierarchical Clustering Bonus", "Mutual Preference Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with dynamic weight tuning,
+    regret-based adjustments, and hierarchical clustering.
+    
+    Args:
+        distance_matrix: Symmetric matrix of distances between nodes.
+    
+    Returns:
+        Heuristic matrix of same shape indicating edge selection priorities.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        base = np.ones_like(distance_matrix) / (distance_matrix + 1e-12)
+        np.fill_diagonal(base, 0)
+        return base
+    
+    # ==================== DYNAMIC WEIGHT TUNING ====================
+    # Weights adapt based on problem size and density characteristics
+    if n < 10:
+        w_rec, w_deg, w_path, w_regret, w_cluster = 0.6, 0.2, 0.2, 0.0, 0.0
+    elif n < 50:
+        w_rec, w_deg, w_path, w_regret, w_cluster = 0.4, 0.15, 0.2, 0.15, 0.1
+    else:
+        w_rec, w_deg, w_path, w_regret, w_cluster = 0.3, 0.1, 0.2, 0.2, 0.2
+    
+    # ==================== 1. BASE RECIPROCAL DISTANCE ====================
+    with np.errstate(divide='ignore'):
+        reciprocal = 1 / distance_matrix
+    np.fill_diagonal(reciprocal, 0)
+    if np.max(reciprocal) > 0:
+        reciprocal = reciprocal / np.max(reciprocal)
+    
+    # ==================== 2. NODE DEGREE PENALTY ====================
+    # Modified from v1: penalize edges from isolated nodes more aggressively
+    threshold_percentile = min(25, 100 * 5 / n)  # Dynamic threshold
+    threshold = np.percentile(distance_matrix[distance_matrix > 0], threshold_percentile)
+    short_edges_mask = distance_matrix < threshold
+    
+    node_degree = np.sum(short_edges_mask, axis=1) - 1  # Exclude self
+    
+    # Enhanced penalty: exponential decay based on min degree
+    degree_factor = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                min_deg = min(node_degree[i], node_degree[j])
+                # More aggressive penalty for isolated nodes
+                degree_factor[i, j] = np.exp(-(3.0 / (min_deg + 1)))
+    
+    # ==================== 3. TWO-STEP PATH AFFINITY ====================
+    path_affinity = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Vectorized computation for better performance
+                other_mask = np.ones(n, dtype=bool)
+                other_mask[[i, j]] = False
+                if np.any(other_mask):
+                    triangle_scores = 1 / (distance_matrix[i, other_mask] + 
+                                          distance_matrix[other_mask, j] + 1e-12)
+                    path_affinity[i, j] = np.max(triangle_scores)
+    
+    # Normalize
+    if np.max(path_affinity) > 0:
+        path_affinity = path_affinity / np.max(path_affinity)
+    
+    # ==================== 4. REGRET-BASED ADJUSTMENT ====================
+    # Inspired by Christofides algorithm: penalize edges with high regret
+    regret_matrix = np.zeros((n, n))
+    k_regret = min(5, n - 1)  # Consider top k alternatives
+    
+    for i in range(n):
+        # Get sorted distances from node i (excluding self)
+        sorted_indices = np.argsort(distance_matrix[i])[1:]
+        sorted_distances = distance_matrix[i, sorted_indices]
+        
+        # Compute regret for each edge (difference from best alternative)
+        if len(sorted_distances) > 1:
+            best_dist = sorted_distances[0]
+            for idx, j in enumerate(sorted_indices):
+                if idx < k_regret:
+                    # For top k edges, regret is difference from best
+                    regret = sorted_distances[idx] - best_dist
+                else:
+                    # For others, use average regret
+                    regret = sorted_distances[idx] - np.mean(sorted_distances[:k_regret])
+                
+                # Convert regret to penalty score (higher regret = lower score)
+                regret_matrix[i, j] = np.exp(-regret / (np.mean(sorted_distances) + 1e-12))
+    
+    # Symmetrize regret matrix
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    np.fill_diagonal(regret_matrix, 0)
+    
+    if np.max(regret_matrix) > 0:
+        regret_matrix = regret_matrix / np.max(regret_matrix)
+    
+    # ==================== 5. HIERARCHICAL CLUSTERING BONUS ====================
+    cluster_bonus = np.ones((n, n))
+    
+    if n >= 4 and w_cluster > 0:
+        # Determine optimal number of clusters (sqrt(n) is often a good heuristic)
+        n_clusters = max(2, min(10, int(np.sqrt(n))))
+        
+        try:
+            # Use hierarchical clustering with precomputed distances
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                affinity='precomputed',
+                linkage='average'
+            )
+            labels = clustering.fit_predict(distance_matrix)
+            
+            # Assign bonus to edges within same cluster
+            for i in range(n):
+                for j in range(i+1, n):
+                    if labels[i] == labels[j]:
+                        # Bonus inversely proportional to cluster size
+                        cluster_size = np.sum(labels == labels[i])
+                        bonus = 1.0 + (1.0 / np.sqrt(cluster_size))
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = bonus
+        except:
+            # Fallback if clustering fails
+            pass
+    
+    # ==================== 6. COMBINE FACTORS ====================
+    heuristics_matrix = (
+        w_rec * reciprocal +
+        w_deg * degree_factor +
+        w_path * path_affinity +
+        w_regret * regret_matrix
+    ) * cluster_bonus
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # ==================== 7. ENHANCED SPARSIFICATION ====================
+    # Keep only mutually preferred edges (like v1) but with adaptive threshold
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    # Dynamic keep factor: more edges for larger problems
+    keep_factor = max(0.15, min(0.4, 10/n))  # Between 15% and 40% of edges per node
+    keep_per_node = max(3, int(keep_factor * n))
+    
+    # First pass: identify top edges for each node
+    top_edges = []
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        top_indices = np.argsort(row)[-keep_per_node:]
+        for j in top_indices:
+            if i != j and (j, i) not in top_edges:
+                top_edges.append((i, j))
+    
+    # Second pass: keep edges with mutual preference
+    for i, j in top_edges:
+        if i != j:
+            # Check if edge is in both nodes' top lists
+            i_row = heuristics_matrix[i].copy()
+            i_row[i] = -np.inf
+            i_top = set(np.argsort(i_row)[-keep_per_node:])
+            
+            j_row = heuristics_matrix[j].copy()
+            j_row[j] = -np.inf
+            j_top = set(np.argsort(j_row)[-keep_per_node:])
+            
+            if j in i_top and i in j_top:
+                sparsified[i, j] = sparsified[j, i] = heuristics_matrix[i, j]
+    
+    # ==================== 8. FINAL NORMALIZATION ====================
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

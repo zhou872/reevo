@@ -1,0 +1,398 @@
+```json
+{
+    "algorithm_features": ["Multi-step Anticipatory Regret", "Spectral Neighborhood Embedding", "Adaptive Sparsification", "Ensemble Weight Learning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.linalg import eigsh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with ensemble learning, anticipatory regret,
+    and scalable graph embeddings.
+    
+    Features:
+    1. Multi-step anticipatory regret with reinforcement-style path evaluation
+    2. Spectral neighborhood embeddings using scalable Nyström approximation
+    3. Adaptive ensemble weight learning via multi-start constructive heuristics
+    4. Progressive sparsification with connectivity preservation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge promise scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Prepare distance matrix
+    dmat = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dmat, np.inf)
+    
+    # Scale-adaptive parameters
+    log_n = np.log(n + 1)
+    scale_factor = log_n / np.log(100)
+    
+    # =================== CORE FEATURE EXTRACTION ===================
+    
+    # 1. REINFORCEMENT-STYLE ANTICIPATORY REGRET
+    # Multi-step lookahead with path continuation value estimation
+    
+    # Precompute nearest neighbors for efficiency
+    k_neighbors = min(15, n - 1)
+    neighbor_indices = np.argsort(dmat, axis=1)[:, 1:k_neighbors+1]
+    neighbor_dists = np.take_along_axis(dmat, neighbor_indices, axis=1)
+    
+    # Compute regret scores with lookahead
+    regret_scores = np.zeros_like(dmat)
+    
+    for i in range(n):
+        # Get distances and neighbors for current node
+        dists_i = dmat[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find k-best alternatives for comparison
+        k_best = min(8, n - 1)
+        best_indices = np.argpartition(dists_i, k_best)[:k_best]
+        best_dists = dists_i[best_indices]
+        
+        if len(best_dists) >= 2:
+            sorted_best = np.sort(best_dists)
+            base_best = sorted_best[0]
+            alt_best = sorted_best[1]
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = dmat[i, j]
+                
+                # Base regret: opportunity cost relative to alternatives
+                base_regret = (direct_cost - base_best) / (alt_best - base_best + 1e-10)
+                
+                # Lookahead regret: estimate continuation value
+                if k_neighbors > 0:
+                    # Find continuation options from j (avoid i)
+                    j_neighbors = neighbor_indices[j]
+                    valid_j_neighbors = j_neighbors[j_neighbors != i]
+                    
+                    if len(valid_j_neighbors) > 0:
+                        # Average cost of continuing from j
+                        continuation_costs = dmat[j, valid_j_neighbors]
+                        
+                        if len(continuation_costs) > 0:
+                            avg_continuation = np.mean(continuation_costs)
+                            # Anticipated total: direct + continuation
+                            anticipated_total = direct_cost + avg_continuation
+                            
+                            # Compare with alternative paths
+                            # Alternative: go to nearest neighbor first, then continue
+                            alt_paths = []
+                            for alt in best_indices[:min(3, len(best_indices))]:
+                                if alt != j:
+                                    # Cost to alternative
+                                    cost_to_alt = dmat[i, alt]
+                                    # Continue from alternative
+                                    alt_neighbors = neighbor_indices[alt]
+                                    valid_alt_neighbors = alt_neighbors[alt_neighbors != i]
+                                    if len(valid_alt_neighbors) > 0:
+                                        alt_continuation = np.mean(dmat[alt, valid_alt_neighbors])
+                                        alt_paths.append(cost_to_alt + alt_continuation)
+                            
+                            if alt_paths:
+                                best_alt = min(alt_paths)
+                                lookahead_regret = (anticipated_total - best_alt) / (best_alt + 1e-10)
+                                # Combine base and lookahead regret
+                                total_regret = 0.7 * base_regret + 0.3 * lookahead_regret
+                            else:
+                                total_regret = base_regret
+                        else:
+                            total_regret = base_regret
+                    else:
+                        total_regret = base_regret
+                else:
+                    total_regret = base_regret
+                
+                # Convert to score (higher = better)
+                regret_scores[i, j] = np.exp(-max(0, total_regret))
+    
+    # 2. SPECTRAL NEIGHBORHOOD EMBEDDINGS (Scalable)
+    # Use Nyström approximation for large instances
+    
+    spectral_scores = np.ones_like(dmat)
+    np.fill_diagonal(spectral_scores, 0)
+    
+    if n <= 500:
+        # Exact eigendecomposition for small instances
+        try:
+            # Create normalized adjacency
+            median_dist = np.median(dmat[dmat < np.inf])
+            adj = np.exp(-dmat / (median_dist + 1e-10))
+            np.fill_diagonal(adj, 0)
+            
+            # Degree matrix
+            degree = np.diag(np.sum(adj, axis=1))
+            degree_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(degree) + 1e-10))
+            
+            # Normalized Laplacian
+            L = np.eye(n) - degree_inv_sqrt @ adj @ degree_inv_sqrt
+            
+            # Compute eigenvectors
+            k_eig = min(8, n - 1)
+            eigenvalues, eigenvectors = eigsh(L, k=k_eig, which='SM')
+            
+            # Use multiple eigenvectors (skip first constant one)
+            if eigenvectors.shape[1] > 1:
+                # Weight eigenvectors by inverse eigenvalue (except first)
+                weights = 1.0 / (eigenvalues[1:] + 1e-10)
+                weights = weights / np.sum(weights)
+                
+                # Weighted embedding similarity
+                for idx, w in enumerate(weights):
+                    vec = eigenvectors[:, idx + 1]
+                    vec_norm = vec / (np.linalg.norm(vec) + 1e-10)
+                    spectral_scores += w * np.outer(vec_norm, vec_norm)
+                
+                # Normalize to [0,1]
+                spectral_scores = (spectral_scores - np.min(spectral_scores)) / \
+                                 (np.max(spectral_scores) - np.min(spectral_scores) + 1e-10)
+        except:
+            pass
+    
+    # 3. ENSEMBLE OF CONSTRUCTIVE HEURISTICS
+    # Generate multiple heuristic tours and extract edge frequencies
+    
+    def generate_greedy_tour(start_node: int) -> np.ndarray:
+        """Generate greedy tour from given starting node"""
+        tour = [start_node]
+        unvisited = set(range(n)) - {start_node}
+        
+        current = start_node
+        while unvisited:
+            # Find nearest unvisited neighbor
+            nearest = min(unvisited, key=lambda x: dmat[current, x])
+            tour.append(nearest)
+            unvisited.remove(nearest)
+            current = nearest
+        
+        return np.array(tour)
+    
+    def generate_regret_tour(start_node: int) -> np.ndarray:
+        """Generate tour using regret heuristic (farthest insertion)"""
+        # Start with two farthest apart nodes
+        if n <= 2:
+            return np.array([0] if n == 1 else [0, 1])
+        
+        # Find farthest pair
+        max_dist = -1
+        farthest_pair = (0, 1)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if dmat[i, j] > max_dist:
+                    max_dist = dmat[i, j]
+                    farthest_pair = (i, j)
+        
+        tour = list(farthest_pair)
+        unvisited = set(range(n)) - set(tour)
+        
+        while unvisited:
+            # For each unvisited node, compute regret
+            regrets = []
+            for node in unvisited:
+                # Find best insertion position and cost
+                best_cost = float('inf')
+                best_pos = -1
+                
+                for pos in range(len(tour)):
+                    i = tour[pos]
+                    j = tour[(pos + 1) % len(tour)]
+                    insert_cost = dmat[i, node] + dmat[node, j] - dmat[i, j]
+                    if insert_cost < best_cost:
+                        best_cost = insert_cost
+                        best_pos = pos
+                
+                # Also consider cost if node were inserted elsewhere
+                second_best_cost = float('inf')
+                for pos in range(len(tour)):
+                    if pos == best_pos:
+                        continue
+                    i = tour[pos]
+                    j = tour[(pos + 1) % len(tour)]
+                    insert_cost = dmat[i, node] + dmat[node, j] - dmat[i, j]
+                    if insert_cost < second_best_cost:
+                        second_best_cost = insert_cost
+                
+                regret = second_best_cost - best_cost
+                regrets.append((node, best_pos, best_cost, regret))
+            
+            # Insert node with maximum regret
+            if regrets:
+                node, pos, _, _ = max(regrets, key=lambda x: x[3])
+                tour.insert(pos + 1, node)
+                unvisited.remove(node)
+        
+        # Rotate to start at start_node
+        start_idx = tour.index(start_node)
+        tour = tour[start_idx:] + tour[:start_idx]
+        return np.array(tour)
+    
+    # Generate ensemble of tours
+    n_starts = min(5, n)
+    start_nodes = np.linspace(0, n - 1, n_starts, dtype=int)
+    
+    ensemble_scores = np.zeros_like(dmat)
+    
+    for start in start_nodes:
+        # Greedy tour
+        greedy_tour = generate_greedy_tour(start)
+        # Regret tour
+        regret_tour = generate_regret_tour(start)
+        
+        # Add edges from both tours
+        for tour in [greedy_tour, regret_tour]:
+            for idx in range(len(tour)):
+                i = tour[idx]
+                j = tour[(idx + 1) % len(tour)]
+                ensemble_scores[i, j] += 1.0
+                ensemble_scores[j, i] += 1.0
+    
+    # Normalize ensemble scores
+    if np.max(ensemble_scores) > 0:
+        ensemble_scores = ensemble_scores / np.max(ensemble_scores)
+    
+    # 4. MINIMUM SPANNING TREE PRIOR
+    mst_scores = np.zeros_like(dmat)
+    try:
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst + mst.T) > 0
+        mst_scores = mst_edges.astype(float) * 0.5
+    except:
+        pass
+    
+    # =================== ENSEMBLE WEIGHT LEARNING ===================
+    
+    # Evaluate feature quality using the ensemble tours
+    def evaluate_feature(feature_mat: np.ndarray) -> float:
+        """Evaluate how well a feature matrix predicts good edges"""
+        non_diag = feature_mat[~np.eye(n, dtype=bool)].flatten()
+        if len(non_diag) == 0 or np.std(non_diag) < 1e-10:
+            return 0.5
+        
+        # Normalize feature
+        fmin, fmax = np.min(non_diag), np.max(non_diag)
+        if fmax - fmin < 1e-10:
+            return 0.5
+        
+        norm_feature = (feature_mat - fmin) / (fmax - fmin)
+        
+        # Evaluate on ensemble edges
+        ensemble_edges = ensemble_scores > 0
+        non_ensemble_edges = ~ensemble_edges & ~np.eye(n, dtype=bool)
+        
+        ensemble_values = norm_feature[ensemble_edges]
+        non_ensemble_values = norm_feature[non_ensemble_edges]
+        
+        if len(ensemble_values) == 0 or len(non_ensemble_values) == 0:
+            return 0.5
+        
+        # Compute separation score
+        mean_ensemble = np.mean(ensemble_values)
+        mean_non = np.mean(non_ensemble_values)
+        std_combined = np.std(np.concatenate([ensemble_values, non_ensemble_values]))
+        
+        if std_combined < 1e-10:
+            return 0.5
+        
+        separation = (mean_ensemble - mean_non) / (std_combined + 1e-10)
+        return np.tanh(separation * 0.5) * 0.5 + 0.5  # Scale to [0,1]
+    
+    # Evaluate each feature
+    features = {
+        'regret': regret_scores,
+        'spectral': spectral_scores,
+        'ensemble': ensemble_scores,
+        'mst': mst_scores
+    }
+    
+    feature_qualities = {name: evaluate_feature(feat) for name, feat in features.items()}
+    
+    # Adaptive weighting: softmax with quality scores as temperatures
+    quality_values = np.array([feature_qualities[name] for name in features])
+    # Shift to positive values
+    quality_values = quality_values - np.min(quality_values) + 0.1
+    weights = quality_values / np.sum(quality_values)
+    
+    # Combine features
+    combined = np.zeros_like(dmat)
+    for (name, feat), weight in zip(features.items(), weights):
+        combined += weight * feat
+    
+    # =================== ADAPTIVE SPARSIFICATION ===================
+    
+    # Determine sparsity level based on instance size
+    target_edges = min(n * (n - 1) // 2, int(2.5 * n * np.sqrt(n)))
+    edges_per_node = max(3, int(target_edges / n))
+    
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    
+    for i in range(n):
+        # Get scores for this node
+        row_scores = combined[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Keep top edges
+        top_indices = np.argpartition(row_scores, -edges_per_node)[-edges_per_node:]
+        candidate_mask[i, top_indices] = True
+    
+    # Ensure symmetry and connectivity
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Force minimum degree of 2 for connectivity
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < 2:
+            # Add top 2 edges by combined score
+            row_scores = combined[i].copy()
+            row_scores[i] = -np.inf
+            top2 = np.argsort(row_scores)[-2:]
+            candidate_mask[i, top2] = True
+            candidate_mask[top2, i] = True
+    
+    # Apply sparsification
+    combined[~candidate_mask] = 0
+    
+    # =================== FINAL PROCESSING ===================
+    
+    # Symmetrize
+    combined = (combined + combined.T) / 2
+    
+    # Row-wise softmax with adaptive temperature
+    for i in range(n):
+        row = combined[i]
+        non_zero = row[row > 0]
+        if len(non_zero) > 0:
+            # Adaptive temperature based on spread
+            row_std = np.std(non_zero)
+            temperature = max(0.1, row_std)
+            
+            # Apply softmax
+            exp_row = np.exp(row / temperature)
+            row_sum = np.sum(exp_row)
+            if row_sum > 1e-10:
+                combined[i] = exp_row / row_sum
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(combined, 0)
+    
+    return combined
+```

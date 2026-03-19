@@ -1,0 +1,185 @@
+```json
+{
+    "algorithm_features": ["Inverse Distance Weighting", "MST Structural Bonus", "Exponential Regret Penalty", "Adaptive Neighborhood Sparsity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with lightweight spatial features and adaptive weighting.
+    
+    Key improvements over v1:
+    1. Lightweight spatial features: neighbor distance averages to anticipate local constraints
+    2. Adaptive factor weighting based on graph properties
+    3. Improved sparsification with connectivity preservation
+    4. More efficient implementation with vectorized operations
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix) if n == 0 else 1 / (distance_matrix + np.eye(n))
+    
+    # 1. Base inverse distance with smoothing
+    np.fill_diagonal(distance_matrix, np.inf)
+    inv_dist = 1 / (distance_matrix + 1e-10)
+    
+    # 2. MST structural bonus
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_bonus = (mst.toarray() > 0).astype(float) + 1.0  # 1 for non-MST, 2 for MST
+    
+    # 3. Lightweight spatial feature: local neighbor density
+    # Compute average distance to k-nearest neighbors for each node
+    k_neighbors = min(4, n - 1)
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        # Get distances to k nearest neighbors
+        neighbor_dists = np.partition(distance_matrix[i], k_neighbors)[:k_neighbors + 1]
+        neighbor_dists = neighbor_dists[neighbor_dists < np.inf]
+        if len(neighbor_dists) > 0:
+            local_density[i] = 1.0 / np.mean(neighbor_dists)
+    
+    # Normalize and create spatial factor matrix
+    if local_density.max() > 0:
+        local_density = local_density / local_density.max()
+    
+    # Spatial factor: edges between nodes in sparse regions get bonus
+    spatial_factor = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Bonus for connecting sparse regions, penalty for dense-to-dense connections
+                sparsity = 1.0 - 0.3 * (local_density[i] + local_density[j])
+                spatial_factor[i, j] = max(0.5, min(1.5, 1.0 + sparsity))
+    
+    # 4. Regret-based penalty with exponential smoothing
+    regret_matrix = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get distances from node i to all others
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        
+        # Find best and second-best distances
+        sorted_idx = np.argsort(distances_i)
+        best_dist = distances_i[sorted_idx[0]]
+        second_best_dist = distances_i[sorted_idx[1]]
+        
+        # Compute regret and apply exponential penalty
+        for j in range(n):
+            if i != j:
+                regret = (distance_matrix[i, j] - best_dist) / (second_best_dist - best_dist + 1e-10)
+                # Exponential penalty: edges much worse than best get heavily penalized
+                regret_matrix[i, j] = np.exp(-min(5.0, max(0.0, regret)))
+    
+    # Symmetrize regret matrix
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # 5. Adaptive weighting based on graph properties
+    # Measure graph sparsity as coefficient of variation of distances
+    non_inf_distances = distance_matrix[distance_matrix < np.inf]
+    if len(non_inf_distances) > 0:
+        cv = np.std(non_inf_distances) / (np.mean(non_inf_distances) + 1e-10)
+        # More weight to spatial features for uniform graphs, less for highly variable ones
+        spatial_weight = 0.5 / (1.0 + cv)
+    else:
+        spatial_weight = 0.3
+    
+    # Combine factors with adaptive weighting
+    base_scores = inv_dist * mst_bonus * regret_matrix
+    scores = base_scores * (1.0 - spatial_weight + spatial_weight * spatial_factor)
+    
+    # 6. Connectivity-preserving sparsification
+    # Keep adaptive number of edges per node based on problem size
+    min_edges = max(2, min(4, n // 5))
+    max_edges = min(8, n - 1)
+    target_edges = min_edges + int(0.5 * (max_edges - min_edges))
+    
+    # Create selection mask
+    mask = np.zeros_like(scores, dtype=bool)
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        # Select top edges, with preference for MST edges
+        mst_indices = np.where(mst.toarray()[i] > 0)[0]
+        non_mst_indices = [j for j in range(n) if j != i and j not in mst_indices]
+        
+        # Always include MST edges
+        if len(mst_indices) > 0:
+            mask[i, mst_indices] = True
+            mask[mst_indices, i] = True
+        
+        # Select additional edges from non-MST
+        if len(non_mst_indices) > 0:
+            non_mst_scores = row_scores[non_mst_indices]
+            if len(non_mst_scores) > 0:
+                k_additional = max(0, target_edges - len(mst_indices))
+                if k_additional > 0:
+                    top_idx = np.argpartition(non_mst_scores, -k_additional)[-k_additional:]
+                    selected_indices = [non_mst_indices[idx] for idx in top_idx]
+                    mask[i, selected_indices] = True
+                    mask[selected_indices, i] = True
+    
+    # Ensure connectivity by checking if mask forms connected graph
+    # Simple check: each node should have at least 1 connection
+    for i in range(n):
+        if not np.any(mask[i]):
+            # Connect to nearest neighbor
+            nearest = np.argmin(distance_matrix[i])
+            mask[i, nearest] = mask[nearest, i] = True
+    
+    # Apply sparsification
+    scores = scores * mask
+    
+    # 7. Final normalization and cleanup
+    np.fill_diagonal(scores, 0)
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    # Zero out extremely weak edges (bottom 30%)
+    non_zero = scores[scores > 0]
+    if len(non_zero) > 0:
+        threshold = np.percentile(non_zero, 30)
+        scores[scores < threshold] = 0
+    
+    return scores
+
+
+# Test with example
+if __name__ == "__main__":
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Non-zero elements: {np.count_nonzero(heuristics)} / {n*n}")
+    print(f"Max value: {heuristics.max():.4f}")
+    print(f"Min non-zero value: {heuristics[heuristics > 0].min():.4f}")
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"Matrix is symmetric: {is_symmetric}")
+    
+    # Check connectivity
+    from scipy.sparse.csgraph import connected_components
+    conn_mask = (heuristics > 0).astype(int)
+    n_components, _ = connected_components(conn_mask, directed=False)
+    print(f"Number of connected components: {n_components} (should be 1)")
+```

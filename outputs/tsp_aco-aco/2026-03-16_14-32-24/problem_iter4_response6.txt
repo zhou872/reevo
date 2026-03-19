@@ -1,0 +1,300 @@
+```json
+{
+    "algorithm_features": ["Multi-step Lookahead with Beam Pruning", "Spectral Graph Embedding Similarity", "Online Weight Adaptation via Greedy Validation", "Hierarchical Feature Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.linalg import eigsh
+from scipy.spatial.distance import cdist
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with multi-step lookahead, spectral embeddings,
+    and online weight adaptation for optimal feature combination.
+    
+    Returns a matrix of edge promise scores between 0 and 1.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        heuristics_matrix = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics_matrix, 0)
+        return heuristics_matrix
+    
+    # Prepare distance matrix with safe handling
+    dmat = distance_matrix.copy()
+    np.fill_diagonal(dmat, np.inf)
+    
+    # ========== DYNAMIC PARAMETER INITIALIZATION ==========
+    scale_factor = np.log10(n + 1) / np.log10(100)
+    candidate_k = max(3, int(np.sqrt(n) * (1 + scale_factor)))
+    beam_width = max(2, int(np.log2(n)))
+    
+    # ========== CORE FEATURE EXTRACTION ==========
+    
+    # 1. Enhanced inverse distance with exponential decay
+    median_dist = np.median(dmat[dmat < np.inf])
+    epsilon = median_dist * 1e-8 if median_dist > 0 else 1e-10
+    inv_dist = np.exp(-dmat / (median_dist + epsilon))
+    
+    # Rank-based weighting
+    rank_weight = np.zeros_like(dmat)
+    for i in range(n):
+        sorted_idx = np.argsort(dmat[i])
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weight[i, j] = np.exp(-rank / candidate_k)
+    inv_dist *= rank_weight
+    
+    # 2. Multi-step lookahead with beam pruning
+    lookahead_scores = np.zeros_like(dmat)
+    
+    # Pre-compute nearest neighbors for each node
+    k_neighbors = min(10, n - 1)
+    neighbor_indices = np.argsort(dmat, axis=1)[:, 1:k_neighbors+1]
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Beam search for 3-step paths
+            beam = [(j, dmat[i, j], [i, j])]  # (current_node, total_cost, path)
+            
+            for step in range(2):  # Extend to 3 steps total
+                new_beam = []
+                for node, cost, path in beam:
+                    # Get candidate continuations (avoid nodes already in path)
+                    candidates = neighbor_indices[node]
+                    valid_candidates = [c for c in candidates if c not in path]
+                    
+                    if not valid_candidates:
+                        continue
+                    
+                    # Evaluate continuations
+                    for next_node in valid_candidates[:beam_width]:
+                        new_cost = cost + dmat[node, next_node]
+                        new_path = path + [next_node]
+                        new_beam.append((next_node, new_cost, new_path))
+                
+                if not new_beam:
+                    break
+                
+                # Prune beam to best candidates
+                new_beam.sort(key=lambda x: x[1])
+                beam = new_beam[:beam_width]
+            
+            # Calculate lookahead score based on best path found
+            if beam:
+                best_cost = min(beam, key=lambda x: x[1])[1]
+                # Normalize by straight-line distance and step count
+                base_cost = dmat[i, j] * 3  # Approximate 3-step baseline
+                lookahead_scores[i, j] = np.exp(-best_cost / (base_cost + epsilon))
+    
+    # 3. Spectral graph embedding for structural patterns
+    embedding_similarity = np.zeros_like(dmat)
+    
+    if n <= 1000:  # Scale limit for eigen decomposition
+        # Create normalized adjacency from inverse distances
+        adj = inv_dist.copy()
+        np.fill_diagonal(adj, 0)
+        
+        # Compute degree matrix
+        degree = np.diag(np.sum(adj, axis=1))
+        degree_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(degree) + 1e-10))
+        
+        # Normalized Laplacian
+        L = np.eye(n) - degree_inv_sqrt @ adj @ degree_inv_sqrt
+        
+        # Compute spectral embedding (first 5 non-trivial eigenvectors)
+        try:
+            eigenvalues, eigenvectors = eigsh(L, k=min(6, n-1), which='SM')
+            # Skip first eigenvector (constant)
+            embedding = eigenvectors[:, 1:min(6, n-1)]
+            
+            if embedding.shape[1] > 0:
+                # Compute cosine similarity in embedding space
+                norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+                safe_norms = np.where(norms == 0, 1, norms)
+                normalized_embedding = embedding / safe_norms
+                embedding_similarity = normalized_embedding @ normalized_embedding.T
+                embedding_similarity = (embedding_similarity + 1) / 2  # Scale to [0,1]
+        except:
+            # Fallback if eigendecomposition fails
+            embedding_similarity = np.ones_like(dmat)
+            np.fill_diagonal(embedding_similarity, 0)
+    else:
+        # For large instances, use fast approximation
+        embedding_similarity = np.ones_like(dmat)
+        np.fill_diagonal(embedding_similarity, 0)
+    
+    # 4. Regret with opportunity cost modeling
+    regret_scores = np.zeros_like(dmat)
+    
+    for i in range(n):
+        dists = dmat[i].copy()
+        dists[i] = np.inf
+        
+        # Find top candidates
+        top_k = min(5, n - 1)
+        top_indices = np.argpartition(dists, top_k)[:top_k]
+        top_dists = dists[top_indices]
+        
+        if len(top_dists) >= 2:
+            sorted_top = np.sort(top_dists)
+            best = sorted_top[0]
+            second_best = sorted_top[1]
+            
+            for j in range(n):
+                if i != j:
+                    # Opportunity cost: how much worse is this edge than alternatives
+                    if np.isclose(dists[j], best):
+                        regret = 0
+                    else:
+                        regret = (dists[j] - best) / (second_best - best + epsilon)
+                    
+                    # Convert to score (higher = better)
+                    regret_scores[i, j] = np.exp(-regret)
+    
+    # 5. Fast constructive heuristic hybridization
+    def greedy_tour_edges(dist_mat: np.ndarray) -> np.ndarray:
+        """Generate edges from a greedy nearest neighbor tour"""
+        n_nodes = dist_mat.shape[0]
+        if n_nodes <= 2:
+            mask = np.ones((n_nodes, n_nodes), dtype=bool)
+            np.fill_diagonal(mask, False)
+            return mask
+        
+        unvisited = set(range(n_nodes))
+        current = 0
+        tour = [current]
+        unvisited.remove(current)
+        
+        while unvisited:
+            # Find nearest unvisited neighbor
+            available = list(unvisited)
+            nearest = available[np.argmin(dist_mat[current, available])]
+            tour.append(nearest)
+            unvisited.remove(nearest)
+            current = nearest
+        
+        # Create edge mask
+        edge_mask = np.zeros((n_nodes, n_nodes), dtype=bool)
+        for idx in range(len(tour)):
+            i = tour[idx]
+            j = tour[(idx + 1) % len(tour)]
+            edge_mask[i, j] = True
+            edge_mask[j, i] = True
+        
+        return edge_mask
+    
+    greedy_edges = greedy_tour_edges(dmat)
+    greedy_bonus = np.zeros_like(dmat)
+    greedy_bonus[greedy_edges] = 1.5  # Bonus for edges in greedy solution
+    
+    # ========== ONLINE WEIGHT ADAPTATION ==========
+    
+    # Evaluate feature quality via greedy validation
+    def evaluate_feature(feature_matrix: np.ndarray) -> float:
+        """Score a feature matrix by how well it predicts greedy tour edges"""
+        if np.max(feature_matrix) == np.min(feature_matrix):
+            return 0.5
+        
+        # Normalize feature
+        norm_feature = (feature_matrix - np.min(feature_matrix)) / \
+                      (np.max(feature_matrix) - np.min(feature_matrix) + epsilon)
+        
+        # Score edges in greedy tour vs random edges
+        greedy_scores = norm_feature[greedy_edges]
+        random_mask = ~greedy_edges
+        np.fill_diagonal(random_mask, False)
+        random_indices = np.where(random_mask)
+        if len(random_indices[0]) > 0:
+            sample_size = min(len(greedy_scores), len(random_indices[0]))
+            random_scores = norm_feature[
+                random_indices[0][:sample_size],
+                random_indices[1][:sample_size]
+            ]
+            
+            if len(random_scores) > 0:
+                # Compute separation score
+                separation = (np.mean(greedy_scores) - np.mean(random_scores)) / \
+                           (np.std(greedy_scores) + np.std(random_scores) + epsilon)
+                return np.tanh(separation)  # Scale to [-1, 1]
+        
+        return 0.0
+    
+    # Evaluate each feature
+    features = {
+        'inv_dist': inv_dist,
+        'lookahead': lookahead_scores,
+        'embedding': embedding_similarity,
+        'regret': regret_scores,
+        'greedy': greedy_bonus
+    }
+    
+    feature_scores = {}
+    for name, feature in features.items():
+        feature_scores[name] = evaluate_feature(feature)
+    
+    # Convert scores to weights (softmax with temperature)
+    temp = 2.0
+    scores_array = np.array([feature_scores[name] for name in features.keys()])
+    exp_scores = np.exp(scores_array / temp)
+    weights = exp_scores / np.sum(exp_scores)
+    
+    # Ensure minimum weight for each feature
+    weights = np.maximum(weights, 0.1)
+    weights = weights / np.sum(weights)
+    
+    # ========== HIERARCHICAL FEATURE FUSION ==========
+    
+    # Combine features with adapted weights
+    heuristics_matrix = np.zeros_like(dmat)
+    for (name, feature), weight in zip(features.items(), weights):
+        heuristics_matrix += weight * feature
+    
+    # ========== ADAPTIVE SPARSIFICATION ==========
+    
+    # Keep top edges per node based on combined scores
+    sparsity = 0.3 + 0.5 * np.exp(-scale_factor)  # More sparse for larger problems
+    edges_per_node = max(3, int(sparsity * n))
+    
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        top_indices = np.argpartition(scores, -edges_per_node)[-edges_per_node:]
+        candidate_mask[i, top_indices] = True
+    
+    # Ensure symmetry and include greedy edges
+    candidate_mask = candidate_mask | candidate_mask.T
+    candidate_mask = candidate_mask | greedy_edges
+    
+    # Apply sparsification
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # ========== POST-PROCESSING ==========
+    
+    # Symmetrize
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    
+    # Row-wise softmax to emphasize relative differences
+    row_max = np.max(heuristics_matrix, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    normalized = heuristics_matrix / row_max
+    
+    # Apply exponential scaling
+    heuristics_matrix = np.exp(normalized) - 1
+    
+    # Final normalization to [0, 1]
+    overall_max = np.max(heuristics_matrix)
+    if overall_max > 0:
+        heuristics_matrix = heuristics_matrix / overall_max
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

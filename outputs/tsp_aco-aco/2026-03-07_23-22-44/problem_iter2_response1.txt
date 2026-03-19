@@ -1,0 +1,154 @@
+```json
+{
+    "algorithm_features": ["Regret-Based Edge Scoring", "Betweenness Centrality Weighting", "Minimum Spanning Tree Connectivity", "Multi-scale Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import ConvexHull
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristics integrating regret-based scoring,
+    centrality measures, and multi-scale sparsification.
+    
+    Key Features:
+    1. Regret-based scoring: Measures opportunity cost of not selecting edges
+    2. Betweenness centrality: Prioritizes edges connecting central nodes
+    3. MST connectivity bonus: Emphasizes structurally important connections
+    4. Multi-scale sparsification: Adaptive edge filtering at different scales
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Prevent division by zero
+    np.fill_diagonal(distance_matrix, np.inf)
+    
+    # 1. Base inverse distance with stabilization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    inv_dist = np.maximum(inv_dist, inv_dist.T)  # Symmetrize
+    
+    # 2. Regret-based scoring: opportunity cost calculation
+    regret_scores = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get distances from node i (excluding self)
+        dist_from_i = distance_matrix[i].copy()
+        dist_from_i[i] = np.inf
+        
+        # Find two best alternatives for each possible edge
+        sorted_indices = np.argsort(dist_from_i)
+        best_idx = sorted_indices[0]
+        second_best_idx = sorted_indices[1]
+        
+        # Calculate regret for each potential edge (i,j)
+        for j in range(n):
+            if i == j:
+                continue
+            # Regret is the difference between using edge (i,j) and the next best option
+            if j == best_idx:
+                # If (i,j) is the best edge, regret is the difference with second best
+                regret = distance_matrix[i, second_best_idx] - distance_matrix[i, j]
+            else:
+                # Otherwise, regret is the difference with the best edge
+                regret = distance_matrix[i, best_idx] - distance_matrix[i, j]
+            
+            # Normalize regret by node's average distance
+            avg_dist_i = np.mean(dist_from_i[dist_from_i < np.inf])
+            regret_scores[i, j] = max(0, regret / (avg_dist_i + 1e-8))
+    
+    # Symmetrize regret scores
+    regret_scores = (regret_scores + regret_scores.T) / 2
+    
+    # 3. Node centrality scoring (approximate betweenness)
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Calculate how often node i lies on shortest paths
+        # Simplified using average distance to other nodes
+        centrality[i] = 1.0 / (np.mean(distance_matrix[i, np.arange(n) != i]) + 1e-8)
+    
+    centrality_weights = np.outer(centrality, centrality)
+    centrality_weights = centrality_weights / np.max(centrality_weights)
+    
+    # 4. Minimum Spanning Tree connectivity bonus
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # 5. Combine all factors with adaptive weighting
+    # Base weights: inverse distance * centrality
+    base_scores = inv_dist * centrality_weights
+    
+    # Add regret-based adjustment (edges with high regret get boosted)
+    regret_adjusted = base_scores * (1.0 + 0.5 * regret_scores)
+    
+    # Apply MST bonus for structurally important edges
+    final_scores = regret_adjusted.copy()
+    final_scores[mst_mask] *= 1.8
+    
+    # 6. Multi-scale sparsification
+    sparsified = np.zeros_like(final_scores)
+    
+    # First level: keep only promising edges per node
+    k1 = max(3, n // 10)  # Top edges for each node
+    for i in range(n):
+        row_scores = final_scores[i].copy()
+        row_scores[i] = -np.inf
+        threshold = np.partition(row_scores, -k1)[-k1]
+        mask = row_scores >= threshold
+        sparsified[i, mask] = final_scores[i, mask]
+    
+    # Second level: global sparsification based on score distribution
+    if n > 10:
+        non_zero_scores = sparsified[sparsified > 0]
+        if len(non_zero_scores) > 0:
+            score_q3 = np.percentile(non_zero_scores, 75)
+            sparsified[sparsified < score_q3 * 0.5] = 0
+    
+    # 7. Convex hull emphasis for larger instances
+    if n >= 8:
+        try:
+            # Use actual convex hull if points are 2D-like
+            # (Approximation for general distance matrices)
+            hull_bonus = np.ones_like(sparsified)
+            
+            # Heuristic: nodes with extreme total distances are likely on hull
+            total_dists = distance_matrix.sum(axis=1)
+            extreme_nodes = np.argsort(total_dists)
+            hull_size = min(6, n // 3)
+            hull_nodes = np.concatenate([
+                extreme_nodes[:hull_size//2],
+                extreme_nodes[-hull_size//2:]
+            ])
+            
+            # Boost edges between hull nodes
+            for i in hull_nodes:
+                for j in hull_nodes:
+                    if i != j and sparsified[i, j] > 0:
+                        sparsified[i, j] *= 1.4
+        except:
+            pass  # Fallback if hull detection fails
+    
+    # 8. Final regularization
+    # Soft penalty for very long edges
+    max_dist = np.max(distance_matrix)
+    length_penalty = np.exp(-distance_matrix / (0.3 * max_dist + 1e-8))
+    final_scores = sparsified * length_penalty
+    
+    # Ensure symmetry
+    final_scores = np.maximum(final_scores, final_scores.T)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    # Clear diagonal
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

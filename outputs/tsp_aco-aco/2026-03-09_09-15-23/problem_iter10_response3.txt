@@ -1,0 +1,335 @@
+```json
+{
+    "algorithm_features": ["Regret-based Edge Priority", "Multi-scale Sparsification", "Approximate Edge Betweenness", "Adaptive Component Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with scalable betweenness approximation
+    and adaptive component weighting based on graph properties.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Multi-Scale Adaptive Sparsification ====================
+    # Use both local and global scale factors for neighbor selection
+    base_k = max(3, min(int(np.log2(n)) * 2, int(np.sqrt(n))))
+    
+    # Pre-sort distances for efficiency
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    
+    # Compute local density with adaptive neighborhood
+    local_density = np.zeros(n)
+    for i in range(n):
+        k_local = min(5, n-1)
+        nearest_dists = sorted_dists[i, 1:k_local+1]
+        local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-10)
+    
+    # Adaptive neighbor selection
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Dynamic k based on local density and global statistics
+        density_factor = 0.5 + 1.5 * (local_density[i] / np.max(local_density))
+        adaptive_k = min(n-1, max(3, int(base_k * density_factor)))
+        
+        # Select neighbors
+        neighbors = sorted_indices[i, 1:adaptive_k+1]
+        adjacency_mask[i, neighbors] = True
+        
+        # Ensure reciprocal connections for robustness
+        if adaptive_k < n // 4:  # Only for sparse connections
+            for j in neighbors[:min(3, len(neighbors))]:
+                adjacency_mask[j, i] = True
+    
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        if np.sum(adjacency_mask[i]) == 0:
+            nearest = sorted_indices[i, 1]
+            adjacency_mask[i, nearest] = adjacency_mask[nearest, i] = True
+    
+    # ==================== 2. Enhanced Regret Analysis ====================
+    # Multi-level regret with scalable computation
+    regret_scores = np.ones_like(distance_matrix)
+    
+    # Precompute nearest and second-nearest distances for each node
+    nearest_dists = sorted_dists[:, 1]
+    second_nearest = np.where(n > 2, sorted_dists[:, 2], np.inf)
+    
+    for i in range(n):
+        i_neighbors = np.where(adjacency_mask[i])[0]
+        if len(i_neighbors) == 0:
+            continue
+            
+        i_min_dist = nearest_dists[i]
+        
+        for j in i_neighbors:
+            if i >= j:
+                continue
+                
+            dist_ij = distance_matrix[i, j]
+            
+            # Base regret: compare to each node's nearest neighbor
+            regret_i = 1.0 if abs(dist_ij - i_min_dist) < 1e-10 else i_min_dist / (dist_ij + 1e-10)
+            
+            # Consider j's perspective
+            j_min_dist = nearest_dists[j]
+            regret_j = 1.0 if abs(dist_ij - j_min_dist) < 1e-10 else j_min_dist / (dist_ij + 1e-10)
+            
+            # Combined symmetric regret
+            base_regret = 0.6 * regret_i + 0.4 * regret_j
+            
+            # Path-based regret: check 2-hop alternatives
+            j_neighbors = np.where(adjacency_mask[j])[0]
+            common_neighbors = np.intersect1d(i_neighbors, j_neighbors)
+            
+            if len(common_neighbors) > 0:
+                two_hop_dists = distance_matrix[i, common_neighbors] + distance_matrix[common_neighbors, j]
+                best_two_hop = np.min(two_hop_dists)
+                
+                if best_two_hop > 0:
+                    path_regret = dist_ij / best_two_hop
+                    # Weighted combination
+                    base_regret = 0.7 * base_regret + 0.3 * path_regret
+            
+            # Regret against second-nearest neighbor (if edge is the nearest)
+            if abs(dist_ij - i_min_dist) < 1e-10 and second_nearest[i] < np.inf:
+                second_regret = dist_ij / (second_nearest[i] + 1e-10)
+                base_regret = 0.8 * base_regret + 0.2 * second_regret
+            
+            regret_scores[i, j] = regret_scores[j, i] = base_regret
+    
+    # ==================== 3. Scalable Betweenness Approximation ====================
+    # Use Brandes-like algorithm with sampling for scalability
+    edge_betweenness = np.ones_like(distance_matrix)
+    
+    if n <= 200:  # Full computation for small instances
+        try:
+            # Build weighted adjacency list
+            adj_list = [[] for _ in range(n)]
+            for i in range(n):
+                neighbors = np.where(adjacency_mask[i])[0]
+                for j in neighbors:
+                    if i < j:
+                        adj_list[i].append((j, distance_matrix[i, j]))
+                        adj_list[j].append((i, distance_matrix[i, j]))
+            
+            # Sample source nodes for betweenness approximation
+            sample_size = min(max(10, int(np.sqrt(n))), n)
+            sample_nodes = np.random.choice(n, sample_size, replace=False)
+            
+            # Initialize betweenness counts
+            edge_counts = np.zeros((n, n))
+            
+            for s in sample_nodes:
+                # Dijkstra's algorithm from source s
+                dist = np.full(n, np.inf)
+                dist[s] = 0
+                prev = [[] for _ in range(n)]
+                sigma = np.zeros(n)
+                sigma[s] = 1
+                
+                # Priority queue: (distance, node)
+                pq = [(0, s)]
+                
+                while pq:
+                    d, u = heapq.heappop(pq)
+                    if d > dist[u]:
+                        continue
+                    
+                    for v, w in adj_list[u]:
+                        new_dist = d + w
+                        if new_dist < dist[v] - 1e-10:
+                            dist[v] = new_dist
+                            prev[v] = [u]
+                            sigma[v] = sigma[u]
+                            heapq.heappush(pq, (new_dist, v))
+                        elif abs(new_dist - dist[v]) < 1e-10:
+                            prev[v].append(u)
+                            sigma[v] += sigma[u]
+                
+                # Backward accumulation of dependencies
+                delta = np.zeros(n)
+                order = np.argsort(dist)[::-1]  # Nodes in non-increasing distance order
+                
+                for w in order:
+                    if w == s:
+                        continue
+                    for v in prev[w]:
+                        # Edge (v, w) is on a shortest path
+                        if sigma[v] > 0:
+                            contribution = (sigma[v] / sigma[w]) * (1 + delta[w])
+                            edge_counts[min(v, w), max(v, w)] += contribution
+                        delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w])
+            
+            # Normalize and convert to scores
+            max_count = edge_counts.max()
+            if max_count > 0:
+                normalized = edge_counts / max_count
+                for i in range(n):
+                    for j in range(i+1, n):
+                        if adjacency_mask[i, j]:
+                            edge_betweenness[i, j] = edge_betweenness[j, i] = 1.0 + 0.5 * normalized[i, j]
+        except:
+            # Fallback to degree-based criticality
+            degrees = adjacency_mask.sum(axis=1)
+            for i in range(n):
+                for j in range(i+1, n):
+                    if adjacency_mask[i, j]:
+                        crit = 1.0 + 0.3 * ((degrees[i] + degrees[j]) / (2 * base_k))
+                        edge_betweenness[i, j] = edge_betweenness[j, i] = min(crit, 1.5)
+    else:
+        # For large instances, use fast approximation
+        degrees = adjacency_mask.sum(axis=1)
+        for i in range(n):
+            for j in range(i+1, n):
+                if adjacency_mask[i, j]:
+                    # Simple approximation based on degrees and local clustering
+                    i_neighbors = np.where(adjacency_mask[i])[0]
+                    j_neighbors = np.where(adjacency_mask[j])[0]
+                    common = len(np.intersect1d(i_neighbors, j_neighbors))
+                    score = 1.0 + 0.4 * (common / (len(i_neighbors) + len(j_neighbors) - common + 1e-10))
+                    edge_betweenness[i, j] = edge_betweenness[j, i] = score
+    
+    # ==================== 4. Shortcut Quality Analysis ====================
+    shortcut_scores = np.ones_like(distance_matrix)
+    
+    # For efficiency, only analyze edges in adjacency mask
+    for i in range(n):
+        i_neighbors = np.where(adjacency_mask[i])[0]
+        if len(i_neighbors) == 0:
+            continue
+            
+        for j in i_neighbors:
+            if i >= j:
+                continue
+                
+            direct = distance_matrix[i, j]
+            
+            # Check 2-hop alternatives through common neighbors
+            j_neighbors = np.where(adjacency_mask[j])[0]
+            common = np.intersect1d(i_neighbors, j_neighbors)
+            
+            if len(common) > 0:
+                two_hop_dists = distance_matrix[i, common] + distance_matrix[common, j]
+                best_alt = np.min(two_hop_dists)
+                
+                if best_alt > 0:
+                    ratio = direct / best_alt
+                    if ratio < 1.0:
+                        # Direct edge is a shortcut
+                        shortcut_scores[i, j] = 1.0 + (1.0 - ratio)
+                    else:
+                        shortcut_scores[i, j] = 1.0 / (ratio + 0.5)  # Penalize non-shortcuts
+                else:
+                    shortcut_scores[i, j] = 1.0
+            else:
+                # No common neighbors - edge might be a bridge
+                # Estimate alternative via nearest neighbor of each
+                if len(i_neighbors) > 0 and len(j_neighbors) > 0:
+                    i_best = np.min(distance_matrix[i, i_neighbors[i_neighbors != j]])
+                    j_best = np.min(distance_matrix[j, j_neighbors[j_neighbors != i]])
+                    est_alt = i_best + j_best
+                    if est_alt > 0:
+                        shortcut_scores[i, j] = 1.0 + min(0.5, direct / est_alt)
+    
+    shortcut_scores = 0.5 * (shortcut_scores + shortcut_scores.T)
+    
+    # ==================== 5. Data-Driven Component Fusion ====================
+    # Compute graph statistics for adaptive weighting
+    avg_degree = adjacency_mask.sum() / n
+    density_variation = np.std(local_density) / (np.mean(local_density) + 1e-10)
+    
+    # Weight adaptation based on problem characteristics
+    if n < 50:
+        # Small problems: emphasize regret and shortcuts
+        w_regret = 0.5
+        w_shortcut = 0.3
+        w_betweenness = 0.2
+    else:
+        # Larger problems: balance all components
+        # More regret for sparse graphs, more betweenness for clustered graphs
+        sparsity_factor = min(1.0, avg_degree / 10)
+        w_regret = 0.4 + 0.2 * (1.0 - sparsity_factor)
+        w_shortcut = 0.3 + 0.1 * density_variation
+        w_betweenness = 0.3 + 0.2 * sparsity_factor
+    
+    # Normalize weights
+    total = w_regret + w_shortcut + w_betweenness
+    w_regret /= total
+    w_shortcut /= total
+    w_betweenness /= total
+    
+    # ==================== 6. Combined Heuristic Computation ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Base inverse distance weighting
+    inv_dist = np.zeros_like(distance_matrix)
+    for i in range(n):
+        neighbors = np.where(adjacency_mask[i])[0]
+        if len(neighbors) > 0:
+            inv_dist[i, neighbors] = 1.0 / (distance_matrix[i, neighbors] + 1e-10)
+    
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    
+    # Combine components with adaptive weights
+    for i in range(n):
+        for j in range(i+1, n):
+            if adjacency_mask[i, j]:
+                # Weighted combination of all components
+                combined = inv_dist[i, j] * (
+                    w_regret * regret_scores[i, j] +
+                    w_shortcut * shortcut_scores[i, j] +
+                    w_betweenness * edge_betweenness[i, j]
+                )
+                
+                # Local density adjustment
+                avg_density = 0.5 * (local_density[i]/np.max(local_density) + 
+                                   local_density[j]/np.max(local_density))
+                density_factor = 0.8 + 0.4 * avg_density
+                
+                heuristics[i, j] = heuristics[j, i] = combined * density_factor
+    
+    # ==================== 7. Final Processing ====================
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure minimum values for edges in mask
+    min_val = heuristics[adjacency_mask].min() if np.any(adjacency_mask) else 1e-8
+    heuristics[adjacency_mask] = np.maximum(heuristics[adjacency_mask], min_val)
+    
+    # Row normalization with smoothing
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Symmetrize using geometric mean for consistency
+    heuristics_sym = np.sqrt(np.maximum(heuristics * heuristics.T, 1e-16))
+    np.fill_diagonal(heuristics_sym, 0)
+    
+    # Final normalization
+    row_sums = heuristics_sym.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics_sym = heuristics_sym / row_sums
+    
+    return heuristics_sym
+```

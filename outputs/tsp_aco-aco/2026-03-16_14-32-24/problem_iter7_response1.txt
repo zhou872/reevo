@@ -1,0 +1,216 @@
+```json
+{
+    "algorithm_features": ["Adaptive Two-Stage Candidate Pruning", "Geometric Rank-Weighted Inverse Distance", "Kernel Density Joint Similarity Scoring", "Connectivity-Enforced Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge evaluation with adaptive candidate pruning,
+    geometric rank-weighted scoring, and kernel density-based similarity measures.
+    
+    Features:
+    1. Adaptive Two-Stage Candidate Pruning: Combines proximity and density criteria
+    2. Geometric Rank-Weighted Inverse Distance: Exponential decay based on relative rank
+    3. Kernel Density Joint Similarity Scoring: Measures node pair density using Gaussian kernel
+    4. Connectivity-Enforced Sparsification: Ensures minimum connectivity while focusing on promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Trivial case: fully connected for small instances
+        heuristics_matrix = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics_matrix, 0)
+        return heuristics_matrix
+    
+    # Safe distance matrix (avoid self-loops and division by zero)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Adaptive Two-Stage Candidate Pruning
+    # Stage 1: Proximity-based candidates
+    k_prox = max(3, int(np.sqrt(n)))
+    proximity_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        neighbors = np.argsort(safe_dist[i])[:k_prox]
+        proximity_mask[i, neighbors] = True
+    
+    # Stage 2: Density-aware candidates
+    # Compute local density for each node using Gaussian kernel
+    k_density = min(5, n-1)
+    bandwidths = np.zeros(n)
+    local_densities = np.zeros(n)
+    
+    for i in range(n):
+        # Adaptive bandwidth: median of distances to k-nearest neighbors
+        k_nearest = np.partition(safe_dist[i], k_density)[:k_density+1]
+        bandwidth = np.median(k_nearest[k_nearest > 0])
+        bandwidths[i] = bandwidth
+        
+        # Compute local density using Gaussian kernel
+        if bandwidth > eps:
+            kernel_vals = np.exp(-0.5 * (safe_dist[i] / bandwidth) ** 2)
+            local_densities[i] = np.sum(kernel_vals) - 1  # Exclude self
+    
+    # Normalize densities
+    if np.max(local_densities) > eps:
+        local_densities = local_densities / np.max(local_densities)
+    
+    # Create density-aware candidate mask
+    density_mask = np.zeros_like(distance_matrix, dtype=bool)
+    density_threshold = np.percentile(local_densities, 30)  # Keep connections for nodes below 30th percentile
+    
+    for i in range(n):
+        if local_densities[i] < density_threshold:
+            # For low-density nodes, connect to nearest high-density nodes
+            high_density_nodes = np.where(local_densities >= 0.7)[0]
+            high_density_nodes = high_density_nodes[high_density_nodes != i]
+            
+            if len(high_density_nodes) > 0:
+                # Connect to top 2 high-density nodes by proximity
+                dists_to_high = safe_dist[i, high_density_nodes]
+                top_indices = np.argsort(dists_to_high)[:min(2, len(high_density_nodes))]
+                density_mask[i, high_density_nodes[top_indices]] = True
+    
+    # Combine candidate masks with symmetry enforcement
+    candidate_mask = proximity_mask | density_mask
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 2. Geometric Rank-Weighted Inverse Distance
+    # Base inverse distance with adaptive scaling
+    inv_dist = 1.0 / safe_dist
+    
+    # Adaptive scaling by quartile distances
+    all_dists = safe_dist[safe_dist < np.inf]
+    q1, q3 = np.percentile(all_dists, [25, 75])
+    iqr = q3 - q1
+    scale_factor = q1 + 0.5 * iqr  # Median-like scaling
+    inv_dist = inv_dist * scale_factor
+    
+    # Rank-based weighting with adaptive decay
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        valid_mask = safe_dist[i] < np.inf
+        if not np.any(valid_mask):
+            continue
+            
+        valid_indices = np.where(valid_mask)[0]
+        valid_dists = safe_dist[i, valid_indices]
+        
+        # Get ranks for valid distances
+        sorted_idx = np.argsort(valid_dists)
+        ranks = np.zeros_like(valid_dists)
+        ranks[sorted_idx] = np.arange(len(valid_dists))
+        
+        # Adaptive decay based on distance spread
+        if len(valid_dists) >= 3:
+            top_dists = valid_dists[sorted_idx[:min(5, len(valid_dists))]]
+            dist_spread = np.std(top_dists) / (np.mean(top_dists) + eps)
+            decay_rate = 0.6 + 0.3 * np.clip(dist_spread, 0, 1)
+        else:
+            decay_rate = 0.7
+        
+        # Apply exponential decay by rank
+        for idx, j in enumerate(valid_indices):
+            rank_weights[i, j] = decay_rate ** ranks[idx]
+    
+    # 3. Kernel Density Joint Similarity Scoring
+    density_scores = np.zeros_like(distance_matrix)
+    
+    # Pre-compute kernel values for efficiency
+    kernel_cache = {}
+    for i in range(n):
+        if bandwidths[i] > eps:
+            kernel_cache[i] = np.exp(-0.5 * (safe_dist[i] / bandwidths[i]) ** 2)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if not candidate_mask[i, j]:
+                continue
+                
+            if i in kernel_cache and j in kernel_cache:
+                # Joint similarity: geometric mean of kernel values
+                joint_kernel = np.sqrt(kernel_cache[i] * kernel_cache[j])
+                
+                # Focus on nodes that are similar to both endpoints
+                # Weight by distance to emphasize local connections
+                weight_mask = (kernel_cache[i] > 0.3) & (kernel_cache[j] > 0.3)
+                joint_score = np.sum(joint_kernel[weight_mask])
+                
+                if joint_score > 0:
+                    # Logarithmic scaling with distance adjustment
+                    dist_factor = np.exp(-safe_dist[i, j] / (scale_factor + eps))
+                    density_scores[i, j] = np.log1p(joint_score) * 0.2 * dist_factor
+                else:
+                    # Small penalty for isolated connections
+                    density_scores[i, j] = -0.05
+    
+    density_scores = np.maximum(density_scores, density_scores.T)
+    
+    # 4. Connectivity-Enforced Sparsification
+    # Combine scores with multiplicative weighting
+    heuristics_matrix = inv_dist * rank_weights * (1.0 + density_scores)
+    
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure minimum connectivity: each node should have at least 2 promising connections
+    for i in range(n):
+        row_scores = heuristics_matrix[i].copy()
+        nonzero_count = np.count_nonzero(row_scores > eps)
+        
+        if nonzero_count < 2:
+            # Find additional candidates among nearest neighbors
+            all_neighbors = np.argsort(safe_dist[i])[:min(10, n-1)]
+            valid_neighbors = [j for j in all_neighbors if j != i and not candidate_mask[i, j]]
+            
+            # Add top connections to reach minimum of 2
+            needed = 2 - nonzero_count
+            if valid_neighbors and needed > 0:
+                # Score potential new connections
+                new_scores = []
+                for j in valid_neighbors[:min(needed * 2, len(valid_neighbors))]:
+                    # Estimate score based on inverse distance and local density
+                    est_score = (1.0 / safe_dist[i, j]) * scale_factor * 0.5
+                    if local_densities[j] > 0.5:
+                        est_score *= (1.0 + 0.3 * local_densities[j])
+                    new_scores.append((j, est_score))
+                
+                # Select top needed connections
+                new_scores.sort(key=lambda x: x[1], reverse=True)
+                for j, score in new_scores[:needed]:
+                    heuristics_matrix[i, j] = score * 0.8  # Discount for estimated connections
+                    heuristics_matrix[j, i] = score * 0.8
+    
+    # Add Minimum Spanning Tree bias for structural guidance (for moderate-sized instances)
+    if n <= 500:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst + mst.T) > 0
+            # Boost MST edges by 25%
+            heuristics_matrix[mst_edges] *= 1.25
+        except:
+            pass  # Skip MST if computation fails
+    
+    # Final symmetrization and normalization
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Softmax-like normalization per row for local consistency
+    row_max = np.max(heuristics_matrix, axis=1, keepdims=True)
+    row_max[row_max < eps] = 1.0  # Avoid division by zero
+    heuristics_matrix = heuristics_matrix / row_max
+    
+    # Global scaling to [0, 1]
+    global_max = np.max(heuristics_matrix)
+    if global_max > eps:
+        heuristics_matrix = heuristics_matrix / global_max
+    
+    return heuristics_matrix
+```

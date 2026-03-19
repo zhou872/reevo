@@ -1,0 +1,393 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "Regret-based Edge Prioritization", "Spatial Clustering Bonus", "Multi-factor Ensemble Learning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import distance_matrix
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with adaptive weights,
+    regret-based scoring, and lightweight spatial clustering.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Matrix of edge priorities with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Compute instance characteristics for adaptive weight tuning
+    instance_features = _compute_instance_features(distance_matrix, n)
+    
+    # 2. Compute individual heuristic components
+    components = _compute_heuristic_components(distance_matrix, n, instance_features)
+    
+    # 3. Dynamically adjust weights based on instance characteristics
+    weights = _compute_adaptive_weights(instance_features, n)
+    
+    # 4. Combine components with adaptive weights
+    combined = _combine_components(components, weights)
+    
+    # 5. Intelligent sparsification with regret-aware thresholding
+    sparsified = _intelligent_sparsification(combined, distance_matrix, n)
+    
+    # 6. Final normalization and symmetry enforcement
+    final = _normalize_and_symmetrize(sparsified, n)
+    
+    return final
+
+
+def _compute_instance_features(dist_mat: np.ndarray, n: int) -> dict:
+    """Compute characteristics of the TSP instance for adaptive weight tuning."""
+    features = {}
+    
+    # Spatial spread: variance of distances
+    upper_tri = dist_mat[np.triu_indices(n, k=1)]
+    features['spatial_spread'] = np.std(upper_tri) / (np.mean(upper_tri) + 1e-10)
+    
+    # Clustering tendency: ratio of short to long edges
+    short_threshold = np.percentile(upper_tri, 25)
+    long_threshold = np.percentile(upper_tri, 75)
+    short_ratio = np.sum(upper_tri < short_threshold) / len(upper_tri)
+    long_ratio = np.sum(upper_tri > long_threshold) / len(upper_tri)
+    features['clustering_tendency'] = short_ratio / (long_ratio + 1e-10)
+    
+    # Distance skewness: measure of distance distribution asymmetry
+    features['distance_skewness'] = np.abs(np.mean(upper_tri) - np.median(upper_tri)) / (np.std(upper_tri) + 1e-10)
+    
+    # Node centrality variation
+    node_sums = np.sum(dist_mat, axis=1)
+    features['centrality_variation'] = np.std(node_sums) / (np.mean(node_sums) + 1e-10)
+    
+    return features
+
+
+def _compute_heuristic_components(dist_mat: np.ndarray, n: int, features: dict) -> dict:
+    """Compute individual heuristic components."""
+    components = {}
+    
+    # 1. Base inverse distance with regularization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = np.where(dist_mat > 0, 1.0 / dist_mat, 0)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Adaptive normalization
+    max_inv = inv_dist.max()
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    components['inverse_distance'] = inv_dist
+    
+    # 2. Exponential nearest neighbor bonus with adaptive k
+    k = min(max(3, int(np.log2(n))), n-1)
+    nn_bonus = np.zeros((n, n))
+    
+    for i in range(n):
+        sorted_idx = np.argsort(dist_mat[i])
+        # Exponential decay: closer neighbors get higher bonus
+        ranks = np.arange(1, k+1)
+        decay = np.exp(-ranks / (k/2))
+        nn_bonus[i, sorted_idx[1:k+1]] = decay / decay.sum()
+    
+    components['nearest_neighbor'] = nn_bonus
+    
+    # 3. Centrality-based weighting
+    # Nodes with smaller total distance to others are more central
+    centrality = 1.0 / (np.sum(dist_mat, axis=1, keepdims=True) + 1e-10)
+    centrality_weight = centrality + centrality.T
+    # Normalize
+    max_centrality = centrality_weight.max()
+    if max_centrality > 0:
+        centrality_weight = centrality_weight / max_centrality
+    components['centrality'] = centrality_weight
+    
+    # 4. Two-hop connection density with adaptive threshold
+    two_hop = np.zeros((n, n))
+    threshold = np.percentile(dist_mat, 25 + 10 * features['clustering_tendency'])
+    
+    for i in range(n):
+        # Find neighbors within threshold distance
+        neighbors_i = set(np.where(dist_mat[i] < threshold)[0])
+        neighbors_i.discard(i)
+        
+        for j in range(i+1, n):
+            neighbors_j = set(np.where(dist_mat[j] < threshold)[0])
+            neighbors_j.discard(j)
+            
+            # Common neighbors indicate dense local structure
+            common = len(neighbors_i.intersection(neighbors_j))
+            # Weight by inverse distance between i and j
+            if dist_mat[i, j] > 0:
+                density = common / (max(len(neighbors_i), len(neighbors_j), 1))
+                two_hop[i, j] = two_hop[j, i] = density / (dist_mat[i, j] + 1e-10)
+    
+    # Normalize
+    max_two_hop = two_hop.max()
+    if max_two_hop > 0:
+        two_hop = two_hop / max_two_hop
+    components['two_hop_density'] = two_hop
+    
+    # 5. Efficient regret-based scoring
+    regret = _compute_efficient_regret(dist_mat, n)
+    components['regret'] = regret
+    
+    # 6. Lightweight spatial clustering bonus
+    cluster_bonus = _compute_cluster_bonus(dist_mat, n, features)
+    components['clustering'] = cluster_bonus
+    
+    return components
+
+
+def _compute_efficient_regret(dist_mat: np.ndarray, n: int) -> np.ndarray:
+    """Compute regret scores efficiently."""
+    regret = np.zeros_like(dist_mat)
+    
+    for i in range(n):
+        # Get distances excluding self
+        row = dist_mat[i].copy()
+        row[i] = np.inf
+        
+        # Find k nearest neighbors (adaptive k)
+        k = min(5, n//3)
+        if k < 2:
+            continue
+            
+        # Get k smallest distances
+        sorted_idx = np.argsort(row)[:k]
+        sorted_dists = row[sorted_idx]
+        
+        if len(sorted_dists) >= 2:
+            # Regret: normalized difference from best
+            base_regret = (sorted_dists[1] - sorted_dists[0]) / (sorted_dists[0] + 1e-10)
+            
+            # Assign regret scores with decay based on rank
+            for rank, j in enumerate(sorted_idx):
+                if i != j:
+                    # Higher regret for better edges
+                    regret[i, j] = base_regret * np.exp(-rank/2)
+    
+    # Symmetrize
+    regret = np.maximum(regret, regret.T)
+    
+    # Normalize
+    max_regret = regret.max()
+    if max_regret > 0:
+        regret = regret / max_regret
+    
+    return regret
+
+
+def _compute_cluster_bonus(dist_mat: np.ndarray, n: int, features: dict) -> np.ndarray:
+    """Compute bonus for edges within spatial clusters."""
+    if n < 4:
+        return np.zeros_like(dist_mat)
+    
+    cluster_bonus = np.zeros_like(dist_mat)
+    
+    try:
+        # Convert to condensed form for linkage
+        condensed = squareform(dist_mat, checks=False)
+        
+        # Adaptive clustering based on instance characteristics
+        if features['clustering_tendency'] > 0.7:
+            # High clustering tendency: use more clusters
+            n_clusters = max(2, min(5, n//10))
+        else:
+            # Low clustering tendency: use fewer clusters
+            n_clusters = max(2, min(3, n//20))
+        
+        # Perform hierarchical clustering
+        Z = linkage(condensed, method='average')
+        labels = fcluster(Z, n_clusters, criterion='maxclust')
+        
+        # Assign bonus to intra-cluster edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if labels[i] == labels[j]:
+                    # Bonus inversely proportional to distance within cluster
+                    if dist_mat[i, j] > 0:
+                        # Normalize by cluster diameter
+                        cluster_mask = labels == labels[i]
+                        cluster_dists = dist_mat[cluster_mask][:, cluster_mask]
+                        cluster_diameter = cluster_dists.max() if cluster_dists.size > 0 else 1
+                        bonus = 1.0 / (dist_mat[i, j] * cluster_diameter + 1e-10)
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = bonus
+        
+        # Normalize
+        max_bonus = cluster_bonus.max()
+        if max_bonus > 0:
+            cluster_bonus = cluster_bonus / max_bonus
+            
+    except Exception as e:
+        warnings.warn(f"Clustering failed: {e}. Using fallback.")
+        # Fallback: use distance-based threshold
+        threshold = np.percentile(dist_mat, 30)
+        for i in range(n):
+            for j in range(i+1, n):
+                if dist_mat[i, j] < threshold:
+                    cluster_bonus[i, j] = cluster_bonus[j, i] = 1.0 / (dist_mat[i, j] + 1e-10)
+        
+        max_bonus = cluster_bonus.max()
+        if max_bonus > 0:
+            cluster_bonus = cluster_bonus / max_bonus
+    
+    return cluster_bonus
+
+
+def _compute_adaptive_weights(features: dict, n: int) -> dict:
+    """Dynamically compute component weights based on instance characteristics."""
+    # Base weights
+    weights = {
+        'inverse_distance': 0.3,
+        'nearest_neighbor': 0.15,
+        'centrality': 0.15,
+        'two_hop_density': 0.15,
+        'regret': 0.15,
+        'clustering': 0.1
+    }
+    
+    # Adjust based on instance features
+    spread = features['spatial_spread']
+    clustering = features['clustering_tendency']
+    
+    # High spatial spread: emphasize centrality and inverse distance
+    if spread > 1.0:
+        weights['inverse_distance'] += 0.05
+        weights['centrality'] += 0.05
+        weights['nearest_neighbor'] -= 0.05
+        weights['clustering'] -= 0.05
+    
+    # High clustering tendency: emphasize two-hop density and clustering
+    if clustering > 0.8:
+        weights['two_hop_density'] += 0.05
+        weights['clustering'] += 0.05
+        weights['regret'] -= 0.05
+    
+    # Small instances: emphasize basic heuristics
+    if n < 20:
+        weights['inverse_distance'] += 0.05
+        weights['nearest_neighbor'] += 0.05
+        weights['clustering'] = max(0.05, weights['clustering'] - 0.05)
+    
+    # Ensure weights sum to 1
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
+
+def _combine_components(components: dict, weights: dict) -> np.ndarray:
+    """Combine heuristic components with adaptive weights."""
+    n = components['inverse_distance'].shape[0]
+    combined = np.zeros((n, n))
+    
+    for key, component in components.items():
+        if key in weights:
+            combined += weights[key] * component
+    
+    return combined
+
+
+def _intelligent_sparsification(matrix: np.ndarray, dist_mat: np.ndarray, n: int) -> np.ndarray:
+    """Sparsify matrix while preserving important edges."""
+    sparsified = np.zeros_like(matrix)
+    
+    # Adaptive number of edges to keep
+    base_edges = max(3, int(np.log2(n)))
+    
+    # Additional edges for dense/sparse instances
+    density_factor = np.mean(dist_mat) / (np.std(dist_mat) + 1e-10)
+    if density_factor > 1.5:  # Sparse instance
+        edges_per_node = base_edges + 2
+    elif density_factor < 0.7:  # Dense instance
+        edges_per_node = base_edges - 1
+    else:
+        edges_per_node = base_edges
+    
+    edges_per_node = max(2, min(edges_per_node, n-1))
+    
+    # Keep top edges for each node with regret-aware adjustment
+    for i in range(n):
+        row = matrix[i].copy()
+        row[i] = -np.inf  # Exclude diagonal
+        
+        # Get top candidate edges
+        candidate_indices = np.argpartition(row, -2*edges_per_node)[-2*edges_per_node:]
+        candidate_values = row[candidate_indices]
+        
+        # Sort candidates by value
+        sorted_idx = candidate_indices[np.argsort(candidate_values)[::-1]]
+        
+        # Keep top edges with consideration for regret
+        kept = 0
+        for j in sorted_idx:
+            if kept >= edges_per_node:
+                break
+            
+            # Check if this edge is in the top 2 for either endpoint
+            if (np.argsort(row)[-1] == j or np.argsort(row)[-2] == j or
+                np.argsort(matrix[j])[-1] == i or np.argsort(matrix[j])[-2] == i):
+                sparsified[i, j] = row[j]
+                kept += 1
+            elif kept < edges_per_node // 2:  # Keep at least half of the quota
+                sparsified[i, j] = row[j]
+                kept += 1
+    
+    return sparsified
+
+
+def _normalize_and_symmetrize(matrix: np.ndarray, n: int) -> np.ndarray:
+    """Final normalization and symmetry enforcement."""
+    # Ensure symmetry by taking maximum of both directions
+    result = np.maximum(matrix, matrix.T)
+    
+    # Zero diagonal
+    np.fill_diagonal(result, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = result.max()
+    if max_val > 0:
+        result = result / max_val
+    
+    return result
+
+
+# Example usage and validation
+if __name__ == "__main__":
+    # Generate a sample distance matrix
+    np.random.seed(42)
+    n = 20
+    coords = np.random.rand(n, 2)
+    dist_mat = distance_matrix(coords, coords)
+    
+    # Test the heuristic function
+    heuristics = heuristics_v2(dist_mat)
+    
+    print(f"Original distance matrix shape: {dist_mat.shape}")
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity: {np.mean(heuristics == 0):.2%}")
+    print(f"Non-zero mean: {heuristics[heuristics > 0].mean():.4f}")
+    print(f"Top 5 edges: {np.sort(heuristics.flatten())[-5:][::-1]}")
+    
+    # Check symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"Matrix is symmetric: {is_symmetric}")
+    
+    # Check diagonal is zero
+    diagonal_zero = np.all(heuristics.diagonal() == 0)
+    print(f"Diagonal is zero: {diagonal_zero}")
+```

@@ -1,0 +1,356 @@
+```json
+{
+    "algorithm_features": ["Dynamic Parameter Adaptation", "Regret-based Lookahead Scoring", "Kernel Density Cross-validation", "Multiplicative Score Combination"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with dynamic adaptation, regret-based lookahead,
+    and optimized kernel density estimation.
+    
+    Key innovations:
+    1. Dynamic parameter adaptation based on instance characteristics
+    2. Regret-based lookahead scoring prioritizing edges with fewer alternatives
+    3. Cross-validated bandwidth selection for kernel density estimation
+    4. Multiplicative score combination with instance-adapted weights
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics_matrix = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics_matrix, 0)
+        return heuristics_matrix
+    
+    # Safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. INSTANCE CHARACTERIZATION & DYNAMIC PARAMETER ADAPTATION
+    # ------------------------------------------------------------
+    # Extract upper triangle distances for analysis
+    triu_indices = np.triu_indices(n, k=1)
+    distances = safe_dist[triu_indices]
+    
+    # Statistical characterization
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + eps)
+    dist_skew = np.mean((distances - dist_mean) ** 3) / (dist_std ** 3 + eps)
+    
+    # Dynamic parameter adaptation
+    if n < 20:
+        base_candidates = min(n - 1, 8)
+        n_bands = 3
+        reg_weight = 0.4
+    elif dist_cv < 0.25:
+        # Uniform instances
+        base_candidates = max(4, int(np.sqrt(n) * 1.5))
+        n_bands = 4
+        reg_weight = 0.3
+    elif dist_cv > 0.8:
+        # Highly variable instances
+        base_candidates = max(6, int(n ** 0.6))
+        n_bands = 5
+        reg_weight = 0.6
+    else:
+        # Moderate instances
+        base_candidates = max(5, int(n ** 0.5))
+        n_bands = 4
+        reg_weight = 0.45
+    
+    # Adjust based on skewness
+    if abs(dist_skew) > 1.0:
+        base_candidates = int(base_candidates * 1.2)
+        reg_weight = min(0.7, reg_weight * 1.3)
+    
+    # ------------------------------------------------------------
+    # 2. ADAPTIVE CANDIDATE SELECTION WITH DENSITY AWARENESS
+    # ------------------------------------------------------------
+    # Multi-scale proximity candidates
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Compute local densities for adaptive candidate selection
+    local_densities = np.zeros(n)
+    for i in range(n):
+        k = min(10, n - 1)
+        # Use k-nearest distances for density estimation
+        knn_dists = np.partition(safe_dist[i], k)[:k]
+        local_densities[i] = 1.0 / (np.mean(knn_dists) + eps)
+    
+    # Normalize densities
+    if np.max(local_densities) > eps:
+        local_densities = local_densities / np.max(local_densities)
+    
+    # Adaptive candidate selection per node
+    for i in range(n):
+        # Base number of candidates adjusted by local density
+        node_candidates = int(base_candidates * (1.0 + 0.5 * (1.0 - local_densities[i])))
+        node_candidates = min(node_candidates, n - 1)
+        
+        # Select candidates based on combined distance and density
+        scores = []
+        for j in range(n):
+            if i == j:
+                continue
+            # Composite score: inverse distance weighted by partner density
+            dist_score = 1.0 / safe_dist[i, j]
+            partner_density = local_densities[j]
+            composite = dist_score * (1.0 + 0.3 * partner_density)
+            scores.append((j, composite))
+        
+        # Select top candidates
+        scores.sort(key=lambda x: x[1], reverse=True)
+        for j, _ in scores[:node_candidates]:
+            candidate_mask[i, j] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # ------------------------------------------------------------
+    # 3. REGRET-BASED LOOKAHEAD SCORING
+    # ------------------------------------------------------------
+    regret_scores = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        # Get valid distances from node i
+        row_dist = safe_dist[i].copy()
+        
+        if np.sum(row_dist < np.inf) >= 3:
+            # Sort distances to find alternatives
+            sorted_indices = np.argsort(row_dist)
+            
+            # Calculate regret for each candidate edge
+            for j in range(n):
+                if i == j or not candidate_mask[i, j]:
+                    continue
+                    
+                # Find the best alternative to j (excluding j itself)
+                alt_dist = np.inf
+                for k in sorted_indices:
+                    if k != j and k != i:
+                        alt_dist = row_dist[k]
+                        break
+                
+                if alt_dist < np.inf:
+                    # Regret: how much worse is (i,j) compared to best alternative
+                    regret = (safe_dist[i, j] - alt_dist) / (dist_mean + eps)
+                    # Convert to score: higher for lower regret
+                    regret_scores[i, j] = np.exp(-max(0, regret) * 2.0)
+    
+    # Symmetrize regret scores
+    regret_scores = np.maximum(regret_scores, regret_scores.T)
+    
+    # ------------------------------------------------------------
+    # 4. CROSS-VALIDATED KERNEL DENSITY ESTIMATION
+    # ------------------------------------------------------------
+    density_scores = np.zeros_like(distance_matrix)
+    
+    # Cross-validate bandwidth for each node
+    bandwidths = np.zeros(n)
+    for i in range(n):
+        # Candidate bandwidths based on distance statistics
+        dists_i = safe_dist[i, safe_dist[i] < np.inf]
+        if len(dists_i) == 0:
+            bandwidths[i] = dist_mean
+            continue
+            
+        # Candidate bandwidths
+        q1, q3 = np.percentile(dists_i, [25, 75])
+        iqr = q3 - q1
+        cand_bandwidths = [
+            np.median(dists_i),
+            q1,
+            q3,
+            iqr * 0.75,
+            np.std(dists_i) * 0.9,
+        ]
+        
+        # Simple cross-validation: maximize log-likelihood on hold-out set
+        best_ll = -np.inf
+        best_bw = cand_bandwidths[0]
+        
+        for bw in cand_bandwidths:
+            if bw < eps:
+                continue
+                
+            # Leave-one-out likelihood
+            ll = 0.0
+            for idx in range(len(dists_i)):
+                # Leave out one point
+                held_out = dists_i[idx]
+                other_dists = np.delete(dists_i, idx)
+                
+                # Gaussian kernel density at held-out point
+                kernel_vals = np.exp(-0.5 * ((other_dists - held_out) / bw) ** 2)
+                density = np.mean(kernel_vals) / (bw * np.sqrt(2 * np.pi) + eps)
+                
+                if density > eps:
+                    ll += np.log(density)
+            
+            if ll > best_ll:
+                best_ll = ll
+                best_bw = bw
+        
+        bandwidths[i] = best_bw
+    
+    # Compute joint density scores for candidate edges
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not candidate_mask[i, j]:
+                continue
+                
+            # Kernel values using cross-validated bandwidths
+            if bandwidths[i] > eps and bandwidths[j] > eps:
+                # Adaptive kernel: use harmonic mean of bandwidths for this pair
+                pair_bw = 2.0 / (1.0 / bandwidths[i] + 1.0 / bandwidths[j] + eps)
+                
+                # Joint density: product of kernels normalized
+                kernel_i = np.exp(-0.5 * (safe_dist[i] / pair_bw) ** 2)
+                kernel_j = np.exp(-0.5 * (safe_dist[j] / pair_bw) ** 2)
+                
+                # Zero out self and diagonal
+                kernel_i[i] = kernel_i[j] = 0
+                kernel_j[i] = kernel_j[j] = 0
+                
+                # Joint score: correlation of kernel profiles
+                if np.sum(kernel_i) > eps and np.sum(kernel_j) > eps:
+                    norm_i = kernel_i / np.sum(kernel_i)
+                    norm_j = kernel_j / np.sum(kernel_j)
+                    joint_score = np.sum(norm_i * norm_j)
+                    
+                    # Scale by distance between i and j
+                    dist_factor = np.exp(-safe_dist[i, j] / (dist_mean + eps))
+                    density_scores[i, j] = joint_score * dist_factor
+    
+    density_scores = np.maximum(density_scores, density_scores.T)
+    
+    # ------------------------------------------------------------
+    # 5. INVERSE DISTANCE WITH ADAPTIVE WEIGHTING
+    # ------------------------------------------------------------
+    inv_dist = 1.0 / safe_dist
+    
+    # Adaptive scaling based on instance characteristics
+    if dist_cv > 0.5:
+        # For variable instances, emphasize shorter distances more
+        scale_power = 1.5
+    else:
+        scale_power = 1.0
+    
+    inv_dist = inv_dist ** scale_power
+    
+    # Normalize inverse distances
+    max_inv = np.max(inv_dist[inv_dist < np.inf])
+    if max_inv > eps:
+        inv_dist = inv_dist / max_inv
+    
+    # ------------------------------------------------------------
+    # 6. MULTIPLICATIVE SCORE COMBINATION WITH ADAPTIVE WEIGHTS
+    # ------------------------------------------------------------
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Instance-adapted component weights
+    if n < 30:
+        weights = {'inv': 0.4, 'regret': 0.4, 'density': 0.2}
+    elif dist_cv < 0.3:
+        weights = {'inv': 0.5, 'regret': 0.3, 'density': 0.2}
+    else:
+        weights = {'inv': 0.35, 'regret': 0.45, 'density': 0.2}
+    
+    # Apply multiplicative combination for candidate edges
+    for i in range(n):
+        for j in range(i + 1, n):
+            if candidate_mask[i, j]:
+                # Combined score with adaptive weights
+                combined = (
+                    weights['inv'] * inv_dist[i, j] +
+                    weights['regret'] * regret_scores[i, j] +
+                    weights['density'] * density_scores[i, j]
+                )
+                
+                # Multiplicative boost for strong consensus
+                if inv_dist[i, j] > 0.7 and regret_scores[i, j] > 0.7:
+                    combined *= 1.3
+                elif inv_dist[i, j] > 0.8 or regret_scores[i, j] > 0.8:
+                    combined *= 1.2
+                
+                heuristics_matrix[i, j] = combined
+    
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # ------------------------------------------------------------
+    # 7. STRUCTURAL ENHANCEMENTS
+    # ------------------------------------------------------------
+    # Minimum Spanning Tree bias for structural guidance
+    if n <= 1000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst + mst.T) > 0
+            heuristics_matrix[mst_edges] *= 1.3
+        except:
+            pass
+    
+    # Ensure minimum connectivity: each node should have at least 2 promising edges
+    for i in range(n):
+        row_scores = heuristics_matrix[i].copy()
+        # Count edges above threshold
+        threshold = np.percentile(row_scores[row_scores > 0], 30) if np.any(row_scores > 0) else 0
+        strong_edges = np.sum(row_scores > max(threshold, eps))
+        
+        if strong_edges < 2:
+            # Add missing connections from nearest neighbors
+            neighbors = np.argsort(safe_dist[i])[1:4]  # Next 3 closest
+            for j in neighbors:
+                if heuristics_matrix[i, j] < eps:
+                    # Estimate score based on distance and regret
+                    est_score = (1.0 / safe_dist[i, j]) * 0.7
+                    if regret_scores[i, j] > 0.5:
+                        est_score *= 1.2
+                    heuristics_matrix[i, j] = est_score
+                    heuristics_matrix[j, i] = est_score
+    
+    # ------------------------------------------------------------
+    # 8. NORMALIZATION
+    # ------------------------------------------------------------
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Row-wise softmax normalization with adaptive temperature
+    for i in range(n):
+        row = heuristics_matrix[i]
+        if np.sum(row) > eps:
+            # Adaptive temperature based on row variance
+            row_nonzero = row[row > 0]
+            if len(row_nonzero) > 1:
+                temperature = max(0.1, np.std(row_nonzero))
+            else:
+                temperature = 0.5
+            
+            # Softmax
+            exp_row = np.exp(row / (temperature + eps))
+            row_sum = np.sum(exp_row)
+            if row_sum > eps:
+                heuristics_matrix[i] = exp_row / row_sum
+    
+    # Global scaling to [0, 1]
+    global_max = np.max(heuristics_matrix)
+    if global_max > eps:
+        heuristics_matrix = heuristics_matrix / global_max
+    
+    return heuristics_matrix
+```

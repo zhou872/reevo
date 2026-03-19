@@ -1,0 +1,161 @@
+```json
+{
+    "algorithm_features": ["Rank-based Regret Penalization", "Centrality-Based Edge Prioritization", "Adaptive MST Sparsification", "Two-step Lookahead Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy import stats
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with adaptive tuning.
+    
+    Features:
+    1. Rank-based regret penalization with dynamic scaling
+    2. Centrality-based edge prioritization using combined metrics
+    3. Adaptive MST-based sparsification with density awareness
+    4. Two-step lookahead scoring for path potential estimation
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges for inclusion in optimal tours.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. INSTANCE ANALYSIS & ADAPTIVE PARAMETERS ===
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    n_log = np.log(n)
+    
+    # Adaptive parameters
+    regret_strength = 0.8 + 0.4 * np.tanh(dist_cv)
+    centrality_weight = 0.7 + 0.3 * (1 - np.exp(-dist_cv))
+    sparsity_threshold = 0.3 + 0.4 * np.tanh(12/n - 0.6)
+    
+    # === 2. RANK-BASED REGRET PENALIZATION ===
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        # Get distances from node i (excluding self)
+        mask = np.arange(n) != i
+        dists_i = distance_matrix[i, mask]
+        sorted_idx = np.argsort(dists_i)
+        
+        # Create rank-based penalties
+        ranks = np.arange(1, len(dists_i) + 1)
+        penalties = 1 / (1 + regret_strength * (ranks - 1))
+        
+        # Apply penalties to regret matrix
+        regret_matrix[i, mask] = penalties[np.argsort(sorted_idx)]
+    
+    # Symmetrize regret matrix using geometric mean
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # === 3. CENTRALITY-BASED EDGE PRIORITIZATION ===
+    # Degree centrality (inverse average distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        avg_dist = np.mean(distance_matrix + np.eye(n) * 1e-12, axis=1)
+        degree_centrality = 1 / avg_dist
+    degree_centrality = degree_centrality / (np.max(degree_centrality) + 1e-12)
+    
+    # MST-based centrality (betweenness proxy)
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_degree = np.sum(mst_mask, axis=1)
+    mst_centrality = mst_degree / (np.max(mst_degree) + 1e-12)
+    
+    # Combine centrality measures
+    centrality = (centrality_weight * degree_centrality + 
+                  (1 - centrality_weight) * mst_centrality)
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # === 4. TWO-STEP LOOKAHEAD PATH POTENTIAL ===
+    path_potential = np.ones((n, n))
+    
+    for i in range(n):
+        # Find top candidate edges from i
+        mask_i = np.arange(n) != i
+        i_dists = distance_matrix[i, mask_i]
+        i_candidates = np.argsort(i_dists)[:min(5, n-1)]
+        
+        for j in range(i+1, n):
+            # Find top candidate edges from j
+            mask_j = np.arange(n) != j
+            j_dists = distance_matrix[j, mask_j]
+            j_candidates = np.argsort(j_dists)[:min(5, n-1)]
+            
+            # Calculate potential two-step paths
+            best_two_step = np.inf
+            
+            # Look at candidate next nodes from both i and j
+            for k in range(n):
+                if k == i or k == j:
+                    continue
+                
+                # Paths: i-k-j and j-k-i (symmetric)
+                path_length = distance_matrix[i, k] + distance_matrix[k, j]
+                best_two_step = min(best_two_step, path_length)
+            
+            # Score based on how much better the edge is than alternatives
+            if best_two_step < np.inf:
+                edge_score = best_two_step / (distance_matrix[i, j] + 1e-12)
+                path_potential[i, j] = min(2.0, max(0.5, edge_score))
+    
+    path_potential = np.maximum(path_potential, path_potential.T)
+    
+    # === 5. BASE SCORE COMBINATION ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Combine factors multiplicatively
+    heuristics = inv_dist * regret_matrix * centrality_matrix * path_potential
+    
+    # Boost MST edges
+    heuristics[mst_mask] *= 1.5
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 6. ADAPTIVE SPARSIFICATION ===
+    if sparsity_threshold > 0 and n > 10:
+        # Separate treatment for different edge types
+        non_mst = ~mst_mask
+        np.fill_diagonal(non_mst, False)
+        
+        if np.any(non_mst):
+            non_mst_vals = heuristics[non_mst]
+            if len(non_mst_vals) > 0:
+                # Dynamic threshold based on value distribution
+                median_val = np.median(non_mst_vals)
+                iqr = stats.iqr(non_mst_vals)
+                threshold = median_val + sparsity_threshold * iqr
+                
+                # Zero out low-scoring non-MST edges
+                zero_mask = non_mst & (heuristics < threshold)
+                heuristics[zero_mask] = 0
+    
+    # === 7. FINAL PROCESSING ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics /= max_val
+    
+    # Ensure non-negative
+    heuristics = np.maximum(heuristics, 0)
+    
+    return heuristics
+```

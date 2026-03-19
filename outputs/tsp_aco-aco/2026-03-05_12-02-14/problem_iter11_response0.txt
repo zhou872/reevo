@@ -1,0 +1,272 @@
+```json
+{
+    "algorithm_features": ["Adaptive Edge Learning", "Memory-Guided Sparsification", "Multi-Strategy Ensemble"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+from collections import defaultdict, deque
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection with adaptive learning,
+    memory-guided sparsification, and multi-strategy ensemble.
+    
+    Key innovations:
+    1. Adaptive edge learning: Dynamically weights different heuristic strategies
+    2. Memory-guided sparsification: Uses tour memory to guide edge preservation
+    3. Multi-strategy ensemble: Combines MST, matching, and tour-based heuristics
+    4. Vectorized sparsification: Efficient top-k selection with exponential decay
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Core Heuristic Components ==========
+    
+    # 1A. Minimum Spanning Tree with importance
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_edges = np.where(mst_array > 0)
+    
+    # MST importance: combine distance inverse with degree centrality
+    mst_importance = np.zeros_like(distance_matrix)
+    for i, j in zip(*mst_edges):
+        if i != j:
+            # Weight by inverse distance and local connectivity
+            mst_importance[i, j] = 1.0 / distance_matrix[i, j]
+    
+    # 1B. Christofides matching on odd-degree vertices
+    degrees = (mst_array > 0).sum(axis=1)
+    odd_vertices = np.where(degrees % 2 == 1)[0]
+    
+    matching_boost = np.zeros_like(distance_matrix)
+    if len(odd_vertices) > 0:
+        # Greedy minimum-weight matching with randomization
+        vertices = odd_vertices.copy()
+        np.random.shuffle(vertices)
+        
+        i = 0
+        while i < len(vertices):
+            if i + 1 < len(vertices):
+                u, v = vertices[i], vertices[i + 1]
+                boost = 1.0 / distance_matrix[u, v]
+                matching_boost[u, v] = matching_boost[v, u] = boost
+                i += 2
+            else:
+                i += 1
+    
+    # ========== Phase 2: Tour-Based Learning ==========
+    
+    # Memory of promising edges from sampled tours
+    edge_memory = defaultdict(float)
+    recent_tours = deque(maxlen=min(10, n))
+    
+    def generate_random_tour():
+        """Generate random tour using insertion heuristic"""
+        tour = list(np.random.permutation(n))
+        # Improve with 2-opt for a few iterations
+        improved = True
+        for _ in range(50):  # Limited iterations
+            improved = False
+            for i in range(n):
+                for j in range(i + 2, min(i + 20, n)):  # Local neighborhood
+                    if j >= n:
+                        j = j % n
+                    a1, a2 = tour[i], tour[(i + 1) % n]
+                    b1, b2 = tour[j], tour[(j + 1) % n]
+                    
+                    current = distance_matrix[a1, a2] + distance_matrix[b1, b2]
+                    new = distance_matrix[a1, b1] + distance_matrix[a2, b2]
+                    
+                    if new < current:
+                        # Reverse segment
+                        if i + 1 < j:
+                            tour[i + 1:j + 1] = tour[i + 1:j + 1][::-1]
+                        else:
+                            segment = tour[i + 1:] + tour[:j + 1]
+                            segment = segment[::-1]
+                            tour[i + 1:] = segment[:len(tour) - i - 1]
+                            tour[:j + 1] = segment[len(tour) - i - 1:]
+                        improved = True
+                        break
+                if improved:
+                    break
+        return tour
+    
+    # Generate and learn from random tours
+    n_samples = min(50, 5 * n)  # Adaptive sample size
+    for _ in range(n_samples):
+        tour = generate_random_tour()
+        recent_tours.append(tour)
+        
+        # Calculate tour quality
+        tour_length = sum(distance_matrix[tour[i], tour[(i + 1) % n]] 
+                         for i in range(n))
+        weight = 1.0 / (1.0 + tour_length / n)  # Normalized weight
+        
+        # Update edge memory
+        for i in range(n):
+            u, v = tour[i], tour[(i + 1) % n]
+            key = (min(u, v), max(u, v))
+            edge_memory[key] += weight
+    
+    # Convert memory to matrix
+    memory_matrix = np.zeros_like(distance_matrix)
+    for (u, v), weight in edge_memory.items():
+        memory_matrix[u, v] = memory_matrix[v, u] = weight
+    
+    # ========== Phase 3: Adaptive Weighting ==========
+    
+    # Analyze instance characteristics
+    triu_distances = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(triu_distances)
+    dist_std = np.std(triu_distances)
+    dist_cv = dist_std / (dist_mean + 1e-10)
+    
+    # Adaptive weights based on instance characteristics
+    if dist_cv < 0.2:
+        # Uniform distances: emphasize MST
+        weights = {'mst': 0.5, 'matching': 0.3, 'memory': 0.2}
+    elif dist_cv > 0.8:
+        # Highly variable: emphasize memory
+        weights = {'memory': 0.5, 'mst': 0.3, 'matching': 0.2}
+    else:
+        # Balanced case
+        weights = {'mst': 0.4, 'memory': 0.35, 'matching': 0.25}
+    
+    # Adjust based on problem size
+    size_factor = min(1.0, n / 100.0)
+    weights['memory'] *= (0.5 + 0.5 * size_factor)
+    weights['matching'] *= (1.0 - 0.3 * size_factor)
+    
+    # Normalize weights
+    total = sum(weights.values())
+    weights = {k: v / total for k, v in weights.items()}
+    
+    # ========== Phase 4: Combine Components ==========
+    
+    # Normalize each component
+    components = []
+    for mat in [mst_importance, matching_boost, memory_matrix]:
+        if np.max(mat) > 0:
+            mat_norm = mat / (np.max(mat) + 1e-10)
+        else:
+            mat_norm = mat
+        components.append(mat_norm)
+    
+    # Weighted combination
+    combined = (weights['mst'] * components[0] +
+                weights['matching'] * components[1] +
+                weights['memory'] * components[2])
+    
+    # Add reciprocal distance as baseline (safeguard)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    if np.max(reciprocal) > 0:
+        reciprocal /= (np.max(reciprocal) + 1e-10)
+    
+    combined = 0.85 * combined + 0.15 * reciprocal
+    np.fill_diagonal(combined, 0)
+    
+    # ========== Phase 5: Memory-Guided Sparsification ==========
+    
+    # Determine adaptive sparsity level
+    if n < 30:
+        k_base = n - 1
+    elif n < 100:
+        k_base = int(3 * np.sqrt(n))
+    else:
+        k_base = int(2 * np.sqrt(n))
+    
+    # Preserve MST edges and top memory edges
+    preserved_edges = set()
+    
+    # All MST edges
+    mst_edge_set = set(zip(*np.where(mst_array > 0)))
+    preserved_edges.update(mst_edge_set)
+    
+    # Top memory edges (by frequency)
+    if len(edge_memory) > 0:
+        sorted_memory = sorted(edge_memory.items(), key=lambda x: x[1], reverse=True)
+        n_top = min(len(sorted_memory), max(10, n))
+        for (u, v), _ in sorted_memory[:n_top]:
+            preserved_edges.add((u, v))
+            preserved_edges.add((v, u))
+    
+    # Create sparsified matrix
+    sparsified = np.zeros_like(combined)
+    
+    # Preserve important edges
+    for i, j in preserved_edges:
+        if i != j:
+            sparsified[i, j] = combined[i, j]
+    
+    # Vectorized adaptive sparsification per node
+    for i in range(n):
+        # Get row and exclude self and already preserved edges
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Mask for non-preserved edges
+        non_preserved_mask = np.ones(n, dtype=bool)
+        non_preserved_mask[i] = False
+        for j in range(n):
+            if (i, j) in preserved_edges:
+                non_preserved_mask[j] = False
+        
+        if np.sum(non_preserved_mask) == 0:
+            continue
+            
+        # Get values and indices of non-preserved edges
+        non_preserved_indices = np.where(non_preserved_mask)[0]
+        values = row[non_preserved_indices]
+        
+        if len(values) == 0:
+            continue
+            
+        # Sort and select top-k with exponential decay
+        sorted_idx = np.argsort(values)[::-1]
+        k = min(k_base, len(values))
+        
+        # Exponential decay weights
+        ranks = np.arange(k)
+        decay_weights = np.exp(-ranks / 3.0)
+        
+        # Apply decay to top-k edges
+        top_indices = non_preserved_indices[sorted_idx[:k]]
+        for idx, j in enumerate(top_indices):
+            if idx < k:
+                sparsified[i, j] = values[sorted_idx[idx]] * decay_weights[idx]
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # Final normalization
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified /= max_val
+    
+    return sparsified
+```

@@ -1,0 +1,428 @@
+```json
+{
+    "algorithm_features": ["Cluster-Aware Exponential Regret", "Adaptive Multi-Hop Lookahead", "Global Connectivity Preservation", "Parameter Self-Optimization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with global clustering detection, adaptive multi-hop lookahead,
+    and self-optimizing parameters for robust performance across diverse instance types.
+    
+    Core Innovations:
+    1. Global clustering detection with cluster-aware regret weights
+    2. Adaptive multi-hop path analysis (2-3 hops) based on instance density
+    3. Reinforcement-inspired parameter optimization via instance characteristics
+    4. Enhanced long-range dependency capture for clustered instances
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. ENHANCED INSTANCE ANALYSIS WITH CLUSTER DETECTION ===
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    
+    if len(distances) > 0:
+        # Basic statistics
+        median_dist = np.median(distances)
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        cv_dist = std_dist / (mean_dist + 1e-12)
+        
+        # Detect clustering using k-means on distance histogram (fast approximation)
+        hist, bins = np.histogram(distances, bins=min(20, n), density=True)
+        peaks = np.where((hist[1:-1] > hist[:-2]) & (hist[1:-1] > hist[2:]))[0] + 1
+        num_clusters = len(peaks)
+        
+        # Quantify clustering strength
+        if num_clusters > 1 and len(peaks) > 1:
+            peak_heights = hist[peaks]
+            valley_depths = hist[peaks[1:]] / (hist[peaks[:-1]] + 1e-12)
+            cluster_strength = np.mean(valley_depths) if len(valley_depths) > 0 else 0
+            is_clustered = cluster_strength < 0.8
+        else:
+            cluster_strength = 0
+            is_clustered = False
+        
+        # Adaptive parameters based on instance characteristics
+        # K for nearest neighbors: larger for clustered instances
+        base_k = max(3, int(np.sqrt(n)))
+        if is_clustered:
+            k = min(base_k * 2, n // 2)
+            # Boost lookahead for clustered instances to capture inter-cluster connections
+            lookahead_factor = 0.7
+            max_hops = 3  # Allow three-hop lookahead for clustered instances
+        elif cv_dist > 1.0:  # High variance, potentially uniform with outliers
+            k = min(base_k, n // 3)
+            lookahead_factor = 0.4
+            max_hops = 2
+        else:  # Moderate variance
+            k = min(base_k * 1.5, n // 3)
+            lookahead_factor = 0.5
+            max_hops = 2
+        
+        # Exponential regret parameters: more aggressive for clustered instances
+        if is_clustered:
+            regret_base = 2.0
+            inter_cluster_boost = 1.5
+        else:
+            regret_base = 1.6
+            inter_cluster_boost = 1.0
+            
+        k = max(3, min(k, n - 1))
+    else:
+        k = min(8, n - 1)
+        regret_base = 1.8
+        lookahead_factor = 0.5
+        max_hops = 2
+        is_clustered = False
+        inter_cluster_boost = 1.0
+    
+    # === 2. GLOBAL CLUSTER DETECTION FOR EDGE WEIGHTING ===
+    # Identify potential clusters using fast approximate spectral method
+    if is_clustered and n > 10:
+        # Compute affinity matrix using Gaussian kernel
+        gamma = 1.0 / (np.median(distances) ** 2 + 1e-12)
+        affinity = np.exp(-gamma * distance_matrix ** 2)
+        np.fill_diagonal(affinity, 0)
+        
+        # Compute normalized Laplacian (simplified)
+        D = np.diag(np.sum(affinity, axis=1))
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-12))
+        L_norm = np.eye(n) - D_inv_sqrt @ affinity @ D_inv_sqrt
+        
+        # Get Fiedler vector (second smallest eigenvector)
+        try:
+            eigvals, eigvecs = np.linalg.eigh(L_norm)
+            fiedler_vec = eigvecs[:, 1]  # Second eigenvector
+            # Simple binary clustering based on sign
+            cluster_labels = (fiedler_vec > 0).astype(int)
+        except:
+            cluster_labels = np.zeros(n, dtype=int)
+    else:
+        cluster_labels = np.zeros(n, dtype=int)
+    
+    # === 3. BASE INVERSE DISTANCE WITH CLUSTER-AWARE MODIFICATION ===
+    eps = np.percentile(distances, 10) * 0.01 if len(distances) > 0 else 1e-12
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + eps * np.eye(n))
+    
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Boost intra-cluster edges for clustered instances
+    if is_clustered and len(np.unique(cluster_labels)) > 1:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_labels[i] == cluster_labels[j]:
+                    # Same cluster: stronger connection
+                    inv_dist[i, j] = inv_dist[j, i] = inv_dist[i, j] * 1.3
+                else:
+                    # Different clusters: mild penalty unless very close
+                    if distance_matrix[i, j] > np.percentile(distances, 75):
+                        inv_dist[i, j] = inv_dist[j, i] = inv_dist[i, j] * 0.7
+    
+    max_inv = np.max(inv_dist[~np.eye(n, dtype=bool)], initial=1.0)
+    inv_dist = inv_dist / max_inv
+    
+    # === 4. K-NEAREST NEIGHBORS WITH CLUSTER-AWARE ADJUSTMENT ===
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    positions = np.argsort(sorted_indices, axis=1)
+    
+    knn_indices = sorted_indices[:, 1:k+1]
+    knn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        knn_mask[i, knn_indices[i]] = True
+    
+    mutual_knn = knn_mask & knn_mask.T
+    
+    # === 5. ADAPTIVE MULTI-HOP REGRET SCORING ===
+    regret_scores = np.ones((n, n))
+    
+    # Precompute K nearest distances for efficiency
+    k_distances = np.zeros((n, k))
+    for i in range(n):
+        k_distances[i] = distance_matrix[i, knn_indices[i]]
+    
+    for i in range(n):
+        i_neighbors = knn_indices[i]
+        i_neighbor_dists = k_distances[i]
+        
+        for j in range(i + 1, n):
+            direct_dist = distance_matrix[i, j]
+            if direct_dist <= 0:
+                continue
+            
+            # === RANK-BASED COMPONENT WITH CLUSTER AWARENESS ===
+            rank_i_j = positions[i, j]
+            rank_j_i = positions[j, i]
+            avg_rank = (rank_i_j + rank_j_i) / 2
+            norm_rank = avg_rank / (n - 1)
+            
+            # Adjust rank penalty based on cluster relationship
+            rank_penalty_factor = 1.0
+            if is_clustered:
+                if cluster_labels[i] == cluster_labels[j]:
+                    # Same cluster: less penalty for higher ranks
+                    rank_penalty_factor = 0.7
+                else:
+                    # Different clusters: more penalty unless very highly ranked
+                    if norm_rank > 0.3:
+                        rank_penalty_factor = 1.3
+            
+            rank_penalty = np.exp(-2.0 * norm_rank * rank_penalty_factor)
+            
+            # === MULTI-HOP REGRET ANALYSIS ===
+            best_alternative = np.inf
+            
+            # One-hop (direct) is already known: direct_dist
+            
+            # Two-hop paths through common neighbors
+            j_neighbors_set = set(knn_indices[j].tolist())
+            for m in i_neighbors:
+                if m in j_neighbors_set and m != i and m != j:
+                    alt_dist = distance_matrix[i, m] + distance_matrix[m, j]
+                    best_alternative = min(best_alternative, alt_dist)
+            
+            # Three-hop paths for clustered instances or when two-hop not found
+            if max_hops >= 3 and (best_alternative == np.inf or 
+                                  (is_clustered and cluster_labels[i] != cluster_labels[j])):
+                # Limit search to top neighbors for efficiency
+                check_limit = min(5, len(i_neighbors))
+                for a in i_neighbors[:check_limit]:
+                    if a == j:
+                        continue
+                    
+                    # Check a's neighbors
+                    a_neighbors = knn_indices[a]
+                    a_check_limit = min(3, len(a_neighbors))
+                    
+                    for b in a_neighbors[:a_check_limit]:
+                        if b == i or b == j:
+                            continue
+                        
+                        # Check if b connects to j
+                        if distance_matrix[b, j] < np.inf:
+                            alt_dist = (distance_matrix[i, a] + 
+                                       distance_matrix[a, b] + 
+                                       distance_matrix[b, j])
+                            best_alternative = min(best_alternative, alt_dist)
+            
+            # Compute exponential regret with cluster-aware adjustments
+            if best_alternative < np.inf:
+                regret_ratio = best_alternative / direct_dist
+                
+                # Enhanced exponential regret function
+                if regret_ratio > 1.0:
+                    # Direct edge is better than best alternative
+                    exp_regret = np.exp(regret_base * (1.0 - 1.0 / regret_ratio))
+                else:
+                    # Alternative is better than direct edge
+                    exp_regret = np.exp(-regret_base * (1.0 - regret_ratio))
+                
+                # Apply inter-cluster boost if applicable
+                if is_clustered and cluster_labels[i] != cluster_labels[j]:
+                    exp_regret *= inter_cluster_boost
+            else:
+                # No alternative found - potentially critical edge
+                critical_boost = 1.5 if is_clustered and cluster_labels[i] != cluster_labels[j] else 1.2
+                exp_regret = np.exp(regret_base * 0.5) * critical_boost
+            
+            # Dynamic weighting with reinforcement-inspired adaptation
+            # Weight shifts based on quality of alternatives found
+            if best_alternative < np.inf:
+                alt_quality = direct_dist / best_alternative
+                weight = 0.3 + 0.4 * min(1.0, alt_quality)
+            else:
+                weight = 0.7  # Emphasize rank more when no alternative found
+            
+            combined_score = weight * exp_regret + (1 - weight) * rank_penalty
+            
+            # Bound the score
+            regret_scores[i, j] = regret_scores[j, i] = max(0.1, min(3.0, combined_score))
+    
+    # === 6. ENHANCED MUTUAL PROXIMITY WITH CLUSTER CONTEXT ===
+    proximity_boost = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mutual_knn[i, j]:
+                # Both are in each other's K-nearest neighbors
+                rank_i = np.where(knn_indices[i] == j)[0][0] / (k - 1)
+                rank_j = np.where(knn_indices[j] == i)[0][0] / (k - 1)
+                avg_rank = (rank_i + rank_j) / 2
+                
+                # Enhanced boost for mutual edges, especially within clusters
+                base_boost = 1.0 + 0.8 * (1.0 - avg_rank) ** 2
+                
+                # Additional boost for intra-cluster mutual edges
+                if is_clustered and cluster_labels[i] == cluster_labels[j]:
+                    base_boost *= 1.2
+                
+                proximity_boost[i, j] = proximity_boost[j, i] = base_boost
+    
+    # === 7. GLOBAL CONNECTIVITY PRESERVATION ===
+    # Compute Minimum Spanning Tree
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Identify potential "bridge" edges between clusters
+    bridge_boost = np.ones((n, n))
+    if is_clustered and len(np.unique(cluster_labels)) > 1:
+        # Find edges connecting different clusters
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_labels[i] != cluster_labels[j]:
+                    # Check if this edge is among the best connections between these clusters
+                    # Simple heuristic: boost if it's in the top quartile of distances
+                    if distance_matrix[i, j] < np.percentile(distances, 25):
+                        bridge_boost[i, j] = bridge_boost[j, i] = 1.4
+    
+    # === 8. COMBINE COMPONENTS WITH ADAPTIVE WEIGHTS ===
+    heuristics = inv_dist * regret_scores * proximity_boost * bridge_boost
+    
+    # Strong preservation of essential edges
+    heuristics[mst_mask] *= 2.0  # MST edges are critical
+    
+    # Additional boost for mutual KNN edges
+    heuristics[mutual_knn] *= 1.8
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 9. ADAPTIVE SPARSIFICATION WITH CLUSTER AWARENESS ===
+    # Compute per-node statistics
+    node_avg_scores = np.zeros(n)
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = 0
+        non_zero = row[row > 0]
+        if len(non_zero) > 0:
+            node_avg_scores[i] = np.mean(non_zero)
+    
+    # Determine target edges per node
+    if is_clustered:
+        # More edges for cluster hubs, fewer for isolated nodes
+        base_edges = max(k + 2, int(np.sqrt(n) * 1.5))
+    else:
+        base_edges = max(k + 2, int(np.sqrt(n) + 3))
+    
+    heuristics_pruned = heuristics.copy()
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = 0
+        
+        # Always preserve critical edges
+        preserve_mask = mst_mask[i] | (mutual_knn[i] & (row > np.percentile(row[row > 0], 80) if np.sum(row > 0) > 0 else False))
+        
+        # Adjust target based on node's role
+        if is_clustered:
+            # Nodes connecting different clusters need more edges
+            if np.sum(cluster_labels[i] != cluster_labels) > n // 3:
+                target_edges = int(base_edges * 1.3)
+            else:
+                target_edges = base_edges
+        else:
+            connectivity_factor = min(1.5, max(0.7, node_avg_scores[i] / (np.mean(node_avg_scores[node_avg_scores > 0]) + 1e-12)))
+            target_edges = int(base_edges * connectivity_factor)
+        
+        target_edges = max(k + 2, min(target_edges, n - 1))
+        
+        # Prune if necessary
+        if np.sum(row > 0) > target_edges:
+            non_preserved = row.copy()
+            non_preserved[preserve_mask] = -np.inf
+            
+            if np.sum(non_preserved > -np.inf) > 0:
+                keep_count = max(0, target_edges - np.sum(preserve_mask))
+                if keep_count > 0:
+                    threshold = np.partition(non_preserved, -keep_count)[-keep_count]
+                    mask = (row < threshold) & (~preserve_mask)
+                    heuristics_pruned[i, mask] = 0
+    
+    # Ensure symmetry after pruning
+    heuristics_final = np.maximum(heuristics_pruned, heuristics_pruned.T)
+    
+    # === 10. FINAL NORMALIZATION AND VALIDATION ===
+    np.fill_diagonal(heuristics_final, 0)
+    
+    non_zero_mask = heuristics_final > 0
+    if np.any(non_zero_mask):
+        max_val = np.max(heuristics_final[non_zero_mask])
+        if max_val > 0:
+            heuristics_final = heuristics_final / max_val
+    
+    heuristics_final = np.clip(heuristics_final, 0, 1)
+    
+    return heuristics_final
+
+
+# Test function remains the same
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    print("Testing heuristics_v2 with various TSP instances:\n")
+    
+    for instance_type in ["uniform", "clustered", "mixed"]:
+        if instance_type == "uniform":
+            n = 30
+            coords = np.random.rand(n, 2) * 100
+        elif instance_type == "clustered":
+            n = 30
+            coords = np.zeros((n, 2))
+            coords[:15] = np.random.randn(15, 2) * 10 + [30, 30]
+            coords[15:] = np.random.randn(15, 2) * 8 + [70, 70]
+        else:  # mixed
+            n = 30
+            coords = np.zeros((n, 2))
+            coords[:10] = np.random.rand(10, 2) * 30
+            coords[10:20] = np.random.rand(10, 2) * 40 + [50, 20]
+            coords[20:] = np.random.rand(10, 2) * 30 + [20, 60]
+        
+        dist_matrix = squareform(pdist(coords))
+        heuristics = heuristics_v2(dist_matrix)
+        
+        print(f"=== {instance_type.upper()} Instance (n={n}) ===")
+        print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+        
+        edges_per_node = np.sum(heuristics > 0, axis=1)
+        print(f"Edges per node: min={edges_per_node.min()}, "
+              f"max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+        
+        is_symmetric = np.allclose(heuristics, heuristics.T)
+        print(f"Matrix symmetric: {is_symmetric}")
+        
+        # Check MST preservation
+        mst = minimum_spanning_tree(dist_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_preserved = np.sum(heuristics[mst_mask] > 0) / np.sum(mst_mask)
+        print(f"MST edges preserved: {mst_preserved:.1%}")
+        
+        # Sample scores
+        print("Sample edge scores (i, j, distance, heuristic):")
+        sample_pairs = [(0, 1), (0, 10), (5, 15), (10, 25)]
+        for i, j in sample_pairs:
+            if i < n and j < n:
+                print(f"({i:2d}, {j:2d}): dist={dist_matrix[i, j]:6.2f}, "
+                      f"score={heuristics[i, j]:.4f}")
+        print()
+```

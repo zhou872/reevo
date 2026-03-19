@@ -1,0 +1,291 @@
+```json
+{
+    "algorithm_features": ["Edge Frequency Learning", "Vectorized Sparsification", "Adaptive MST-Based Weighting"]
+}
+```
+
+```python
+import numpy as np
+from collections import defaultdict, deque
+from scipy import sparse
+import warnings
+
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Streamlined heuristic matrix for TSP edge selection with edge frequency learning,
+    vectorized sparsification, and adaptive MST-based weighting.
+    
+    Core improvements:
+    1. Edge frequency learning from multiple 2-opt tours
+    2. Vectorized row-wise sparsification with exponential decay
+    3. MST-based adaptive weighting without complex clustering
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Efficient Tour Generation ==========
+    
+    # Generate diverse initial tours using nearest neighbor
+    num_starts = min(15, n)
+    starts = np.random.choice(n, num_starts, replace=False)
+    tours = []
+    
+    for start in starts:
+        # Nearest neighbor tour
+        tour = np.zeros(n, dtype=int)
+        visited = np.zeros(n, dtype=bool)
+        tour[0] = start
+        visited[start] = True
+        
+        for i in range(1, n):
+            current = tour[i-1]
+            # Get unvisited distances with small noise for tie-breaking
+            unvisited_mask = ~visited
+            distances = distance_matrix[current].copy()
+            distances[~unvisited_mask] = np.inf
+            distances += np.random.rand(n) * 1e-9 * np.max(distances[unvisited_mask])
+            next_node = np.argmin(distances)
+            tour[i] = next_node
+            visited[next_node] = True
+        
+        tours.append(tour)
+    
+    # ========== Phase 2: Fast 2-opt Improvement ==========
+    
+    def two_opt_fast(tour):
+        """Vectorized 2-opt local search implementation."""
+        n_nodes = len(tour)
+        improved = True
+        max_iter = 100
+        
+        for _ in range(max_iter):
+            improved = False
+            
+            # Pre-compute edge distances for quick gain calculation
+            edges = [(tour[i], tour[(i+1)%n_nodes]) for i in range(n_nodes)]
+            edge_dists = np.array([distance_matrix[u, v] for u, v in edges])
+            
+            # Check possible 2-opt swaps
+            for i in range(n_nodes):
+                for j in range(i+2, min(i+n_nodes-1, n_nodes)):
+                    j_mod = j % n_nodes
+                    
+                    # Current edges
+                    a, b = tour[i], tour[(i+1)%n_nodes]
+                    c, d = tour[j_mod], tour[(j_mod+1)%n_nodes]
+                    
+                    # Skip if edges share vertices
+                    if a == c or a == d or b == c or b == d:
+                        continue
+                    
+                    # Calculate gain
+                    current = distance_matrix[a, b] + distance_matrix[c, d]
+                    new = distance_matrix[a, c] + distance_matrix[b, d]
+                    
+                    if new < current - 1e-10:
+                        # Reverse segment between i+1 and j
+                        if i+1 < j_mod:
+                            tour[i+1:j_mod+1] = tour[i+1:j_mod+1][::-1]
+                        else:
+                            # Handle wrap-around case
+                            segment = np.concatenate([tour[i+1:], tour[:j_mod+1]])
+                            segment = segment[::-1]
+                            tour[i+1:] = segment[:n_nodes-i-1]
+                            tour[:j_mod+1] = segment[n_nodes-i-1:]
+                        improved = True
+                        break
+                if improved:
+                    break
+            
+            if not improved:
+                break
+        
+        return tour
+    
+    # Improve tours and build edge frequency statistics
+    edge_freq = defaultdict(float)
+    
+    for tour in tours:
+        improved_tour = two_opt_fast(tour.copy())
+        
+        # Calculate tour quality (inverse of length)
+        tour_length = 0
+        for i in range(n):
+            u, v = improved_tour[i], improved_tour[(i+1)%n]
+            tour_length += distance_matrix[u, v]
+        tour_weight = 1.0 / max(tour_length, 1e-10)
+        
+        # Update edge frequencies with quality weighting
+        for i in range(n):
+            u, v = improved_tour[i], improved_tour[(i+1)%n]
+            key = (min(u, v), max(u, v))
+            edge_freq[key] += tour_weight
+    
+    # ========== Phase 3: Structural Components ==========
+    
+    # MST component
+    mst = sparse.csgraph.minimum_spanning_tree(distance_matrix)
+    mst_dense = mst.toarray()
+    mst_mask = mst_dense > 0
+    
+    # Enhanced MST weighting: consider degree in MST
+    mst_degrees = mst_mask.sum(axis=1) + mst_mask.sum(axis=0)
+    mst_component = np.zeros_like(distance_matrix)
+    
+    # Vectorized MST edge scoring
+    i_idx, j_idx = np.where(mst_mask)
+    for i, j in zip(i_idx, j_idx):
+        if i != j:
+            base_score = 1.0 / distance_matrix[i, j]
+            # Boost edges connected to high-degree MST nodes
+            degree_boost = 1.0 + 0.15 * (mst_degrees[i] + mst_degrees[j])
+            mst_component[i, j] = base_score * degree_boost
+    
+    # Reciprocal distance baseline
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    # Edge frequency component
+    freq_component = np.zeros_like(distance_matrix)
+    for (u, v), freq in edge_freq.items():
+        freq_component[u, v] = freq_component[v, u] = freq
+    
+    # ========== Phase 4: Adaptive Weighting ==========
+    
+    # Analyze distance distribution for adaptive weights
+    triu_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_cv = np.std(triu_dists) / (np.mean(triu_dists) + 1e-10)
+    
+    # Set weights based on problem characteristics
+    if dist_cv < 0.3:
+        # Uniform distances: emphasize MST structure
+        w_mst, w_freq, w_recip = 0.5, 0.3, 0.2
+    elif dist_cv > 0.7:
+        # Variable distances: emphasize learned frequencies
+        w_mst, w_freq, w_recip = 0.3, 0.5, 0.2
+    else:
+        # Balanced case
+        w_mst, w_freq, w_recip = 0.4, 0.4, 0.2
+    
+    # Adjust for problem size
+    if n > 300:
+        w_freq = min(0.6, w_freq * 1.2)
+        w_mst = max(0.2, w_mst * 0.8)
+    elif n < 50:
+        w_mst = min(0.6, w_mst * 1.3)
+        w_freq = max(0.2, w_freq * 0.8)
+    
+    # Normalize components and combine
+    for comp in [mst_component, freq_component, reciprocal]:
+        max_val = comp.max()
+        if max_val > 0:
+            comp /= max_val
+    
+    heuristic_matrix = (w_mst * mst_component + 
+                       w_freq * freq_component + 
+                       w_recip * reciprocal)
+    
+    # Ensure symmetry and zero diagonal
+    heuristic_matrix = (heuristic_matrix + heuristic_matrix.T) / 2
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    # ========== Phase 5: Vectorized Sparsification ==========
+    
+    # Determine edges per node adaptively
+    if n < 50:
+        k = n - 1
+    elif n < 200:
+        k = int(2.2 * np.sqrt(n))
+    else:
+        k = int(1.6 * np.sqrt(n))
+    
+    # Identify preserved edges (MST + top frequency edges)
+    preserved_mask = np.zeros_like(heuristic_matrix, dtype=bool)
+    
+    # MST edges
+    preserved_mask[mst_mask] = True
+    
+    # Top frequency edges
+    if edge_freq:
+        freq_vals = list(edge_freq.values())
+        top_threshold = np.percentile(freq_vals, 80) if len(freq_vals) > 10 else np.mean(freq_vals)
+        
+        for (u, v), freq in edge_freq.items():
+            if freq >= top_threshold:
+                preserved_mask[u, v] = preserved_mask[v, u] = True
+    
+    # Initialize sparsified matrix
+    sparsified = np.zeros_like(heuristic_matrix)
+    
+    # Preserve important edges at full strength
+    sparsified[preserved_mask] = heuristic_matrix[preserved_mask]
+    
+    # Vectorized row processing with exponential decay
+    for i in range(n):
+        # Get current preserved count for this node
+        preserved_count = preserved_mask[i].sum()
+        
+        if preserved_count >= k:
+            # Already have enough preserved edges
+            continue
+        
+        # Get candidate edges (non-preserved, non-diagonal)
+        candidate_mask = ~preserved_mask[i]
+        candidate_mask[i] = False  # Exclude diagonal
+        candidate_indices = np.where(candidate_mask)[0]
+        
+        if len(candidate_indices) == 0:
+            continue
+        
+        candidate_values = heuristic_matrix[i, candidate_indices]
+        
+        # Sort candidates descending
+        sort_order = np.argsort(-candidate_values)
+        sorted_indices = candidate_indices[sort_order]
+        sorted_values = candidate_values[sort_order]
+        
+        # Number of additional edges needed
+        needed = min(k - preserved_count, len(sorted_indices))
+        
+        if needed <= 0:
+            continue
+        
+        # Apply exponential decay
+        ranks = np.arange(needed)
+        decay_factors = np.exp(-ranks / 2.5)  # Smooth decay
+        
+        selected_indices = sorted_indices[:needed]
+        sparsified[i, selected_indices] = sorted_values[:needed] * decay_factors
+    
+    # Ensure symmetry and final processing
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # Normalize
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified /= max_val
+    
+    # Clip negligible values
+    sparsified[sparsified < 1e-7] = 0
+    
+    return sparsified
+```

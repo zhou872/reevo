@@ -1,0 +1,174 @@
+```json
+{
+    "algorithm_features": ["Rank-Based Regret Minimization", "Two-step Lookahead Edge Scoring", "Minimum Spanning Tree Priority", "Local Density Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with rank-based regret
+    minimization and two-step lookahead edge scoring.
+    
+    Core improvements:
+    1. Rank-based regret minimization: Normalizes edge costs by alternative quality ranks
+    2. Two-step lookahead edge scoring: Considers next-step opportunities for each edge
+    3. Minimum spanning tree priority: Prioritizes edges likely in optimal structure
+    4. Local density bonus: Rewards intra-cluster connections
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic_matrix = np.zeros((n, n))
+    
+    # Adaptive neighborhood size
+    k = max(3, min(8, n // 4))
+    
+    # 1. RANK-BASED REGRET MINIMIZATION
+    rank_matrix = np.ones((n, n))
+    for i in range(n):
+        # Get distances from node i to all others
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Rank all edges from node i (1 = best, n-1 = worst)
+        sorted_indices = np.argsort(distances)
+        ranks = np.zeros(n)
+        for rank, idx in enumerate(sorted_indices, 1):
+            ranks[idx] = rank
+        
+        # Normalize ranks to [0, 1] where 1 is best
+        max_rank = n - 1
+        if max_rank > 0:
+            rank_scores = 1.0 - (ranks - 1) / max_rank
+        
+        # Apply rank-based scores
+        for j in range(n):
+            if i != j:
+                # Symmetric geometric mean of rank scores
+                rank_matrix[i, j] = np.sqrt(rank_scores[j] * (1.0 - (ranks[j] - 1) / max_rank))
+    
+    # 2. TWO-STEP LOOKAHEAD EDGE SCORING
+    lookahead_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Two-step lookahead: i -> j -> best next from j
+            distances_from_j = distance_matrix[j].copy()
+            distances_from_j[i] = np.inf
+            distances_from_j[j] = np.inf
+            
+            min_next_from_j = np.min(distances_from_j)
+            
+            # Two-step lookahead: j -> i -> best next from i
+            distances_from_i = distance_matrix[i].copy()
+            distances_from_i[i] = np.inf
+            distances_from_i[j] = np.inf
+            
+            min_next_from_i = np.min(distances_from_i)
+            
+            # Average two-step lookahead score
+            lookahead_score_ij = 1.0 / (distance_matrix[i, j] + min_next_from_j)
+            lookahead_score_ji = 1.0 / (distance_matrix[j, i] + min_next_from_i)
+            lookahead_matrix[i, j] = lookahead_matrix[j, i] = (lookahead_score_ij + lookahead_score_ji) / 2.0
+    
+    # 3. MINIMUM SPANNING TREE PRIORITY
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_bonus = np.where(mst_mask, 1.5, 1.0)  # 50% boost for MST edges
+    except:
+        mst_bonus = np.ones((n, n))
+    
+    # 4. LOCAL DENSITY BONUS
+    density_bonus = np.ones((n, n))
+    
+    # Compute average distance to k-nearest neighbors for each node
+    avg_nearest_dist = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest_dists = np.sort(distances)[:k]
+        avg_nearest_dist[i] = np.mean(nearest_dists)
+    
+    # Apply local density bonus
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Bonus for edges within dense regions
+            avg_density = (avg_nearest_dist[i] + avg_nearest_dist[j]) / 2.0
+            if distance_matrix[i, j] < 1.5 * avg_density:
+                # Stronger bonus for edges well within dense regions
+                if distance_matrix[i, j] < avg_density:
+                    density_bonus[i, j] = density_bonus[j, i] = 1.3
+                else:
+                    density_bonus[i, j] = density_bonus[j, i] = 1.1
+    
+    # COMBINE ALL FACTORS
+    # Base reciprocal distance (with safe handling)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Combine factors with non-linear weighting
+    combined = inv_dist * rank_matrix * lookahead_matrix * mst_bonus * density_bonus
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2.0
+    
+    # SPARSIFICATION: Keep promising edges only
+    # Strategy 1: Keep top edges per node (adaptive threshold)
+    sparsified = combined.copy()
+    
+    # Set diagonal to zero
+    np.fill_diagonal(sparsified, 0)
+    
+    # Determine adaptive thresholds
+    thresholds = np.zeros(n)
+    for i in range(n):
+        non_zero_vals = sparsified[i, sparsified[i] > 0]
+        if len(non_zero_vals) > 0:
+            thresholds[i] = np.percentile(non_zero_vals, 70)
+        else:
+            thresholds[i] = 0
+    
+    # Apply thresholds
+    for i in range(n):
+        sparsified[i, sparsified[i] < thresholds[i]] = 0
+    
+    # Strategy 2: Ensure minimum connectivity
+    min_connections = max(2, n // 10)
+    for i in range(n):
+        num_connections = np.sum(sparsified[i] > 0)
+        if num_connections < min_connections:
+            # Add nearest neighbors based on combined score
+            row_vals = combined[i].copy()
+            row_vals[i] = -np.inf
+            additional_indices = np.argsort(row_vals)[-min_connections:]
+            for idx in additional_indices:
+                sparsified[i, idx] = combined[i, idx]
+                sparsified[idx, i] = combined[idx, i]
+    
+    # Strategy 3: Keep MST edges (already in mst_bonus, ensure they're not removed)
+    if 'mst_mask' in locals():
+        sparsified[mst_mask] = np.maximum(sparsified[mst_mask], combined[mst_mask])
+    
+    # NORMALIZATION
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

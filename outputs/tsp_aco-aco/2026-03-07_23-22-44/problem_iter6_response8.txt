@@ -1,0 +1,410 @@
+```json
+{
+    "algorithm_features": ["Multi-step Lookahead with Neighborhood Pruning", "Adaptive Weighting with Problem Characterization", "Hierarchical Regret Analysis", "Topological Feature Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with adaptive multi-step lookahead, intelligent feature fusion,
+    and performance-optimized computations.
+    
+    Core Innovations:
+    1. Hierarchical lookahead with dynamic neighborhood pruning for efficiency
+    2. Automated feature weighting based on problem structure analysis
+    3. Multi-resolution regret analysis with caching
+    4. Integrated topological features with mutual reinforcement
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. PRELIMINARY COMPUTATIONS ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Compute MST for structural guidance
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # Precompute nearest neighbors for efficiency
+    k_neighbors = min(10, n - 1)
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_neighbors+1]
+    
+    # ==================== 2. PROBLEM CHARACTERIZATION ====================
+    def characterize_problem() -> dict:
+        """Extract key problem characteristics for adaptive parameter tuning"""
+        upper_triangle = distance_matrix[np.triu_indices(n, 1)]
+        
+        return {
+            'size': n,
+            'avg_distance': np.mean(upper_triangle),
+            'distance_variation': np.std(upper_triangle) / (np.mean(upper_triangle) + 1e-8),
+            'sparsity': np.sum(distance_matrix > 2 * np.median(upper_triangle)) / (n * n),
+            'mst_avg_degree': np.mean(np.sum(mst_edges, axis=1)),
+            'edge_density': np.sum(distance_matrix <= np.percentile(upper_triangle, 25)) / (n * n)
+        }
+    
+    char = characterize_problem()
+    
+    # ==================== 3. ADAPTIVE MULTI-STEP LOOKAHEAD ====================
+    def compute_lookahead_scores() -> np.ndarray:
+        """Hierarchical lookahead with adaptive depth and neighborhood pruning"""
+        lookahead = np.ones_like(distance_matrix)
+        
+        if n < 4:
+            return lookahead
+        
+        # Adaptive parameters based on problem characteristics
+        lookahead_depth = min(3, int(2 + char['size'] / 50))
+        neighborhood_size = min(5, int(2 + char['size'] / 20))
+        
+        # Precompute limited neighborhood for each node
+        neighborhoods = {}
+        for i in range(n):
+            # Take closest neighbors, but also include some random diverse ones
+            close_neighbors = nearest_indices[i, :neighborhood_size]
+            if len(close_neighbors) < neighborhood_size:
+                close_neighbors = np.append(close_neighbors, 
+                                          np.random.choice([j for j in range(n) if j != i], 
+                                                         neighborhood_size - len(close_neighbors), 
+                                                         replace=False))
+            neighborhoods[i] = set(close_neighbors)
+        
+        for i in range(n):
+            for j in neighborhoods[i]:
+                if i == j:
+                    continue
+                
+                # Evaluate limited lookahead paths
+                min_path_cost = float('inf')
+                
+                # Try depth-limited exploration
+                def explore_path(current: int, visited: set, depth: int, cost: float) -> float:
+                    if depth == 0 or len(visited) == n:
+                        # Estimate remaining tour using MST approximation
+                        remaining = [k for k in range(n) if k not in visited]
+                        if not remaining:
+                            return cost
+                        
+                        # Create submatrix for remaining nodes
+                        sub_idx = list(visited) + remaining
+                        sub_matrix = distance_matrix[np.ix_(sub_idx, sub_idx)]
+                        
+                        if len(sub_idx) > 1:
+                            mst_remaining = minimum_spanning_tree(sub_matrix)
+                            mst_cost = mst_remaining.sum()
+                            # Approximate remaining tour as 2x MST (Christofides-like)
+                            remaining_cost = 2 * mst_cost
+                        else:
+                            remaining_cost = 0
+                        
+                        return cost + remaining_cost
+                    
+                    # Consider limited next steps from current node
+                    candidates = list(neighborhoods[current] - visited)
+                    if not candidates:
+                        candidates = [k for k in range(n) if k not in visited][:neighborhood_size]
+                    
+                    best_local = float('inf')
+                    for next_node in candidates[:neighborhood_size]:
+                        new_visited = visited | {next_node}
+                        new_cost = cost + distance_matrix[current, next_node]
+                        path_cost = explore_path(next_node, new_visited, depth-1, new_cost)
+                        best_local = min(best_local, path_cost)
+                    
+                    return best_local
+                
+                # Start with edge (i, j)
+                initial_visited = {i, j}
+                initial_cost = distance_matrix[i, j]
+                estimated_cost = explore_path(j, initial_visited, lookahead_depth - 1, initial_cost)
+                
+                # Convert to score (lower cost = higher score)
+                if estimated_cost > 0:
+                    lookahead[i, j] = 1.0 / estimated_cost
+                else:
+                    lookahead[i, j] = 1.0
+        
+        # Symmetrize and normalize
+        lookahead = (lookahead + lookahead.T) / 2
+        max_val = np.max(lookahead)
+        if max_val > 0:
+            lookahead = lookahead / max_val
+            
+        return lookahead
+    
+    lookahead_scores = compute_lookahead_scores()
+    
+    # ==================== 4. HIERARCHICAL REGRET ANALYSIS ====================
+    def compute_regret_scores() -> np.ndarray:
+        """Multi-level regret analysis with caching"""
+        regret = np.ones_like(distance_matrix)
+        
+        if n < 3:
+            return regret
+        
+        # Adaptive regret parameters
+        k_alternatives = min(7, n - 2)
+        
+        # Precompute sorted distances for each node (excluding self)
+        sorted_dists = []
+        sorted_indices = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            sorted_idx = np.argsort(dists)
+            sorted_dists.append(dists[sorted_idx])
+            sorted_indices.append(sorted_idx)
+        
+        for i in range(n):
+            # Consider top k alternatives for each target j
+            for rank, j in enumerate(nearest_indices[i]):
+                if j == i:
+                    continue
+                
+                # Get k best alternative edges from i (excluding j)
+                alt_indices = [idx for idx in sorted_indices[i][:k_alternatives+1] 
+                             if idx != j][:k_alternatives]
+                
+                if not alt_indices:
+                    continue
+                
+                # Compute simple 2-step alternative paths
+                alt_costs = []
+                for alt in alt_indices:
+                    # Find best completion from alt to j or similar node
+                    # Simple approximation: alt -> nearest to j
+                    candidates = [k for k in nearest_indices[alt] if k != i and k != alt]
+                    if candidates:
+                        best_next = candidates[0]
+                        alt_cost = distance_matrix[i, alt] + distance_matrix[alt, best_next]
+                        # Add estimated continuation to j
+                        if best_next != j:
+                            # Approximate with triangle inequality
+                            est_to_j = distance_matrix[best_next, j]
+                            alt_cost += est_to_j
+                        else:
+                            alt_cost += 0
+                        alt_costs.append(alt_cost)
+                
+                if alt_costs:
+                    # Calculate weighted regret
+                    current_cost = distance_matrix[i, j]
+                    best_alt = np.min(alt_costs)
+                    raw_regret = max(0, best_alt - current_cost)
+                    
+                    # Normalize by local distance scale
+                    local_scale = np.mean([distance_matrix[i, k] for k in alt_indices])
+                    if local_scale > 0:
+                        norm_regret = raw_regret / local_scale
+                    else:
+                        norm_regret = raw_regret
+                    
+                    # Convert to score using adaptive sigmoid
+                    # Scale factor adapts to problem density
+                    scale = 2.0 - char['edge_density']
+                    regret[i, j] = 1.0 / (1.0 + np.exp(-scale * norm_regret))
+        
+        # Symmetrize
+        regret = (regret + regret.T) / 2
+        return regret
+    
+    regret_scores = compute_regret_scores()
+    
+    # ==================== 5. TOPOLOGICAL FEATURE FUSION ====================
+    def compute_topological_scores() -> np.ndarray:
+        """Integrated topological features with mutual reinforcement"""
+        topology = np.ones_like(distance_matrix)
+        
+        if n < 3:
+            return topology
+        
+        # 5.1 MST-based features
+        mst_degrees = np.sum(mst_edges, axis=1)
+        
+        # Boost connections between low-degree MST nodes
+        for i in range(n):
+            for j in nearest_indices[i]:
+                if i == j:
+                    continue
+                
+                # MST edge reinforcement
+                if mst_edges[i, j]:
+                    topology[i, j] *= 1.5 + 0.3 * np.log1p(n) / 10
+                
+                # Degree complementarity bonus
+                deg_i, deg_j = mst_degrees[i], mst_degrees[j]
+                if deg_i <= 2 and deg_j <= 2:
+                    # Both are leaves or low-degree nodes
+                    topology[i, j] *= 1.2
+        
+        # 5.2 Cluster detection using distance thresholds
+        if n > 4:
+            # Adaptive threshold based on distance distribution
+            upper_triangle = distance_matrix[np.triu_indices(n, 1)]
+            cluster_threshold = np.percentile(upper_triangle, 30)
+            
+            # Identify dense connections
+            dense_mask = distance_matrix < cluster_threshold
+            np.fill_diagonal(dense_mask, False)
+            
+            # Boost intra-cluster edges
+            for i in range(n):
+                dense_neighbors = np.where(dense_mask[i])[0]
+                if len(dense_neighbors) > 1:
+                    # This node is in a dense region
+                    for j in dense_neighbors[:min(5, len(dense_neighbors))]:
+                        if i != j:
+                            # Bonus proportional to shared dense neighbors
+                            shared = len(set(dense_neighbors) & set(np.where(dense_mask[j])[0]))
+                            cluster_bonus = 1.0 + 0.15 * min(shared, 4)
+                            topology[i, j] *= cluster_bonus
+        
+        # 5.3 Boundary edge detection (approximate convex hull)
+        if n > 5:
+            # Nodes with high average distance to others are likely on boundary
+            mean_dists = np.mean(distance_matrix, axis=1)
+            boundary_threshold = np.percentile(mean_dists, 75)
+            boundary_nodes = mean_dists > boundary_threshold
+            
+            # Boost connections between boundary nodes
+            for i in np.where(boundary_nodes)[0]:
+                for j in nearest_indices[i]:
+                    if i != j and boundary_nodes[j]:
+                        # Additional check: edge should be relatively short compared to alternatives
+                        alt_dists = [distance_matrix[i, k] for k in nearest_indices[i] 
+                                   if k != j and boundary_nodes[k]]
+                        if alt_dists:
+                            if distance_matrix[i, j] < 0.7 * np.min(alt_dists):
+                                topology[i, j] *= 1.3
+        
+        return topology
+    
+    topological_scores = compute_topological_scores()
+    
+    # ==================== 6. ADAPTIVE FEATURE WEIGHTING ====================
+    def compute_adaptive_weights() -> Tuple[float, float, float, float]:
+        """Dynamic weights based on problem characteristics"""
+        # Base weights influenced by problem size and structure
+        if n < 10:
+            w_inv, w_look, w_reg, w_top = 0.3, 0.4, 0.2, 0.1
+        elif n < 30:
+            w_inv, w_look, w_reg, w_top = 0.25, 0.35, 0.25, 0.15
+        elif n < 100:
+            w_inv, w_look, w_reg, w_top = 0.2, 0.3, 0.3, 0.2
+        else:
+            w_inv, w_look, w_reg, w_top = 0.15, 0.25, 0.35, 0.25
+        
+        # Adjust based on problem characteristics
+        # More lookahead for sparse problems, more topology for dense ones
+        w_look *= (1.0 + 0.5 * char['sparsity'])
+        w_top *= (1.0 + 0.5 * char['edge_density'])
+        
+        # More regret for problems with high variation
+        w_reg *= (1.0 + 0.3 * char['distance_variation'])
+        
+        # Normalize
+        total = w_inv + w_look + w_reg + w_top
+        return w_inv/total, w_look/total, w_reg/total, w_top/total
+    
+    w_inv, w_look, w_reg, w_top = compute_adaptive_weights()
+    
+    # ==================== 7. FEATURE COMBINATION ====================
+    # Normalize individual components to comparable scales
+    components = {
+        'inv': inv_dist / (np.max(inv_dist) + 1e-8),
+        'look': lookahead_scores,
+        'reg': regret_scores,
+        'top': topological_scores / (np.max(topological_scores) + 1e-8)
+    }
+    
+    # Weighted linear combination
+    combined = (w_inv * components['inv'] + 
+                w_look * components['look'] + 
+                w_reg * components['reg'] + 
+                w_top * components['top'])
+    
+    # Ensure symmetry
+    symmetric = (combined + combined.T) / 2
+    np.fill_diagonal(symmetric, 0)
+    
+    # ==================== 8. INTELLIGENT SPARSIFICATION ====================
+    def adaptive_sparsify(scores: np.ndarray) -> np.ndarray:
+        """Keep most promising edges while maintaining connectivity"""
+        sparsified = np.zeros_like(scores)
+        
+        if n <= 2:
+            return scores
+        
+        # Adaptive retention per node
+        base_retain = max(3, int(np.sqrt(n) + 1))
+        
+        for i in range(n):
+            row_scores = scores[i].copy()
+            row_scores[i] = -np.inf
+            
+            # Determine threshold adaptively
+            positive = row_scores[row_scores > 0]
+            if len(positive) == 0:
+                continue
+            
+            # Keep at least base_retain edges
+            n_keep = min(base_retain + int(mst_degrees[i] * 0.5), n - 1)
+            n_keep = min(n_keep, len(positive))
+            
+            if n_keep > 0:
+                threshold = np.partition(row_scores, -n_keep)[-n_keep]
+                keep_mask = row_scores >= max(threshold, np.median(positive))
+                
+                # Also keep MST edges
+                keep_mask = keep_mask | mst_edges[i]
+                
+                # Apply mask
+                sparsified[i, keep_mask] = scores[i, keep_mask]
+        
+        return sparsified
+    
+    sparsified = adaptive_sparsify(symmetric)
+    
+    # ==================== 9. FINAL ENHANCEMENTS ====================
+    # Distance-based attenuation (exponential decay)
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        decay = np.exp(-distance_matrix / (0.3 * max_dist + 1e-8))
+        final = sparsified * decay
+    else:
+        final = sparsified
+    
+    # Mild MST reinforcement for connectivity
+    final = final * np.where(mst_edges, 1.2, 1.0)
+    
+    # Final normalization
+    max_val = np.max(final)
+    if max_val > 0:
+        final = final / max_val
+    
+    # Ensure symmetry one last time
+    final = (final + final.T) / 2
+    np.fill_diagonal(final, 0)
+    
+    return final
+```

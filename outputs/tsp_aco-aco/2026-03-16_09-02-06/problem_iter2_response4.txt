@@ -1,0 +1,211 @@
+```json
+{
+    "algorithm_features": ["Two-step Path Efficiency Lookahead", "Adaptive Clustering Coefficient Weighting", "Distribution-aware Triangle Inequality", "Mutual Preference Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.ndimage import gaussian_filter
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with:
+    1. Two-step path efficiency lookahead
+    2. Adaptive clustering coefficient weighting
+    3. Distribution-aware triangle inequality penalty
+    4. Mutual preference sparsification
+    
+    Returns a matrix of edge priorities with the same shape as the input.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Trivial cases
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. Base reciprocal distance ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1.0 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # === 2. Adaptive sparsification via mutual preference ===
+    k = max(2, int(np.sqrt(n)))  # Neighborhood size
+    
+    # Create preference scores based on distance ranks
+    preference = np.zeros_like(distance_matrix)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        ranks = np.argsort(np.argsort(dists))
+        pref_scores = (n - 1 - ranks) / (n - 1)
+        preference[i] = pref_scores
+    
+    # Mutual preference: geometric mean of both endpoints' preferences
+    mutual_pref = np.sqrt(preference * preference.T)
+    
+    # Keep edges where at least one endpoint ranks it in top k
+    mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        # Get k+1 smallest distances (including self)
+        nearest = np.argpartition(distance_matrix[i], k+1)[:k+1]
+        nearest = nearest[nearest != i][:k]  # Remove self, keep exactly k
+        mask[i, nearest] = True
+    
+    # === 3. Adaptive clustering coefficient weighting ===
+    # Compute local clustering coefficients based on reciprocal distances
+    clust_coeff = np.zeros(n)
+    for i in range(n):
+        # Find top neighbors by reciprocal distance
+        recip_i = reciprocal[i].copy()
+        recip_i[i] = -np.inf
+        top_neighbors = np.argsort(recip_i)[-k:]
+        
+        if len(top_neighbors) >= 2:
+            # Compute average reciprocal among neighbors
+            total = 0
+            count = 0
+            for idx_a, a in enumerate(top_neighbors):
+                for b in top_neighbors[idx_a+1:]:
+                    if reciprocal[a, b] > 0:
+                        total += reciprocal[a, b]
+                        count += 1
+            clust_coeff[i] = total / max(count, 1)
+        else:
+            clust_coeff[i] = 0
+    
+    # Normalize clustering coefficients
+    if np.max(clust_coeff) > 0:
+        clust_coeff = clust_coeff / np.max(clust_coeff)
+    
+    # Apply clustering boost: edges between nodes in dense regions get higher weight
+    clust_boost = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                clust_boost[i, j] = 1.0 + 0.5 * (clust_coeff[i] + clust_coeff[j])
+    
+    # === 4. Distribution-aware triangle inequality penalty ===
+    # First compute all triangle ratios to determine adaptive threshold
+    triangle_ratios = []
+    for i in range(n):
+        for j in range(i+1, n):
+            if mask[i, j] or mask[j, i]:  # Only consider promising edges
+                # Find best alternative one-step path
+                others = [k for k in range(n) if k not in (i, j)]
+                if others:
+                    indirect = distance_matrix[i, others] + distance_matrix[others, j]
+                    best_indirect = np.min(indirect)
+                    if best_indirect > 0:
+                        ratio = distance_matrix[i, j] / best_indirect
+                        triangle_ratios.append(ratio)
+    
+    # Set adaptive threshold based on percentile of observed ratios
+    if triangle_ratios:
+        threshold = np.percentile(triangle_ratios, 75)  # 75th percentile
+        threshold = max(1.2, min(2.0, threshold))  # Bound between 1.2 and 2.0
+    else:
+        threshold = 1.5  # Default fallback
+    
+    # Apply penalty with adaptive threshold
+    tri_penalty = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            others = [k for k in range(n) if k not in (i, j)]
+            if others:
+                indirect = distance_matrix[i, others] + distance_matrix[others, j]
+                best_indirect = np.min(indirect)
+                if distance_matrix[i, j] > threshold * best_indirect:
+                    penalty = best_indirect / distance_matrix[i, j]
+                    tri_penalty[i, j] = tri_penalty[j, i] = max(0.3, penalty)
+    
+    # === 5. Two-step path efficiency lookahead ===
+    two_step_penalty = np.ones_like(distance_matrix)
+    m = max(2, k // 2)  # Smaller neighborhood for two-step lookahead
+    
+    for i in range(n):
+        # Get top m neighbors for i
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        top_i = np.argsort(dists_i)[:m]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Get top m neighbors for j
+            dists_j = distance_matrix[j].copy()
+            dists_j[j] = np.inf
+            top_j = np.argsort(dists_j)[:m]
+            
+            # Find best two-step path i->a->b->j
+            best_two_step = np.inf
+            for a in top_i:
+                if a == j:
+                    continue
+                for b in top_j:
+                    if b == i or b == a:
+                        continue
+                    path_len = (distance_matrix[i, a] + 
+                               distance_matrix[a, b] + 
+                               distance_matrix[b, j])
+                    best_two_step = min(best_two_step, path_len)
+            
+            # Apply penalty if direct edge is inefficient
+            if best_two_step < np.inf and distance_matrix[i, j] > 1.8 * best_two_step:
+                penalty = best_two_step / distance_matrix[i, j]
+                two_step_penalty[i, j] = max(0.2, penalty)
+    
+    # === 6. Degree awareness (boost for nodes with few good connections) ===
+    degree_boost = np.ones_like(distance_matrix)
+    for i in range(n):
+        # Count how many edges are in top reciprocal quartile
+        recip_i = reciprocal[i].copy()
+        recip_i[i] = -np.inf
+        if np.max(recip_i) > 0:
+            threshold = np.percentile(recip_i[recip_i > 0], 75)
+            good_count = np.sum(recip_i >= threshold)
+            
+            if good_count < 3 and good_count > 0:
+                boost = 3.0 / good_count
+                # Apply boost to this node's best edges
+                best_edges = recip_i >= threshold
+                degree_boost[i, best_edges] = boost
+    
+    # === 7. Combine all factors ===
+    # Start with base reciprocal and mutual preference
+    heuristics = reciprocal * mutual_pref
+    
+    # Apply penalties and boosts
+    heuristics *= tri_penalty * two_step_penalty
+    heuristics *= degree_boost * clust_boost
+    
+    # Sparsify using mutual mask (keep if either endpoint considers it promising)
+    mask_symmetric = mask | mask.T
+    heuristics = heuristics * mask_symmetric
+    
+    # Apply minimum spanning tree as fallback for connectivity
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0).astype(float)
+    heuristics = np.maximum(heuristics, 0.1 * mst_mask * heuristics.max())
+    
+    # Ensure symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # Smooth with light Gaussian filter (preserves sparsity pattern)
+    non_zero_mask = heuristics > 0
+    heuristics_smoothed = gaussian_filter(heuristics, sigma=0.3, mode='constant')
+    heuristics = heuristics_smoothed * non_zero_mask
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

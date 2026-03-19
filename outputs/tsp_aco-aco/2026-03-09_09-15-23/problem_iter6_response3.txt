@@ -1,0 +1,587 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Thresholding", "Instance-Aware Weight Learning", "Centrality-Enhanced Multi-Hop Lookahead", "Sparsity-Adaptive Search Depth"]
+}
+```
+
+```python
+import numpy as np
+import warnings
+from typing import Tuple, Dict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with adaptive regret thresholds,
+    instance-aware weight learning, and centrality-enhanced multi-hop lookahead.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Matrix of edge priorities with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # 1. Adaptive Neighborhood Selection with Sparsity Awareness
+    adjacency_mask, sparsity_score = _adaptive_neighborhood_selection_v2(distance_matrix, n)
+    
+    # 2. Instance Characterization
+    instance_features = _compute_instance_characteristics(distance_matrix, adjacency_mask, n, sparsity_score)
+    
+    # 3. Rank-Weighted Inverse Distance with Adaptive Decay
+    inv_dist = _rank_weighted_inverse_distance_v2(distance_matrix, adjacency_mask, n, instance_features)
+    
+    # 4. MST Analysis with Dynamic Bonuses
+    mst_mask, odd_degree_nodes, mst_centrality = _mst_analysis_v2(distance_matrix, n, instance_features)
+    
+    # 5. Adaptive Multi-Hop Regret Analysis
+    regret_scores = _adaptive_multi_hop_regret(distance_matrix, adjacency_mask, n, instance_features)
+    
+    # 6. Centrality-Enhanced Multi-Hop Lookahead
+    lookahead_scores = _centrality_enhanced_lookahead(distance_matrix, adjacency_mask, n, mst_centrality)
+    
+    # 7. Instance-Aware Component Weighting
+    component_weights = _learn_component_weights(instance_features)
+    
+    # 8. Dynamic Combination of Components
+    heuristics = _dynamic_component_combination(
+        distance_matrix, adjacency_mask, inv_dist, mst_mask, 
+        odd_degree_nodes, regret_scores, lookahead_scores, 
+        component_weights, instance_features, n
+    )
+    
+    # 9. Final Processing with Sparsity Adaptation
+    heuristics = _final_processing_v2(heuristics, adjacency_mask, n, sparsity_score)
+    
+    return heuristics
+
+def _adaptive_neighborhood_selection_v2(distance_matrix: np.ndarray, n: int) -> Tuple[np.ndarray, float]:
+    """Select adaptive neighborhoods with sparsity scoring."""
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Base neighborhood size with sparsity adaptation
+    base_k = max(2, int(np.sqrt(n)))
+    sparsity_scores = []
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Sort distances
+        sorted_dists = np.sort(distances)
+        
+        # Calculate local sparsity measure
+        if len(sorted_dists) >= 3:
+            # Ratio of median to minimum distance
+            min_dist = sorted_dists[0]
+            median_dist = sorted_dists[len(sorted_dists)//2]
+            sparsity = median_dist / (min_dist + 1e-10)
+            sparsity_scores.append(sparsity)
+            
+            # Adaptive k based on local sparsity
+            adaptive_k = min(n-1, int(base_k * (1.0 + 0.3 * np.log1p(sparsity))))
+        else:
+            adaptive_k = base_k
+            sparsity_scores.append(1.0)
+        
+        # Get nearest neighbors
+        nn_indices = np.argpartition(distances, adaptive_k)[:adaptive_k]
+        adjacency_mask[i, nn_indices] = True
+        
+        # Adaptive threshold based on sparsity
+        if len(nn_indices) > 0:
+            if sparsity_scores[-1] > 1.5:  # Sparse region
+                threshold = 1.8 * np.max(distances[nn_indices])
+            else:  # Dense region
+                threshold = 1.2 * np.max(distances[nn_indices])
+            within_threshold = distances <= threshold
+            adjacency_mask[i, within_threshold] = True
+    
+    # Global sparsity score
+    global_sparsity = np.median(sparsity_scores) if sparsity_scores else 1.0
+    
+    # Ensure symmetry
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    return adjacency_mask, global_sparsity
+
+def _compute_instance_characteristics(distance_matrix: np.ndarray, 
+                                     adjacency_mask: np.ndarray, 
+                                     n: int, 
+                                     sparsity_score: float) -> Dict[str, float]:
+    """Compute comprehensive instance features for adaptive behavior."""
+    features = {}
+    
+    # 1. Degree distribution characteristics
+    degrees = adjacency_mask.sum(axis=1)
+    features['avg_degree'] = degrees.mean() / n
+    features['degree_skew'] = np.abs(degrees.mean() - np.median(degrees)) / (degrees.std() + 1e-10)
+    
+    # 2. Distance distribution characteristics
+    masked_dists = distance_matrix[adjacency_mask]
+    if len(masked_dists) > 0:
+        features['dist_cv'] = masked_dists.std() / (masked_dists.mean() + 1e-10)
+        features['dist_skew'] = np.mean((masked_dists - masked_dists.mean())**3) / (masked_dists.std()**3 + 1e-10)
+    else:
+        features['dist_cv'] = 1.0
+        features['dist_skew'] = 0.0
+    
+    # 3. Clustering coefficient
+    clustering_sum = 0
+    for i in range(n):
+        neighbors = np.where(adjacency_mask[i])[0]
+        if len(neighbors) >= 2:
+            neighbor_mask = adjacency_mask[neighbors][:, neighbors]
+            triangles = neighbor_mask.sum() / 2
+            possible = len(neighbors) * (len(neighbors) - 1) / 2
+            clustering_sum += triangles / (possible + 1e-10)
+    features['clustering'] = clustering_sum / n
+    
+    # 4. Sparsity feature
+    features['sparsity'] = sparsity_score
+    
+    # 5. Minimum spanning tree characteristics
+    try:
+        from scipy.sparse import csgraph
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_dists = mst[mst > 0].data
+        if len(mst_dists) > 0:
+            features['mst_cv'] = mst_dists.std() / (mst_dists.mean() + 1e-10)
+        else:
+            features['mst_cv'] = 1.0
+    except:
+        features['mst_cv'] = 1.0
+    
+    return features
+
+def _rank_weighted_inverse_distance_v2(distance_matrix: np.ndarray, 
+                                      adjacency_mask: np.ndarray, 
+                                      n: int,
+                                      instance_features: Dict[str, float]) -> np.ndarray:
+    """Compute inverse distance with instance-adaptive rank weighting."""
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Adaptive decay based on instance characteristics
+    # More clustered instances benefit from sharper decay
+    base_decay = 0.7
+    decay_factor = base_decay * (1.0 + 0.3 * instance_features['clustering'])
+    
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = row_dists[valid_mask]
+            if len(valid_dists) > 0:
+                # Rank by distance (closest = rank 1)
+                ranks = np.argsort(np.argsort(valid_dists)) + 1
+                
+                # Adaptive exponential decay
+                weights = np.exp(-decay_factor * (ranks - 1))
+                weights = weights / np.sum(weights)
+                
+                # Apply weighted inverse distance with distance variance consideration
+                if instance_features['dist_cv'] > 1.0:
+                    # For high variance, use inverse square for stronger discrimination
+                    inv_vals = 1.0 / (valid_dists**2 + 1e-10)
+                else:
+                    inv_vals = 1.0 / (valid_dists + 1e-10)
+                
+                inv_dist[i, valid_mask] = inv_vals * weights
+    
+    # Symmetrize with geometric mean for consistency
+    inv_dist = np.sqrt(np.maximum(inv_dist, 1e-10) * np.maximum(inv_dist.T, 1e-10))
+    
+    return inv_dist
+
+def _mst_analysis_v2(distance_matrix: np.ndarray, 
+                    n: int,
+                    instance_features: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Enhanced MST analysis with centrality computation."""
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    try:
+        # Compute MST using Prim's algorithm
+        visited = np.zeros(n, dtype=bool)
+        min_edge = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        mst_weights = np.zeros(n)
+        
+        min_edge[0] = 0
+        
+        for _ in range(n):
+            # Find minimum edge to unvisited node
+            u = -1
+            min_val = np.inf
+            for i in range(n):
+                if not visited[i] and min_edge[i] < min_val:
+                    min_val = min_edge[i]
+                    u = i
+            
+            if u == -1:
+                break
+                
+            visited[u] = True
+            
+            # Add edge to MST if not the root
+            if parent[u] != -1:
+                mst_mask[u, parent[u]] = True
+                mst_mask[parent[u], u] = True
+                mst_weights[u] = distance_matrix[u, parent[u]]
+            
+            # Update distances to unvisited nodes
+            for v in range(n):
+                if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                    min_edge[v] = distance_matrix[u, v]
+                    parent[v] = u
+        
+        # Compute MST degrees for Christofides bonus
+        mst_degrees = np.sum(mst_mask, axis=1)
+        odd_degree_nodes = np.where(mst_degrees % 2 == 1)[0]
+        
+        # Compute MST-based centrality (betweenness approximation)
+        mst_centrality = np.zeros(n)
+        for i in range(n):
+            if mst_degrees[i] > 1:
+                # Nodes with higher degree in MST are more central
+                mst_centrality[i] = mst_degrees[i] / (np.sum(mst_degrees) + 1e-10)
+            else:
+                # Leaf nodes get reduced centrality
+                mst_centrality[i] = 0.5 / n
+        
+        # Normalize centrality
+        if mst_centrality.max() > 0:
+            mst_centrality = mst_centrality / mst_centrality.max()
+        
+    except Exception as e:
+        warnings.warn(f"MST computation failed: {e}")
+        # Fallback
+        for i in range(n):
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nearest = np.argmin(distances)
+            mst_mask[i, nearest] = mst_mask[nearest, i] = True
+        
+        mst_degrees = np.sum(mst_mask, axis=1)
+        odd_degree_nodes = np.where(mst_degrees % 2 == 1)[0]
+        mst_centrality = np.ones(n) / n
+    
+    return mst_mask, odd_degree_nodes, mst_centrality
+
+def _adaptive_multi_hop_regret(distance_matrix: np.ndarray,
+                              adjacency_mask: np.ndarray,
+                              n: int,
+                              instance_features: Dict[str, float]) -> np.ndarray:
+    """Adaptive regret analysis with sparsity-aware thresholds."""
+    regret = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Adaptive search depth based on sparsity
+    if instance_features['sparsity'] > 2.0:  # Very sparse
+        max_depth = 2
+        sample_size = min(5, n-2)
+    elif instance_features['sparsity'] > 1.2:  # Sparse
+        max_depth = 3
+        sample_size = min(8, n-2)
+    else:  # Dense
+        max_depth = 4
+        sample_size = min(15, n-2)
+    
+    # Adaptive regret threshold
+    regret_threshold = 1.5 + 0.5 * instance_features['sparsity']
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                direct_dist = distance_matrix[i, j]
+                
+                if direct_dist < 1e-10:
+                    continue
+                
+                # Find best alternative paths
+                min_alternative = np.inf
+                
+                # 2-hop alternatives (always check)
+                for k in range(n):
+                    if k != i and k != j:
+                        two_hop_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                        min_alternative = min(min_alternative, two_hop_dist)
+                
+                # Deeper alternatives if needed and if max_depth > 2
+                if max_depth >= 3 and min_alternative < direct_dist * regret_threshold:
+                    # Sample intermediate nodes for efficiency
+                    candidates = np.random.choice([x for x in range(n) if x not in [i, j]], 
+                                                 size=min(sample_size, n-2), replace=False)
+                    
+                    # 3-hop alternatives
+                    for k1 in candidates:
+                        for k2 in candidates:
+                            if k1 != k2:
+                                three_hop_dist = (distance_matrix[i, k1] + 
+                                                 distance_matrix[k1, k2] + 
+                                                 distance_matrix[k2, j])
+                                min_alternative = min(min_alternative, three_hop_dist)
+                    
+                    # 4-hop alternatives if max_depth >= 4
+                    if max_depth >= 4:
+                        for k1 in candidates:
+                            for k2 in candidates:
+                                if k1 == k2:
+                                    continue
+                                for k3 in candidates:
+                                    if k3 in [k1, k2]:
+                                        continue
+                                    four_hop_dist = (distance_matrix[i, k1] + 
+                                                    distance_matrix[k1, k2] + 
+                                                    distance_matrix[k2, k3] + 
+                                                    distance_matrix[k3, j])
+                                    min_alternative = min(min_alternative, four_hop_dist)
+                
+                if min_alternative < np.inf:
+                    # Regret ratio with adaptive transformation
+                    regret_ratio = min_alternative / direct_dist
+                    
+                    # Different transformation based on instance characteristics
+                    if instance_features['dist_skew'] > 0.5:  # Right-skewed distances
+                        # More aggressive transformation for skewed distributions
+                        regret[i, j] = regret[j, i] = np.exp(2.0 * (regret_ratio - 1))
+                    else:
+                        regret[i, j] = regret[j, i] = np.exp(regret_ratio - 1)
+    
+    # Normalize with adaptive scaling
+    max_regret = regret.max()
+    if max_regret > 0:
+        regret = regret / max_regret
+    
+    # Boost scores for edges with high regret (critical shortcuts)
+    regret = np.power(regret, 1.0 + 0.2 * instance_features['clustering'])
+    
+    return regret
+
+def _centrality_enhanced_lookahead(distance_matrix: np.ndarray,
+                                  adjacency_mask: np.ndarray,
+                                  n: int,
+                                  mst_centrality: np.ndarray) -> np.ndarray:
+    """Multi-hop lookahead enhanced with node centrality measures."""
+    lookahead = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Compute degree centrality for additional perspective
+    degree_centrality = adjacency_mask.sum(axis=1)
+    if degree_centrality.max() > 0:
+        degree_centrality = degree_centrality / degree_centrality.max()
+    
+    # Combined centrality measure
+    combined_centrality = 0.7 * mst_centrality + 0.3 * degree_centrality
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                score = 0
+                total_weight = 0
+                
+                # Look at promising 3-node chains weighted by centrality
+                for k in range(n):
+                    if k != i and k != j and adjacency_mask[j, k]:
+                        # Evaluate path i->j->k and alternative i->k directly
+                        chain_length = distance_matrix[i, j] + distance_matrix[j, k]
+                        direct_length = distance_matrix[i, k]
+                        
+                        if direct_length > 1e-10:
+                            ratio = chain_length / direct_length
+                            
+                            # Penalty weighted by centrality of intermediate node
+                            penalty = max(0, 2.0 - ratio) / 2.0
+                            centrality_weight = combined_centrality[k]
+                            
+                            score += penalty * centrality_weight
+                            total_weight += centrality_weight
+                
+                if total_weight > 0:
+                    lookahead[i, j] = lookahead[j, i] = score / total_weight
+                else:
+                    # No valid chains found
+                    lookahead[i, j] = lookahead[j, i] = 0.5
+    
+    # Invert: higher penalty means lower score, so we take complement
+    lookahead = 1.0 - lookahead
+    
+    # Normalize
+    max_lookahead = lookahead.max()
+    min_lookahead = lookahead.min()
+    if max_lookahead > min_lookahead:
+        lookahead = (lookahead - min_lookahead) / (max_lookahead - min_lookahead)
+    
+    return lookahead
+
+def _learn_component_weights(instance_features: Dict[str, float]) -> Dict[str, float]:
+    """Learn optimal component weights based on instance characteristics."""
+    weights = {}
+    
+    # Base weights
+    base_inv_dist = 1.0
+    base_mst = 0.8
+    base_regret = 0.6
+    base_lookahead = 0.4
+    
+    # Adjust based on instance features
+    
+    # 1. Clustering adjustment: clustered instances benefit more from MST and lookahead
+    cluster_adj = 0.4 * instance_features['clustering']
+    weights['mst'] = base_mst + cluster_adj
+    weights['lookahead'] = base_lookahead + 0.3 * cluster_adj
+    
+    # 2. Sparsity adjustment: sparse instances need more regret analysis
+    sparsity_adj = 0.3 * min(instance_features['sparsity'], 3.0) / 3.0
+    weights['regret'] = base_regret + sparsity_adj
+    
+    # 3. Distance variance adjustment: high variance favors inverse distance
+    var_adj = 0.2 * min(instance_features['dist_cv'], 2.0) / 2.0
+    weights['inv_dist'] = base_inv_dist + var_adj
+    
+    # 4. Degree skew adjustment: skewed distributions favor lookahead
+    skew_adj = 0.2 * min(abs(instance_features['degree_skew']), 1.0)
+    weights['lookahead'] += skew_adj
+    
+    # Ensure non-negative weights
+    for key in weights:
+        weights[key] = max(0.1, weights[key])
+    
+    # Normalize to sum to 1
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] = weights[key] / total
+    
+    return weights
+
+def _dynamic_component_combination(distance_matrix: np.ndarray,
+                                  adjacency_mask: np.ndarray,
+                                  inv_dist: np.ndarray,
+                                  mst_mask: np.ndarray,
+                                  odd_degree_nodes: np.ndarray,
+                                  regret_scores: np.ndarray,
+                                  lookahead_scores: np.ndarray,
+                                  component_weights: Dict[str, float],
+                                  instance_features: Dict[str, float],
+                                  n: int) -> np.ndarray:
+    """Dynamically combine all heuristic components with learned weights."""
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Precompute local densities for adjustment
+    local_densities = np.zeros(n)
+    base_k = max(2, int(np.sqrt(n)))
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest_dists = np.partition(distances, base_k)[:base_k]
+        local_densities[i] = 1.0 / (np.mean(nearest_dists) + 1e-10)
+    
+    if local_densities.max() > 0:
+        local_densities = local_densities / local_densities.max()
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Weighted combination of components
+                component_sum = 0
+                
+                # Inverse distance component
+                if inv_dist[i, j] > 0:
+                    component_sum += component_weights['inv_dist'] * inv_dist[i, j]
+                
+                # MST component
+                mst_value = 1.0 if mst_mask[i, j] else 0.0
+                component_sum += component_weights['mst'] * mst_value
+                
+                # Regret component
+                component_sum += component_weights['regret'] * regret_scores[i, j]
+                
+                # Lookahead component
+                component_sum += component_weights['lookahead'] * lookahead_scores[i, j]
+                
+                # Base score from weighted combination
+                score = component_sum
+                
+                # Enhanced matching bonus for odd-degree nodes
+                if i in odd_degree_nodes and j in odd_degree_nodes:
+                    other_odd = [node for node in odd_degree_nodes if node not in (i, j)]
+                    if other_odd:
+                        # Weight distances by local densities
+                        weighted_dists_i = [distance_matrix[i, k] / (local_densities[k] + 1e-10) 
+                                           for k in other_odd]
+                        weighted_dists_j = [distance_matrix[j, k] / (local_densities[k] + 1e-10) 
+                                           for k in other_odd]
+                        
+                        avg_weighted_i = np.mean(weighted_dists_i) if weighted_dists_i else 0
+                        avg_weighted_j = np.mean(weighted_dists_j) if weighted_dists_j else 0
+                        
+                        if avg_weighted_i > 0 and avg_weighted_j > 0:
+                            matching_quality = (avg_weighted_i + avg_weighted_j) / (2 * distance_matrix[i, j] + 1e-10)
+                            # Adaptive bonus based on instance characteristics
+                            bonus_strength = 0.5 + 0.3 * instance_features['clustering']
+                            bonus_factor = 1.0 + bonus_strength * min(matching_quality, 2.5)
+                            score *= bonus_factor
+                
+                # Local density synergy bonus
+                density_synergy = 1.0 + 0.3 * (local_densities[i] * local_densities[j])
+                score *= density_synergy
+                
+                # Sparsity-aware scaling
+                if instance_features['sparsity'] > 1.5:
+                    # Boost scores in sparse regions to avoid over-penalizing
+                    score *= (1.0 + 0.2 * np.log1p(instance_features['sparsity']))
+                
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    return heuristics
+
+def _final_processing_v2(heuristics: np.ndarray,
+                        adjacency_mask: np.ndarray,
+                        n: int,
+                        sparsity_score: float) -> np.ndarray:
+    """Final normalization and processing with sparsity adaptation."""
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Sparsity-adaptive smoothing
+    if sparsity_score > 1.5:
+        # Sparse instances: more aggressive smoothing to connect distant nodes
+        smoothing_factor = 0.3
+    else:
+        smoothing_factor = 0.1
+    
+    # Add adaptive smoothing to promising edges
+    heuristics[adjacency_mask] += smoothing_factor * np.random.random(heuristics[adjacency_mask].shape)
+    
+    # Ensure positive values
+    heuristics = np.maximum(heuristics, 1e-10)
+    
+    # Adaptive normalization
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    
+    # Use softmax-like normalization for dense instances
+    if sparsity_score < 1.2 and n > 10:
+        # Apply softmax temperature
+        temperature = 0.5 + 0.5 * sparsity_score
+        exp_heuristics = np.exp(heuristics / temperature)
+        row_sums_exp = exp_heuristics.sum(axis=1, keepdims=True)
+        row_sums_exp[row_sums_exp == 0] = 1
+        heuristics = exp_heuristics / row_sums_exp
+    else:
+        heuristics = heuristics / row_sums
+    
+    # Symmetrize with weighted mean
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

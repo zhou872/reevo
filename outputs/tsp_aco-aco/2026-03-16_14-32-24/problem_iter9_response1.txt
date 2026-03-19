@@ -1,0 +1,177 @@
+```json
+{
+    "algorithm_features": ["Exponential Rank-Weighted Scoring", "Two-Level Regret Penalty", "Adaptive Candidate Sparsification", "Minimum Spanning Tree Bias"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge evaluation with simplified regret modeling,
+    adaptive rank weighting based on coefficient of variation, and strategic sparsification.
+    
+    Key improvements over v1:
+    1. Simplified regret-based penalty using exponential decay
+    2. Rank-weighted scoring with coefficient of variation mapped via sigmoid
+    3. More aggressive sparsification with minimum degree constraints
+    4. Lightweight structural bias from Minimum Spanning Tree
+    """
+    n = distance_matrix.shape[0]
+    
+    # Safe distance matrix (avoid self-loops and division by zero)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Adaptive candidate list with symmetry enforcement
+    # Use O(log(n)) candidates per node, with minimum 4
+    k_candidate = max(4, int(np.log2(n) * 2.5))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get top k candidates by distance
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure candidate list is symmetric
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 2. Simplified Regret-Based Penalty using exponential decay
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        # Get two smallest distances (excluding infinity)
+        sorted_dists = np.sort(dists[dists < np.inf])
+        
+        if len(sorted_dists) >= 2:
+            best_dist = sorted_dists[0]
+            second_best = sorted_dists[1]
+            
+            # Normalize difference to second-best alternative
+            for j in range(n):
+                if i != j and dists[j] < np.inf:
+                    # Compute normalized regret: (d_ij - d_best) / (d_second - d_best + eps)
+                    norm_diff = (dists[j] - best_dist) / (second_best - best_dist + eps)
+                    # Apply exponential penalty: exp(-norm_diff)
+                    regret_matrix[i, j] = np.exp(-norm_diff)
+        else:
+            # Fallback: uniform penalty for isolated nodes
+            regret_matrix[i, :] = 1.0
+            regret_matrix[i, i] = 0.0
+    
+    # 3. Exponential Rank-Weighted Scoring with Coefficient of Variation
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get first 5 nearest distances (or as many as available)
+        distances = safe_dist[i].copy()
+        sorted_idx = np.argsort(distances)
+        
+        # Coefficient of Variation for first k distances
+        k = min(5, n-1)
+        if k > 1:
+            top_k_dists = distances[sorted_idx[1:k+1]]
+            mean_dist = np.mean(top_k_dists)
+            std_dist = np.std(top_k_dists)
+            
+            if mean_dist > eps:
+                cv = std_dist / mean_dist
+                # Map CV to decay rate using sigmoid: 0.3 to 0.85 range
+                # Sigmoid: 1 / (1 + exp(-x)), scaled and shifted
+                # Transform cv to get desired range
+                x = 4.0 * (cv - 0.5)  # Adjust sensitivity
+                decay_rate = 0.3 + 0.55 * (1 / (1 + np.exp(-x)))
+                decay_rate = np.clip(decay_rate, 0.3, 0.85)
+            else:
+                decay_rate = 0.7
+        else:
+            decay_rate = 0.7
+        
+        # Assign weights with exponential decay by rank
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # 4. Inverse distance weighting (normalized)
+    inv_dist = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row = safe_dist[i]
+        if np.max(row) > eps:
+            # Normalize inverse distances
+            inv_row = 1.0 / (row + eps)
+            # Scale by average of top k distances
+            top_k = np.sort(row)[1:min(6, n)]
+            scale = np.mean(top_k) if len(top_k) > 0 else 1.0
+            inv_dist[i] = inv_row * scale
+    
+    # 5. Minimum Spanning Tree structural bias
+    mst_bias = np.zeros_like(distance_matrix)
+    if n <= 2000:  # Reasonable limit for MST computation
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            mst_bias = mst_mask * 0.25  # Lower weight than v1
+        except:
+            pass  # Fallback: no MST bias
+    
+    # 6. Combine factors with simplified formula
+    # Base score: inverse distance weighted by rank
+    base_score = inv_dist * rank_weights
+    
+    # Apply regret penalty multiplicatively
+    score_with_regret = base_score * regret_matrix
+    
+    # Add MST bias additively (not multiplicative as in v1)
+    heuristics_matrix = score_with_regret * (1.0 + mst_bias)
+    
+    # 7. Multi-factor sparsification with connectivity constraints
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure each node has at least 3 connections (increased from v1)
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_indices = np.where(row > 0)[0]
+        
+        if len(nonzero_indices) < 3:
+            # Need to add more connections
+            all_indices = np.arange(n)
+            # Exclude self and already selected
+            available = np.setdiff1d(all_indices, np.append(nonzero_indices, i))
+            if len(available) > 0:
+                # Add connections based on combined score
+                scores = []
+                for j in available:
+                    combined_score = (rank_weights[i, j] * regret_matrix[i, j] * 
+                                    (1.0 / (safe_dist[i, j] + eps)))
+                    scores.append(combined_score)
+                
+                # Select top missing connections
+                needed = 3 - len(nonzero_indices)
+                top_k = min(needed, len(available))
+                if top_k > 0:
+                    top_indices = np.argsort(scores)[-top_k:]
+                    for idx in top_indices:
+                        j = available[idx]
+                        boost = np.max(row) * 1.2 if np.max(row) > 0 else 1.0
+                        heuristics_matrix[i, j] = boost
+                        heuristics_matrix[j, i] = boost
+    
+    # 8. Symmetrize and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1] range with softmax-style scaling
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        # Use soft normalization: preserve relative differences but compress range
+        heuristics_matrix = heuristics_matrix / max_val
+        # Apply mild exponential scaling to emphasize differences
+        heuristics_matrix = np.power(heuristics_matrix, 0.8)
+    
+    return heuristics_matrix
+```

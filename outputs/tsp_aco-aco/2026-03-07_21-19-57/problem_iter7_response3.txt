@@ -1,0 +1,205 @@
+```json
+{
+    "algorithm_features": ["Bidirectional Rank Regret", "Adaptive Density Similarity", "Dynamic Threshold Sparsification", "Minimum Spanning Tree Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with bidirectional
+    rank-based regret minimization and dynamic thresholding.
+    
+    Core improvements over v1:
+    1. Bidirectional Rank Regret: Considers rank alternatives from both endpoints
+       to better capture opportunity cost and edge importance
+    2. Adaptive Density Similarity: Exponential bonus based on local cluster density
+       similarity to encourage intra-cluster connections
+    3. Dynamic Threshold Sparsification: Adaptive sparsification that preserves
+       structurally important edges while removing unpromising ones
+    4. Minimum Spanning Tree Preservation: Guarantees connectivity through MST edges
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # 1. BIDIRECTIONAL RANK REGRET MINIMIZATION
+    # Compute rank-based opportunity cost from both endpoints
+    rank_regret = np.ones((n, n))
+    
+    # Precompute sorted distances and ranks for all nodes
+    sorted_indices = np.zeros((n, n-1), dtype=int)
+    sorted_dists = np.zeros((n, n-1))
+    
+    for i in range(n):
+        dist_i = distance_matrix[i, :].copy()
+        dist_i[i] = np.inf
+        sorted_idx = np.argsort(dist_i)
+        sorted_indices[i] = sorted_idx
+        sorted_dists[i] = dist_i[sorted_idx]
+    
+    # Compute regret based on ranks from both endpoints
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Find rank of j in i's sorted neighbors
+            rank_i = np.where(sorted_indices[i] == j)[0][0]
+            
+            # Find rank of i in j's sorted neighbors  
+            rank_j = np.where(sorted_indices[j] == i)[0][0]
+            
+            # Combined regret measure (lower rank sum = less regret)
+            # Normalize by (n-1) to keep in [0,1] range
+            regret_score = (rank_i + rank_j) / (2 * (n - 2))
+            
+            # Transform: lower regret -> higher heuristic value
+            rank_regret[i, j] = 1.0 / (1.0 + regret_score)
+    
+    # 2. ADAPTIVE DENSITY SIMILARITY BONUS
+    # Compute local density using k-nearest neighbors
+    k = max(3, min(10, int(0.15 * n)))  # Adaptive k based on problem size
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Get k nearest distances
+        if len(distances) > k:
+            kth_smallest = np.partition(distances, k)[k]
+            nearest_dists = distances[distances <= kth_smallest]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        
+        if len(nearest_dists) > 0:
+            # Density as inverse of average nearest neighbor distance
+            local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+        else:
+            local_density[i] = 1.0
+    
+    # Normalize densities to [0, 1] range
+    if np.max(local_density) > np.min(local_density):
+        local_density = (local_density - np.min(local_density)) / \
+                       (np.max(local_density) - np.min(local_density))
+    
+    # Apply exponential similarity bonus
+    density_bonus = np.ones((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            density_diff = abs(local_density[i] - local_density[j])
+            # Enhanced formula with stronger emphasis on similarity
+            density_bonus[i, j] = 1.0 + np.exp(-3.0 * density_diff)
+    
+    # 3. LOCAL DENSITY-BASED PROXIMITY BONUS
+    # Compute average nearest neighbor distances for thresholding
+    avg_nn_dist = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        k_effective = min(k, np.sum(distances < np.inf))
+        if k_effective > 0:
+            k_smallest = np.partition(distances, k_effective)[:k_effective]
+            avg_nn_dist[i] = np.mean(k_smallest)
+        else:
+            avg_nn_dist[i] = 1.0
+    
+    # Apply dynamic thresholding with density-aware bonuses
+    proximity_factor = np.ones((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist = distance_matrix[i, j]
+            threshold = 2.0 * min(avg_nn_dist[i], avg_nn_dist[j])
+            
+            if dist <= threshold:
+                # Bonus for edges within threshold, stronger for shorter edges
+                ratio = dist / (threshold + 1e-8)
+                # Enhanced bonus that considers both distance ratio and local density
+                base_bonus = 1.0 / (1.0 + 0.5 * (avg_nn_dist[i] + avg_nn_dist[j]))
+                proximity_factor[i, j] = 1.0 + (1.0 - ratio) * base_bonus
+            else:
+                # Penalty for edges beyond threshold, scaled by how far beyond
+                excess_ratio = dist / (threshold + 1e-8)
+                proximity_factor[i, j] = 0.5 / excess_ratio
+    
+    # 4. MINIMUM SPANNING TREE STRUCTURAL IMPORTANCE
+    # Always include MST edges to guarantee connectivity
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_boost = np.where(mst_mask, 1.5, 1.0)  # 50% boost for MST edges
+    
+    # 5. COMBINE ALL COMPONENTS
+    # Base component: inverse distance (with regularization)
+    avg_dist = np.mean(distance_matrix[distance_matrix > 0])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 0.1 * avg_dist)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Combine factors multiplicatively with balanced weights
+    heuristic = inv_dist * rank_regret * density_bonus * proximity_factor * mst_boost
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2.0
+    
+    # 6. INTELLIGENT DYNAMIC SPARSIFICATION
+    sparsify_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always preserve MST edges
+    sparsify_mask = sparsify_mask | mst_mask
+    
+    # Dynamic threshold based on heuristic distribution
+    for i in range(n):
+        # Get heuristic values for this node (excluding self)
+        node_heuristics = heuristic[i, :].copy()
+        node_heuristics[i] = -np.inf
+        
+        # Determine number of edges to preserve per node
+        # Preserve more edges for larger problems
+        preserve_count = max(2, min(n//2, int(0.25 * n)))
+        
+        # Preserve top edges by combined heuristic
+        top_indices = np.argpartition(node_heuristics, -preserve_count)[-preserve_count:]
+        sparsify_mask[i, top_indices] = True
+        sparsify_mask[top_indices, i] = True
+        
+        # Additionally preserve edges that are in top ranks for both endpoints
+        # (bidirectional strong candidates)
+        for j in range(n):
+            if i == j:
+                continue
+            # Check if edge is in top 3 for both endpoints based on rank_regret
+            if rank_regret[i, j] > np.sort(rank_regret[i, :])[-min(3, n-1)] and \
+               rank_regret[j, i] > np.sort(rank_regret[j, :])[-min(3, n-1)]:
+                sparsify_mask[i, j] = True
+                sparsify_mask[j, i] = True
+    
+    # Apply sparsification
+    heuristic = heuristic * sparsify_mask
+    
+    # Normalize to [0, 1] range for consistency
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    return heuristic
+```

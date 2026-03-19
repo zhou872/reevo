@@ -1,0 +1,355 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sampling", "Dynamic Weighting", "Ant Colony Heuristic", "Instance Adaptation"]
+}
+```
+
+```python
+import numpy as np
+import heapq
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP combining multiple strategies with adaptive learning.
+    
+    Features:
+    1. Dynamic weighting based on instance characteristics
+    2. Ant Colony Optimization inspired pheromone initialization
+    3. Instance-based parameter adaptation
+    4. Smart sparsification with memory of previous decisions
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1.0 / (distance_matrix + np.eye(n) * 1e-12)
+            result[np.isinf(result)] = 0
+        return result
+    
+    # ========== 1. INSTANCE ANALYSIS & PARAMETER ADAPTATION ==========
+    instance_type = _analyze_instance(distance_matrix, n)
+    params = _get_adaptive_parameters(n, instance_type)
+    
+    # ========== 2. BASE INVERSE DISTANCE WITH ADAPTIVE TRANSFORM ==========
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Transform distances to better match TSP properties
+        transformed_dist = distance_matrix ** params['distance_exponent']
+        inverse_dist = 1.0 / (transformed_dist + np.eye(n) * 1e-12)
+        inverse_dist[np.isinf(inverse_dist)] = 0
+    
+    # Normalize base heuristic
+    if np.max(inverse_dist) > 0:
+        inverse_dist = inverse_dist / np.max(inverse_dist)
+    
+    # ========== 3. ENHANCED MUTUAL NEAREST NEIGHBORS ==========
+    mutual_nn = _compute_mutual_nearest_neighbors(distance_matrix, n, params)
+    
+    # ========== 4. MST-BASED CONNECTIVITY WITH ADAPTIVE WEIGHTS ==========
+    mst_importance = _compute_mst_importance(distance_matrix, n)
+    
+    # ========== 5. ANT COLONY OPTIMIZATION INITIALIZATION ==========
+    pheromone_matrix = _initialize_aco_heuristic(distance_matrix, n, params)
+    
+    # ========== 6. GEOMETRIC QUALITY HEURISTIC ==========
+    geometric_factor = _compute_geometric_quality(distance_matrix, n, params)
+    
+    # ========== 7. DYNAMIC WEIGHT COMBINATION ==========
+    # Weights adapt based on instance characteristics
+    weights = params['weights']
+    
+    # Combine factors with dynamic weights
+    heuristic_matrix = (
+        weights['base'] * inverse_dist +
+        weights['mnn'] * mutual_nn +
+        weights['mst'] * mst_importance +
+        weights['aco'] * pheromone_matrix +
+        weights['geo'] * geometric_factor
+    )
+    
+    # Apply geometric factor multiplicatively as well
+    heuristic_matrix *= (1.0 + params['geo_mult_factor'] * geometric_factor)
+    
+    # ========== 8. ADAPTIVE SPARSIFICATION ==========
+    sparsified = _adaptive_sparsification(heuristic_matrix, n, params, distance_matrix)
+    
+    # ========== 9. FINAL NORMALIZATION ==========
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+
+
+def _analyze_instance(dist_matrix: np.ndarray, n: int) -> str:
+    """Analyze the instance to determine its characteristics."""
+    # Check if distances are Euclidean-like (triangle inequality holds)
+    triangle_violations = 0
+    if n >= 3:
+        sample_size = min(100, n**2)  # Sample some triangles
+        for _ in range(sample_size):
+            i, j, k = np.random.choice(n, 3, replace=False)
+            if dist_matrix[i, j] > dist_matrix[i, k] + dist_matrix[k, j]:
+                triangle_violations += 1
+        
+        violation_ratio = triangle_violations / sample_size
+        if violation_ratio > 0.1:
+            return "non_euclidean"
+    
+    # Check distance distribution
+    upper_tri = dist_matrix[np.triu_indices(n, k=1)]
+    cv = np.std(upper_tri) / np.mean(upper_tri)  # Coefficient of variation
+    
+    if cv < 0.3:
+        return "uniform"
+    elif cv > 0.7:
+        return "clustered"
+    else:
+        return "mixed"
+
+
+def _get_adaptive_parameters(n: int, instance_type: str) -> dict:
+    """Get adaptive parameters based on instance size and type."""
+    base_params = {
+        'k_neighbors': max(2, int(np.sqrt(n))),
+        'm_keep': max(3, int(np.sqrt(n))),
+        'distance_exponent': 1.0,
+        'geo_mult_factor': 0.3,
+    }
+    
+    # Adjust based on instance type
+    if instance_type == "uniform":
+        base_params.update({
+            'weights': {'base': 1.5, 'mnn': 1.2, 'mst': 0.8, 'aco': 0.6, 'geo': 0.4},
+            'num_random_tours': max(10, n // 2),
+            'sparsity_factor': 0.7,
+        })
+    elif instance_type == "clustered":
+        base_params.update({
+            'weights': {'base': 1.2, 'mnn': 1.5, 'mst': 1.0, 'aco': 0.8, 'geo': 0.5},
+            'num_random_tours': max(15, n),
+            'sparsity_factor': 0.6,  # Keep more edges for clustered instances
+        })
+    elif instance_type == "non_euclidean":
+        base_params.update({
+            'weights': {'base': 2.0, 'mnn': 0.8, 'mst': 1.2, 'aco': 1.0, 'geo': 0.3},
+            'num_random_tours': max(20, n * 2),
+            'sparsity_factor': 0.8,
+            'distance_exponent': 0.8,  # Less emphasis on raw distances
+        })
+    else:  # mixed
+        base_params.update({
+            'weights': {'base': 1.5, 'mnn': 1.0, 'mst': 1.0, 'aco': 0.7, 'geo': 0.4},
+            'num_random_tours': max(15, n),
+            'sparsity_factor': 0.7,
+        })
+    
+    return base_params
+
+
+def _compute_mutual_nearest_neighbors(dist_matrix: np.ndarray, n: int, params: dict) -> np.ndarray:
+    """Compute mutual nearest neighbors with bidirectional checking."""
+    k = params['k_neighbors']
+    mutual_nn = np.zeros((n, n))
+    
+    # Precompute nearest neighbors for all nodes
+    neighbor_lists = []
+    for i in range(n):
+        distances = dist_matrix[i].copy()
+        distances[i] = np.inf
+        nearest = np.argpartition(distances, k)[:k]
+        neighbor_lists.append(set(nearest))
+    
+    # Mark mutual nearest neighbors
+    for i in range(n):
+        for j in neighbor_lists[i]:
+            if j != i and i in neighbor_lists[j]:
+                mutual_nn[i, j] = 1
+    
+    return mutual_nn
+
+
+def _compute_mst_importance(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute MST importance with edge weights reflecting connectivity value."""
+    mst_importance = np.zeros((n, n))
+    
+    # Prim's algorithm for MST
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    heap = []
+    
+    # Initialize heap with edges from node 0
+    for j in range(1, n):
+        heapq.heappush(heap, (dist_matrix[0, j], 0, j))
+    
+    while heap:
+        dist, u, v = heapq.heappop(heap)
+        if visited[v]:
+            continue
+        
+        # Add MST edge with importance based on distance rank
+        mst_importance[u, v] = mst_importance[v, u] = 1.0
+        
+        visited[v] = True
+        
+        # Add new edges to heap
+        for w in range(n):
+            if not visited[w] and w != v:
+                heapq.heappush(heap, (dist_matrix[v, w], v, w))
+    
+    return mst_importance
+
+
+def _initialize_aco_heuristic(dist_matrix: np.ndarray, n: int, params: dict) -> np.ndarray:
+    """Initialize ACO-inspired heuristic using random tour sampling."""
+    num_tours = params['num_random_tours']
+    pheromone = np.ones((n, n))
+    np.fill_diagonal(pheromone, 0)
+    
+    if n < 4:
+        return pheromone
+    
+    # Generate random tours with simple 2-opt improvements
+    for _ in range(num_tours):
+        tour = np.random.permutation(n)
+        improved_tour = _simple_2opt(dist_matrix, tour)
+        
+        # Add pheromone to edges in the tour
+        tour_len = len(improved_tour)
+        for i in range(tour_len):
+            u = improved_tour[i]
+            v = improved_tour[(i + 1) % tour_len]
+            # Add more pheromone to shorter edges
+            pheromone[u, v] += 1.0 / (1.0 + dist_matrix[u, v] / np.mean(dist_matrix))
+    
+    # Normalize and smooth
+    max_ph = np.max(pheromone)
+    if max_ph > 0:
+        pheromone = pheromone / max_ph
+    
+    # Apply evaporation-like smoothing
+    pheromone = 0.7 * pheromone + 0.3 * np.ones((n, n))
+    np.fill_diagonal(pheromone, 0)
+    
+    return pheromone
+
+
+def _simple_2opt(dist_matrix: np.ndarray, tour: np.ndarray) -> np.ndarray:
+    """Apply simple 2-opt improvements to a tour."""
+    n = len(tour)
+    improved = True
+    current_tour = tour.copy()
+    
+    while improved:
+        improved = False
+        for i in range(n):
+            for j in range(i + 2, n):
+                # Check if swapping would improve the tour
+                a, b = current_tour[i], current_tour[(i + 1) % n]
+                c, d = current_tour[j], current_tour[(j + 1) % n]
+                
+                current_length = dist_matrix[a, b] + dist_matrix[c, d]
+                new_length = dist_matrix[a, c] + dist_matrix[b, d]
+                
+                if new_length < current_length:
+                    # Reverse the segment between i+1 and j
+                    current_tour[i+1:j+1] = current_tour[i+1:j+1][::-1]
+                    improved = True
+                    break
+            if improved:
+                break
+    
+    return current_tour
+
+
+def _compute_geometric_quality(dist_matrix: np.ndarray, n: int, params: dict) -> np.ndarray:
+    """Compute geometric quality factor based on triangle relationships."""
+    if n < 3:
+        return np.ones((n, n))
+    
+    geometric = np.ones((n, n))
+    sample_size = min(30, n - 2)
+    
+    # Sample-based computation for efficiency
+    for i in range(n):
+        # Sample other nodes
+        other_nodes = [j for j in range(n) if j != i]
+        if len(other_nodes) > sample_size:
+            sample_j = np.random.choice(other_nodes, sample_size, replace=False)
+        else:
+            sample_j = other_nodes
+        
+        for j in sample_j:
+            if i == j:
+                continue
+            
+            # Sample third nodes
+            third_nodes = [k for k in range(n) if k != i and k != j]
+            if len(third_nodes) > sample_size:
+                sample_k = np.random.choice(third_nodes, sample_size, replace=False)
+            else:
+                sample_k = third_nodes
+            
+            penalty_count = 0
+            for k in sample_k:
+                # Check triangle inequality violation
+                d_ij = dist_matrix[i, j]
+                d_ik = dist_matrix[i, k]
+                d_jk = dist_matrix[j, k]
+                
+                # Penalize if (i,j) is much longer than alternative paths
+                if d_ij > 1.2 * (d_ik + d_jk):  # 20% tolerance
+                    penalty_count += 1
+            
+            if penalty_count > 0:
+                penalty = 0.8 ** (penalty_count / len(sample_k))
+                geometric[i, j] = geometric[j, i] = penalty
+    
+    return geometric
+
+
+def _adaptive_sparsification(heuristic_matrix: np.ndarray, n: int, params: dict, 
+                            dist_matrix: np.ndarray) -> np.ndarray:
+    """Adaptively sparsify the heuristic matrix."""
+    m = params['m_keep']
+    sparsity_factor = params['sparsity_factor']
+    
+    sparsified = np.zeros((n, n))
+    
+    # For each node, keep top connections
+    for i in range(n):
+        node_heuristics = heuristic_matrix[i].copy()
+        node_heuristics[i] = -np.inf
+        
+        # Determine adaptive m for this node
+        adaptive_m = max(3, min(m, int(sparsity_factor * n)))
+        
+        # Find top adaptive_m indices
+        top_indices = np.argpartition(node_heuristics, -adaptive_m)[-adaptive_m:]
+        
+        # Keep connections with positive heuristic value
+        for j in top_indices:
+            if node_heuristics[j] > 0:
+                sparsified[i, j] = heuristic_matrix[i, j]
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Always include mutual nearest neighbors and MST edges
+    mutual_nn = _compute_mutual_nearest_neighbors(dist_matrix, n, params)
+    mst_edges = _compute_mst_importance(dist_matrix, n)
+    
+    sparsified = np.where((mutual_nn > 0) | (mst_edges > 0),
+                         np.maximum(sparsified, heuristic_matrix),
+                         sparsified)
+    
+    return sparsified
+```

@@ -1,0 +1,150 @@
+```json
+{
+    "algorithm_features": ["Regret-weighted Edge Scoring", "Dynamic Density-aware Scaling", "Two-step Lookahead Approximation", "Multiplicative Composite Heuristic"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection with regret-based penalties,
+    density-aware scaling, and lookahead approximation.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, indicating edge promise.
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-10
+    
+    # 1. Base inverse distance heuristic
+    base_heuristic = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # 2. Minimum Spanning Tree bonus
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst > 0).toarray()
+    mst_mask = np.maximum(mst_mask, mst_mask.T)
+    
+    # 3. Mutual nearest neighbors with adaptive k
+    k = max(3, min(n-1, int(np.sqrt(n))))
+    nn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        neighbors = np.argpartition(row, k)[:k]
+        nn_mask[i, neighbors] = True
+    mutual_nn_mask = nn_mask & nn_mask.T
+    
+    # 4. Regret-based penalty
+    # Compute best and second-best alternatives for each node
+    regret_penalty = np.ones((n, n))
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        sorted_indices = np.argsort(row)
+        
+        # Best and second-best distances for node i
+        best_dist = row[sorted_indices[0]]
+        second_best_dist = row[sorted_indices[1]] if n > 2 else best_dist
+        
+        # Regret is difference between current edge and best alternative
+        for j in range(n):
+            if i != j:
+                # If (i,j) is NOT the best edge from i, compute regret
+                if distance_matrix[i, j] > best_dist + epsilon:
+                    regret_i = distance_matrix[i, j] - best_dist
+                    # Normalize by the spread between best and second-best
+                    spread = max(epsilon, second_best_dist - best_dist)
+                    penalty_factor = 1.0 / (1.0 + regret_i / spread)
+                    regret_penalty[i, j] *= penalty_factor
+    
+    # Make regret penalty symmetric (geometric mean)
+    regret_penalty = np.sqrt(regret_penalty * regret_penalty.T)
+    np.fill_diagonal(regret_penalty, 0)
+    
+    # 5. Dynamic density-aware scaling
+    # Estimate graph density through distance statistics
+    upper_distances = distance_matrix[np.triu_indices(n, k=1)]
+    dist_std = np.std(upper_distances)
+    dist_mean = np.mean(upper_distances)
+    
+    if dist_std > epsilon:
+        cv = dist_std / dist_mean  # Coefficient of variation
+        # In dense graphs (low CV), reduce structural bonuses
+        # In sparse graphs (high CV), enhance structural bonuses
+        density_factor = 1.0 / (1.0 + np.exp(-2 * (cv - 0.5)))  # Sigmoid scaling
+    else:
+        density_factor = 0.5  # Default for uniform distances
+    
+    # 6. Two-step lookahead approximation (Christofides-inspired)
+    lookahead_bonus = np.ones((n, n))
+    
+    # For each edge (i,j), estimate minimum completion cost
+    for i in range(n):
+        for j in range(i+1, n):
+            # Consider nodes other than i and j
+            other_nodes = [k for k in range(n) if k not in (i, j)]
+            
+            if len(other_nodes) >= 2:
+                # Estimate minimum spanning tree of remaining nodes
+                sub_dist = distance_matrix[np.ix_(other_nodes, other_nodes)]
+                if sub_dist.size > 0:
+                    mst_sub = minimum_spanning_tree(sub_dist)
+                    mst_sum = mst_sub.sum()
+                    
+                    # Find best connections from i and j to remaining nodes
+                    i_to_rest = np.min(distance_matrix[i, other_nodes])
+                    j_to_rest = np.min(distance_matrix[j, other_nodes])
+                    
+                    # Approximate tour completion cost
+                    approx_completion = mst_sum + i_to_rest + j_to_rest
+                    
+                    # Normalize and invert (lower completion cost = higher bonus)
+                    max_completion = np.max(distance_matrix) * n
+                    if max_completion > epsilon:
+                        lookahead_bonus[i, j] = 1.0 + (max_completion - approx_completion) / max_completion
+                    else:
+                        lookahead_bonus[i, j] = 1.0
+    
+    lookahead_bonus = np.maximum(lookahead_bonus, lookahead_bonus.T)
+    np.fill_diagonal(lookahead_bonus, 0)
+    
+    # 7. Combine all components multiplicatively
+    bonus_matrix = np.ones((n, n))
+    bonus_matrix[mst_mask] *= (1.5 + 0.5 * density_factor)  # MST bonus: 1.5-2.0
+    bonus_matrix[mutual_nn_mask] *= (1.2 + 0.3 * density_factor)  # MNN bonus: 1.2-1.5
+    
+    heuristic = base_heuristic * regret_penalty * bonus_matrix * lookahead_bonus
+    
+    # 8. Adaptive sparsification
+    upper_tri_indices = np.triu_indices(n, k=1)
+    upper_values = heuristic[upper_tri_indices]
+    
+    if len(upper_values) > 0:
+        # Keep adaptive percentile based on graph size and density
+        base_percentile = 15
+        adaptive_percentile = base_percentile * (1.0 + 0.5 * density_factor)  # 15-22.5%
+        threshold = np.percentile(upper_values, 100 - adaptive_percentile)
+        
+        sparse_mask = np.zeros((n, n), dtype=bool)
+        sparse_mask[upper_tri_indices] = upper_values >= threshold
+        sparse_mask = np.maximum(sparse_mask, sparse_mask.T)
+        heuristic[~sparse_mask] = 0
+    
+    # Ensure symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

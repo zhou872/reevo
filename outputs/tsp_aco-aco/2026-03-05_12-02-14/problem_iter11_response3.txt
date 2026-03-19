@@ -1,0 +1,261 @@
+```json
+{
+    "algorithm_features": ["Vectorized Sparsification", "Multi-Armed Bandit Sampling", "Neural Heat Diffusion", "Adaptive Entropy"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse
+import warnings
+from collections import defaultdict, deque
+from scipy.spatial import KDTree
+from scipy.stats import entropy
+import numba
+
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection with vectorized adaptive
+    sparsification, neural heat diffusion, and multi-armed bandit sampling.
+    
+    Key innovations:
+    1. Vectorized adaptive sparsification with entropy-based temperature
+    2. Multi-armed bandit edge sampling with UCB exploration
+    3. Neural heat diffusion for topological analysis
+    4. Gradient boosting of promising edge clusters
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Neural Heat Diffusion ==========
+    
+    # Create adjacency matrix with Gaussian kernel
+    sigma = np.median(distance_matrix[distance_matrix > 0])
+    heat_matrix = np.exp(-distance_matrix**2 / (2 * sigma**2))
+    np.fill_diagonal(heat_matrix, 0)
+    
+    # Diffusion process (simplified PageRank-like)
+    alpha = 0.85
+    P = heat_matrix / heat_matrix.sum(axis=1, keepdims=True).clip(min=1e-10)
+    heat_scores = np.ones(n) / n
+    
+    for _ in range(10):
+        heat_scores = alpha * heat_scores @ P + (1 - alpha) * np.ones(n) / n
+    
+    # Edge heat = product of node heats
+    heat_edges = np.outer(heat_scores, heat_scores)
+    np.fill_diagonal(heat_edges, 0)
+    
+    # ========== Phase 2: Multi-Armed Bandit Sampling ==========
+    
+    @numba.jit(nopython=True)
+    def fast_bandit_scores(dist_mat, num_samples=500):
+        """UCB-inspired edge sampling with vectorized operations."""
+        n = dist_mat.shape[0]
+        counts = np.ones((n, n), dtype=np.float32)
+        values = np.zeros((n, n), dtype=np.float32)
+        
+        # Initialize with inverse distances
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / dist_mat
+            inv_dist[np.isinf(inv_dist)] = 0
+            inv_dist = np.nan_to_num(inv_dist)
+        
+        np.fill_diagonal(inv_dist, 0)
+        values = inv_dist.copy()
+        
+        for _ in range(num_samples):
+            # Compute UCB scores
+            total_counts = counts.sum(axis=1, keepdims=True).clip(min=1)
+            avg_values = values / counts.clip(min=1)
+            exploration = np.sqrt(2 * np.log(total_counts) / counts.clip(min=1))
+            ucb_scores = avg_values + exploration
+            
+            # Sample edges for each node
+            for i in range(n):
+                row = ucb_scores[i].copy()
+                row[i] = -np.inf
+                
+                # Sample proportionally to scores
+                row_positive = row.clip(min=0)
+                if row_positive.sum() > 0:
+                    probs = row_positive / row_positive.sum()
+                    j = np.random.choice(n, p=probs)
+                    
+                    # Update counts and values
+                    counts[i, j] += 1
+                    counts[j, i] += 1
+                    
+                    # Value update based on edge quality
+                    edge_value = 1.0 / (dist_mat[i, j] + 1e-10)
+                    decay = 0.95
+                    values[i, j] = decay * values[i, j] + (1 - decay) * edge_value
+                    values[j, i] = values[i, j]
+        
+        # Final scores combine exploitation and exploration
+        final_scores = values / counts.clip(min=1)
+        return final_scores
+    
+    bandit_scores = fast_bandit_scores(distance_matrix)
+    
+    # ========== Phase 3: Vectorized Adaptive Sparsification ==========
+    
+    def vectorized_sparsification(matrix, base_k=None):
+        """Vectorized adaptive sparsification with exponential decay."""
+        n = matrix.shape[0]
+        
+        # Adaptive k selection based on entropy
+        if base_k is None:
+            row_entropies = entropy(matrix + 1e-10, axis=1)
+            avg_entropy = np.mean(row_entropies)
+            k_base = int(np.clip(3 + n * (1 - avg_entropy / np.log(n)), 3, n//2))
+        else:
+            k_base = base_k
+        
+        # Temperature based on matrix statistics
+        row_std = matrix.std(axis=1).mean()
+        temperature = np.clip(1.0 / (row_std + 1e-5), 0.1, 10.0)
+        
+        # Create sorted indices for each row
+        row_indices = np.argsort(-matrix, axis=1)
+        row_values = np.take_along_axis(matrix, row_indices, axis=1)
+        
+        # Exponential decay mask with adaptive k
+        k_values = np.clip(k_base + (n * (1 - temperature)).astype(int), 3, n-1)
+        ranks = np.arange(n).reshape(1, -1)
+        k_mask = ranks < k_values.reshape(-1, 1)
+        
+        # Apply exponential decay
+        decay_mask = np.exp(-ranks / temperature).reshape(-1, n)
+        decayed_values = row_values * decay_mask
+        
+        # Create sparse mask
+        sparsified = np.zeros_like(matrix)
+        rows = np.repeat(np.arange(n), k_values)
+        cols = row_indices[np.arange(n)[:, None], np.arange(max(k_values))].flatten()[:len(rows)]
+        
+        # Ensure we don't go out of bounds
+        valid_mask = cols < n
+        rows = rows[valid_mask]
+        cols = cols[valid_mask]
+        
+        # Get corresponding values
+        values = decayed_values[np.arange(n)[:, None], np.arange(max(k_values))].flatten()[:len(rows)]
+        values = values[valid_mask]
+        
+        # Fill sparse matrix
+        sparsified[rows, cols] = values
+        sparsified = np.maximum(sparsified, sparsified.T)
+        
+        return sparsified
+    
+    # ========== Phase 4: Gradient Boosting ==========
+    
+    # Compute gradient-like features
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist = np.nan_to_num(inv_dist)
+    
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Local gradient (difference from neighborhood mean)
+    kdtree = KDTree(distance_matrix)
+    _, nn_indices = kdtree.query(distance_matrix, k=min(5, n))
+    
+    grad_features = np.zeros_like(distance_matrix)
+    for i in range(n):
+        neighbors = nn_indices[i]
+        neighbor_dists = distance_matrix[i, neighbors]
+        if len(neighbors) > 1:
+            mean_dist = neighbor_dists.mean()
+            grad_features[i] = np.abs(distance_matrix[i] - mean_dist)
+    
+    # Normalize gradient features
+    if grad_features.max() > 0:
+        grad_features = 1.0 / (1.0 + grad_features / grad_features.max())
+    
+    # ========== Phase 5: Ensemble Combination ==========
+    
+    # Normalize components
+    components = []
+    weights = []
+    
+    # Component 1: Heat diffusion
+    heat_norm = heat_edges / (heat_edges.max() + 1e-10)
+    components.append(heat_norm)
+    weights.append(0.25)
+    
+    # Component 2: Bandit scores
+    bandit_norm = bandit_scores / (bandit_scores.max() + 1e-10)
+    components.append(bandit_norm)
+    weights.append(0.35)
+    
+    # Component 3: Inverse distance
+    inv_norm = inv_dist / (inv_dist.max() + 1e-10)
+    components.append(inv_norm)
+    weights.append(0.20)
+    
+    # Component 4: Gradient features
+    grad_norm = grad_features / (grad_features.max() + 1e-10)
+    components.append(grad_norm)
+    weights.append(0.20)
+    
+    # Weighted combination
+    combined = np.zeros_like(distance_matrix)
+    for comp, w in zip(components, weights):
+        combined += w * comp
+    
+    # Ensure symmetry
+    combined = 0.5 * (combined + combined.T)
+    np.fill_diagonal(combined, 0)
+    
+    # ========== Phase 6: Final Sparsification ==========
+    
+    # Apply vectorized sparsification
+    sparsified = vectorized_sparsification(combined)
+    
+    # Boost edges in promising clusters
+    # Simple clustering by connectivity
+    threshold = np.percentile(sparsified[sparsified > 0], 70)
+    strong_edges = sparsified > threshold
+    
+    # Find connected components
+    if strong_edges.any():
+        n_components, labels = sparse.csgraph.connected_components(strong_edges.astype(int), directed=False)
+        if n_components > 1:
+            # Boost intra-cluster edges
+            for label in range(n_components):
+                mask = labels == label
+                if mask.sum() > 1:
+                    cluster_indices = np.where(mask)[0]
+                    for i in cluster_indices:
+                        for j in cluster_indices:
+                            if i != j:
+                                sparsified[i, j] *= 1.2
+    
+    # Final normalization and zero diagonal
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified /= max_val
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

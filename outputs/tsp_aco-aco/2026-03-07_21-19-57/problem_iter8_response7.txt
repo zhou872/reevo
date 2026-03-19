@@ -1,0 +1,485 @@
+```json
+{
+    "algorithm_features": ["Dynamic Weight Optimization via Graph Metrics", "Lagrangian Penalty for Global Constraints", "Modularity-based Community Sparsification", "Multi-head Regret Minimization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with machine-learned
+    weight optimization, constraint-aware penalty, and community-based sparsification.
+    
+    Core innovations:
+    1. Dynamic Weight Optimization: Uses graph topology metrics (diameter, clustering
+       coefficient, degree variance) to adapt component weights without training data
+    2. Lagrangian-inspired Constraint Penalty: Applies soft penalties for edges that
+       would violate global tour constraints (excessive clustering, long jumps)
+    3. Modularity-based Community Detection: Fast greedy modularity maximization to
+       identify natural clusters, enabling targeted intra/inter-community scoring
+    4. Multi-head Regret Minimization: Computes regret from multiple perspectives
+       (distance rank, angular position, density context) for robust edge evaluation
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # =====================================================================
+    # 1. DYNAMIC WEIGHT OPTIMIZATION VIA GRAPH METRICS
+    # =====================================================================
+    # Compute graph topology metrics to adapt weights
+    graph_metrics = {}
+    
+    # Average clustering coefficient approximation
+    k_cluster = max(2, int(0.1 * n))
+    clustering_scores = []
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        nearest_indices = np.argsort(distances)[:k_cluster]
+        
+        if len(nearest_indices) >= 2:
+            # Count connections among nearest neighbors
+            connections = 0
+            for a_idx, a in enumerate(nearest_indices):
+                for b in nearest_indices[a_idx+1:]:
+                    if distance_matrix[a, b] < np.percentile(distance_matrix, 25):
+                        connections += 1
+            
+            max_connections = k_cluster * (k_cluster - 1) / 2
+            clustering_scores.append(connections / max_connections if max_connections > 0 else 0)
+    
+    graph_metrics['clustering'] = np.mean(clustering_scores) if clustering_scores else 0.5
+    
+    # Degree variance approximation
+    k_degree = max(2, int(0.2 * n))
+    degrees = []
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        threshold = np.partition(distances, k_degree)[k_degree]
+        degree = np.sum(distances <= threshold)
+        degrees.append(degree)
+    
+    graph_metrics['degree_variance'] = np.var(degrees) / (n * n) if n > 1 else 0
+    
+    # Graph diameter approximation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_sym = mst_array + mst_array.T
+    mst_graph = csr_matrix(mst_sym > 0)
+    
+    # BFS from random nodes to estimate diameter
+    diameter_samples = []
+    for start in np.random.choice(n, min(5, n), replace=False):
+        distances_bfs = -np.ones(n, dtype=int)
+        distances_bfs[start] = 0
+        queue = [start]
+        
+        while queue:
+            node = queue.pop(0)
+            neighbors = mst_graph[node].indices
+            for neighbor in neighbors:
+                if distances_bfs[neighbor] == -1:
+                    distances_bfs[neighbor] = distances_bfs[node] + 1
+                    queue.append(neighbor)
+        
+        if np.max(distances_bfs) > 0:
+            diameter_samples.append(np.max(distances_bfs))
+    
+    graph_metrics['diameter_ratio'] = np.mean(diameter_samples) / n if diameter_samples else 0.3
+    
+    # Compute adaptive weights based on metrics
+    w_regret = 0.4 + 0.3 * graph_metrics['clustering'] - 0.2 * graph_metrics['degree_variance']
+    w_centrality = 0.3 + 0.4 * graph_metrics['diameter_ratio']
+    w_similarity = 0.2 + 0.3 * graph_metrics['clustering']
+    w_proximity = 0.25 - 0.1 * graph_metrics['degree_variance']
+    w_community = 0.35 + 0.2 * graph_metrics['clustering']
+    
+    # Normalize weights to sum to 1
+    weight_sum = w_regret + w_centrality + w_similarity + w_proximity + w_community
+    weights = {
+        'regret': w_regret / weight_sum,
+        'centrality': w_centrality / weight_sum,
+        'similarity': w_similarity / weight_sum,
+        'proximity': w_proximity / weight_sum,
+        'community': w_community / weight_sum
+    }
+    
+    # =====================================================================
+    # 2. MULTI-HEAD REGRET MINIMIZATION
+    # =====================================================================
+    regret_matrix = np.ones((n, n))
+    
+    # Compute node positions via multidimensional scaling approximation
+    if n > 3:
+        # Use top eigenvectors of double-centered distance matrix
+        D_sq = distance_matrix ** 2
+        row_mean = D_sq.mean(axis=1, keepdims=True)
+        col_mean = D_sq.mean(axis=0, keepdims=True)
+        overall_mean = D_sq.mean()
+        B = -0.5 * (D_sq - row_mean - col_mean + overall_mean)
+        
+        # Get top 2 eigenvalues/vectors
+        eigenvalues, eigenvectors = np.linalg.eigh(B)
+        idx = np.argsort(eigenvalues)[::-1][:2]
+        if len(idx) >= 2:
+            positions = eigenvectors[:, idx] @ np.diag(np.sqrt(np.maximum(eigenvalues[idx], 0)))
+        else:
+            positions = np.random.randn(n, 2)
+    else:
+        positions = np.random.randn(n, 2)
+    
+    # Normalize positions
+    positions = positions - positions.mean(axis=0)
+    
+    # Compute angular positions
+    angles = np.arctan2(positions[:, 1], positions[:, 0])
+    
+    # Multi-head regret calculation
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Head 1: Distance-based regret
+            distances_i = distance_matrix[i, :].copy()
+            distances_i[i] = np.inf
+            sorted_i = np.argsort(distances_i)
+            j_rank_dist = np.where(sorted_i == j)[0][0] / (n - 1)
+            
+            # Head 2: Angular regret
+            angle_diff = abs(angles[i] - angles[j])
+            if angle_diff > np.pi:
+                angle_diff = 2 * np.pi - angle_diff
+            
+            angular_neighbors = np.argsort(np.abs(angles - angles[i]))
+            j_rank_angle = np.where(angular_neighbors == j)[0][0] / (n - 1)
+            
+            # Head 3: Density-aware regret
+            # Local density estimation
+            k_density = max(3, int(0.15 * n))
+            i_distances = distance_matrix[i, :].copy()
+            i_distances[i] = np.inf
+            i_density = 1.0 / np.mean(np.partition(i_distances, k_density)[:k_density])
+            
+            j_distances = distance_matrix[j, :].copy()
+            j_distances[j] = np.inf
+            j_density = 1.0 / np.mean(np.partition(j_distances, k_density)[:k_density])
+            
+            density_ratio = abs(i_density - j_density) / max(i_density, j_density)
+            density_penalty = 1.0 / (1.0 + density_ratio)
+            
+            # Combine multi-head regrets
+            regret_components = [j_rank_dist, j_rank_angle]
+            regret_weights = [0.6, 0.4]
+            base_regret = np.average(regret_components, weights=regret_weights)
+            
+            # Apply density-aware adjustment
+            regret_matrix[i, j] = density_penalty * (1.0 - 0.7 * base_regret) + 0.3
+    
+    # =====================================================================
+    # 3. MODULARITY-BASED COMMUNITY DETECTION
+    # =====================================================================
+    # Fast greedy modularity optimization (Louvain-inspired)
+    communities = np.arange(n)  # Start with each node in its own community
+    
+    # Create k-nearest neighbor graph for community detection
+    k_nn = max(3, int(0.1 * n))
+    adj_matrix = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        nearest = np.argpartition(distances, k_nn)[:k_nn]
+        adj_matrix[i, nearest] = True
+        adj_matrix[nearest, i] = True
+    
+    # Simple label propagation for community detection
+    max_iterations = 10
+    for iteration in range(max_iterations):
+        changed = False
+        nodes = np.random.permutation(n)
+        
+        for node in nodes:
+            # Get neighbors' communities
+            neighbors = np.where(adj_matrix[node])[0]
+            if len(neighbors) == 0:
+                continue
+            
+            neighbor_communities = communities[neighbors]
+            unique_communities, counts = np.unique(neighbor_communities, return_counts=True)
+            
+            # Choose most frequent community
+            if len(unique_communities) > 0:
+                most_frequent = unique_communities[np.argmax(counts)]
+                if communities[node] != most_frequent:
+                    communities[node] = most_frequent
+                    changed = True
+        
+        if not changed:
+            break
+    
+    # Ensure communities are numbered consecutively
+    unique_comms, communities = np.unique(communities, return_inverse=True)
+    n_communities = len(unique_comms)
+    
+    # Compute community-aware scoring
+    community_matrix = np.ones((n, n))
+    
+    if n_communities > 1:
+        # Compute modularity of partition
+        total_edges = np.sum(adj_matrix) / 2
+        modularity = 0.0
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if adj_matrix[i, j]:
+                    expected = (np.sum(adj_matrix[i]) * np.sum(adj_matrix[j])) / (2 * total_edges)
+                    if communities[i] == communities[j]:
+                        modularity += (1 - expected) / total_edges
+        
+        # Community scoring based on modularity
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                if communities[i] == communities[j]:
+                    # Intra-community: bonus based on modularity
+                    bonus = 0.5 * modularity if modularity > 0 else 0.3
+                    community_matrix[i, j] = 1.0 + bonus
+                else:
+                    # Inter-community: penalty based on modularity
+                    penalty = 0.3 * modularity if modularity > 0 else 0.1
+                    community_matrix[i, j] = 1.0 - penalty
+    else:
+        # Single community case
+        community_matrix.fill(1.0)
+    
+    # =====================================================================
+    # 4. EDGE BETWEENNESS CENTRALITY WITH COMMUNITY AWARENESS
+    # =====================================================================
+    centrality_matrix = np.ones((n, n))
+    
+    # Compute MST (as before)
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_edges = np.where(mst_array + mst_array.T > 0)
+    
+    # Community-aware betweenness
+    for i, j in zip(*mst_edges):
+        if i >= j:
+            continue
+        
+        # Temporarily remove edge
+        mst_graph = csr_matrix(mst_array + mst_array.T > 0)
+        mst_graph[i, j] = 0
+        mst_graph[j, i] = 0
+        
+        # Find connected components
+        visited = np.zeros(n, dtype=bool)
+        component_sizes = []
+        
+        for start in range(n):
+            if not visited[start]:
+                stack = [start]
+                visited[start] = True
+                size = 1
+                
+                while stack:
+                    node = stack.pop()
+                    neighbors = mst_graph[node].indices
+                    for neighbor in neighbors:
+                        if not visited[neighbor]:
+                            visited[neighbor] = True
+                            stack.append(neighbor)
+                            size += 1
+                
+                component_sizes.append(size)
+        
+        # Calculate betweenness
+        if len(component_sizes) == 2:
+            betweenness = component_sizes[0] * component_sizes[1]
+            
+            # Adjust by community crossing
+            if communities[i] != communities[j]:
+                betweenness *= 1.2  # Boost inter-community bridge edges
+            
+            # Normalize
+            norm_betweenness = betweenness / ((n * n) / 4)
+            centrality_matrix[i, j] = 1.0 + 0.8 * norm_betweenness
+            centrality_matrix[j, i] = centrality_matrix[i, j]
+    
+    # =====================================================================
+    # 5. LAGRANGIAN-INSPIRED CONSTRAINT PENALTY
+    # =====================================================================
+    penalty_matrix = np.ones((n, n))
+    
+    # Compute global statistics
+    median_dist = np.median(distance_matrix[distance_matrix > 0])
+    avg_degree = np.mean([np.sum(distance_matrix[i, :] < 2 * median_dist) for i in range(n)])
+    
+    for i in range(n):
+        # Local constraint: node shouldn't connect to too many similar edges
+        i_distances = distance_matrix[i, :].copy()
+        i_distances[i] = np.inf
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist_ij = distance_matrix[i, j]
+            
+            # Penalty 1: Excessive clustering
+            similar_count = np.sum((distance_matrix[i, :] < 1.5 * dist_ij) & 
+                                  (distance_matrix[i, :] > 0))
+            cluster_penalty = max(0, similar_count - avg_degree) / n
+            
+            # Penalty 2: Very long jumps (except for inter-community)
+            if communities[i] == communities[j]:
+                length_penalty = max(0, dist_ij - 2 * median_dist) / median_dist
+            else:
+                # Allow longer jumps between communities
+                length_penalty = max(0, dist_ij - 3 * median_dist) / median_dist
+            
+            # Penalty 3: Angular concentration
+            if n > 10:
+                angle_i = angles[i]
+                angle_j = angles[j]
+                angle_diff = abs(angle_i - angle_j)
+                if angle_diff > np.pi:
+                    angle_diff = 2 * np.pi - angle_diff
+                
+                # Check if there are many similar angles
+                similar_angles = np.sum(np.abs(angles - angle_i) < 0.5) - 1
+                angular_penalty = similar_angles / n
+            else:
+                angular_penalty = 0
+            
+            # Combined penalty
+            total_penalty = 0.5 * cluster_penalty + 0.3 * length_penalty + 0.2 * angular_penalty
+            penalty_matrix[i, j] = 1.0 / (1.0 + total_penalty)
+    
+    # =====================================================================
+    # 6. COMBINE COMPONENTS WITH OPTIMIZED WEIGHTS
+    # =====================================================================
+    # Base inverse distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 1e-8 * np.median(distance_matrix[distance_matrix > 0]))
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Weighted geometric mean
+    heuristic = (inv_dist ** 0.25) * \
+                (regret_matrix ** weights['regret']) * \
+                (centrality_matrix ** weights['centrality']) * \
+                (community_matrix ** weights['community']) * \
+                (penalty_matrix ** 0.2)
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # =====================================================================
+    # 7. COMMUNITY-AWARE SPARSIFICATION
+    # =====================================================================
+    sparsification_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    sparsification_mask = sparsification_mask | (mst_array + mst_array.T > 0)
+    
+    # Community-based edge selection
+    for comm in range(n_communities):
+        nodes_in_comm = np.where(communities == comm)[0]
+        
+        if len(nodes_in_comm) > 1:
+            # Within community: keep top edges
+            for i in nodes_in_comm:
+                # Get scores for nodes in same community
+                comm_scores = heuristic[i, nodes_in_comm].copy()
+                comm_scores[i == nodes_in_comm] = -np.inf
+                
+                # Keep top k intra-community edges
+                k_intra = max(2, int(0.3 * len(nodes_in_comm)))
+                if len(comm_scores) > k_intra:
+                    top_intra = np.argpartition(comm_scores, -k_intra)[-k_intra:]
+                    for idx in top_intra:
+                        j = nodes_in_comm[idx]
+                        sparsification_mask[i, j] = True
+                        sparsification_mask[j, i] = True
+    
+    # Inter-community connections
+    # For each node, keep best edges to other communities
+    for i in range(n):
+        other_comms = np.unique(communities[communities != communities[i]])
+        
+        for comm in other_comms:
+            nodes_in_other = np.where(communities == comm)[0]
+            
+            if len(nodes_in_other) > 0:
+                # Get scores for edges to this community
+                other_scores = heuristic[i, nodes_in_other]
+                
+                # Keep best edge to this community
+                if len(other_scores) > 0:
+                    best_idx = np.argmax(other_scores)
+                    j = nodes_in_other[best_idx]
+                    sparsification_mask[i, j] = True
+                    sparsification_mask[j, i] = True
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(sparsification_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        if len(connected) < 2:
+            # Add nearest neighbors
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            distances[connected] = np.inf
+            nearest = np.argsort(distances)[:2]
+            
+            for nb in nearest:
+                if distances[nb] < np.inf:
+                    sparsification_mask[i, nb] = True
+                    sparsification_mask[nb, i] = True
+    
+    # Apply sparsification
+    heuristic = heuristic * sparsification_mask
+    
+    # Final normalization
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    # Smooth with local averaging
+    smoothed = heuristic.copy()
+    for i in range(n):
+        neighbors = np.where(sparsification_mask[i, :])[0]
+        if len(neighbors) > 0:
+            for j in neighbors:
+                if i != j:
+                    # Average with 2-hop neighbors
+                    j_neighbors = np.where(sparsification_mask[j, :])[0]
+                    if len(j_neighbors) > 0:
+                        two_hop_score = np.mean(heuristic[j_neighbors, j])
+                        smoothed[i, j] = 0.7 * heuristic[i, j] + 0.3 * two_hop_score
+    
+    heuristic = smoothed
+    
+    return heuristic
+```

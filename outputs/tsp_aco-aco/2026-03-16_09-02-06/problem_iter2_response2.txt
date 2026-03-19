@@ -1,0 +1,184 @@
+```json
+{
+    "algorithm_features": ["Regret-weighted Inverse Distance", "Adaptive Factor Tuning", "Spatial Clustering Penalty", "Bidirectional Edge Competition"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge scoring with regret-based optimization
+    and adaptive parameter tuning. Returns a sparse matrix of edge promise indicators.
+    
+    Key innovations:
+    1. Regret-weighted inverse distance (prioritizes edges with high opportunity cost)
+    2. Adaptive factor tuning based on problem size and structure
+    3. Spatial clustering penalty based on distance distribution
+    4. Bidirectional edge competition model
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) * (1 - np.eye(n))
+    
+    # === 1. ADAPTIVE PARAMETER TUNING ===
+    # Adjust weights and thresholds based on problem size and structure
+    n_log = np.log10(max(n, 10))
+    density_factor = np.mean(distance_matrix) / (np.std(distance_matrix) + 1e-12)
+    
+    # Weight adaptation based on problem characteristics
+    weight_inv_dist = 0.8 + 0.4 * np.tanh(2 - density_factor)
+    weight_regret = 1.2 - 0.3 * np.tanh(n_log - 1)
+    weight_competition = 0.4 + 0.2 * np.tanh(2 - n_log)
+    weight_mst = 0.6 + 0.2 * np.tanh(n_log - 1.5)
+    
+    # Sparsification parameters
+    edges_per_node = max(3, int(np.ceil(np.sqrt(n))))
+    global_top_percent = max(15, 40 - 5 * n_log)
+    
+    # === 2. REGRET-WEIGHTED INVERSE DISTANCE ===
+    # Base distance preference with regret weighting
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    inv_dist[np.eye(n, dtype=bool)] = 0
+    
+    # Compute regret: opportunity cost of not taking an edge
+    regret_matrix = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get distances from node i, excluding self
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Find two nearest neighbors
+        nn_indices = np.argpartition(dists, 2)[:2]
+        if len(nn_indices) >= 2:
+            d1, d2 = dists[nn_indices[0]], dists[nn_indices[1]]
+            regret = max(0, d2 - d1)
+            
+            # Distribute regret to nearest neighbor
+            regret_matrix[i, nn_indices[0]] = regret / (d1 + 1e-12)
+    
+    # Symmetrize regret and combine with inverse distance
+    regret_weighted = inv_dist * (1 + (regret_matrix + regret_matrix.T) / 2)
+    
+    # === 3. SPATIAL CLUSTERING PENALTY ===
+    # Penalize edges that connect nodes in different "clusters"
+    # Based on distance distribution rather than actual clustering
+    clustering_penalty = np.ones_like(distance_matrix)
+    
+    # Estimate local density around each node
+    local_radius = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        # Use median distance as radius estimate
+        local_radius[i] = np.median(dists)
+    
+    # Penalize edges significantly longer than local radii
+    for i in range(n):
+        for j in range(i + 1, n):
+            max_radius = max(local_radius[i], local_radius[j])
+            if distance_matrix[i, j] > 2.5 * max_radius:
+                # Strong penalty for inter-cluster edges
+                clustering_penalty[i, j] = clustering_penalty[j, i] = 0.3
+            elif distance_matrix[i, j] > 1.5 * max_radius:
+                # Moderate penalty
+                clustering_penalty[i, j] = clustering_penalty[j, i] = 0.7
+    
+    # === 4. BIDIRECTIONAL EDGE COMPETITION ===
+    # Model competition from both endpoints
+    competition_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # For each potential edge (i,j), assess competition
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Competition at node i: how many good alternatives to j?
+            comp_i = 0
+            dist_ij = distance_matrix[i, j]
+            
+            for k in range(n):
+                if k != i and k != j and distance_matrix[i, k] < 1.5 * dist_ij:
+                    comp_i += 1
+            
+            # Competition at node j: how many good alternatives to i?
+            comp_j = 0
+            for k in range(n):
+                if k != i and k != j and distance_matrix[j, k] < 1.5 * dist_ij:
+                    comp_j += 1
+            
+            # Combined competition score
+            total_comp = comp_i + comp_j
+            competition_matrix[i, j] = 1.0 / (1.0 + 0.2 * total_comp)
+    
+    # === 5. MINIMUM SPANNING TREE BIAS ===
+    mst_bias = np.ones_like(distance_matrix)
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = mst.toarray() != 0
+        # Strong bias for MST edges, especially for larger instances
+        mst_strength = 1.5 + 0.5 * np.tanh(n_log - 1)
+        mst_bias[mst_mask] = mst_strength
+    except:
+        # Fallback: no MST bias if computation fails
+        pass
+    
+    # === 6. COMBINE FACTORS WITH ADAPTIVE WEIGHTS ===
+    combined_scores = (
+        weight_inv_dist * regret_weighted +
+        weight_competition * competition_matrix +
+        weight_mst * mst_bias
+    ) * clustering_penalty
+    
+    # Normalize to [0, 1] range for stable thresholding
+    max_score = np.max(combined_scores)
+    if max_score > 0:
+        combined_scores = combined_scores / max_score
+    
+    # === 7. ADAPTIVE SPARSIFICATION ===
+    # Strategy 1: Keep top edges per node
+    node_top_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        row_scores = combined_scores[i].copy()
+        row_scores[i] = -np.inf  # Ignore diagonal
+        
+        # Get top edges for this node
+        if edges_per_node < n - 1:
+            top_indices = np.argpartition(-row_scores, edges_per_node)[:edges_per_node]
+        else:
+            top_indices = np.arange(n)
+            top_indices = top_indices[top_indices != i]
+        
+        node_top_mask[i, top_indices] = True
+    
+    # Strategy 2: Keep globally promising edges
+    # Use both upper and lower triangles to avoid directional bias
+    upper_scores = combined_scores[np.triu_indices(n, 1)]
+    if len(upper_scores) > 0:
+        threshold = np.percentile(upper_scores, 100 - global_top_percent)
+        global_top_mask = combined_scores >= threshold
+    else:
+        global_top_mask = np.ones_like(combined_scores, dtype=bool)
+    
+    # Strategy 3: Ensure mutual consideration (edges good for both endpoints)
+    mutual_mask = node_top_mask & node_top_mask.T
+    
+    # Final mask: combine strategies
+    final_mask = mutual_mask | global_top_mask
+    final_mask[np.eye(n, dtype=bool)] = False  # Always exclude diagonal
+    
+    # Apply sparsification
+    sparsified_scores = np.zeros((n, n))
+    sparsified_scores[final_mask] = combined_scores[final_mask]
+    
+    # Ensure symmetry and final normalization
+    sparsified_scores = (sparsified_scores + sparsified_scores.T) / 2
+    sparsified_scores = np.maximum(0, sparsified_scores)  # Remove any negative values
+    
+    return sparsified_scores
+```

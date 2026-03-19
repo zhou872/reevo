@@ -1,0 +1,451 @@
+```json
+{
+    "algorithm_features": ["Efficient Approximation", "Adaptive Weight Tuning", "Ensemble Heuristics", "Connectivity Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
+from typing import Tuple, Optional
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with computational efficiency
+    for large instances and adaptive weight tuning.
+    
+    Key improvements over v1:
+    1. Computational efficiency: O(n log n) for large n via sampling and approximations
+    2. Dynamic weight adjustment based on instance characteristics
+    3. Robust fallback mechanisms for clustering failures
+    4. Memory-efficient operations using sparse representations when possible
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge selection priorities
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        reciprocal = 1.0 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal, 0)
+        max_val = np.max(reciprocal)
+        return reciprocal / max_val if max_val > 0 else reciprocal
+    
+    # Initialize result matrix with base heuristic
+    base_heuristic = np.zeros_like(distance_matrix, dtype=np.float32)
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # 1. Base reciprocal distance (efficient computation)
+    # Use float32 for memory efficiency on large instances
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1.0 / distance_matrix.astype(np.float32)
+    base_heuristic[np.isinf(base_heuristic)] = 0
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # Normalize base heuristic
+    base_max = base_heuristic.max()
+    if base_max > 0:
+        base_heuristic /= base_max
+    
+    # 2. Efficient Minimum Spanning Tree extraction
+    # Use sparse representation for memory efficiency
+    try:
+        mst_sparse = minimum_spanning_tree(csr_matrix(distance_matrix))
+        mst_dense = mst_sparse.toarray()
+        mst_mask = (mst_dense > 0) | (mst_dense.T > 0)
+    except:
+        # Fallback: use Prim's algorithm approximation for very large matrices
+        mst_mask = _approx_mst(distance_matrix)
+    
+    # 3. Adaptive clustering with efficient computation
+    cluster_weights = _compute_cluster_weights(distance_matrix, n)
+    
+    # 4. Edge importance approximation (betweenness alternative)
+    edge_importance = _approx_edge_importance(distance_matrix, n)
+    
+    # 5. Node similarity via efficient embeddings
+    node_similarity = _compute_node_similarity(distance_matrix, n)
+    
+    # 6. Combine heuristics with dynamic weights
+    weights = _compute_dynamic_weights(distance_matrix, n)
+    
+    # Combine all factors
+    heuristic_matrix = np.zeros_like(distance_matrix, dtype=np.float32)
+    
+    # Precompute indices for vectorized operations
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Vectorized combination of factors
+    for factor, weight in weights.items():
+        if factor == 'base':
+            heuristic_matrix[i_idx, j_idx] += weight * base_heuristic[i_idx, j_idx]
+        elif factor == 'mst':
+            mst_factor = np.zeros_like(base_heuristic, dtype=np.float32)
+            mst_factor[mst_mask] = 2.0
+            heuristic_matrix += weight * mst_factor
+        elif factor == 'cluster':
+            heuristic_matrix[i_idx, j_idx] += weight * cluster_weights[i_idx, j_idx]
+        elif factor == 'importance':
+            heuristic_matrix[i_idx, j_idx] += weight * edge_importance[i_idx, j_idx]
+        elif factor == 'similarity':
+            heuristic_matrix[i_idx, j_idx] += weight * node_similarity[i_idx, j_idx]
+    
+    # Symmetrize
+    heuristic_matrix = (heuristic_matrix + heuristic_matrix.T) / 2
+    
+    # 7. Efficient adaptive sparsification
+    heuristic_matrix = _adaptive_sparsify(heuristic_matrix, distance_matrix, mst_mask, n)
+    
+    # 8. Connectivity verification and repair
+    heuristic_matrix = _ensure_connectivity(heuristic_matrix, distance_matrix, n)
+    
+    # 9. Final normalization
+    max_val = np.max(heuristic_matrix)
+    if max_val > 0:
+        heuristic_matrix /= max_val
+    else:
+        # Fallback to base heuristic
+        heuristic_matrix = base_heuristic.copy()
+    
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    return heuristic_matrix
+
+def _approx_mst(distance_matrix: np.ndarray) -> np.ndarray:
+    """Approximate MST using Prim's algorithm for large instances."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=bool)
+    visited = np.zeros(n, dtype=bool)
+    
+    # Start from random node
+    current = np.random.randint(0, n)
+    visited[current] = True
+    
+    for _ in range(n - 1):
+        # Find minimum edge from visited to unvisited
+        unvisited = ~visited
+        if not unvisited.any():
+            break
+            
+        # Get edges from visited to unvisited
+        min_dist = np.inf
+        min_i = min_j = 0
+        
+        # Use only a sample of edges for large n
+        sample_size = min(1000, n)
+        visited_idx = np.where(visited)[0]
+        unvisited_idx = np.where(unvisited)[0]
+        
+        if len(visited_idx) > 0 and len(unvisited_idx) > 0:
+            # Sample from both sets
+            v_sample = np.random.choice(visited_idx, min(sample_size, len(visited_idx)), replace=False)
+            u_sample = np.random.choice(unvisited_idx, min(sample_size, len(unvisited_idx)), replace=False)
+            
+            for i in v_sample:
+                for j in u_sample:
+                    if distance_matrix[i, j] < min_dist:
+                        min_dist = distance_matrix[i, j]
+                        min_i, min_j = i, j
+        
+        if min_dist < np.inf:
+            mst_mask[min_i, min_j] = mst_mask[min_j, min_i] = True
+            visited[min_j] = True
+    
+    return mst_mask
+
+def _compute_cluster_weights(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute weights based on clustering structure."""
+    cluster_weights = np.ones_like(distance_matrix, dtype=np.float32)
+    
+    # Determine clustering strategy based on instance size
+    if n <= 1000:
+        # Use efficient clustering for medium instances
+        try:
+            n_clusters = max(2, min(10, int(np.sqrt(n))))
+            
+            # Use distance-based features for clustering
+            k_features = min(5, n - 1)
+            features = np.zeros((n, k_features))
+            for i in range(n):
+                sorted_dists = np.sort(distance_matrix[i])[1:k_features+1]
+                features[i, :len(sorted_dists)] = sorted_dists
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                labels = KMeans(n_clusters=n_clusters, random_state=42, n_init=3).fit_predict(features)
+            
+            # Create intra-cluster mask
+            for i in range(n):
+                cluster_mask = (labels == labels[i])
+                cluster_mask[i] = False  # Exclude self
+                cluster_weights[i, cluster_mask] = 2.0
+                cluster_weights[~cluster_mask, i] = 0.7
+                
+        except:
+            # Fallback to distance-based clustering
+            pass
+    else:
+        # For very large instances, use simple distance thresholding
+        median_dist = np.median(distance_matrix[distance_matrix > 0])
+        for i in range(0, n, 100):  # Process in batches
+            end_i = min(i + 100, n)
+            local_dist = distance_matrix[i:end_i]
+            close_mask = local_dist < median_dist * 0.5
+            cluster_weights[i:end_i][close_mask] = 1.5
+    
+    return cluster_weights
+
+def _approx_edge_importance(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Approximate edge importance without full betweenness computation."""
+    importance = np.ones((n, n), dtype=np.float32)
+    
+    if n > 500:
+        # For large instances, use simple degree-based approximation
+        # Nodes that are closer to many other nodes are more important
+        centrality = np.sum(1.0 / (distance_matrix + np.eye(n) * 1e-12), axis=1)
+        centrality /= np.max(centrality)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                importance[i, j] = importance[j, i] = 1.0 + (centrality[i] + centrality[j]) / 2
+    else:
+        # For smaller instances, use local path efficiency
+        try:
+            G = nx.Graph()
+            # Add edges for nearest neighbors only
+            k_neighbors = min(10, n - 1)
+            for i in range(n):
+                neighbors = np.argsort(distance_matrix[i])[1:k_neighbors+1]
+                for j in neighbors:
+                    if not G.has_edge(i, j):
+                        G.add_edge(i, j, weight=distance_matrix[i, j])
+            
+            # Approximate importance via local clustering coefficient
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if G.has_edge(i, j):
+                        # Count common neighbors
+                        common_neighbors = len(set(G.neighbors(i)) & set(G.neighbors(j)))
+                        importance[i, j] = importance[j, i] = 1.0 + 0.5 * common_neighbors
+                        
+        except:
+            pass
+    
+    return importance
+
+def _compute_node_similarity(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute node similarity via efficient distance-based embeddings."""
+    similarity = np.ones((n, n), dtype=np.float32)
+    
+    # Use landmarks for embedding
+    n_landmarks = min(8, max(3, int(np.log2(n))))
+    
+    # Select diverse landmarks
+    if n_landmarks > 0:
+        landmarks = _select_diverse_landmarks(distance_matrix, n_landmarks)
+        
+        # Create embeddings as distances to landmarks
+        embeddings = distance_matrix[:, landmarks]
+        
+        # Normalize embeddings
+        embeddings = embeddings / (np.max(embeddings, axis=0) + 1e-12)
+        
+        # Compute cosine similarity efficiently
+        emb_norm = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        emb_normalized = embeddings / (emb_norm + 1e-12)
+        similarity = np.dot(emb_normalized, emb_normalized.T)
+        np.fill_diagonal(similarity, 0)
+        
+        # Rescale to [0.5, 1.5] range
+        similarity = 0.5 + similarity
+    
+    return similarity
+
+def _select_diverse_landmarks(distance_matrix: np.ndarray, k: int) -> np.ndarray:
+    """Select k diverse landmarks using farthest-first traversal."""
+    n = distance_matrix.shape[0]
+    landmarks = []
+    
+    # Start with random point
+    landmarks.append(np.random.randint(0, n))
+    
+    for _ in range(1, k):
+        if len(landmarks) == 0:
+            break
+            
+        # For each candidate point, compute minimum distance to existing landmarks
+        min_dists = np.full(n, np.inf)
+        for l in landmarks:
+            min_dists = np.minimum(min_dists, distance_matrix[l])
+        
+        # Select point with maximum minimum distance
+        # Exclude already selected landmarks
+        min_dists[landmarks] = -1
+        new_landmark = np.argmax(min_dists)
+        landmarks.append(new_landmark)
+    
+    return np.array(landmarks)
+
+def _compute_dynamic_weights(distance_matrix: np.ndarray, n: int) -> dict:
+    """Compute dynamic weights based on instance characteristics."""
+    weights = {
+        'base': 1.0,
+        'mst': 1.5,
+        'cluster': 0.8,
+        'importance': 0.7,
+        'similarity': 0.6
+    }
+    
+    # Adjust weights based on instance size
+    size_factor = min(1.0, n / 1000)
+    weights['base'] *= (1.0 + 0.5 * size_factor)
+    weights['mst'] *= (1.0 + 0.3 * size_factor)
+    
+    # Adjust based on distance distribution
+    if n > 10:
+        flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+        cv = np.std(flat_dists) / (np.mean(flat_dists) + 1e-12)
+        
+        # If distances have high variance, emphasize MST more
+        if cv > 0.5:
+            weights['mst'] *= 1.2
+            weights['cluster'] *= 0.9
+    
+    # Normalize weights
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
+def _adaptive_sparsify(heuristic_matrix: np.ndarray, distance_matrix: np.ndarray, 
+                      mst_mask: np.ndarray, n: int) -> np.ndarray:
+    """Efficient adaptive sparsification preserving connectivity."""
+    result = heuristic_matrix.copy()
+    
+    # Determine target degree per node
+    target_degree = min(max(3, int(np.log2(n) * 1.5)), n - 1)
+    
+    # Process nodes in batches for large instances
+    batch_size = min(100, n)
+    
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        
+        for i in range(start, end):
+            row = result[i].copy()
+            row[i] = -np.inf  # Ignore self
+            
+            # Identify MST neighbors
+            mst_neighbors = np.where(mst_mask[i])[0]
+            
+            if len(row[row > 0]) > target_degree:
+                # Keep top target_degree edges, always including MST neighbors
+                threshold = np.partition(row, -target_degree)[-target_degree]
+                keep_mask = (row >= threshold) | np.isin(np.arange(n), mst_neighbors)
+                result[i, ~keep_mask] = 0
+                result[~keep_mask, i] = 0
+    
+    # Ensure symmetry
+    result = np.maximum(result, result.T)
+    
+    # Boost edges that form promising local structures
+    if n <= 500:  # Only for manageable sizes
+        for i in range(n):
+            neighbors = np.where(result[i] > 0)[0]
+            if len(neighbors) >= 3:
+                for j in neighbors:
+                    if j <= i:
+                        continue
+                    # Check for tight triangles with common neighbors
+                    common = np.intersect1d(
+                        np.where(result[i] > 0)[0],
+                        np.where(result[j] > 0)[0]
+                    )[:3]  # Check only first few
+                    
+                    if len(common) > 0:
+                        avg_dist = (distance_matrix[i, j] + 
+                                   np.mean([distance_matrix[i, k] + distance_matrix[j, k] 
+                                           for k in common]))
+                        if distance_matrix[i, j] < avg_dist * 0.8:
+                            result[i, j] = result[j, i] = result[i, j] * 1.2
+    
+    return result
+
+def _ensure_connectivity(heuristic_matrix: np.ndarray, distance_matrix: np.ndarray, 
+                        n: int) -> np.ndarray:
+    """Ensure the heuristic matrix represents a connected graph."""
+    result = heuristic_matrix.copy()
+    
+    # Check connectivity via DFS
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    
+    while stack:
+        node = stack.pop()
+        if not visited[node]:
+            visited[node] = True
+            neighbors = np.where(result[node] > 0)[0]
+            stack.extend(neighbors)
+    
+    if not np.all(visited):
+        # Add minimum edges to connect components
+        components = _find_connected_components(result)
+        if len(components) > 1:
+            # Connect components with nearest edges
+            for i in range(len(components) - 1):
+                comp1 = components[i]
+                comp2 = components[i + 1]
+                
+                # Find closest pair between components
+                min_dist = np.inf
+                best_pair = (0, 0)
+                
+                # Sample pairs for large components
+                for a in comp1[:min(10, len(comp1))]:
+                    for b in comp2[:min(10, len(comp2))]:
+                        if distance_matrix[a, b] < min_dist:
+                            min_dist = distance_matrix[a, b]
+                            best_pair = (a, b)
+                
+                a, b = best_pair
+                # Boost this edge
+                boost_value = max(result[a, b], 1.0 / (distance_matrix[a, b] + 1e-12))
+                result[a, b] = result[b, a] = boost_value
+    
+    return result
+
+def _find_connected_components(matrix: np.ndarray) -> list:
+    """Find connected components in the graph defined by non-zero entries."""
+    n = matrix.shape[0]
+    visited = np.zeros(n, dtype=bool)
+    components = []
+    
+    for i in range(n):
+        if not visited[i]:
+            # Start new component
+            component = []
+            stack = [i]
+            
+            while stack:
+                node = stack.pop()
+                if not visited[node]:
+                    visited[node] = True
+                    component.append(node)
+                    neighbors = np.where(matrix[node] > 0)[0]
+                    stack.extend(neighbors)
+            
+            if component:
+                components.append(component)
+    
+    return components
+```

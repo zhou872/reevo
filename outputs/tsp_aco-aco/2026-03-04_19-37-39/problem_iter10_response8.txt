@@ -1,0 +1,354 @@
+```json
+{
+    "algorithm_features": ["Edge Frequency Sampling", "Adaptive Weight Learning", "Efficient Betweenness Approximation", "Probabilistic Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with efficient betweenness approximation,
+    adaptive weight learning, and intelligent geometric insights.
+    
+    Key improvements:
+    1. Optimized path sampling for edge betweenness using tour-based extraction
+    2. Data-driven adaptive weighting based on component performance metrics
+    3. Probabilistic edge selection with connectivity preservation
+    4. Memory-efficient implementation for large instances
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. INSTANCE ANALYSIS =====
+    distances_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / (dist_mean + 1e-10)
+    
+    # Size-adaptive parameters
+    log_n = np.log(n + 1)
+    density_factor = min(1.0, n / 100.0)
+    
+    # ===== 2. EFFICIENT TOUR GENERATION WITH QUALITY TRACKING =====
+    def generate_diverse_tours(num_tours: int) -> Tuple[List[np.ndarray], List[float]]:
+        """Generate diverse tours using multiple construction methods."""
+        tours = []
+        lengths = []
+        
+        # Method distribution based on instance characteristics
+        if n < 30:
+            method_counts = {'nn': 5, 'fi': 4, 'random': 3}
+        elif n < 100:
+            method_counts = {'nn': 6, 'fi': 5, 'random': 3}
+        else:
+            method_counts = {'nn': 8, 'fi': 4, 'random': 4}
+        
+        for method, count in method_counts.items():
+            for _ in range(min(count, num_tours // 3 + 1)):
+                if method == 'nn':  # Nearest neighbor
+                    tour = _fast_nearest_neighbor(distance_matrix)
+                elif method == 'fi':  # Farthest insertion
+                    tour = _fast_farthest_insertion(distance_matrix)
+                else:  # Random
+                    tour = np.random.permutation(n)
+                
+                # Apply fast 2-opt
+                tour = _fast_2opt(tour, distance_matrix, max_iter=int(20 * density_factor))
+                tours.append(tour)
+                lengths.append(_tour_length(tour, distance_matrix))
+        
+        return tours, lengths
+    
+    # Generate tours
+    num_tours = min(15, max(5, int(2 * log_n)))
+    tours, tour_lengths = generate_diverse_tours(num_tours)
+    
+    # ===== 3. OPTIMIZED EDGE FREQUENCY WITH QUALITY WEIGHTS =====
+    edge_freq = np.zeros_like(distance_matrix)
+    if tour_lengths:
+        # Exponential weighting based on tour quality
+        min_len = min(tour_lengths)
+        weights = np.exp(-(np.array(tour_lengths) - min_len) / (dist_mean + 1e-10))
+        weights = weights / weights.sum()
+        
+        for tour, weight in zip(tours, weights):
+            for i in range(n):
+                j = (i + 1) % n
+                u, v = tour[i], tour[j]
+                edge_freq[u, v] += weight
+                edge_freq[v, u] += weight
+        
+        if edge_freq.max() > 0:
+            edge_freq = edge_freq / edge_freq.max()
+    
+    # ===== 4. EFFICIENT BETWEENNESS APPROXIMATION USING TOUR PATHS =====
+    edge_betweenness = np.zeros_like(distance_matrix)
+    
+    # Use existing tours to sample paths efficiently
+    num_path_samples = min(100, max(20, n))
+    
+    for tour in tours:
+        # Convert tour to array for efficient indexing
+        tour_array = np.array(tour)
+        
+        # Sample multiple path segments from this tour
+        for _ in range(min(5, num_path_samples // len(tours) + 1)):
+            if n <= 2:
+                continue
+                
+            # Random start and length
+            start = np.random.randint(0, n)
+            length = np.random.randint(2, min(n, 10))
+            
+            # Extract path segment (wrapping around if needed)
+            path_indices = [(start + i) % n for i in range(length)]
+            path = tour_array[path_indices]
+            
+            # Count edges in this path
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                edge_betweenness[u, v] += 1
+                edge_betweenness[v, u] += 1
+    
+    # Normalize betweenness
+    if edge_betweenness.max() > 0:
+        edge_betweenness = edge_betweenness / edge_betweenness.max()
+    
+    # ===== 5. ADAPTIVE COMPONENT WEIGHT LEARNING =====
+    # Compute component quality metrics
+    freq_variance = np.var(edge_freq[np.triu_indices(n, k=1)]) if n > 1 else 0
+    bet_variance = np.var(edge_betweenness[np.triu_indices(n, k=1)]) if n > 1 else 0
+    
+    # Learn weights based on component characteristics
+    w_freq = 0.25 + 0.15 * min(1.0, freq_variance * 5)  # More weight if frequency has high variance
+    w_bet = 0.25 + 0.15 * min(1.0, bet_variance * 5)    # More weight if betweenness has high variance
+    w_dist = 0.30 * (0.5 + 0.5 * (1 - cv))             # Less weight if distances are uniform
+    w_mst = 0.20 * density_factor                      # MST weight scales with instance size
+    
+    # Normalize weights
+    total = w_freq + w_bet + w_dist + w_mst + 1e-10
+    w_freq /= total
+    w_bet /= total
+    w_dist /= total
+    w_mst /= total
+    
+    # ===== 6. COMPONENT COMPUTATION =====
+    # Inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    if inv_dist.max() > 0:
+        inv_dist = inv_dist / inv_dist.max()
+    
+    # MST component
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    mst_scores = np.zeros_like(distance_matrix)
+    mst_scores[mst_mask] = 1.0
+    # Boost MST edges that appear in good tours
+    if np.any(edge_freq > 0):
+        mst_scores[mst_mask] *= (1.0 + 0.5 * edge_freq[mst_mask])
+    
+    # ===== 7. COMBINE COMPONENTS =====
+    heuristics_matrix = (
+        w_freq * edge_freq +
+        w_bet * edge_betweenness +
+        w_dist * inv_dist +
+        w_mst * mst_scores
+    )
+    
+    # ===== 8. PROBABILISTIC SPARSIFICATION =====
+    # Determine edges to keep per node
+    min_edges = max(2, int(1.2 * log_n))
+    max_edges = min(n - 1, int(3 * log_n + 5))
+    
+    sparsity_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        # Adaptive edge count based on score distribution
+        valid_scores = scores[scores > 0]
+        if len(valid_scores) == 0:
+            continue
+            
+        score_mean = np.mean(valid_scores)
+        score_std = np.std(valid_scores)
+        
+        # More edges if scores are evenly distributed
+        if score_std > 0:
+            edge_factor = 0.5 + 0.5 * (1 - min(1.0, score_std / score_mean))
+        else:
+            edge_factor = 1.0
+            
+        n_edges = min(max_edges, max(min_edges, int(edge_factor * (n - 1) * 0.15)))
+        
+        # Probabilistic selection
+        if len(valid_scores) > n_edges:
+            # Softmax probabilities
+            temperature = max(0.1, score_std)
+            exp_scores = np.exp((scores - score_mean) / temperature)
+            exp_scores[i] = 0
+            probs = exp_scores / exp_scores.sum()
+            
+            # Select edges with highest probabilities
+            selected = np.argsort(probs)[-n_edges:]
+            sparsity_mask[i, selected] = True
+        else:
+            # Keep all valid edges
+            sparsity_mask[i, scores > 0] = True
+    
+    # Ensure connectivity and symmetry
+    sparsity_mask = sparsity_mask | mst_mask
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # ===== 9. FINAL PROCESSING =====
+    # Ensure symmetry and zero diagonal
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Adaptive normalization
+    non_zero = heuristics_matrix[heuristics_matrix > 0]
+    if len(non_zero) > 0:
+        # Winsorize to reduce outlier influence
+        q_low, q_high = np.percentile(non_zero, [5, 95])
+        heuristics_matrix = np.clip(heuristics_matrix, q_low, q_high)
+        
+        # Normalize to [0, 1]
+        h_min, h_max = heuristics_matrix.min(), heuristics_matrix.max()
+        if h_max > h_min:
+            heuristics_matrix = (heuristics_matrix - h_min) / (h_max - h_min + 1e-10)
+    
+    return heuristics_matrix
+
+# ===== OPTIMIZED HELPER FUNCTIONS =====
+
+def _fast_nearest_neighbor(dist_matrix: np.ndarray) -> np.ndarray:
+    """Fast nearest neighbor tour construction."""
+    n = dist_matrix.shape[0]
+    start = np.random.randint(0, n)
+    tour = [start]
+    unvisited = list(range(n))
+    unvisited.remove(start)
+    
+    current = start
+    while unvisited:
+        # Vectorized nearest neighbor search
+        distances = dist_matrix[current, unvisited]
+        nearest_idx = np.argmin(distances)
+        next_node = unvisited[nearest_idx]
+        tour.append(next_node)
+        unvisited.remove(next_node)
+        current = next_node
+    
+    return np.array(tour)
+
+def _fast_farthest_insertion(dist_matrix: np.ndarray) -> np.ndarray:
+    """Optimized farthest insertion tour construction."""
+    n = dist_matrix.shape[0]
+    if n <= 2:
+        return np.arange(n)
+    
+    # Start with two farthest nodes
+    max_idx = np.unravel_index(np.argmax(dist_matrix), dist_matrix.shape)
+    start, second = max_idx[0], max_idx[1]
+    
+    tour = [start, second]
+    unvisited = set(range(n)) - {start, second}
+    
+    while unvisited:
+        # Find farthest node from tour
+        dist_to_tour = np.min(dist_matrix[list(unvisited)][:, tour], axis=1)
+        farthest_idx = list(unvisited)[np.argmax(dist_to_tour)]
+        
+        # Find best insertion position
+        best_pos = 1
+        best_increase = float('inf')
+        
+        for i in range(len(tour)):
+            j = (i + 1) % len(tour)
+            increase = (dist_matrix[tour[i], farthest_idx] + 
+                       dist_matrix[farthest_idx, tour[j]] - 
+                       dist_matrix[tour[i], tour[j]])
+            if increase < best_increase:
+                best_increase = increase
+                best_pos = j
+        
+        tour.insert(best_pos, farthest_idx)
+        unvisited.remove(farthest_idx)
+    
+    return np.array(tour)
+
+def _fast_2opt(tour: np.ndarray, dist_matrix: np.ndarray, max_iter: int = 20) -> np.ndarray:
+    """Efficient 2-opt local search."""
+    n = len(tour)
+    if n < 4:
+        return tour
+    
+    current_tour = tour.copy()
+    improved = True
+    iter_count = 0
+    
+    while improved and iter_count < max_iter:
+        improved = False
+        
+        # Randomized search for improvements
+        indices = np.random.permutation(n)
+        for i in indices:
+            for j in range((i + 2) % n, min(i + n//2 + 2, n)):
+                if j == n-1 and i == 0:
+                    continue
+                
+                a, b = current_tour[i], current_tour[(i + 1) % n]
+                c, d = current_tour[j], current_tour[(j + 1) % n]
+                
+                old_len = dist_matrix[a, b] + dist_matrix[c, d]
+                new_len = dist_matrix[a, c] + dist_matrix[b, d]
+                
+                if new_len < old_len:
+                    # Reverse segment
+                    if i < j:
+                        current_tour[i+1:j+1] = current_tour[i+1:j+1][::-1]
+                    else:
+                        segment = np.concatenate([current_tour[i+1:], current_tour[:j+1]])
+                        segment = segment[::-1]
+                        current_tour[i+1:] = segment[:n-i-1]
+                        current_tour[:j+1] = segment[n-i-1:]
+                    
+                    improved = True
+                    break
+            if improved:
+                break
+        
+        iter_count += 1
+    
+    return current_tour
+
+def _tour_length(tour: np.ndarray, dist_matrix: np.ndarray) -> float:
+    """Calculate tour length."""
+    n = len(tour)
+    # Vectorized calculation
+    idx1 = tour
+    idx2 = np.roll(tour, -1)
+    return np.sum(dist_matrix[idx1, idx2])
+```

@@ -1,0 +1,411 @@
+```json
+{
+    "algorithm_features": ["Variable-Step Regret Analysis", "Meta-Heuristic Weight Optimization", "Probabilistic Edge Selection", "Local Search Feedback Integration"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, Dict, List
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with variable-step regret analysis, meta-heuristic weight optimization,
+    probabilistic edge selection models, and local search feedback integration.
+    
+    Core Innovations:
+    1. Variable-step regret analysis based on graph density
+    2. Meta-heuristic weight optimization using problem characteristics
+    3. Probabilistic edge selection with confidence scoring
+    4. Local search feedback simulation for edge quality estimation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Suppress warnings for cleaner output
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+    
+    # ==================== 1. PROBLEM CHARACTERIZATION ====================
+    def characterize_problem() -> Dict[str, float]:
+        """Analyze problem characteristics for adaptive parameter setting"""
+        # Compute basic statistics
+        triu_indices = np.triu_indices(n, 1)
+        distances = distance_matrix[triu_indices]
+        
+        stats = {}
+        stats['avg_distance'] = np.mean(distances)
+        stats['distance_std'] = np.std(distances)
+        stats['distance_cv'] = stats['distance_std'] / stats['avg_distance'] if stats['avg_distance'] > 0 else 0
+        
+        # Graph density characterization
+        threshold = stats['avg_distance']
+        stats['density'] = np.sum(distances <= threshold) / len(distances)
+        
+        # Distance distribution skewness
+        if len(distances) > 2:
+            stats['skewness'] = np.mean((distances - stats['avg_distance']) ** 3) / (stats['distance_std'] ** 3)
+        else:
+            stats['skewness'] = 0
+        
+        # Cluster tendency (using MST structure)
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = np.sum(mst > 0)
+        max_edges = n * (n - 1) / 2
+        stats['mst_coverage'] = mst_edges / max_edges if max_edges > 0 else 0
+        
+        return stats
+    
+    problem_stats = characterize_problem()
+    
+    # ==================== 2. VARIABLE-STEP REGRET ANALYSIS ====================
+    def compute_variable_step_regret() -> np.ndarray:
+        """Compute regret scores with step count adapted to graph density"""
+        # Determine optimal step count based on density and size
+        if n <= 10:
+            base_steps = 2
+        elif n <= 30:
+            base_steps = 3
+        else:
+            # More steps for dense graphs, fewer for sparse
+            density_factor = min(1.0, max(0.0, problem_stats['density']))
+            base_steps = int(2 + density_factor * 3)
+            base_steps = min(base_steps, 5)  # Cap at 5 steps
+        
+        # Adaptive step count per edge based on local density
+        step_counts = np.full((n, n), base_steps, dtype=int)
+        
+        if n > 3:
+            # Compute local density for each node
+            local_densities = np.zeros(n)
+            for i in range(n):
+                # Use k-nearest neighbors to estimate local density
+                k = min(5, n - 1)
+                if k > 0:
+                    dists = np.partition(distance_matrix[i], k)[:k+1]
+                    valid_dists = dists[dists > 0]
+                    local_densities[i] = 1.0 / (np.mean(valid_dists) + 1e-8) if len(valid_dists) > 0 else 0
+            
+            # Normalize local densities
+            if np.max(local_densities) > 0:
+                local_densities = local_densities / np.max(local_densities)
+            
+            # Adjust step counts based on endpoint densities
+            for i in range(n):
+                for j in range(i + 1, n):
+                    avg_density = (local_densities[i] + local_densities[j]) / 2
+                    # More steps in dense regions
+                    step_counts[i, j] = int(base_steps + avg_density * 2)
+                    step_counts[i, j] = min(max(step_counts[i, j], 1), 6)
+                    step_counts[j, i] = step_counts[i, j]
+        
+        # Compute regret with variable steps
+        regret_scores = np.zeros_like(distance_matrix, dtype=float)
+        
+        for i in range(n):
+            # Precompute nearest neighbors for each node
+            k_neighbors = min(8, n - 1)
+            neighbor_dists = distance_matrix[i].copy()
+            neighbor_dists[i] = np.inf
+            neighbor_indices = np.argpartition(neighbor_dists, k_neighbors)[:k_neighbors]
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                steps = step_counts[i, j]
+                current_edge_cost = distance_matrix[i, j]
+                
+                # Evaluate k alternative paths with the given step count
+                alternative_costs = []
+                
+                for alt_idx in neighbor_indices:
+                    if alt_idx == j:
+                        continue
+                    
+                    # Greedy path exploration with limited steps
+                    path_cost = distance_matrix[i, alt_idx]
+                    current_node = alt_idx
+                    visited = {i, alt_idx}
+                    steps_remaining = steps - 1
+                    
+                    while steps_remaining > 0 and len(visited) < n:
+                        # Find next node (greedy, not revisiting)
+                        next_dists = distance_matrix[current_node].copy()
+                        for v in visited:
+                            next_dists[v] = np.inf
+                        next_dists[current_node] = np.inf
+                        
+                        if np.all(np.isinf(next_dists)):
+                            break
+                        
+                        next_node = np.argmin(next_dists)
+                        path_cost += next_dists[next_node]
+                        current_node = next_node
+                        visited.add(next_node)
+                        steps_remaining -= 1
+                    
+                    alternative_costs.append(path_cost)
+                
+                if alternative_costs:
+                    best_alternative = np.min(alternative_costs)
+                    # Regret: difference between current edge cost and best alternative
+                    regret = max(0, best_alternative - current_edge_cost)
+                    
+                    # Normalize regret by average alternative cost
+                    avg_alternative = np.mean(alternative_costs)
+                    normalized_regret = regret / (avg_alternative + 1e-8) if avg_alternative > 0 else 0
+                    
+                    # Sigmoid transformation for bounded scores
+                    regret_scores[i, j] = 1.0 / (1.0 + np.exp(-normalized_regret))
+        
+        # Symmetrize regret scores
+        regret_scores = (regret_scores + regret_scores.T) / 2.0
+        return regret_scores
+    
+    regret_scores = compute_variable_step_regret()
+    
+    # ==================== 3. META-HEURISTIC WEIGHT OPTIMIZATION ====================
+    def optimize_component_weights() -> Tuple[float, float, float, float, float]:
+        """Optimize weights for heuristic components using problem characteristics"""
+        # Extract relevant statistics
+        density = problem_stats['density']
+        cv = problem_stats['distance_cv']
+        skewness = abs(problem_stats['skewness'])
+        mst_cov = problem_stats['mst_coverage']
+        
+        # Base weights from problem analysis
+        # Regret weight: higher for complex, varied distances
+        w_regret = 0.3 + 0.3 * cv + 0.2 * skewness
+        
+        # Inverse distance weight: higher for sparse problems
+        w_invdist = 0.2 + 0.3 * (1 - density)
+        
+        # MST-based weight: higher when MST covers more of the graph
+        w_mst = 0.2 + 0.2 * mst_cov
+        
+        # Cluster weight: higher for dense, clustered problems
+        w_cluster = 0.15 + 0.25 * density
+        
+        # Novelty weight: for edges not covered by other heuristics
+        w_novelty = 0.1 + 0.1 * (1 - cv)  # Higher for uniform distances
+        
+        # Normalize weights
+        total = w_regret + w_invdist + w_mst + w_cluster + w_novelty
+        return (
+            w_regret / total,
+            w_invdist / total,
+            w_mst / total,
+            w_cluster / total,
+            w_novelty / total
+        )
+    
+    w_r, w_i, w_m, w_c, w_n = optimize_component_weights()
+    
+    # ==================== 4. COMPONENT COMPUTATION ====================
+    # Inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # MST component
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_binary = (mst > 0) | (mst.T > 0)
+    mst_component = mst_binary.astype(float)
+    
+    # Cluster analysis component
+    def compute_cluster_component() -> np.ndarray:
+        """Identify and score intra-cluster edges"""
+        cluster_scores = np.zeros_like(distance_matrix)
+        
+        if n < 4:
+            return cluster_scores
+        
+        # Detect clusters using distance threshold
+        threshold = np.percentile(distance_matrix[distance_matrix > 0], 25)
+        
+        # Build adjacency matrix for clusters
+        cluster_adj = (distance_matrix <= threshold).astype(float)
+        np.fill_diagonal(cluster_adj, 0)
+        
+        # Score edges within clusters inversely proportional to distance
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_adj[i, j] > 0:
+                    # Higher score for shorter intra-cluster edges
+                    score = 1.0 / (distance_matrix[i, j] + 1e-8)
+                    cluster_scores[i, j] = score
+                    cluster_scores[j, i] = score
+        
+        # Normalize
+        max_score = np.max(cluster_scores)
+        if max_score > 0:
+            cluster_scores = cluster_scores / max_score
+        
+        return cluster_scores
+    
+    cluster_scores = compute_cluster_component()
+    
+    # Novelty component (edges not strongly covered by other heuristics)
+    def compute_novelty_component() -> np.ndarray:
+        """Identify promising edges not highlighted by other components"""
+        novelty_scores = np.zeros_like(distance_matrix)
+        
+        # Combine existing scores
+        combined = w_r * regret_scores + w_i * inv_dist + w_m * mst_component + w_c * cluster_scores
+        
+        # Find edges with moderate scores (not too high, not too low)
+        for i in range(n):
+            row_scores = combined[i].copy()
+            row_scores[i] = -1
+            
+            if len(row_scores) > 2:
+                q1 = np.percentile(row_scores, 25)
+                q3 = np.percentile(row_scores, 75)
+                
+                # Novel edges are those in the middle range
+                mask = (row_scores >= q1) & (row_scores <= q3)
+                novelty_scores[i][mask] = 1.0 - abs(row_scores[mask] - (q1 + q3)/2)
+        
+        return novelty_scores
+    
+    novelty_scores = compute_novelty_component()
+    
+    # ==================== 5. PROBABILISTIC EDGE SELECTION MODEL ====================
+    def compute_probabilistic_scores() -> np.ndarray:
+        """Convert heuristic scores to probabilistic edge selection model"""
+        # Combine components with optimized weights
+        combined = (
+            w_r * regret_scores +
+            w_i * inv_dist +
+            w_m * mst_component +
+            w_c * cluster_scores +
+            w_n * novelty_scores
+        )
+        
+        # Apply softmax per node to get probabilities
+        prob_matrix = np.zeros_like(combined)
+        
+        for i in range(n):
+            row = combined[i].copy()
+            row[i] = -np.inf  # Exclude self
+            
+            # Temperature scaling based on problem complexity
+            temperature = 0.1 + 0.9 * problem_stats['distance_cv']
+            
+            # Softmax with temperature
+            exp_row = np.exp(row / temperature)
+            row_sum = np.sum(exp_row)
+            
+            if row_sum > 0:
+                prob_matrix[i] = exp_row / row_sum
+            prob_matrix[i, i] = 0
+        
+        # Symmetrize probabilities
+        prob_matrix = (prob_matrix + prob_matrix.T) / 2.0
+        
+        return prob_matrix
+    
+    prob_scores = compute_probabilistic_scores()
+    
+    # ==================== 6. LOCAL SEARCH FEEDBACK SIMULATION ====================
+    def simulate_local_search_feedback() -> np.ndarray:
+        """Simulate local search to refine edge scores"""
+        feedback_scores = prob_scores.copy()
+        
+        if n < 4:
+            return feedback_scores
+        
+        # Simulate 2-opt moves to estimate edge quality
+        for i in range(n):
+            for j in range(i + 1, n):
+                if prob_scores[i, j] < 0.1:
+                    continue
+                
+                # Find potential 2-opt partners
+                k_candidates = []
+                for k in range(n):
+                    if k != i and k != j and prob_scores[i, k] > 0.05:
+                        k_candidates.append(k)
+                
+                if not k_candidates:
+                    continue
+                
+                # Evaluate potential improvements
+                improvements = []
+                for k in k_candidates:
+                    # Find l to complete the 2-opt
+                    for l in range(n):
+                        if l not in [i, j, k] and prob_scores[j, l] > 0.05:
+                            current_cost = distance_matrix[i, j] + distance_matrix[k, l]
+                            new_cost = distance_matrix[i, k] + distance_matrix[j, l]
+                            improvement = current_cost - new_cost
+                            if improvement > 0:
+                                improvements.append(improvement)
+                
+                if improvements:
+                    avg_improvement = np.mean(improvements)
+                    # Boost score based on improvement potential
+                    boost = min(0.5, avg_improvement / (distance_matrix[i, j] + 1e-8))
+                    feedback_scores[i, j] = min(1.0, prob_scores[i, j] + boost)
+                    feedback_scores[j, i] = feedback_scores[i, j]
+        
+        return feedback_scores
+    
+    final_scores = simulate_local_search_feedback()
+    
+    # ==================== 7. ADAPTIVE REFINEMENT ====================
+    # Dynamic edge retention based on scores
+    retained_edges = np.zeros_like(final_scores, dtype=bool)
+    
+    for i in range(n):
+        row_scores = final_scores[i].copy()
+        row_scores[i] = -1
+        
+        # Adaptive retention: keep top-k edges based on problem size
+        k = max(3, min(10, int(np.sqrt(n))))
+        
+        if len(row_scores) > k:
+            top_indices = np.argpartition(row_scores, -k)[-k:]
+            retained_edges[i, top_indices] = True
+        else:
+            retained_edges[i] = row_scores > 0
+    
+    # Ensure symmetry
+    retained_edges = retained_edges | retained_edges.T
+    
+    # Apply retention mask
+    final_scores = final_scores * retained_edges
+    
+    # ==================== 8. FINAL NORMALIZATION ====================
+    # Ensure non-negativity
+    final_scores = np.maximum(final_scores, 0)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    # Zero diagonal
+    np.fill_diagonal(final_scores, 0)
+    
+    # Restore warnings
+    warnings.filterwarnings('default', category=RuntimeWarning)
+    
+    return final_scores
+```

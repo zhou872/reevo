@@ -1,0 +1,389 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret with Exponential Decay", "Spectral Clustering Penalty", "2-opt Neighborhood Analysis", "Dynamic Entropy Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with 2-opt neighborhood analysis and dynamic
+    component weighting based on solution structure feedback.
+    
+    Key improvements over v1:
+    1. 2-opt move probability estimation for edge stability
+    2. Reinforcement-inspired dynamic weighting of heuristic components
+    3. Hierarchical clustering for multi-scale structure analysis
+    4. Adaptive regret depth based on problem complexity
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # ===== 1. DYNAMIC PARAMETER INITIALIZATION =====
+    avg_dist = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    std_dist = np.std(distance_matrix[np.triu_indices(n, k=1)])
+    uniformity = std_dist / (avg_dist + 1e-10)
+    
+    # Adaptive parameters
+    k_nn = max(3, int(np.log2(n) * (1.5 - 0.5 * uniformity)))
+    regret_depth = min(4, max(2, int(np.log(n) / np.log(1.5))))
+    cluster_levels = min(3, max(2, int(np.log2(n) / 2)))
+    
+    # ===== 2. BASE COMPONENTS =====
+    # Inverse distance with local scaling
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    
+    # Local density estimation
+    local_scales = np.zeros(n)
+    for i in range(n):
+        k_local = min(k_nn, n-1)
+        local_scales[i] = np.mean(sorted_dists[i, 1:k_local+1]) if k_local > 0 else avg_dist
+    
+    scale_matrix = np.maximum(local_scales[:, None], local_scales[None, :])
+    inv_dist = 1 / (distance_matrix + 1e-10 * avg_dist)
+    inv_dist /= scale_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ===== 3. HIERARCHICAL SPECTRAL CLUSTERING =====
+    cluster_penalties = np.ones((n, n))
+    
+    if n > 10:
+        # Multi-level clustering
+        for level in range(cluster_levels):
+            # Create similarity matrix for this level
+            gamma = avg_dist * (0.5 ** level)
+            W = np.exp(-distance_matrix / (gamma + 1e-10))
+            np.fill_diagonal(W, 0)
+            
+            D = np.diag(W.sum(axis=1))
+            D_inv_sqrt = np.diag(1 / np.sqrt(np.diag(D) + 1e-10))
+            L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+            
+            try:
+                # Compute top eigenvectors
+                eigvals, eigvecs = eigh(L_norm, subset_by_index=[1, min(4, n-1)])
+                for k in range(1, min(3, eigvecs.shape[1])):
+                    vec = eigvecs[:, k]
+                    # Soft clustering assignment
+                    cluster_prob = 1 / (1 + np.exp(-10 * (vec - np.median(vec))))
+                    
+                    # Penalty based on cluster difference
+                    diff = np.abs(cluster_prob[:, None] - cluster_prob[None, :])
+                    penalty = 1 - 0.4 * (0.7 ** level) * diff
+                    cluster_penalties *= penalty
+            except:
+                continue
+    
+    # ===== 4. ENHANCED REGRET ANALYSIS WITH ADAPTIVE DEPTH =====
+    regret_scores = np.ones((n, n))
+    
+    # Precompute best paths of different lengths
+    best_paths = []
+    weights = []
+    
+    # Weight decay for longer lookaheads
+    total_weight = 0
+    for d in range(1, regret_depth + 1):
+        weight = np.exp(-0.8 * (d - 1))
+        weights.append(weight)
+        total_weight += weight
+    weights = [w / total_weight for w in weights]
+    
+    # Compute best paths for each depth
+    for depth in range(1, regret_depth + 1):
+        best_at_depth = np.full(n, np.inf)
+        
+        if depth == 1:
+            best_at_depth = sorted_dists[:, 1]
+        else:
+            # Approximate best d-step path using limited branching
+            for i in range(n):
+                best_cost = np.inf
+                # Consider top branching_factor alternatives at each step
+                branching = min(3, n // 2)
+                
+                # Recursive search with pruning
+                def dfs(current, visited, cost, steps):
+                    nonlocal best_cost
+                    if steps == depth:
+                        best_cost = min(best_cost, cost)
+                        return
+                    
+                    # Consider top neighbors
+                    neighbors = sorted_indices[current, 1:branching+1]
+                    for nb in neighbors:
+                        if nb not in visited:
+                            new_cost = cost + distance_matrix[current, nb]
+                            if new_cost < best_cost:  # Pruning
+                                dfs(nb, visited | {nb}, new_cost, steps + 1)
+                
+                dfs(i, {i}, 0, 0)
+                best_at_depth[i] = best_cost if best_cost < np.inf else depth * avg_dist
+        
+        best_paths.append(best_at_depth)
+    
+    # Compute combined regret for each edge
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            combined_regret = 0
+            for d in range(regret_depth):
+                if d == 0:
+                    path_cost = distance_matrix[i, j]
+                else:
+                    # Estimate d-step path cost through j
+                    # Simplified: cost to j + average continuation
+                    continuation_cost = 0
+                    count = 0
+                    
+                    # Sample possible continuations
+                    for k_idx in range(1, min(4, n)):
+                        k = sorted_indices[j, k_idx]
+                        if k != i:
+                            if d == 1:
+                                est_cost = distance_matrix[i, j] + distance_matrix[j, k]
+                            else:
+                                # Approximate with average
+                                est_cost = distance_matrix[i, j] + (d * avg_dist)
+                            continuation_cost += est_cost
+                            count += 1
+                    
+                    if count > 0:
+                        path_cost = continuation_cost / count
+                    else:
+                        path_cost = distance_matrix[i, j] + d * avg_dist
+                
+                regret = (path_cost - best_paths[d][i]) / (best_paths[d][i] + 1e-10)
+                combined_regret += weights[d] * max(0, regret)
+            
+            # Convert regret to score
+            regret_scores[i, j] = np.exp(-1.2 * combined_regret)
+    
+    # ===== 5. 2-OPT NEIGHBORHOOD ANALYSIS =====
+    opt2_scores = np.ones((n, n))
+    
+    if n >= 4:
+        # Precompute candidate pairs for 2-opt moves
+        for i in range(n):
+            # Consider edges from i to its promising connections
+            top_edges = min(5, n-1)
+            candidates_i = sorted_indices[i, 1:top_edges+1]
+            
+            for j_idx in range(len(candidates_i)):
+                j = candidates_i[j_idx]
+                if i >= j:
+                    continue
+                    
+                # Find alternative edges that could replace (i,j) in 2-opt
+                gain_sum = 0
+                count = 0
+                
+                # Look for crossing edges that would create a 2-opt improvement
+                for k in candidates_i:
+                    if k == j:
+                        continue
+                        
+                    # Find l that connects to both i's and j's neighborhoods
+                    top_l = min(3, n-1)
+                    candidates_l = sorted_indices[j, 1:top_l+1]
+                    
+                    for l in candidates_l:
+                        if l == i or l == k:
+                            continue
+                            
+                        # Check if (i,j) and (k,l) cross
+                        # Compute 2-opt gain: d(i,j) + d(k,l) - d(i,k) - d(j,l)
+                        gain = distance_matrix[i, j] + distance_matrix[k, l] - \
+                               distance_matrix[i, k] - distance_matrix[j, l]
+                        
+                        if gain > 0:
+                            # Edge (i,j) is likely to be removed in 2-opt
+                            gain_sum += gain
+                            count += 1
+                
+                if count > 0:
+                    avg_gain = gain_sum / count
+                    # Convert gain to survival probability
+                    survival_prob = np.exp(-2.0 * avg_gain / (distance_matrix[i, j] + 1e-10))
+                    opt2_scores[i, j] = opt2_scores[j, i] = max(0.2, survival_prob)
+    
+    # ===== 6. MST ENHANCEMENT WITH CYCLE POTENTIAL =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst + mst.T) > 0
+    
+    mst_scores = np.ones((n, n))
+    
+    # Compute for each non-MST edge how many MST cycles it completes
+    for i in range(n):
+        for j in range(i+1, n):
+            if not mst_edges[i, j]:
+                # Find the path between i and j in MST
+                # Simple BFS to find path and its max edge
+                visited = np.zeros(n, dtype=bool)
+                parent = np.full(n, -1)
+                queue = [i]
+                visited[i] = True
+                
+                found = False
+                for node in queue:
+                    if found:
+                        break
+                    neighbors = np.where(mst_edges[node])[0]
+                    for nb in neighbors:
+                        if not visited[nb]:
+                            visited[nb] = True
+                            parent[nb] = node
+                            queue.append(nb)
+                            if nb == j:
+                                found = True
+                                break
+                
+                if found:
+                    # Reconstruct path and find max edge
+                    path = []
+                    current = j
+                    max_edge = 0
+                    while current != i:
+                        prev = parent[current]
+                        path.append((prev, current))
+                        max_edge = max(max_edge, distance_matrix[prev, current])
+                        current = prev
+                    
+                    # Score based on improvement over max edge in path
+                    improvement = max(0, max_edge - distance_matrix[i, j])
+                    cycle_score = 0.5 + 0.5 * np.tanh(improvement / (avg_dist + 1e-10))
+                    mst_scores[i, j] = mst_scores[j, i] = cycle_score
+    
+    # Boost MST edges
+    mst_bonus = 1.2 + 0.3 * (1 - uniformity)  # Higher bonus for non-uniform instances
+    mst_scores[mst_edges] *= mst_bonus
+    
+    # ===== 7. DYNAMIC COMPONENT WEIGHTING =====
+    # Estimate component effectiveness based on their consistency
+    
+    # Compute component correlations
+    components = {
+        'inv': inv_dist / (inv_dist.max() + 1e-10),
+        'regret': regret_scores,
+        'cluster': cluster_penalties,
+        'opt2': opt2_scores,
+        'mst': mst_scores
+    }
+    
+    # Adaptive weights based on problem characteristics
+    base_weights = {
+        'inv': 1.0,
+        'regret': 0.9 + 0.2 * uniformity,  # Higher for uniform
+        'cluster': 0.6 * (1 - uniformity),  # Higher for clustered
+        'opt2': 0.7 + 0.1 * np.log2(n) / 10,
+        'mst': 0.8
+    }
+    
+    # Adjust weights based on component agreement
+    component_mats = list(components.values())
+    avg_correlation = 0
+    count = 0
+    for a in range(len(component_mats)):
+        for b in range(a+1, len(component_mats)):
+            # Flatten upper triangles
+            triu_idx = np.triu_indices(n, 1)
+            vec_a = component_mats[a][triu_idx]
+            vec_b = component_mats[b][triu_idx]
+            
+            if np.std(vec_a) > 1e-10 and np.std(vec_b) > 1e-10:
+                corr = np.corrcoef(vec_a, vec_b)[0, 1]
+                if not np.isnan(corr):
+                    avg_correlation += abs(corr)
+                    count += 1
+    
+    if count > 0:
+        avg_correlation /= count
+        # When components disagree, rely more on regret and opt2
+        if avg_correlation < 0.3:
+            base_weights['regret'] *= 1.3
+            base_weights['opt2'] *= 1.2
+            base_weights['inv'] *= 0.8
+    
+    # Normalize weights
+    weight_sum = sum(base_weights.values())
+    weights = {k: v/weight_sum for k, v in base_weights.items()}
+    
+    # ===== 8. COMBINE COMPONENTS =====
+    combined = np.ones((n, n))
+    for name, weight in weights.items():
+        combined *= components[name] ** weight
+    
+    # ===== 9. ADAPTIVE SPARSIFICATION =====
+    # Compute edge importance using multiple criteria
+    edge_importance = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            # Importance factors
+            imp1 = combined[i, j] / (combined[i].max() + 1e-10)
+            imp2 = combined[i, j] / (combined[:, j].max() + 1e-10)
+            
+            # Local rank
+            rank_i = np.sum(combined[i] > combined[i, j])
+            rank_j = np.sum(combined[:, j] > combined[i, j])
+            rank_factor = 1 - (rank_i + rank_j) / (2 * (n - 2))
+            
+            edge_importance[i, j] = edge_importance[j, i] = \
+                (imp1 + imp2) * rank_factor * 0.5
+    
+    # Dynamic threshold based on desired edge density
+    target_density = min(0.3, max(0.15, 20/n))  # Higher density for smaller n
+    triu_values = edge_importance[np.triu_indices(n, 1)]
+    
+    if len(triu_values) > 0:
+        threshold = np.percentile(triu_values, 100 * (1 - target_density))
+        mask = edge_importance >= threshold
+        
+        # Ensure minimum connectivity
+        for i in range(n):
+            if mask[i].sum() < 2:
+                # Add best missing connections
+                row = combined[i].copy()
+                row[i] = -np.inf
+                row[mask[i]] = -np.inf
+                needed = 2 - mask[i].sum()
+                if needed > 0:
+                    top_indices = np.argpartition(row, -needed)[-needed:]
+                    mask[i, top_indices] = True
+                    mask[top_indices, i] = True
+        
+        combined = combined * mask
+    
+    # ===== 10. FINAL PROCESSING =====
+    np.fill_diagonal(combined, 0)
+    
+    # Smooth normalization preserving relative order
+    row_sums = combined.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    combined = combined / row_sums
+    
+    # Gentle smoothing
+    combined = 0.9 * combined + 0.1 * (1/(n-1))
+    np.fill_diagonal(combined, 0)
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+```

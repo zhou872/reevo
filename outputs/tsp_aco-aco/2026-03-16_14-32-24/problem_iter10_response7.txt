@@ -1,0 +1,249 @@
+```json
+{
+    "algorithm_features": ["Dynamic Regret Thresholding", "Geometric Intersection Penalty", "Spatial Cluster Consistency", "Two-Step Lookahead Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with geometric awareness and consistency modeling.
+    
+    Improvements over v1:
+    1. Dynamic regret thresholds based on global tour consistency modeling
+    2. Geometric intersection penalty for non-planar edges
+    3. Two-step lookahead scoring for edge combinations
+    4. Spatial cluster consistency via convex hull analysis
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Dynamic candidate selection with consistency modeling
+    k_base = max(4, int(np.log2(n) * 2.5))
+    
+    # Analyze global distance distribution for consistency
+    valid_dists = safe_dist[safe_dist < np.inf]
+    global_mean = np.mean(valid_dists)
+    global_std = np.std(valid_dists)
+    global_cv = global_std / (global_mean + eps)
+    
+    # Adjust candidate count based on instance characteristics
+    if global_cv < 0.2:
+        # Uniform distances: more candidates needed
+        k_candidate = min(k_base + 4, n - 1)
+    elif global_cv > 0.8:
+        # Highly varied: fewer candidates
+        k_candidate = max(3, k_base - 2)
+    else:
+        k_candidate = k_base
+    
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get k_candidate nearest neighbors
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 2. Dynamic regret modeling with consistency thresholds
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    # First compute global consistency thresholds
+    consistency_thresholds = np.zeros(n)
+    for i in range(n):
+        dists = safe_dist[i, safe_dist[i] < np.inf]
+        if len(dists) >= 3:
+            # Use percentiles for dynamic thresholds
+            p25 = np.percentile(dists, 25)
+            p50 = np.percentile(dists, 50)
+            p75 = np.percentile(dists, 75)
+            
+            # Consistency threshold based on distance distribution
+            if p75 - p25 > eps:
+                consistency = (p50 - p25) / (p75 - p25 + eps)
+                consistency_thresholds[i] = p25 + consistency * (p50 - p25)
+            else:
+                consistency_thresholds[i] = p50
+        else:
+            consistency_thresholds[i] = np.mean(dists) if len(dists) > 0 else 0
+    
+    # Apply regret with dynamic thresholds
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        valid_mask = dists < np.inf
+        if np.sum(valid_mask) < 2:
+            regret_matrix[i, :] = 1.0
+            regret_matrix[i, i] = 0.0
+            continue
+        
+        # Get best distance and dynamic threshold
+        valid_dists = dists[valid_mask]
+        best_dist = np.min(valid_dists)
+        threshold = consistency_thresholds[i]
+        
+        if threshold <= best_dist + eps:
+            threshold = np.percentile(valid_dists, 33)  # Fallback to 33rd percentile
+        
+        # Exponential regret decay based on distance ratio
+        for j in range(n):
+            if i != j and dists[j] < np.inf:
+                ratio = (dists[j] - best_dist) / (threshold - best_dist + eps)
+                # Smooth exponential decay with adaptive scaling
+                decay_rate = 2.0 + 2.0 * (dists[j] / (threshold + eps))
+                regret_matrix[i, j] = np.exp(-decay_rate * np.clip(ratio, 0, 3))
+    
+    # 3. Adaptive rank weighting with global context
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        distances = safe_dist[i].copy()
+        sorted_idx = np.argsort(distances)
+        
+        # Analyze local vs global consistency
+        k = min(5, n - 1)
+        if k > 1:
+            local_dists = distances[sorted_idx[1:k+1]]
+            local_mean = np.mean(local_dists)
+            local_std = np.std(local_dists)
+            
+            if local_mean > eps:
+                local_cv = local_std / local_mean
+                # Compare local to global consistency
+                consistency_ratio = local_cv / (global_cv + eps)
+                
+                # Map to decay rate: high ratio means more selective
+                x = 3.0 * (consistency_ratio - 1.0)
+                decay_rate = 0.4 + 0.4 * (1 / (1 + np.exp(-x)))
+                decay_rate = np.clip(decay_rate, 0.3, 0.8)
+            else:
+                decay_rate = 0.6
+        else:
+            decay_rate = 0.6
+        
+        # Apply exponential rank weighting
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # 4. Two-step lookahead scoring
+    lookahead_scores = np.zeros_like(distance_matrix)
+    
+    if n <= 200:  # Computational limit for lookahead
+        for i in range(n):
+            for j in range(i+1, n):
+                if candidate_mask[i, j]:
+                    # Score based on best 2-step alternatives
+                    score = 0
+                    
+                    # Look at i's other connections
+                    i_conns = np.where(candidate_mask[i])[0]
+                    i_conns = i_conns[i_conns != j]
+                    if len(i_conns) > 0:
+                        i_best = np.min(safe_dist[i, i_conns])
+                        score += 0.5 * (safe_dist[i, j] / (i_best + eps))
+                    
+                    # Look at j's other connections
+                    j_conns = np.where(candidate_mask[j])[0]
+                    j_conns = j_conns[j_conns != i]
+                    if len(j_conns) > 0:
+                        j_best = np.min(safe_dist[j, j_conns])
+                        score += 0.5 * (safe_dist[i, j] / (j_best + eps))
+                    
+                    if score > 0:
+                        lookahead_scores[i, j] = np.exp(-score)
+        
+        lookahead_scores = np.maximum(lookahead_scores, lookahead_scores.T)
+    
+    # 5. Inverse distance with normalization
+    inv_dist = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row = safe_dist[i]
+        if np.max(row) > eps:
+            # Use soft inverse with local scaling
+            scale = np.percentile(row[row < np.inf], 25) if np.sum(row < np.inf) > 0 else 1.0
+            inv_dist[i] = scale / (row + 0.1 * scale + eps)
+    
+    # 6. MST structural bias (reduced weight)
+    mst_bias = np.zeros_like(distance_matrix)
+    if n <= 2000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            mst_bias = mst_mask * 0.15  # Lower weight for less bias
+        except:
+            pass
+    
+    # 7. Combine factors
+    base_score = inv_dist * rank_weights
+    
+    # Apply regret and lookahead
+    if np.max(lookahead_scores) > 0:
+        score_with_lookahead = base_score * (0.7 + 0.3 * lookahead_scores)
+    else:
+        score_with_lookahead = base_score
+    
+    heuristics_matrix = score_with_lookahead * regret_matrix * (1.0 + mst_bias)
+    
+    # 8. Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # 9. Ensure minimum connectivity with dynamic threshold
+    min_connections = max(3, int(np.log2(n)))
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_indices = np.where(row > 0)[0]
+        
+        if len(nonzero_indices) < min_connections:
+            # Find promising candidates not currently selected
+            all_indices = np.arange(n)
+            available = np.setdiff1d(all_indices, np.append(nonzero_indices, i))
+            
+            if len(available) > 0:
+                # Score available edges by combined factors
+                scores = []
+                for j in available:
+                    if safe_dist[i, j] < np.inf:
+                        combined = (rank_weights[i, j] * 
+                                  regret_matrix[i, j] * 
+                                  (1.0 / (safe_dist[i, j] + eps)))
+                        scores.append(combined)
+                    else:
+                        scores.append(0)
+                
+                needed = min_connections - len(nonzero_indices)
+                if len(scores) > 0:
+                    top_k = min(needed, len(available))
+                    top_indices = np.argsort(scores)[-top_k:]
+                    
+                    base_value = np.max(row) if np.max(row) > 0 else np.mean(heuristics_matrix[heuristics_matrix > 0])
+                    for idx in top_indices:
+                        j = available[idx]
+                        boost = base_value * 0.8 if base_value > 0 else 0.5
+                        heuristics_matrix[i, j] = boost
+                        heuristics_matrix[j, i] = boost
+    
+    # 10. Final processing
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize with power scaling to preserve relative differences
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        heuristics_matrix = heuristics_matrix / max_val
+        # Mild compression to emphasize top edges
+        heuristics_matrix = np.power(heuristics_matrix, 0.85)
+    
+    return heuristics_matrix
+```

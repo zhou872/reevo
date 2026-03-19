@@ -1,0 +1,205 @@
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection using multiplicative combination
+    of structural factors, adaptive sparsification, and promising edge masks.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more
+        promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Prepare safe distance matrix (avoid division by zero and self-loops)
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # 1. Base heuristic: reciprocal of distance with exponential decay
+    scale = np.median(safe_dist[safe_dist < np.inf])
+    base_heuristic = np.exp(-safe_dist / (scale + 1e-10))
+    
+    # 2. Triangle inequality penalty (vectorized version)
+    triangle_penalty = np.ones_like(base_heuristic)
+    
+    if n >= 3:
+        # Precompute distance ranks for efficient thresholding
+        for i in range(n):
+            for j in range(i + 1, n):
+                if safe_dist[i, j] < np.inf:
+                    # Find minimum detour through third node k
+                    mask = np.ones(n, dtype=bool)
+                    mask[[i, j]] = False
+                    min_detour = np.min(safe_dist[i, mask] + safe_dist[mask, j])
+                    
+                    # Apply penalty based on how much longer direct edge is
+                    ratio = safe_dist[i, j] / (min_detour + 1e-10)
+                    if ratio > 2.0:
+                        penalty = 0.1
+                    elif ratio > 1.5:
+                        penalty = 0.3
+                    elif ratio > 1.2:
+                        penalty = 0.6
+                    else:
+                        penalty = 1.0
+                    triangle_penalty[i, j] = triangle_penalty[j, i] = penalty
+    
+    # 3. Local density bonus (enhanced spatial clustering)
+    density_bonus = np.ones_like(base_heuristic)
+    
+    if n >= 4:
+        # Adaptive density estimation per node
+        for i in range(n):
+            # Compute local density radius (distance to k-th nearest neighbor)
+            k_density = max(2, min(5, n // 4))
+            sorted_dists = np.sort(safe_dist[i])
+            radius = sorted_dists[min(k_density, n-1)]
+            
+            for j in range(i + 1, n):
+                if safe_dist[i, j] < np.inf:
+                    # Check if both nodes are in each other's dense regions
+                    in_i_dense = safe_dist[i, j] <= 1.5 * radius
+                    j_radius = np.sort(safe_dist[j])[min(k_density, n-1)]
+                    in_j_dense = safe_dist[i, j] <= 1.5 * j_radius
+                    
+                    if in_i_dense and in_j_dense:
+                        # Both in dense regions - likely same cluster
+                        density_bonus[i, j] = density_bonus[j, i] = 1.5
+                    elif in_i_dense or in_j_dense:
+                        # One in dense region - moderate bonus
+                        density_bonus[i, j] = density_bonus[j, i] = 1.2
+                    else:
+                        # Neither in dense regions - slight penalty
+                        density_bonus[i, j] = density_bonus[j, i] = 0.8
+    
+    # 4. Degree control with adaptive competition
+    degree_factor = np.ones_like(base_heuristic)
+    
+    # Adaptive number of competitive edges per node
+    m = max(3, min(8, int(np.sqrt(n))))
+    
+    # Compute initial combined score before degree adjustment
+    initial_score = base_heuristic * triangle_penalty * density_bonus
+    
+    for i in range(n):
+        row_scores = initial_score[i].copy()
+        row_scores[i] = -np.inf  # Ignore self
+        
+        if np.all(row_scores == -np.inf):
+            continue
+            
+        # Get top m edges for this node
+        top_count = min(m, n - 1)
+        top_indices = np.argpartition(-row_scores, top_count)[:top_count]
+        threshold = np.min(row_scores[top_indices])
+        
+        # Compute exponential ranking weights
+        for j in range(n):
+            if i != j:
+                score_ratio = row_scores[j] / (threshold + 1e-10)
+                if score_ratio >= 1.0:
+                    # Boost top edges with exponential decay
+                    degree_factor[i, j] = 1.0 + np.exp(1.0 - score_ratio)
+                else:
+                    # Penalize non-top edges more aggressively
+                    degree_factor[i, j] = 0.1 * score_ratio
+    
+    # 5. Multiplicative combination of all factors
+    combined_heuristic = base_heuristic * triangle_penalty * density_bonus * degree_factor
+    
+    # 6. Promising edge masks
+    mask = np.zeros_like(combined_heuristic, dtype=bool)
+    
+    # 6a. k-nearest neighbors mask (adaptive k)
+    k = max(2, min(6, n // 3 + 1))
+    for i in range(n):
+        if n > 1:
+            nearest = np.argpartition(safe_dist[i], k+1)[:k+1]
+            nearest = nearest[nearest != i]
+            mask[i, nearest[:min(k, len(nearest))]] = True
+    
+    # Make symmetric
+    mask = np.logical_or(mask, mask.T)
+    
+    # 6b. Minimum spanning tree mask (Prim's algorithm)
+    if n > 1:
+        mst_mask = np.zeros_like(mask, dtype=bool)
+        visited = np.zeros(n, dtype=bool)
+        visited[0] = True
+        
+        for _ in range(n - 1):
+            # Vectorized min edge search between visited and unvisited
+            visited_idx = np.where(visited)[0]
+            unvisited_idx = np.where(~visited)[0]
+            
+            if len(visited_idx) == 0 or len(unvisited_idx) == 0:
+                break
+                
+            # Create masks and find minimum edge
+            v_grid, u_grid = np.meshgrid(visited_idx, unvisited_idx, indexing='ij')
+            edge_distances = safe_dist[v_grid, u_grid]
+            
+            if edge_distances.size == 0:
+                break
+                
+            min_pos = np.unravel_index(np.argmin(edge_distances), edge_distances.shape)
+            min_edge = (visited_idx[min_pos[0]], unvisited_idx[min_pos[1]])
+            
+            if safe_dist[min_edge] < np.inf:
+                mst_mask[min_edge] = True
+                mst_mask[min_edge[::-1]] = True
+                visited[min_edge[1]] = True
+        
+        mask = np.logical_or(mask, mst_mask)
+    
+    # 6c. High score mask (adaptive percentile)
+    if n > 2:
+        non_diag = ~np.eye(n, dtype=bool)
+        valid_scores = combined_heuristic[non_diag]
+        
+        if len(valid_scores) > 0 and np.max(valid_scores) > 0:
+            # Adaptive threshold based on problem size and score distribution
+            if n <= 10:
+                percentile = 80
+            elif n <= 50:
+                percentile = 85
+            else:
+                percentile = 90
+            
+            threshold = np.percentile(valid_scores[valid_scores > 0], percentile)
+            score_mask = combined_heuristic > threshold
+            mask = np.logical_or(mask, score_mask)
+    
+    # 7. Apply mask and sparsify
+    result = combined_heuristic * mask
+    
+    # Additional sparsification: keep strongest edges per node
+    for i in range(n):
+        row = result[i].copy()
+        non_zero = row[row > 0]
+        
+        if len(non_zero) > m:
+            # Keep edges above dynamic threshold
+            threshold = np.percentile(non_zero, 50)  # Median
+            row[row < threshold] = 0
+            result[i] = row
+    
+    # 8. Final processing
+    np.fill_diagonal(result, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(result)
+    if max_val > 0:
+        result = result / max_val
+    
+    # Ensure symmetry (average in case of minor asymmetries)
+    result = (result + result.T) / 2
+    
+    return result
+```

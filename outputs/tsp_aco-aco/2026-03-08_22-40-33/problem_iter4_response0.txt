@@ -1,0 +1,398 @@
+```json
+{
+    "algorithm_features": ["Two-hop Path Advantage Ratio", "Density-Adaptive Component Weighting", "Triangle Inequality Sparsity Bonus", "Mutual K-NN Local Clustering"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+from scipy.spatial.distance import pdist, squareform
+from scipy.spatial import ConvexHull
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  k_nn: int = 5,
+                  base_regret: float = 1.5,
+                  mst_bonus_base: float = 2.0,
+                  adaptive_sparsity: bool = True) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with convex hull features
+    and density-adaptive component integration.
+    
+    Key improvements over v1:
+    1. Convex hull edge detection for Euclidean instances
+    2. Two-hop path advantage ratio with softmax weighting
+    3. Density-adaptive component weighting with instance characterization
+    4. Mutual K-NN local clustering with triangle inequality bonus
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        k_nn: Number of nearest neighbors for local computations
+        base_regret: Base factor for regret-based penalty
+        mst_bonus_base: Base multiplicative bonus for MST edges
+        adaptive_sparsity: Whether to use adaptive sparsification
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # 1. Base inverse distance with regularization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Compute graph instance characteristics
+    density_metric, triangle_satisfaction = compute_instance_characteristics(distance_matrix)
+    
+    # 3. Compute Minimum Spanning Tree with density-adaptive bonus
+    mst_mask, mst_bonus = compute_adaptive_mst(distance_matrix, density_metric, mst_bonus_base)
+    
+    # 4. Two-hop path advantage ratio with softmax weighting
+    path_advantage = compute_two_hop_advantage(distance_matrix, k_nn, triangle_satisfaction)
+    
+    # 5. Mutual K-NN local clustering with triangle inequality bonus
+    cluster_score = compute_mutual_knn_clustering(distance_matrix, k_nn, triangle_satisfaction)
+    
+    # 6. Convex hull detection for Euclidean-like instances
+    hull_bonus = np.zeros((n, n))
+    if triangle_satisfaction > 0.8:  # Likely Euclidean
+        hull_bonus = detect_convex_hull_edges(distance_matrix)
+    
+    # 7. Density-adaptive component weighting
+    weights = compute_adaptive_weights(density_metric, triangle_satisfaction, n)
+    
+    # 8. Combine components with learned weights
+    combined = (weights[0] * inv_dist +
+                weights[1] * path_advantage +
+                weights[2] * cluster_score +
+                weights[3] * hull_bonus)
+    
+    # Apply MST bonus
+    combined[mst_mask] *= mst_bonus
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    # 9. Adaptive sparsification
+    if adaptive_sparsity:
+        combined = adaptive_sparsification(combined, mst_mask, density_metric, triangle_satisfaction)
+    
+    # 10. Normalize to [0,1]
+    max_val = np.max(combined)
+    if max_val > 0:
+        combined = combined / max_val
+    
+    np.fill_diagonal(combined, 0)
+    return combined
+
+def compute_instance_characteristics(distance_matrix: np.ndarray) -> Tuple[float, float]:
+    """Compute density metric and triangle inequality satisfaction rate."""
+    n = distance_matrix.shape[0]
+    
+    # Exclude diagonal
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    if len(distances) == 0:
+        return 0.5, 0.5
+    
+    # Density metric using coefficient of variation
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv = std_dist / (mean_dist + 1e-12)
+    density = 1 - min(cv, 2.0) / 2.0
+    
+    # Triangle inequality satisfaction rate (sampled)
+    triangle_samples = min(1000, n * (n-1) * (n-2) // 6)
+    triangle_violations = 0
+    
+    # Sample random triples
+    for _ in range(triangle_samples):
+        i, j, k = np.random.choice(n, 3, replace=False)
+        if (distance_matrix[i, j] > 
+            distance_matrix[i, k] + distance_matrix[k, j] + 1e-12):
+            triangle_violations += 1
+    
+    triangle_satisfaction = 1 - triangle_violations / triangle_samples
+    
+    return np.clip(density, 0.1, 0.9), np.clip(triangle_satisfaction, 0, 1)
+
+def compute_adaptive_mst(distance_matrix: np.ndarray, 
+                         density: float, 
+                         base_bonus: float) -> Tuple[np.ndarray, float]:
+    """Compute MST with adaptive bonus based on graph characteristics."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    # Prim's algorithm for MST
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    for _ in range(n):
+        # Find minimum edge from unvisited vertices
+        u = -1
+        min_val = np.inf
+        for i in range(n):
+            if not visited[i] and min_edge[i] < min_val:
+                min_val = min_edge[i]
+                u = i
+        
+        if u == -1:
+            break
+            
+        visited[u] = True
+        
+        if parent[u] != -1:
+            mst_mask[u, parent[u]] = True
+            mst_mask[parent[u], u] = True
+        
+        # Update distances to unvisited vertices
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    # Adaptive bonus: higher for sparse graphs where MST is critical
+    adaptive_bonus = base_bonus + (1 - density) * 0.5
+    
+    return mst_mask, adaptive_bonus
+
+def compute_two_hop_advantage(distance_matrix: np.ndarray, 
+                              k: int,
+                              triangle_satisfaction: float) -> np.ndarray:
+    """Compute two-hop path advantage ratio with softmax weighting."""
+    n = distance_matrix.shape[0]
+    advantage = np.zeros((n, n))
+    
+    # For each node, find k nearest neighbors
+    knn_distances = np.zeros((n, n))
+    knn_indices = np.zeros((n, k), dtype=int)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        indices = np.argsort(dists)[:k]
+        knn_indices[i] = indices
+        knn_distances[i, indices] = 1 / (dists[indices] + 1e-12)
+    
+    # Compute two-hop advantage for each edge
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+                
+            # Find best two-hop path through k-nearest neighbors of i and j
+            two_hop_candidates = []
+            
+            # Through neighbors of i
+            for k_node in knn_indices[i]:
+                if k_node != j:
+                    two_hop = distance_matrix[i, k_node] + distance_matrix[k_node, j]
+                    two_hop_candidates.append(two_hop)
+            
+            # Through neighbors of j
+            for k_node in knn_indices[j]:
+                if k_node != i and k_node not in knn_indices[i]:
+                    two_hop = distance_matrix[i, k_node] + distance_matrix[k_node, j]
+                    two_hop_candidates.append(two_hop)
+            
+            if two_hop_candidates:
+                min_two_hop = min(two_hop_candidates)
+                # Advantage ratio: how much better is direct edge?
+                if min_two_hop > 0:
+                    advantage_ratio = min_two_hop / distance_matrix[i, j]
+                    # Softmax-like transformation emphasizing significant advantages
+                    if triangle_satisfaction > 0.8:
+                        # In metric spaces, direct edge should be shortest
+                        advantage_score = np.exp(advantage_ratio - 1)
+                    else:
+                        # In non-metric spaces, be more conservative
+                        advantage_score = 1 / (1 + np.exp(-2 * (advantage_ratio - 1)))
+                    
+                    advantage[i, j] = advantage[j, i] = advantage_score
+    
+    return advantage
+
+def compute_mutual_knn_clustering(distance_matrix: np.ndarray,
+                                  k: int,
+                                  triangle_satisfaction: float) -> np.ndarray:
+    """Compute mutual K-NN clustering with triangle inequality bonus."""
+    n = distance_matrix.shape[0]
+    cluster_score = np.zeros((n, n))
+    
+    # Find k-nearest neighbors for each node
+    knn_masks = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        mask = np.zeros(n, dtype=bool)
+        mask[np.argsort(dists)[:k]] = True
+        knn_masks.append(mask)
+    
+    # Compute mutual clustering scores
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+                
+            # Mutual nearest neighbor bonus
+            mutual_nn = knn_masks[i][j] and knn_masks[j][i]
+            
+            # Common neighbors
+            common_neighbors = np.sum(knn_masks[i] & knn_masks[j])
+            common_ratio = common_neighbors / k
+            
+            # Triangle inequality bonus (if applicable)
+            triangle_bonus = 0
+            if triangle_satisfaction > 0.7:
+                # Check if edge participates in many satisfying triangles
+                tri_count = 0
+                for l in range(min(10, n)):
+                    if l != i and l != j:
+                        if (distance_matrix[i, j] <= 
+                            distance_matrix[i, l] + distance_matrix[l, j] + 1e-12):
+                            tri_count += 1
+                triangle_bonus = tri_count / 10
+            
+            # Combine factors
+            cluster_score[i, j] = cluster_score[j, i] = (
+                0.4 * float(mutual_nn) +
+                0.4 * common_ratio +
+                0.2 * triangle_bonus
+            )
+    
+    return cluster_score
+
+def detect_convex_hull_edges(distance_matrix: np.ndarray) -> np.ndarray:
+    """Detect convex hull edges for Euclidean-like distance matrices."""
+    n = distance_matrix.shape[0]
+    hull_bonus = np.zeros((n, n))
+    
+    try:
+        # Attempt to embed in Euclidean space using MDS
+        from sklearn.manifold import MDS
+        if n > 3:
+            mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+            coords = mds.fit_transform(distance_matrix)
+            
+            # Compute convex hull
+            hull = ConvexHull(coords)
+            
+            # Mark hull edges
+            for simplex in hull.simplices:
+                i, j = simplex[0], simplex[1]
+                hull_bonus[i, j] = hull_bonus[j, i] = 1.0
+                
+                # Also give partial bonus to vertices adjacent to hull vertices
+                for k in range(n):
+                    if k != i and k != j:
+                        if distance_matrix[i, k] < np.percentile(distance_matrix[i], 25):
+                            hull_bonus[i, k] = hull_bonus[k, i] = max(hull_bonus[i, k], 0.3)
+                        if distance_matrix[j, k] < np.percentile(distance_matrix[j], 25):
+                            hull_bonus[j, k] = hull_bonus[k, j] = max(hull_bonus[j, k], 0.3)
+    except:
+        # If convex hull computation fails, return zero matrix
+        pass
+    
+    return hull_bonus
+
+def compute_adaptive_weights(density: float, 
+                             triangle_satisfaction: float,
+                             n: int) -> np.ndarray:
+    """Compute adaptive weights based on instance characteristics."""
+    # Base weights for different components
+    if triangle_satisfaction > 0.8:
+        # Euclidean-like: emphasize path advantage and hull features
+        weights = np.array([
+            0.25,  # inverse distance
+            0.35,  # path advantage
+            0.25,  # clustering
+            0.15   # hull bonus
+        ])
+    elif density > 0.7:
+        # Dense graph: emphasize clustering and local structure
+        weights = np.array([0.3, 0.25, 0.35, 0.1])
+    else:
+        # Sparse or non-metric: emphasize inverse distance
+        weights = np.array([0.45, 0.25, 0.25, 0.05])
+    
+    # Adjust for problem size
+    if n > 100:
+        # For large instances, reduce hull bonus weight
+        weights[3] *= 0.5
+        weights = weights / np.sum(weights)
+    
+    return weights
+
+def adaptive_sparsification(heuristics: np.ndarray,
+                            mst_mask: np.ndarray,
+                            density: float,
+                            triangle_satisfaction: float) -> np.ndarray:
+    """Apply adaptive sparsification based on graph characteristics."""
+    n = heuristics.shape[0]
+    result = heuristics.copy()
+    
+    # Keep all MST edges
+    result[mst_mask] = heuristics[mst_mask]
+    
+    # For non-MST edges, apply adaptive thresholding
+    non_mst_mask = ~mst_mask
+    np.fill_diagonal(non_mst_mask, False)
+    
+    non_mst_values = result[non_mst_mask]
+    if len(non_mst_values) == 0:
+        return result
+    
+    # Determine threshold based on characteristics
+    if triangle_satisfaction > 0.8:
+        # Euclidean: be selective, keep fewer edges
+        percentile = 75
+    elif density > 0.7:
+        # Dense: keep more edges for exploration
+        percentile = 60
+    else:
+        # Sparse: keep moderate number of edges
+        percentile = 65
+    
+    threshold = np.percentile(non_mst_values, percentile)
+    
+    # Apply threshold with some randomness for exploration
+    rng = np.random.RandomState(42)
+    for i in range(n):
+        for j in range(i+1, n):
+            if non_mst_mask[i, j] and result[i, j] < threshold:
+                # Soft threshold: keep with small probability based on how close to threshold
+                if result[i, j] > 0:
+                    keep_prob = np.exp((result[i, j] - threshold) / (threshold + 1e-12))
+                    if rng.random() > keep_prob:
+                        result[i, j] = result[j, i] = 0
+    
+    return result
+
+# Example usage and test
+if __name__ == "__main__":
+    # Create a sample Euclidean distance matrix
+    np.random.seed(42)
+    n_nodes = 30
+    coords = np.random.rand(n_nodes, 2) * 100
+    dist_matrix = squareform(pdist(coords))
+    
+    # Calculate heuristics
+    heuristics = heuristics_v2(dist_matrix.copy())
+    
+    print(f"Original distance matrix shape: {dist_matrix.shape}")
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+    print(f"Non-zero entries per row: {(heuristics != 0).sum(axis=1).mean():.1f}")
+    
+    # Show some example scores
+    print("\nSample edge scores (i, j, distance, heuristic):")
+    for i, j in [(0, 1), (0, 2), (1, 2), (3, 4), (5, 10)]:
+        if i < n_nodes and j < n_nodes:
+            print(f"({i}, {j}): dist={dist_matrix[i, j]:.2f}, "
+                  f"heuristic={heuristics[i, j]:.4f}")
+```

@@ -1,0 +1,268 @@
+```json
+{
+    "algorithm_features": ["Adaptive Instance Weighting", "Closeness Centrality Refinement", "Dynamic Regret Minimization", "Triangle Inequality Penalty"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge selection heuristics with adaptive instance learning.
+    
+    Key improvements over v1:
+    1. Instance-aware adaptive weighting based on distance distribution statistics
+    2. Enhanced closeness centrality with distance-decay normalization
+    3. Dynamic regret computation that adjusts based on local competition
+    4. Robust triangle inequality enforcement with fallback mechanisms
+    5. Intelligent sparsification preserving Hamiltonian feasibility
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # ========== 1. INSTANCE CHARACTERISTICS ANALYSIS ==========
+    def analyze_instance(dist_mat: np.ndarray) -> dict:
+        """Extract key statistics for adaptive weight tuning."""
+        # Get upper triangular without diagonal
+        triu_indices = np.triu_indices_from(dist_mat, k=1)
+        distances = dist_mat[triu_indices]
+        
+        stats = {
+            'cv': np.std(distances) / (np.mean(distances) + 1e-10),  # Coefficient of variation
+            'skewness': np.mean((distances - np.mean(distances))**3) / (np.std(distances)**3 + 1e-10),
+            'sparsity_ratio': np.sum(distances < np.percentile(distances, 25)) / len(distances),
+            'distance_entropy': -np.sum(np.histogram(distances, bins=20)[0] / len(distances) * 
+                                       np.log(np.histogram(distances, bins=20)[0] / len(distances) + 1e-10))
+        }
+        
+        # Determine instance type
+        if stats['cv'] < 0.3 and stats['sparsity_ratio'] > 0.4:
+            stats['type'] = 'uniform_dense'
+        elif stats['cv'] > 0.7:
+            stats['type'] = 'heterogeneous'
+        else:
+            stats['type'] = 'moderate'
+        
+        return stats
+    
+    instance_stats = analyze_instance(distance_matrix)
+    
+    # ========== 2. ADAPTIVE WEIGHT COMPUTATION ==========
+    def compute_adaptive_weights(stats: dict) -> Tuple[float, float, float, float]:
+        """Dynamically adjust factor weights based on instance characteristics."""
+        # Base weights
+        w_dist = 0.4
+        w_centrality = 0.2
+        w_regret = 0.3
+        w_triangle = 0.1
+        
+        # Adjust based on instance type
+        if stats['type'] == 'uniform_dense':
+            # In dense uniform graphs, local structure matters more
+            w_dist *= 0.8
+            w_centrality *= 1.3
+            w_regret *= 1.2
+            w_triangle *= 0.7
+        elif stats['type'] == 'heterogeneous':
+            # In heterogeneous graphs, distance and triangle inequality are key
+            w_dist *= 1.3
+            w_centrality *= 0.7
+            w_regret *= 0.9
+            w_triangle *= 1.1
+        else:  # moderate
+            # Balanced approach
+            w_dist *= 1.0
+            w_centrality *= 1.0
+            w_regret *= 1.0
+            w_triangle *= 1.0
+        
+        # Normalize
+        total = w_dist + w_centrality + w_regret + w_triangle
+        return (w_dist/total, w_centrality/total, w_regret/total, w_triangle/total)
+    
+    w_dist, w_centrality, w_regret, w_triangle = compute_adaptive_weights(instance_stats)
+    
+    # ========== 3. BASE INVERSE DISTANCE ==========
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        np.fill_diagonal(inv_dist, 0)
+    
+    # ========== 4. ENHANCED CLOSENESS CENTRALITY ==========
+    def compute_centrality(dist_mat: np.ndarray) -> np.ndarray:
+        """Compute distance-decay normalized centrality."""
+        # Closeness centrality with distance decay
+        n = dist_mat.shape[0]
+        centrality = np.zeros(n)
+        
+        for i in range(n):
+            # Use exponential distance decay for more realistic influence
+            decayed_distances = np.exp(-dist_mat[i] / (np.median(dist_mat[i][dist_mat[i] > 0]) + 1e-10))
+            centrality[i] = np.sum(decayed_distances) - 1  # Subtract self
+        
+        # Normalize by node degree approximation
+        degree_approx = np.sum(dist_mat < np.percentile(dist_mat, 30, axis=1, keepdims=True), axis=1)
+        centrality = centrality * (degree_approx / (n-1))
+        
+        return centrality / (np.max(centrality) + 1e-10)
+    
+    centrality = compute_centrality(distance_matrix)
+    
+    # ========== 5. DYNAMIC REGRET COMPUTATION ==========
+    def compute_regret_factors(dist_mat: np.ndarray, inv_dist_mat: np.ndarray) -> np.ndarray:
+        """Compute regret scores with local competition adjustment."""
+        n = dist_mat.shape[0]
+        regret_scores = np.zeros_like(dist_mat)
+        
+        for i in range(n):
+            # Get distances from node i
+            dist_row = dist_mat[i].copy()
+            dist_row[i] = np.inf
+            
+            # Sort distances
+            sorted_indices = np.argsort(dist_row)
+            sorted_distances = dist_row[sorted_indices]
+            
+            # Compute rank-based scores with competition adjustment
+            for rank, j in enumerate(sorted_indices):
+                if i == j:
+                    continue
+                
+                # Base regret: how much worse than the best alternative
+                regret_from_i = (dist_mat[i, j] - sorted_distances[0]) / (sorted_distances[-1] - sorted_distances[0] + 1e-10)
+                
+                # Competition adjustment: consider how many similar alternatives exist
+                similar_count = np.sum(np.abs(sorted_distances - dist_mat[i, j]) < 0.1 * dist_mat[i, j])
+                competition_factor = np.exp(-similar_count / (n/10))
+                
+                # Combine
+                regret_scores[i, j] = (1 - regret_from_i) * competition_factor
+        
+        # Symmetrize
+        regret_scores = (regret_scores + regret_scores.T) / 2
+        
+        return regret_scores
+    
+    regret_factors = compute_regret_factors(distance_matrix, inv_dist)
+    
+    # ========== 6. ROBUST TRIANGLE INEQUALITY PENALTY ==========
+    def compute_triangle_factors(dist_mat: np.ndarray) -> np.ndarray:
+        """Compute triangle inequality factors with fallback mechanisms."""
+        n = dist_mat.shape[0]
+        triangle_factors = np.ones_like(dist_mat)
+        
+        # Precompute nearest neighbors for efficiency
+        k_nearest = max(2, int(np.sqrt(n)))
+        nearest_masks = np.zeros((n, n), dtype=bool)
+        
+        for i in range(n):
+            indices = np.argpartition(dist_mat[i], k_nearest+1)[:k_nearest+1]
+            indices = indices[indices != i]
+            nearest_masks[i, indices] = True
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if not (nearest_masks[i, j] or nearest_masks[j, i]):
+                    triangle_factors[i, j] = triangle_factors[j, i] = 0.5
+                    continue
+                
+                # Find best intermediate node among shared nearest neighbors
+                shared_nn = np.where(nearest_masks[i] & nearest_masks[j])[0]
+                shared_nn = shared_nn[~np.isin(shared_nn, [i, j])]
+                
+                if len(shared_nn) > 0:
+                    indirect_dists = dist_mat[i, shared_nn] + dist_mat[shared_nn, j]
+                    best_indirect = np.min(indirect_dists)
+                    
+                    # Compute penalty based on triangle violation
+                    direct = dist_mat[i, j]
+                    if direct > best_indirect:
+                        penalty = np.exp(-(direct - best_indirect) / (best_indirect + 1e-10))
+                        triangle_factors[i, j] = triangle_factors[j, i] = penalty
+                    else:
+                        triangle_factors[i, j] = triangle_factors[j, i] = 1.0
+                else:
+                    # Fallback: use overall statistics
+                    triangle_factors[i, j] = triangle_factors[j, i] = 0.7
+        
+        return triangle_factors
+    
+    triangle_factors = compute_triangle_factors(distance_matrix)
+    
+    # ========== 7. COMBINE FACTORS WITH ADAPTIVE WEIGHTS ==========
+    edge_scores = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            # Skip if too distant (adaptive threshold)
+            if distance_matrix[i, j] > 2 * np.percentile(distance_matrix, 75):
+                continue
+            
+            # Factor 1: Inverse distance (normalized)
+            dist_factor = inv_dist[i, j] / (np.max(inv_dist[i]) + 1e-10)
+            
+            # Factor 2: Centrality product (enhanced)
+            centrality_factor = (centrality[i] * centrality[j]) ** 0.5
+            
+            # Factor 3: Regret factor
+            regret_factor = regret_factors[i, j]
+            
+            # Factor 4: Triangle factor
+            triangle_factor = triangle_factors[i, j]
+            
+            # Adaptive combination
+            score = (w_dist * dist_factor +
+                    w_centrality * centrality_factor +
+                    w_regret * regret_factor +
+                    w_triangle * triangle_factor)
+            
+            edge_scores[i, j] = edge_scores[j, i] = score
+    
+    # ========== 8. INTELLIGENT SPARSIFICATION ==========
+    # Adaptive sparsity based on instance characteristics
+    if instance_stats['type'] == 'uniform_dense':
+        keep_ratio = 0.3
+    elif instance_stats['type'] == 'heterogeneous':
+        keep_ratio = 0.5
+    else:
+        keep_ratio = 0.4
+    
+    # Determine threshold per node
+    for i in range(n):
+        non_zero = edge_scores[i][edge_scores[i] > 0]
+        if len(non_zero) > 0:
+            threshold = np.percentile(non_zero, 100 * (1 - keep_ratio))
+            edge_scores[i][edge_scores[i] < threshold] = 0
+    
+    # Ensure connectivity: each node must have at least 2 connections
+    for i in range(n):
+        connected = np.where(edge_scores[i] > 0)[0]
+        if len(connected) < 2:
+            # Find closest nodes not yet connected
+            dist_row = distance_matrix[i].copy()
+            dist_row[i] = np.inf
+            dist_row[edge_scores[i] > 0] = np.inf  # Already connected
+            
+            closest = np.argsort(dist_row)[:2 - len(connected)]
+            for j in closest:
+                if j != i:
+                    # Recompute score for these essential edges
+                    edge_scores[i, j] = edge_scores[j, i] = (
+                        w_dist * (inv_dist[i, j] / (np.max(inv_dist[i]) + 1e-10)) +
+                        w_centrality * ((centrality[i] * centrality[j]) ** 0.5) +
+                        w_regret * regret_factors[i, j] +
+                        w_triangle * triangle_factors[i, j]
+                    )
+    
+    # ========== 9. FINAL NORMALIZATION ==========
+    row_sums = edge_scores.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    edge_scores = edge_scores / row_sums
+    
+    # Zero out diagonal
+    np.fill_diagonal(edge_scores, 0)
+    
+    return edge_scores
+```

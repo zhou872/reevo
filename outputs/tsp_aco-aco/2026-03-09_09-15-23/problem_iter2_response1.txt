@@ -1,0 +1,321 @@
+```json
+{
+    "algorithm_features": ["Two-Step Lookahead Cost Estimation", "Regret-Based Edge Penalization", "Dynamic Multi-Factor Fusion", "Adaptive Progressive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import distance_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge prioritization incorporating lookahead,
+    regret-based penalization, and dynamic weight adaptation.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes.
+        
+    Returns:
+        Priority matrix of same shape, where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) / (distance_matrix + 1e-12)
+    
+    # 1. Base inverse distance (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    inv_dist[np.eye(n, dtype=bool)] = 0
+    
+    # 2. Minimum Spanning Tree edges
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # 3. Two-step lookahead cost estimation
+    lookahead_score = _compute_lookahead_score(distance_matrix)
+    
+    # 4. Regret-based edge penalization
+    regret_penalty = _compute_regret_penalty(distance_matrix)
+    
+    # 5. Adaptive k-nearest neighbors bonus
+    knn_bonus = _compute_knn_bonus(distance_matrix, base_k=max(2, n//10))
+    
+    # 6. Cluster density reward
+    density_bonus = _compute_density_bonus(distance_matrix)
+    
+    # 7. Dynamic weight adaptation based on graph properties
+    weights = _compute_dynamic_weights(distance_matrix)
+    
+    # 8. Multi-factor fusion with regret-aware adjustment
+    priorities = inv_dist * (
+        weights['inv_dist'] +
+        weights['mst'] * mst_mask +
+        weights['lookahead'] * lookahead_score +
+        weights['knn'] * knn_bonus +
+        weights['density'] * density_bonus
+    ) * (1.0 - weights['regret'] * regret_penalty)
+    
+    # 9. Progressive sparsification with connectivity guarantee
+    priorities = _progressive_sparsify(priorities, n)
+    
+    # Ensure symmetry and zero diagonal
+    priorities = (priorities + priorities.T) / 2
+    priorities[np.eye(n, dtype=bool)] = 0
+    
+    # Final normalization
+    if priorities.max() > 0:
+        priorities = priorities / priorities.max()
+    
+    return priorities
+
+
+def _compute_mst_mask(dist_matrix: np.ndarray) -> np.ndarray:
+    """Return binary mask of edges in Minimum Spanning Tree."""
+    n = dist_matrix.shape[0]
+    mask = np.zeros_like(dist_matrix, dtype=float)
+    
+    if n <= 1:
+        return mask
+    
+    # Prim's algorithm for MST
+    in_mst = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        u = np.argmin(np.where(~in_mst, min_edge, np.inf))
+        in_mst[u] = True
+        
+        if parent[u] != -1:
+            mask[u, parent[u]] = 1
+            mask[parent[u], u] = 1
+        
+        for v in range(n):
+            if not in_mst[v] and dist_matrix[u, v] < min_edge[v]:
+                min_edge[v] = dist_matrix[u, v]
+                parent[v] = u
+    
+    return mask
+
+
+def _compute_lookahead_score(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Two-step lookahead cost estimation for edge (i,j).
+    Computes min_{k≠i,j} [dist(i,j) + dist(j,k)] for each edge.
+    """
+    n = dist_matrix.shape[0]
+    if n <= 3:
+        return np.ones_like(dist_matrix)
+    
+    score = np.zeros_like(dist_matrix)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Two-step lookahead: i -> j -> k (k ≠ i, j)
+            # We want edges that lead to good subsequent connections
+            # Inverse of the minimum two-step cost from i via j
+            
+            # Get all k ≠ i,j
+            mask = np.ones(n, dtype=bool)
+            mask[[i, j]] = False
+            valid_k = np.where(mask)[0]
+            
+            if len(valid_k) == 0:
+                continue
+                
+            # Compute two-step costs: dist(i,j) + dist(j,k)
+            two_step_costs = dist_matrix[i, j] + dist_matrix[j, valid_k]
+            min_two_step = np.min(two_step_costs)
+            
+            if min_two_step > 0:
+                # Lower two-step cost is better, so take inverse
+                score[i, j] = 1.0 / min_two_step
+    
+    # Normalize
+    if score.max() > 0:
+        score = score / score.max()
+    
+    return score
+
+
+def _compute_regret_penalty(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Regret-based penalty: penalize edges that, if excluded,
+    would force inclusion of much worse alternatives.
+    """
+    n = dist_matrix.shape[0]
+    penalty = np.zeros_like(dist_matrix)
+    
+    for i in range(n):
+        # Sort distances from i (excluding self)
+        sorted_dists = np.sort(dist_matrix[i])
+        sorted_idx = np.argsort(dist_matrix[i])
+        
+        # Find best and second-best edges from i (excluding diagonal)
+        best_idx = sorted_idx[1] if n > 1 else 0
+        second_best_idx = sorted_idx[2] if n > 2 else best_idx
+        
+        best_dist = sorted_dists[1] if n > 1 else 0
+        second_best_dist = sorted_dists[2] if n > 2 else best_dist
+        
+        # Regret for edge (i,j) is how much worse j is than the best
+        for j in range(n):
+            if i == j:
+                continue
+                
+            if best_dist > 0:
+                # Relative regret: how much worse is this edge compared to best
+                regret_ratio = (dist_matrix[i, j] - best_dist) / best_dist
+                
+                # For the best edge itself, compute alternative regret
+                if j == best_idx and second_best_dist > best_dist:
+                    regret_ratio = (second_best_dist - best_dist) / best_dist
+                
+                # Apply sigmoid function to map regret to [0,1]
+                penalty[i, j] = 1.0 / (1.0 + np.exp(-5.0 * regret_ratio))
+    
+    # Make symmetric
+    penalty = (penalty + penalty.T) / 2
+    return penalty
+
+
+def _compute_knn_bonus(dist_matrix: np.ndarray, base_k: int = 3) -> np.ndarray:
+    """Bonus based on adaptive k-nearest neighbors with distance weighting."""
+    n = dist_matrix.shape[0]
+    bonus = np.zeros_like(dist_matrix)
+    
+    k = min(base_k, max(2, n // 5))
+    
+    for i in range(n):
+        indices = np.argsort(dist_matrix[i])[:k+1]
+        indices = indices[indices != i][:k]
+        
+        for rank, j in enumerate(indices):
+            weight = (k - rank) / k  # Linear decay
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = weight / dist_matrix[i, j]
+    
+    # Symmetrize and normalize
+    bonus = (bonus + bonus.T) / 2
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+
+def _compute_density_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """Reward edges within dense clusters."""
+    n = dist_matrix.shape[0]
+    if n <= 3:
+        return np.zeros_like(dist_matrix)
+    
+    # Estimate local density for each node
+    densities = np.zeros(n)
+    for i in range(n):
+        distances = np.sort(dist_matrix[i])[1:4]  # 3 nearest (excluding self)
+        densities[i] = 1.0 / (np.median(distances) + 1e-12)
+    
+    if densities.max() > 0:
+        densities = densities / densities.max()
+    
+    # Bonus is geometric mean of endpoint densities
+    bonus = np.zeros_like(dist_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = np.sqrt(densities[i] * densities[j]) / dist_matrix[i, j]
+    
+    bonus = bonus + bonus.T
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+
+def _compute_dynamic_weights(dist_matrix: np.ndarray) -> dict:
+    """Compute adaptive weights based on graph properties."""
+    n = dist_matrix.shape[0]
+    
+    # Analyze graph properties
+    avg_dist = np.mean(dist_matrix[np.eye(n) == 0])
+    std_dist = np.std(dist_matrix[np.eye(n) == 0])
+    coeff_var = std_dist / (avg_dist + 1e-12)
+    
+    # Base weights that adapt to graph size and structure
+    log_n = np.log1p(n)
+    
+    weights = {
+        'inv_dist': 1.0,  # Base weight for inverse distance
+        'mst': 2.0 + 2.0 * log_n / n,  # More important for small graphs
+        'lookahead': 0.5 + 0.3 * np.log1p(n/10),  # More important for larger graphs
+        'regret': 0.2 + 0.15 * coeff_var,  # More important when distances vary
+        'knn': 1.2 - 0.1 * log_n,  # Less important for larger graphs
+        'density': 0.7  # Constant weight
+    }
+    
+    # Normalize to maintain overall scale
+    total = sum(weights.values()) - weights['inv_dist']  # inv_dist is base 1.0
+    scale = 1.0 + total / 5.0  # Target average factor around 1.0
+    
+    for key in weights:
+        if key != 'inv_dist':
+            weights[key] = weights[key] / scale
+    
+    return weights
+
+
+def _progressive_sparsify(priorities: np.ndarray, n: int) -> np.ndarray:
+    """Progressively sparsify matrix while ensuring connectivity."""
+    result = priorities.copy()
+    
+    if n <= 10:
+        threshold = np.percentile(result[result > 0], 50) if np.any(result > 0) else 0
+    else:
+        keep_ratio = max(0.1, 20.0 / n)
+        if np.any(result > 0):
+            threshold = np.percentile(result[result > 0], 100 * (1 - keep_ratio))
+        else:
+            threshold = 0
+    
+    # Apply threshold
+    result[result < threshold] = 0
+    
+    # Ensure each node has at least 2 connections
+    original_priorities = priorities.copy()
+    for i in range(n):
+        non_zero = np.where(result[i] > 0)[0]
+        if len(non_zero) < 2:
+            # Add back top edges if needed
+            top_indices = np.argsort(original_priorities[i])[-2:]
+            for idx in top_indices:
+                if idx != i:
+                    result[i, idx] = original_priorities[i, idx]
+                    result[idx, i] = original_priorities[idx, i]
+    
+    return result
+
+
+# Example usage and validation
+if __name__ == "__main__":
+    # Generate a sample distance matrix
+    np.random.seed(42)
+    n = 15
+    coords = np.random.rand(n, 2)
+    dist_mat = distance_matrix(coords, coords)
+    
+    # Test the heuristic function
+    heuristics = heuristics_v2(dist_mat)
+    
+    print(f"Original distance matrix shape: {dist_mat.shape}")
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity: {np.mean(heuristics == 0):.2%}")
+    print(f"Non-zero mean: {heuristics[heuristics > 0].mean():.4f}")
+    print(f"Non-zero std: {heuristics[heuristics > 0].std():.4f}")
+    print(f"Top 5 edges: {np.sort(heuristics.flatten())[-5:][::-1]}")
+```

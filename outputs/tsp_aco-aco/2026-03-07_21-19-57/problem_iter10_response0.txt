@@ -1,0 +1,254 @@
+```json
+{
+    "algorithm_features": ["Regret-Enhanced Rank Incentive", "Adaptive Neighborhood Scaling", "Weighted Additive Component Fusion", "Structural Connectivity Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with:
+    1. Regret-enhanced rank incentives incorporating lookahead
+    2. Adaptive neighborhood scaling based on distance distribution
+    3. Weighted additive combination of heuristic components
+    4. Structural connectivity preservation via multi-criteria sparsification
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions (0 = discouraged edge)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    
+    # 1. ADAPTIVE NEIGHBORHOOD SIZE BASED ON DISTANCE DISTRIBUTION
+    # Use coefficient of variation to adapt neighborhood size
+    triu_distances = distance_matrix[np.triu_indices(n, 1)]
+    avg_dist = np.mean(triu_distances)
+    std_dist = np.std(triu_distances)
+    cv = std_dist / (avg_dist + 1e-8)
+    
+    # Adaptive k: smaller neighborhoods for high variance, larger for uniform
+    base_k = 0.1 * n  # Base 10% of nodes
+    k_scaling = 1.5 - np.tanh(cv)  # Range ~0.5 to 2.0
+    k = max(3, int(base_k * k_scaling))
+    k = min(k, n - 1)
+    
+    # 2. REGRET-ENHANCED RANK INCENTIVES WITH LOOKAHEAD
+    rank_matrix = np.zeros((n, n))
+    regret_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Sort distances and get ranks
+        sorted_indices = np.argsort(distances)
+        sorted_distances = distances[sorted_indices]
+        
+        # Store best and second best for regret calculation
+        best_dist = sorted_distances[0]
+        second_best = sorted_distances[1] if len(sorted_distances) > 1 else best_dist
+        regret_i = second_best - best_dist
+        
+        # Normalized regret for this node
+        norm_regret = regret_i / (best_dist + 1e-8)
+        
+        # Assign rank incentives with regret enhancement
+        for rank, j in enumerate(sorted_indices):
+            if i == j:
+                continue
+                
+            # Base rank incentive: exponential decay with rank
+            base_rank_inc = np.exp(-rank / (k + 1e-8))
+            
+            # Regret enhancement: boost for edges with high regret cost
+            # if this is the best edge, apply full regret; otherwise proportional
+            if rank == 0:
+                regret_enhancement = 1.0 + 0.5 * np.tanh(norm_regret)
+            else:
+                # Reduced enhancement for non-best edges
+                regret_enhancement = 1.0 + 0.2 * np.tanh(norm_regret) * np.exp(-rank/3)
+            
+            rank_matrix[i, j] = base_rank_inc * regret_enhancement
+            
+            # Store regret for edge (symmetric)
+            if rank == 0:
+                regret_matrix[i, j] = norm_regret
+    
+    # Make regret matrix symmetric by taking maximum
+    regret_matrix = np.maximum(regret_matrix, regret_matrix.T)
+    
+    # 3. ADAPTIVE DENSITY SIMILARITY COMPONENT
+    density_matrix = np.zeros((n, n))
+    
+    # Compute local density using adaptive k
+    local_density = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Get k nearest distances
+        if n > k:
+            kth_smallest = np.partition(distances, k)[k]
+            nearest_mask = distances <= kth_smallest
+            nearest_dists = distances[nearest_mask]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        
+        if len(nearest_dists) > 0:
+            local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+    
+    # Normalize densities
+    if np.max(local_density) > 0:
+        local_density = local_density / np.max(local_density)
+    
+    # Create density similarity matrix
+    for i in range(n):
+        for j in range(i + 1, n):
+            density_diff = abs(local_density[i] - local_density[j])
+            # Exponential similarity: nodes with similar densities get higher score
+            similarity = np.exp(-2.0 * density_diff)
+            density_matrix[i, j] = density_matrix[j, i] = similarity
+    
+    # 4. SPATIAL PROXIMITY COMPONENT
+    proximity_matrix = np.zeros((n, n))
+    
+    # Compute adaptive proximity threshold for each node
+    prox_thresholds = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Use k nearest to compute threshold
+        if n > k:
+            k_nearest = np.partition(distances, k)[:k]
+            prox_thresholds[i] = 1.5 * np.mean(k_nearest)
+        else:
+            valid_dists = distances[distances < np.inf]
+            prox_thresholds[i] = 1.5 * np.mean(valid_dists) if len(valid_dists) > 0 else avg_dist
+    
+    # Apply proximity scoring
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = distance_matrix[i, j]
+            threshold = min(prox_thresholds[i], prox_thresholds[j])
+            
+            if dist <= threshold:
+                # Within threshold: linear decay from 1.0 at 0 distance
+                proximity_matrix[i, j] = 1.0 - 0.5 * (dist / (threshold + 1e-8))
+            else:
+                # Beyond threshold: exponential decay
+                excess_ratio = dist / (threshold + 1e-8)
+                proximity_matrix[i, j] = 0.5 * np.exp(1 - excess_ratio)
+    
+    # 5. MINIMUM SPANNING TREE COMPONENT
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_matrix = np.where(mst_mask, 1.3, 1.0)  # 30% boost for MST edges
+    
+    # 6. WEIGHTED ADDITIVE COMBINATION OF COMPONENTS
+    # Normalize each component to [0, 1] range
+    def safe_normalize(mat):
+        max_val = np.max(mat)
+        if max_val > 0:
+            return mat / max_val
+        return mat
+    
+    rank_norm = safe_normalize(rank_matrix)
+    regret_norm = safe_normalize(regret_matrix)
+    density_norm = safe_normalize(density_matrix)
+    proximity_norm = safe_normalize(proximity_matrix)
+    
+    # Base inverse distance component (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 1e-8 * avg_dist)
+        inv_dist[np.diag_indices(n)] = 0
+    inv_dist_norm = safe_normalize(inv_dist)
+    
+    # Weighted combination (weights sum to 1.0)
+    weights = {
+        'inv_dist': 0.25,
+        'rank': 0.25,
+        'regret': 0.15,
+        'density': 0.15,
+        'proximity': 0.15,
+        'mst': 0.05  # mst_matrix already has boost, we use lower weight
+    }
+    
+    # Apply weighted additive combination
+    heuristic = (weights['inv_dist'] * inv_dist_norm +
+                 weights['rank'] * rank_norm +
+                 weights['regret'] * regret_norm +
+                 weights['density'] * density_norm +
+                 weights['proximity'] * proximity_norm)
+    
+    # Apply MST boost multiplicatively to preserve its binary nature
+    heuristic = heuristic * mst_matrix
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # 7. STRUCTURAL CONNECTIVITY PRESERVATION VIA SPARSIFICATION
+    # Start with essential backbone: MST edges
+    final_mask = mst_mask.copy()
+    
+    # Add edges based on multiple criteria
+    for i in range(n):
+        # Criterion 1: Top edges by combined heuristic
+        node_heuristics = heuristic[i, :].copy()
+        node_heuristics[i] = -np.inf
+        
+        # Adaptive number of top edges based on node's density
+        density_factor = 0.5 + 0.5 * local_density[i]  # Denser areas get more connections
+        top_count = max(2, int(density_factor * 0.2 * n))  # 10-20% of nodes
+        
+        if top_count > 0:
+            top_indices = np.argpartition(node_heuristics, -top_count)[-top_count:]
+            final_mask[i, top_indices] = True
+            final_mask[top_indices, i] = True
+        
+        # Criterion 2: High regret edges (if not already included)
+        if np.max(regret_matrix[i, :]) > 0:
+            regret_threshold = 0.5 * np.max(regret_matrix[i, :])
+            high_regret = regret_matrix[i, :] > regret_threshold
+            high_regret[i] = False
+            final_mask[i, high_regret] = True
+            final_mask[high_regret, i] = True
+    
+    # Ensure minimum connectivity of 2 for each node
+    for i in range(n):
+        connected = np.where(final_mask[i, :])[0]
+        connected = connected[connected != i]
+        if len(connected) < 2:
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            # Add the 2 closest nodes not already connected
+            for candidate in np.argsort(distances):
+                if candidate != i and not final_mask[i, candidate]:
+                    final_mask[i, candidate] = True
+                    final_mask[candidate, i] = True
+                    if np.sum(final_mask[i, :]) >= 3:  # Now have at least 2 connections
+                        break
+    
+    # Apply sparsification mask
+    heuristic = heuristic * final_mask
+    
+    # Final normalization
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    np.fill_diagonal(heuristic, 0)
+    return heuristic
+```

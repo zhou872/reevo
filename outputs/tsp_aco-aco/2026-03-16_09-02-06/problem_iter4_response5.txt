@@ -1,0 +1,165 @@
+```json
+{
+    "algorithm_features": ["Mutual Top-K Edge Prioritization", "Adaptive Sparsity-Based Thresholding", "Two-Step Path Extension Scoring", "Neighborhood Clustering Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge scoring with adaptive mutual edge prioritization,
+    lightweight lookahead for promising edges, and clustering-aware reinforcement.
+    
+    Features:
+    1. Dynamic top-k percentage based on distance distribution sparsity
+    2. Two-step lookahead only for mutually important edges (efficiency)
+    3. Clustering reinforcement for nodes sharing neighbors
+    4. MST connectivity guarantee with hybrid sparsification
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Priority matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n == 0:
+        return np.array([])
+    
+    # Create working copy and handle self-loops
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Dynamic top-k percentage based on distance sparsity
+    upper_dists = dist[np.triu_indices(n, k=1)]
+    if len(upper_dists) > 1:
+        # Coefficient of variation measures sparsity
+        cv = np.std(upper_dists) / (np.mean(upper_dists) + 1e-10)
+        # More selective for sparse graphs (high CV), less for dense (low CV)
+        base_pct = 0.3
+        adj_pct = base_pct * (1.5 - 0.5 * np.tanh(cv - 1.0))  # Smooth adjustment
+        top_percentage = np.clip(adj_pct, 0.15, 0.45)
+    else:
+        top_percentage = 0.3
+    
+    k_per_node = max(1, int(top_percentage * (n - 1)))
+    
+    # 2. Base inverse distance attractiveness
+    inv_dist = 1 / (dist + 1e-10)
+    
+    # 3. Mutual top-k edge identification with penalty
+    penalty_matrix = np.ones_like(inv_dist)
+    # Precompute sorted indices for all nodes
+    sorted_indices = np.argsort(inv_dist, axis=1)[:, ::-1]
+    
+    for i in range(n):
+        i_top_set = set(sorted_indices[i, :k_per_node])
+        for j in range(i + 1, n):
+            j_top_set = set(sorted_indices[j, :k_per_node])
+            
+            # Penalize if not mutually in top sets
+            if (i not in j_top_set) or (j not in i_top_set):
+                penalty_matrix[i, j] = 0.2  # Stronger penalty than v1
+                penalty_matrix[j, i] = 0.2
+    
+    # Apply initial penalty
+    scores = inv_dist * penalty_matrix
+    
+    # 4. Lightweight lookahead for mutually important edges only
+    # Identify mutual edges (those with penalty = 1.0)
+    mutual_mask = (penalty_matrix == 1.0)
+    
+    if np.any(mutual_mask):
+        # Precompute nearest neighbor for each node (excluding self)
+        nearest = np.zeros(n)
+        for i in range(n):
+            valid_mask = np.arange(n) != i
+            nearest[i] = np.min(dist[i, valid_mask]) if np.any(valid_mask) else 0
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if mutual_mask[i, j]:
+                    # Current edge cost
+                    current_cost = dist[i, j]
+                    
+                    # Best extensions from both ends (excluding the other node)
+                    best_from_i = np.min(dist[i, [k for k in range(n) 
+                                                  if k not in (i, j)]]) if n > 2 else 0
+                    best_from_j = np.min(dist[j, [k for k in range(n) 
+                                                  if k not in (i, j)]]) if n > 2 else 0
+                    
+                    # Two-step cost estimate
+                    lookahead_cost = current_cost + best_from_i + best_from_j
+                    
+                    # Bonus inversely proportional to lookahead cost
+                    # Normalize by average nearest neighbor distance
+                    avg_nn = (nearest[i] + nearest[j]) / 2
+                    lookahead_bonus = avg_nn / (lookahead_cost + 1e-10)
+                    
+                    # Apply bonus to mutually important edges
+                    scores[i, j] *= (1.0 + 0.3 * np.tanh(lookahead_bonus))
+                    scores[j, i] = scores[i, j]
+    
+    # 5. Clustering reinforcement for mutual edges
+    for i in range(n):
+        # Get k nearest neighbors for clustering (slightly larger than top-k)
+        k_cluster = min(6, n - 1)
+        i_neighbors = set(sorted_indices[i, :k_cluster])
+        
+        for j in range(i + 1, n):
+            if mutual_mask[i, j]:
+                j_neighbors = set(sorted_indices[j, :k_cluster])
+                
+                # Count common neighbors in top clusters
+                common = len(i_neighbors.intersection(j_neighbors) - {i, j})
+                if common > 0:
+                    # Reinforcement bonus proportional to overlap
+                    cluster_bonus = 0.2 * (common / k_cluster)
+                    scores[i, j] *= (1.0 + cluster_bonus)
+                    scores[j, i] = scores[i, j]
+    
+    # 6. Hybrid sparsification with adaptive parameters
+    m = max(2, int(np.sqrt(n)))  # Local top per node
+    p = 0.25  # Global percentile cutoff
+    
+    # Local mask: top m edges per node
+    local_mask = np.zeros_like(scores, dtype=bool)
+    for i in range(n):
+        row = scores[i].copy()
+        row[i] = -np.inf
+        top_m = np.argpartition(row, -m)[-m:]
+        local_mask[i, top_m] = True
+        local_mask[top_m, i] = True  # Symmetry
+    
+    # Global mask: top p percentile
+    upper_scores = scores[np.triu_indices(n, k=1)]
+    if len(upper_scores) > 0:
+        threshold = np.percentile(upper_scores, (1 - p) * 100)
+        global_mask = scores >= threshold
+        global_mask = global_mask | global_mask.T
+    else:
+        global_mask = np.ones_like(scores, dtype=bool)
+    
+    # 7. MST connectivity guarantee
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    
+    # Combine all masks (union)
+    final_mask = local_mask | global_mask | mst_mask
+    
+    # Apply final mask
+    scores = scores * final_mask
+    
+    # Final normalization
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

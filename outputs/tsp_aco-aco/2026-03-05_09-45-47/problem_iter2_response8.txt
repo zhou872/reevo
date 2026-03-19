@@ -1,0 +1,225 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "Christofides Hybrid", "Dynamic Sparsification", "Multi-Heuristic Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with adaptive components.
+    
+    Features:
+    1. Adaptive weight tuning based on problem size and structure
+    2. Incorporates Christofides algorithm components (MST + matching)
+    3. Dynamic sparsification thresholds based on edge distribution
+    4. Multi-heuristic fusion with problem-aware blending
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # 1. Base inverse distance heuristic (robust to zeros)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Adaptive parameters based on problem size and structure
+    params = _compute_adaptive_params(distance_matrix)
+    
+    # 3. Christofides-inspired components
+    mst_mask, matching_mask = _compute_christofides_components(distance_matrix)
+    
+    # 4. Nearest neighbor structure
+    nn_mask = _compute_nn_structure(distance_matrix, params['k_nn'])
+    
+    # 5. Problem-aware heuristic fusion
+    heuristic = _fuse_heuristics(
+        inv_dist, mst_mask, matching_mask, nn_mask,
+        distance_matrix, params
+    )
+    
+    # 6. Dynamic sparsification based on edge distribution
+    heuristic = _dynamic_sparsification(heuristic, distance_matrix, params)
+    
+    # Ensure symmetry
+    heuristic = np.maximum(heuristic, heuristic.T)
+    
+    return heuristic
+
+def _compute_adaptive_params(distance_matrix: np.ndarray) -> dict:
+    """Compute adaptive parameters based on problem characteristics."""
+    n = distance_matrix.shape[0]
+    
+    # Analyze distance distribution
+    flat_dists = distance_matrix[np.triu_indices(n, 1)]
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    
+    # Adaptive weights based on problem size and structure
+    size_factor = np.log2(n + 1) / 10  # Scale with log(n)
+    structure_factor = np.clip(dist_cv, 0.1, 2.0) / 2  # Normalized structure measure
+    
+    return {
+        'k_nn': max(2, int(np.ceil(np.log2(n) * (1 + structure_factor)))),
+        'mst_weight': 0.6 - 0.2 * structure_factor,
+        'matching_weight': 0.4 + 0.2 * structure_factor,
+        'nn_weight': 0.3 + 0.1 * size_factor,
+        'dist_weight': 1.0 - 0.2 * size_factor,
+        'sparsity_factor': 0.7 + 0.1 * structure_factor,
+        'size_factor': size_factor,
+        'structure_factor': structure_factor
+    }
+
+def _compute_christofides_components(distance_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute MST and matching components inspired by Christofides algorithm."""
+    n = distance_matrix.shape[0]
+    
+    # Minimum spanning tree
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Identify odd-degree vertices in MST
+    degrees = np.sum(mst_mask, axis=1)
+    odd_vertices = np.where(degrees % 2 == 1)[0]
+    
+    # Simplified greedy matching on odd vertices
+    matching_mask = np.zeros_like(distance_matrix, dtype=bool)
+    if len(odd_vertices) > 0:
+        # Sort odd vertices by degree centrality
+        odd_degrees = degrees[odd_vertices]
+        sorted_indices = np.argsort(-odd_degrees)
+        sorted_odd = odd_vertices[sorted_indices]
+        
+        matched = set()
+        for i in range(len(sorted_odd)):
+            v = sorted_odd[i]
+            if v in matched:
+                continue
+                
+            # Find closest unmatched odd vertex
+            best_u = -1
+            best_dist = np.inf
+            for j in range(i + 1, len(sorted_odd)):
+                u = sorted_odd[j]
+                if u not in matched:
+                    dist = distance_matrix[v, u]
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_u = u
+            
+            if best_u != -1:
+                matching_mask[v, best_u] = True
+                matching_mask[best_u, v] = True
+                matched.add(v)
+                matched.add(best_u)
+    
+    return mst_mask, matching_mask
+
+def _compute_nn_structure(distance_matrix: np.ndarray, k: int) -> np.ndarray:
+    """Compute nearest neighbor structure with adaptive k."""
+    n = distance_matrix.shape[0]
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        indices = np.argsort(distance_matrix[i])[1:k+1]
+        nn_mask[i, indices] = True
+    
+    # Make symmetric
+    nn_mask = nn_mask | nn_mask.T
+    return nn_mask
+
+def _fuse_heuristics(inv_dist: np.ndarray, mst_mask: np.ndarray, 
+                     matching_mask: np.ndarray, nn_mask: np.ndarray,
+                     distance_matrix: np.ndarray, params: dict) -> np.ndarray:
+    """Intelligently fuse multiple heuristic components."""
+    n = distance_matrix.shape[0]
+    
+    # Base heuristic value
+    heuristic = inv_dist.copy()
+    
+    # Apply Christofides-inspired boosting
+    christofides_mask = mst_mask | matching_mask
+    
+    # Adjust boost factors based on edge length distribution within masks
+    mst_dists = distance_matrix[mst_mask]
+    matching_dists = distance_matrix[matching_mask]
+    nn_dists = distance_matrix[nn_mask]
+    
+    # Compute normalized boost factors
+    if len(mst_dists) > 0:
+        mst_boost = np.median(mst_dists) / (np.median(distance_matrix[christofides_mask]) + 1e-10)
+        mst_boost = np.clip(mst_boost, 1.0, 2.0)
+    else:
+        mst_boost = 1.5
+    
+    if len(matching_dists) > 0:
+        matching_boost = np.median(matching_dists) / (np.median(distance_matrix[christofides_mask]) + 1e-10)
+        matching_boost = np.clip(matching_boost, 1.0, 2.0)
+    else:
+        matching_boost = 1.5
+    
+    if len(nn_dists) > 0:
+        nn_boost = np.median(nn_dists) / (np.median(distance_matrix[np.triu_indices(n, 1)]) + 1e-10)
+        nn_boost = np.clip(nn_boost, 0.8, 1.2)
+    else:
+        nn_boost = 1.0
+    
+    # Apply weighted boosts
+    heuristic[mst_mask] *= params['mst_weight'] * mst_boost
+    heuristic[matching_mask] *= params['matching_weight'] * matching_boost
+    heuristic[nn_mask] *= params['nn_weight'] * nn_boost
+    
+    # Penalize long edges not in any good structure
+    long_edge_mask = ~(mst_mask | matching_mask | nn_mask)
+    heuristic[long_edge_mask] *= 0.5
+    
+    return heuristic
+
+def _dynamic_sparsification(heuristic: np.ndarray, distance_matrix: np.ndarray, 
+                            params: dict) -> np.ndarray:
+    """Apply dynamic sparsification based on edge distribution."""
+    n = heuristic.shape[0]
+    sparsified = heuristic.copy()
+    
+    # Local sparsification per node
+    for i in range(n):
+        row = heuristic[i].copy()
+        row[i] = -np.inf  # Ignore diagonal
+        
+        # Adaptive keep count based on node connectivity
+        node_deg = np.sum(distance_matrix[i] > 0)
+        keep_count = max(2, int(np.ceil(np.log2(n) * (1 + node_deg / n))))
+        keep_count = min(keep_count, n - 1)
+        
+        if keep_count < n - 1:
+            threshold = np.partition(row, -keep_count)[-keep_count]
+            sparsified[i, row < threshold] = 0
+    
+    # Global adaptive threshold based on distribution
+    non_zero = sparsified[sparsified > 0]
+    if len(non_zero) > 0:
+        # Use percentile based on sparsity factor
+        percentile = params['sparsity_factor'] * 100
+        threshold = np.percentile(non_zero, 100 - percentile)
+        sparsified[sparsified < threshold] = 0
+    
+    # Ensure at least some connectivity
+    for i in range(n):
+        if np.sum(sparsified[i] > 0) < 2:
+            # Connect to two nearest neighbors
+            indices = np.argsort(distance_matrix[i])[1:3]
+            sparsified[i, indices] = heuristic[i, indices]
+            sparsified[indices, i] = heuristic[indices, i]
+    
+    return sparsified
+```

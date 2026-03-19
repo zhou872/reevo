@@ -1,0 +1,142 @@
+```json
+{
+    "algorithm_features": ["MST Connectivity Multiplier", "Exponential Regret Penalization", "Degree-constrained Edge Sparsification", "Neighborhood Density Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges combining multiple factors:
+    1. Inverse distance with logarithmic smoothing (base attractiveness)
+    2. MST edge importance weighting (connectivity backbone)
+    3. Exponential regret penalization (opportunity cost awareness)
+    4. Degree-controlled sparsification with density awareness
+    5. Local neighborhood clustering bonus
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix) if n == 1 else np.array([])
+    
+    # Create a working copy and handle diagonal
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Base attractiveness with logarithmic smoothing
+    # Logarithm helps reduce dominance of very short edges while maintaining ordering
+    min_dist = dist[dist < np.inf].min()
+    base_attract = np.log1p(min_dist / (dist + 1e-10))
+    
+    # 2. MST connectivity weighting with distance-scaled importance
+    mst_adj = minimum_spanning_tree(dist).toarray()
+    mst_mask = mst_adj > 0
+    
+    # MST edges get bonus inversely proportional to their relative length within MST
+    if mst_mask.any():
+        mst_edges = dist[mst_mask]
+        if mst_edges.size > 0:
+            # Normalize MST edge weights
+            mst_norm = mst_edges.min() / (mst_edges + 1e-10)
+            mst_weight = np.ones_like(dist)
+            mst_weight[mst_mask] = 1.0 + mst_norm  # 1.0-2.0 range based on relative importance
+        else:
+            mst_weight = np.ones_like(dist)
+    else:
+        mst_weight = np.ones_like(dist)
+    
+    # 3. Exponential regret penalization with local normalization
+    regret_matrix = np.ones_like(dist)
+    
+    for i in range(n):
+        # Get distances from node i
+        d_i = dist[i].copy()
+        d_i[i] = np.inf
+        
+        # Find best, second best, and median distances
+        valid_d = d_i[d_i < np.inf]
+        if len(valid_d) >= 2:
+            sorted_d = np.sort(valid_d)
+            best = sorted_d[0]
+            second_best = sorted_d[1]
+            median_d = np.median(sorted_d)
+            
+            # Calculate regret with robust normalization
+            for j in range(n):
+                if i != j and d_i[j] < np.inf:
+                    # Regret relative to best alternative
+                    regret_norm = (d_i[j] - best) / (median_d - best + 1e-10)
+                    # Exponential penalty: exp(-regret) gives values in (0, 1]
+                    regret_matrix[i, j] = np.exp(-np.clip(regret_norm, 0, 5))
+    
+    # 4. Local neighborhood density bonus
+    # Nodes in dense clusters should have higher intra-cluster edge scores
+    density_bonus = np.ones_like(dist)
+    
+    # Calculate local density for each node
+    local_densities = np.zeros(n)
+    for i in range(n):
+        d_i = dist[i].copy()
+        d_i[i] = np.inf
+        # Use median of k-nearest distances as density measure
+        k = min(5, n-1)
+        if k > 0:
+            knn_dists = np.partition(d_i, k)[:k+1]
+            local_densities[i] = np.median(knn_dists[knn_dists < np.inf])
+    
+    # Apply density-aware bonus: prefer edges between nodes in similar density regions
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist[i, j] < np.inf:
+                # Bonus for connecting nodes with similar local densities
+                dens_diff = abs(local_densities[i] - local_densities[j])
+                dens_ratio = min(local_densities[i], local_densities[j]) / (dens_diff + 1e-10)
+                bonus = 1.0 + np.tanh(min(dens_ratio, 10) / 10)  # 1.0-1.76 range
+                density_bonus[i, j] = density_bonus[j, i] = bonus
+    
+    # 5. Combine all factors with weighted multiplication
+    scores = base_attract * mst_weight * regret_matrix * density_bonus
+    
+    # 6. Adaptive degree-controlled sparsification
+    # Determine number of edges to keep per node based on graph size
+    k_base = max(2, int(np.sqrt(n)))  # Adaptive k based on sqrt(n)
+    k_min = max(2, min(k_base, n // 3))
+    k_max = max(k_min, min(n // 2, 10))  # Cap at reasonable value
+    
+    mask = np.zeros_like(scores, dtype=bool)
+    
+    for i in range(n):
+        # Determine k for this node based on its connectivity pattern
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Count how many edges have significant scores
+        score_threshold = np.percentile(row_scores[row_scores > -np.inf], 30) if n > 2 else -np.inf
+        significant_edges = np.sum(row_scores > score_threshold)
+        
+        # Adaptive k: more edges for well-connected nodes, fewer for isolated ones
+        k = min(k_max, max(k_min, significant_edges // 2))
+        
+        # Keep top k edges
+        if k > 0:
+            top_k_idx = np.argpartition(row_scores, -k)[-k:]
+            mask[i, top_k_idx] = True
+            mask[top_k_idx, i] = True  # Maintain symmetry
+    
+    # Ensure MST connectivity is preserved
+    mask = mask | mst_mask
+    
+    # Apply sparsification
+    scores = scores * mask
+    
+    # Final normalization and diagonal cleanup
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

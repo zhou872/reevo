@@ -1,0 +1,463 @@
+```json
+{
+    "algorithm_features": ["Multi-Factor Adaptive Fusion", "2-opt Tour Enhancement", "Dynamic Graph Sparsification", "Landmark Spatial Embedding"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with adaptive factor learning,
+    2-opt tour optimization, and dynamic graph sparsification.
+    
+    Strategy:
+    1. Landmark MDS embedding for spatial neighborhood detection
+    2. Multi-factor adaptive fusion with learned instance-specific weights
+    3. Enhanced tour construction using 2-opt local optimization
+    4. Dynamic sparsification preserving critical connectivity
+    5. Graph pattern recognition for edge boosting
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric n x n matrix of pairwise distances
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        reciprocal = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal, 0)
+        return reciprocal
+    
+    # 1. Base reciprocal weights
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    reciprocal_weights = np.nan_to_num(reciprocal_weights, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # 2. Fast spatial embedding using landmark MDS
+    coords = _landmark_mds(distance_matrix)
+    
+    # 3. Spatial neighborhood via KD-tree with adaptive k
+    k_spatial = max(3, min(n - 1, int(np.log2(n)) * 2))
+    tree = KDTree(coords)
+    spatial_neighbors = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances, indices = tree.query(coords[i], k=k_spatial + 1)
+        # Exclude self if present
+        if indices[0] == i:
+            indices = indices[1:]
+        else:
+            indices = indices[:-1]
+        spatial_neighbors[i, indices] = True
+    
+    spatial_neighbors = spatial_neighbors | spatial_neighbors.T
+    
+    # 4. Minimum Spanning Tree edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    mst_edges = mst_edges | mst_edges.T
+    
+    # 5. Enhanced tour edges using 2-opt optimization
+    tour_edges, tour_quality = _enhanced_tour_edges(distance_matrix)
+    
+    # 6. Local distance statistics with adaptive neighborhood size
+    m_local = min(max(3, int(np.log2(n))), n - 1)
+    local_avg_dist = np.zeros(n)
+    for i in range(n):
+        sorted_dists = np.sort(distance_matrix[i])
+        local_avg_dist[i] = np.mean(sorted_dists[1:m_local + 1])
+    
+    # 7. Degree-based connectivity factor
+    degrees = np.sum(distance_matrix > 0, axis=1)
+    degree_factor = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                degree_factor[i, j] = 1.0 / (1 + abs(degrees[i] - degrees[j]))
+    
+    # 8. Adaptive factor weighting based on instance characteristics
+    weights = _compute_adaptive_weights(distance_matrix, tour_quality, n)
+    
+    # 9. Multi-factor fusion with learned weights
+    heuristic = np.ones_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            base = reciprocal_weights[i, j]
+            
+            # Apply adaptive weights to each factor
+            spatial_val = weights['spatial'] * (2.5 if spatial_neighbors[i, j] else 0.6)
+            mst_val = weights['mst'] * (3.2 if mst_edges[i, j] else 0.7)
+            tour_val = weights['tour'] * (2.8 if tour_edges[i, j] else 0.8)
+            
+            # Local connectivity factor
+            max_local = max(local_avg_dist[i], local_avg_dist[j])
+            if max_local > 0:
+                dist_ratio = distance_matrix[i, j] / max_local
+                local_val = weights['local'] * np.exp(-dist_ratio ** 2)
+            else:
+                local_val = weights['local'] * 1.0
+            
+            # Degree balance factor
+            degree_val = weights['degree'] * degree_factor[i, j]
+            
+            # Multiplicative fusion
+            combined = base * spatial_val * mst_val * tour_val * local_val * degree_val
+            
+            # Synergy bonuses
+            if spatial_neighbors[i, j] and mst_edges[i, j]:
+                combined *= 1.3
+            if tour_edges[i, j]:
+                combined *= 1.4
+            if spatial_neighbors[i, j] and tour_edges[i, j]:
+                combined *= 1.2
+            
+            heuristic[i, j] = heuristic[j, i] = combined
+    
+    np.fill_diagonal(heuristic, 0)
+    
+    # 10. Dynamic sparsification with adaptive connectivity preservation
+    sparsified = _dynamic_sparsify(heuristic, distance_matrix, n)
+    
+    # 11. Graph pattern boosting (triangles and quadrilaterals)
+    pattern_boost = _graph_pattern_boost(sparsified, n)
+    
+    # 12. Edge consistency refinement
+    refined = _edge_consistency_refinement(sparsified * pattern_boost, distance_matrix)
+    
+    # 13. Final normalization
+    refined = np.maximum(refined, refined.T)
+    max_val = np.max(refined)
+    if max_val > 0:
+        refined /= max_val
+    
+    np.fill_diagonal(refined, 0)
+    
+    return refined
+
+
+def _landmark_mds(distance_matrix: np.ndarray) -> np.ndarray:
+    """Fast 2D embedding using landmark Multidimensional Scaling."""
+    n = distance_matrix.shape[0]
+    
+    # Find two farthest points as landmarks
+    max_idx = np.unravel_index(np.argmax(distance_matrix), distance_matrix.shape)
+    a, b = max_idx[0], max_idx[1]
+    
+    d_ab = distance_matrix[a, b]
+    if d_ab == 0:
+        return np.zeros((n, 2))
+    
+    coords = np.zeros((n, 2))
+    
+    for i in range(n):
+        d_ia = distance_matrix[i, a]
+        d_ib = distance_matrix[i, b]
+        
+        x = (d_ia ** 2 + d_ab ** 2 - d_ib ** 2) / (2 * d_ab)
+        y_sq = max(d_ia ** 2 - x ** 2, 0)
+        y = np.sqrt(y_sq)
+        
+        coords[i] = [x, y]
+    
+    return coords
+
+
+def _two_opt_swap(tour: list, i: int, j: int) -> list:
+    """Perform 2-opt swap on tour segment."""
+    new_tour = tour[:i]
+    new_tour.extend(reversed(tour[i:j+1]))
+    new_tour.extend(tour[j+1:])
+    return new_tour
+
+
+def _two_opt_improvement(tour: list, distance_matrix: np.ndarray) -> list:
+    """Improve tour using 2-opt local optimization."""
+    n = len(tour)
+    improved = True
+    
+    while improved:
+        improved = False
+        best_gain = 0
+        best_i, best_j = -1, -1
+        
+        for i in range(1, n - 2):
+            for j in range(i + 1, n - 1):
+                # Calculate gain from swapping edges (i-1,i) and (j,j+1) 
+                # to (i-1,j) and (i,j+1)
+                a, b = tour[i-1], tour[i]
+                c, d = tour[j], tour[j+1]
+                
+                current = distance_matrix[a, b] + distance_matrix[c, d]
+                new = distance_matrix[a, c] + distance_matrix[b, d]
+                gain = current - new
+                
+                if gain > best_gain:
+                    best_gain = gain
+                    best_i, best_j = i, j
+        
+        if best_gain > 0:
+            tour = _two_opt_swap(tour, best_i, best_j)
+            improved = True
+    
+    return tour
+
+
+def _enhanced_tour_edges(distance_matrix: np.ndarray):
+    """Construct multiple enhanced tours using 2-opt optimization."""
+    n = distance_matrix.shape[0]
+    best_tours = []
+    best_lengths = []
+    
+    # Try multiple starting points
+    n_starts = min(max(3, int(np.log2(n)) * 2), n)
+    start_indices = np.linspace(0, n - 1, n_starts, dtype=int)
+    
+    for start in start_indices:
+        # Greedy construction
+        tour = [start]
+        visited = set(tour)
+        
+        while len(visited) < n:
+            current = tour[-1]
+            mask = np.ones(n, dtype=bool)
+            mask[list(visited)] = False
+            if not np.any(mask):
+                break
+                
+            available_dists = distance_matrix[current].copy()
+            available_dists[~mask] = np.inf
+            next_node = np.argmin(available_dists)
+            tour.append(next_node)
+            visited.add(next_node)
+        
+        # Complete tour
+        tour.append(start)
+        
+        # 2-opt improvement
+        tour = _two_opt_improvement(tour, distance_matrix)
+        
+        # Calculate tour length
+        length = 0
+        for i in range(len(tour) - 1):
+            length += distance_matrix[tour[i], tour[i + 1]]
+        
+        best_tours.append(tour)
+        best_lengths.append(length)
+    
+    # Select top 3 tours
+    sorted_indices = np.argsort(best_lengths)[:3]
+    top_tours = [best_tours[i] for i in sorted_indices]
+    
+    # Create edge matrix with frequency weights
+    edge_matrix = np.zeros((n, n), dtype=float)
+    for tour in top_tours:
+        for i in range(len(tour) - 1):
+            u, v = tour[i], tour[i + 1]
+            edge_matrix[u, v] += 1
+            edge_matrix[v, u] += 1
+    
+    # Normalize frequencies
+    if np.max(edge_matrix) > 0:
+        edge_matrix = edge_matrix / np.max(edge_matrix)
+    
+    tour_quality = np.mean(best_lengths[:3]) if len(best_lengths) >= 3 else np.inf
+    
+    return (edge_matrix > 0.5), tour_quality
+
+
+def _compute_adaptive_weights(distance_matrix: np.ndarray, tour_quality: float, n: int):
+    """Compute adaptive weights based on instance characteristics."""
+    # Analyze distance distribution
+    off_diag = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(off_diag)
+    dist_std = np.std(off_diag)
+    cv = dist_std / dist_mean if dist_mean > 0 else 0
+    
+    # Analyze spatial structure via MST
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_length = mst.sum()
+    avg_mst_edge = mst_length / (n - 1) if n > 1 else 0
+    
+    # Compute base weights
+    weights = {
+        'spatial': 1.0,
+        'mst': 1.0,
+        'tour': 1.0,
+        'local': 1.0,
+        'degree': 1.0
+    }
+    
+    # Adjust based on coefficient of variation
+    if cv > 0.5:  # High variability - emphasize spatial structure
+        weights['spatial'] *= 1.3
+        weights['mst'] *= 0.9
+    else:  # Low variability - emphasize tour and local factors
+        weights['tour'] *= 1.2
+        weights['local'] *= 1.1
+    
+    # Adjust based on problem size
+    size_factor = min(1.0, n / 100)
+    weights['spatial'] *= (0.8 + 0.4 * size_factor)
+    weights['degree'] *= (0.7 + 0.6 * size_factor)
+    
+    # Adjust based on tour quality relative to MST
+    if tour_quality < np.inf and avg_mst_edge > 0:
+        tour_ratio = tour_quality / (avg_mst_edge * n)
+        if tour_ratio < 1.2:  # Good tour found
+            weights['tour'] *= 1.3
+        else:  # Poor tour - rely more on spatial factors
+            weights['spatial'] *= 1.2
+            weights['mst'] *= 1.1
+    
+    # Normalize weights
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
+
+def _dynamic_sparsify(heuristic: np.ndarray, distance_matrix: np.ndarray, n: int):
+    """Dynamic sparsification with adaptive edge retention."""
+    sparsified = np.zeros_like(heuristic)
+    
+    # Analyze heuristic distribution
+    non_zero = heuristic[heuristic > 0]
+    if len(non_zero) == 0:
+        return heuristic
+    
+    # Determine retention strategy based on distribution skewness
+    mean_val = np.mean(non_zero)
+    median_val = np.median(non_zero)
+    skewness = 3 * (mean_val - median_val) / np.std(non_zero) if np.std(non_zero) > 0 else 0
+    
+    if skewness > 0.5:  # Right-skewed - keep more edges
+        base_edges = max(4, int(np.log2(n)) * 3)
+    else:  # Left-skewed or symmetric - be more selective
+        base_edges = max(3, int(np.log2(n)) * 2)
+    
+    edges_per_node = min(base_edges, n - 1)
+    
+    # Per-node edge retention with adaptive thresholds
+    for i in range(n):
+        row = heuristic[i].copy()
+        row[i] = -np.inf
+        
+        if edges_per_node < n:
+            # Use dynamic threshold based on distribution percentiles
+            if skewness > 0:
+                threshold = np.percentile(row[row > -np.inf], 100 - (edges_per_node * 100 // n))
+            else:
+                indices = np.argpartition(row, -edges_per_node)[-edges_per_node:]
+                threshold = np.min(row[indices])
+        else:
+            threshold = 0
+        
+        mask = row >= threshold
+        sparsified[i] = heuristic[i] * mask
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Critical edge preservation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    mst_edges = mst_edges | mst_edges.T
+    
+    # Also preserve high-degree node connections
+    degrees = np.sum(sparsified > 0, axis=1)
+    high_degree_nodes = np.where(degrees > np.median(degrees) * 1.5)[0]
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_edges[i, j] or (i in high_degree_nodes and j in high_degree_nodes):
+                sparsified[i, j] = max(sparsified[i, j], heuristic[i, j])
+                sparsified[j, i] = sparsified[i, j]
+    
+    return sparsified
+
+
+def _graph_pattern_boost(heuristic: np.ndarray, n: int):
+    """Boost edges based on graph patterns (triangles, quadrilaterals)."""
+    pattern_boost = np.ones_like(heuristic)
+    
+    for i in range(n):
+        neighbors_i = np.where(heuristic[i] > 0)[0]
+        if len(neighbors_i) < 2:
+            continue
+            
+        for j in neighbors_i:
+            if j <= i:
+                continue
+                
+            neighbors_j = np.where(heuristic[j] > 0)[0]
+            
+            # Find common neighbors (triangles)
+            common = set(neighbors_i) & set(neighbors_j)
+            triangle_count = len(common)
+            
+            # Find quadrilateral patterns (two-hop connections)
+            two_hop = set()
+            for k in neighbors_i:
+                if k != j:
+                    two_hop.update(np.where(heuristic[k] > 0)[0])
+            
+            quadrilateral_count = len(two_hop & set(neighbors_j)) - triangle_count
+            
+            # Apply boosting based on patterns
+            if triangle_count > 0:
+                boost = 1 + 0.2 * np.log1p(triangle_count)
+                if quadrilateral_count > 0:
+                    boost *= (1 + 0.1 * quadrilateral_count)
+                pattern_boost[i, j] = pattern_boost[j, i] = boost
+    
+    return pattern_boost
+
+
+def _edge_consistency_refinement(heuristic: np.ndarray, distance_matrix: np.ndarray):
+    """Refine heuristic values based on edge consistency in local neighborhoods."""
+    n = heuristic.shape[0]
+    refined = heuristic.copy()
+    
+    for i in range(n):
+        neighbors = np.where(heuristic[i] > 0)[0]
+        if len(neighbors) < 2:
+            continue
+        
+        for j in neighbors:
+            if j <= i:
+                continue
+                
+            # Check local consistency: edge should be stronger if it's part of many
+            # consistent local triangles
+            local_strength = 0
+            count = 0
+            
+            for k in neighbors:
+                if k != j and heuristic[j, k] > 0:
+                    # Check triangle inequality consistency
+                    if (distance_matrix[i, j] + distance_matrix[j, k] >= distance_matrix[i, k] * 0.9 and
+                        distance_matrix[i, k] + distance_matrix[k, j] >= distance_matrix[i, j] * 0.9):
+                        local_strength += heuristic[j, k]
+                        count += 1
+            
+            if count > 0:
+                avg_local = local_strength / count
+                # Adjust edge strength based on local consistency
+                refined[i, j] = refined[j, i] = (refined[i, j] * 0.7 + avg_local * 0.3)
+    
+    return refined
+```

@@ -1,0 +1,527 @@
+```json
+{
+    "algorithm_features": ["Convex Hull Boundary Bonus", "Adaptive Monte Carlo Simulation Policy", "Multi-factor Weight Optimization", "Sparse Region Prioritization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import ConvexHull
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristic with convex hull analysis and optimized simulation.
+    Returns matrix where higher values indicate more promising edges for inclusion.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heur = 1 / (distance_matrix + np.eye(n) * 1e-8)
+        np.fill_diagonal(heur, 0)
+        return heur
+    
+    # Step 1: Comprehensive instance analysis
+    stats = _analyze_instance_v3(distance_matrix)
+    
+    # Step 2: Compute core factors with convex hull consideration
+    factors = _compute_enhanced_factors(distance_matrix, stats)
+    
+    # Step 3: RL-optimized simulation for critical edges
+    simulation_scores = _compute_optimized_simulations(distance_matrix, stats, factors)
+    
+    # Step 4: Dynamic weight optimization with convex hull influence
+    weights = _compute_optimized_weights(distance_matrix, stats)
+    
+    # Step 5: Multiplicative combination with candidate filtering
+    heur = np.zeros((n, n))
+    candidate_mask = _build_enhanced_candidate_mask(distance_matrix, stats, factors)
+    
+    # Combine all factors with optimized exponents
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                combined = (
+                    (factors['inv_dist'][i, j] ** weights['w_inv']) *
+                    (factors['regret'][i, j] ** weights['w_regret']) *
+                    (factors['density'][i, j] ** weights['w_density']) *
+                    (simulation_scores[i, j] ** weights['w_simulation']) *
+                    (factors['hull'][i, j] ** weights['w_hull']) *
+                    (factors['mst'][i, j] ** weights['w_mst'])
+                )
+                heur[i, j] = heur[j, i] = combined
+    
+    # Step 6: Advanced post-processing
+    heur = _post_process_v3(heur, distance_matrix, stats, factors)
+    
+    return heur
+
+def _analyze_instance_v3(distance_matrix: np.ndarray) -> dict:
+    """Comprehensive instance analysis including convex hull metrics."""
+    n = distance_matrix.shape[0]
+    mask = ~np.eye(n, dtype=bool)
+    flat_dists = distance_matrix[mask].flatten()
+    
+    stats = {
+        'n': n,
+        'mean_dist': np.mean(flat_dists),
+        'std_dist': np.std(flat_dists),
+        'cv_dist': np.std(flat_dists) / (np.mean(flat_dists) + 1e-8),
+        'min_dist': np.min(flat_dists),
+        'max_dist': np.max(flat_dists),
+        'sparsity': _estimate_structural_sparsity(distance_matrix),
+        'cluster_tendency': _estimate_cluster_tendency_v2(distance_matrix),
+        'hull_score': _estimate_hull_influence(distance_matrix)
+    }
+    
+    # Add distance percentiles for better weight adaptation
+    percentiles = np.percentile(flat_dists, [25, 50, 75, 90])
+    stats.update({
+        'q1_dist': percentiles[0],
+        'median_dist': percentiles[1],
+        'q3_dist': percentiles[2],
+        'p90_dist': percentiles[3]
+    })
+    
+    return stats
+
+def _estimate_structural_sparsity(distance_matrix: np.ndarray) -> float:
+    """Measure structural sparsity using entropy-based approach."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return 0.5
+    
+    # Normalize distances
+    flat_dists = distance_matrix[~np.eye(n, dtype=bool)].flatten()
+    min_d, max_d = np.min(flat_dists), np.max(flat_dists)
+    if max_d - min_d < 1e-8:
+        return 0.5
+    
+    normalized = (flat_dists - min_d) / (max_d - min_d + 1e-8)
+    
+    # Compute histogram entropy (more uniform = more sparse)
+    hist, _ = np.histogram(normalized, bins=min(20, n), density=True)
+    hist = hist[hist > 0]
+    entropy = -np.sum(hist * np.log(hist))
+    max_entropy = np.log(len(hist))
+    
+    return entropy / max_entropy if max_entropy > 0 else 0.5
+
+def _estimate_cluster_tendency_v2(distance_matrix: np.ndarray) -> float:
+    """Enhanced cluster tendency using multiple metrics."""
+    n = distance_matrix.shape[0]
+    if n < 8:
+        return 0.5
+    
+    # Metric 1: Hopkins-like statistic
+    m = min(15, n // 2)
+    sample_idx = np.random.choice(n, m, replace=False)
+    
+    sample_nn = []
+    random_nn = []
+    for idx in sample_idx:
+        dists = distance_matrix[idx].copy()
+        dists[idx] = np.inf
+        sample_nn.append(np.min(dists))
+        
+        # Random distances from matrix
+        random_dists = np.random.choice(distance_matrix.flatten(), m)
+        random_nn.append(np.min(random_dists))
+    
+    hopkins = np.sum(sample_nn) / (np.sum(sample_nn) + np.sum(random_nn) + 1e-8)
+    
+    # Metric 2: Variance ratio
+    intra_cluster = np.mean([np.mean(distance_matrix[i, sample_idx]) for i in sample_idx])
+    inter_cluster = np.mean(distance_matrix)
+    variance_ratio = intra_cluster / (inter_cluster + 1e-8)
+    
+    # Combined score
+    return 0.6 * hopkins + 0.4 * min(1.0, variance_ratio * 2)
+
+def _estimate_hull_influence(distance_matrix: np.ndarray) -> float:
+    """Estimate importance of convex hull edges using distance distribution."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return 0.5
+    
+    # Simulate hull by looking for "extreme" distances
+    flat_dists = distance_matrix[~np.eye(n, dtype=bool)].flatten()
+    
+    # Measure skewness and kurtosis
+    from scipy.stats import skew, kurtosis
+    try:
+        dist_skew = abs(skew(flat_dists))
+        dist_kurt = kurtosis(flat_dists)
+    except:
+        dist_skew = 0
+        dist_kurt = 0
+    
+    # Higher kurtosis and skewness suggest more extreme edges (potential hull edges)
+    hull_score = 1 - np.exp(-(dist_skew + abs(dist_kurt)) / 4)
+    return min(max(hull_score, 0.3), 0.9)
+
+def _compute_enhanced_factors(distance_matrix: np.ndarray, stats: dict) -> dict:
+    """Compute all heuristic factors including convex hull bonus."""
+    n = stats['n']
+    factors = {}
+    
+    # 1. Inverse distance (base factor)
+    inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-8)
+    np.fill_diagonal(inv_dist, 0)
+    factors['inv_dist'] = inv_dist
+    
+    # 2. Regret scoring with adaptive k
+    factors['regret'] = _compute_regret_scores_v2(distance_matrix, stats)
+    
+    # 3. Density scoring with local vs global consideration
+    factors['density'] = _compute_density_scores_v2(distance_matrix, stats)
+    
+    # 4. Convex hull approximation scoring
+    factors['hull'] = _compute_hull_scores(distance_matrix, stats)
+    
+    # 5. MST inclusion scoring
+    factors['mst'] = _compute_mst_scores_v2(distance_matrix, stats)
+    
+    return factors
+
+def _compute_regret_scores_v2(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """Enhanced regret computation with adaptive k and smoothing."""
+    n = stats['n']
+    regret = np.ones((n, n))
+    
+    # Adaptive k based on instance characteristics
+    base_k = min(5, max(2, n // 8))
+    k = int(base_k * (1 + stats['cv_dist']))
+    k = min(k, n - 1)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= k:
+            # Get k-th best distance with smoothing
+            kth_best = np.partition(dists, k-1)[k-1]
+            
+            # Compute regret scores with continuous scaling
+            for j in range(n):
+                if i != j:
+                    ratio = distance_matrix[i, j] / (kth_best + 1e-8)
+                    if ratio <= 1.0:
+                        regret[i, j] = 2.0 - ratio
+                    else:
+                        # Exponential decay for worse edges
+                        regret[i, j] = np.exp(2 - ratio)
+    
+    # Symmetrize and normalize
+    regret = np.sqrt(regret * regret.T)
+    np.fill_diagonal(regret, 0)
+    
+    max_val = np.max(regret)
+    if max_val > 0:
+        regret = regret / max_val
+    
+    return regret
+
+def _compute_density_scores_v2(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """Density scoring with adaptive neighborhood radius."""
+    n = stats['n']
+    density_scores = np.ones((n, n))
+    
+    # Adaptive neighborhood size
+    k = min(7, max(3, n // 6))
+    
+    # Compute local densities
+    local_density = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if k < len(dists):
+            k_nearest = np.partition(dists, k)[:k]
+        else:
+            k_nearest = dists[dists < np.inf]
+        
+        local_density[i] = np.mean(k_nearest)
+    
+    # Normalize and apply sigmoid transformation
+    if np.std(local_density) > 1e-8:
+        local_density = (local_density - np.mean(local_density)) / np.std(local_density)
+        local_density = 1 / (1 + np.exp(-local_density))  # Sigmoid
+    
+    # Score edges: favor connections between sparse regions
+    for i in range(n):
+        for j in range(i+1, n):
+            # Geometric mean of inverted densities
+            score = 1 / ((local_density[i] * local_density[j]) + 1e-8)
+            density_scores[i, j] = density_scores[j, i] = np.sqrt(score)
+    
+    # Normalize
+    max_val = np.max(density_scores)
+    if max_val > 0:
+        density_scores = density_scores / max_val
+    
+    return density_scores
+
+def _compute_hull_scores(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """Score edges likely to be on convex hull."""
+    n = stats['n']
+    hull_scores = np.ones((n, n))
+    
+    if n < 4:
+        return hull_scores
+    
+    # Identify candidate hull edges by looking for "long" edges in sparse regions
+    threshold = stats['p90_dist']  # 90th percentile
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = distance_matrix[i, j]
+            
+            if dist > threshold:
+                # Check if this edge connects to relatively isolated nodes
+                # Count how many other edges from i and j are below median
+                i_edges = (distance_matrix[i] < stats['median_dist']).sum()
+                j_edges = (distance_matrix[j] < stats['median_dist']).sum()
+                
+                isolation = (i_edges + j_edges) / (2 * n)
+                
+                # Higher score for long edges connecting isolated nodes
+                if isolation < 0.3:
+                    hull_scores[i, j] = hull_scores[j, i] = 1.5 + (1 - isolation)
+    
+    # Smooth the scores
+    hull_scores = np.minimum(hull_scores, 2.0)
+    np.fill_diagonal(hull_scores, 0)
+    
+    # Normalize
+    max_val = np.max(hull_scores)
+    if max_val > 0:
+        hull_scores = hull_scores / max_val
+    
+    return hull_scores
+
+def _compute_mst_scores_v2(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+    """MST-based scoring with edge importance estimation."""
+    n = stats['n']
+    mst_scores = np.ones((n, n))
+    
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_present = (mst + mst.T) > 0
+            
+            # Boost MST edges, more for critical ones
+            mst_scores[mst_present] = 1.8
+            
+            # Additional boost for edges that appear in multiple MSTs of perturbed matrices
+            if n <= 50:  # Only for manageable sizes
+                n_perturb = min(5, n // 5)
+                for _ in range(n_perturb):
+                    perturbed = distance_matrix * np.random.uniform(0.95, 1.05, distance_matrix.shape)
+                    perturbed_mst = minimum_spanning_tree(perturbed).toarray()
+                    mst_present_perturbed = (perturbed_mst + perturbed_mst.T) > 0
+                    mst_scores[mst_present_perturbed] *= 1.1
+                
+                mst_scores = np.minimum(mst_scores, 2.5)
+        except:
+            pass
+    
+    np.fill_diagonal(mst_scores, 0)
+    return mst_scores
+
+def _compute_optimized_simulations(distance_matrix: np.ndarray, stats: dict, factors: dict) -> np.ndarray:
+    """Optimized Monte Carlo simulations with adaptive policy."""
+    n = stats['n']
+    simulation_scores = np.ones((n, n))
+    
+    if n < 4:
+        return simulation_scores
+    
+    # Adaptive simulation parameters
+    n_simulations = min(25, max(5, int(np.log2(n) * 6)))
+    max_depth = min(6, n - 2)
+    
+    # Pre-compute useful matrices
+    inv_dist = factors['inv_dist']
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            # Skip clearly unpromising edges
+            if distance_matrix[i, j] > 2.5 * stats['mean_dist']:
+                simulation_scores[i, j] = simulation_scores[j, i] = 0.2
+                continue
+            
+            scores = []
+            for _ in range(n_simulations):
+                score = _simulate_with_policy(distance_matrix, i, j, max_depth, stats, inv_dist)
+                scores.append(score)
+            
+            simulation_scores[i, j] = simulation_scores[j, i] = np.median(scores)
+    
+    # Normalize
+    max_val = np.max(simulation_scores)
+    if max_val > 0:
+        simulation_scores = simulation_scores / max_val
+    
+    np.fill_diagonal(simulation_scores, 0)
+    return simulation_scores
+
+def _simulate_with_policy(distance_matrix: np.ndarray, start_i: int, start_j: int, 
+                         max_depth: int, stats: dict, inv_dist: np.ndarray) -> float:
+    """Simulate partial tour with optimized selection policy."""
+    n = distance_matrix.shape[0]
+    visited = np.zeros(n, dtype=bool)
+    visited[start_i] = visited[start_j] = True
+    
+    current = start_j
+    tour_length = distance_matrix[start_i, start_j]
+    
+    # Adaptive selection policy
+    temperature = stats['mean_dist'] / 2
+    
+    for step in range(max_depth):
+        unvisited = np.where(~visited)[0]
+        if len(unvisited) == 0:
+            break
+        
+        # Combined heuristic for next node selection
+        dists = distance_matrix[current, unvisited]
+        inv_scores = inv_dist[current, unvisited]
+        
+        # Softmax with adaptive temperature
+        weights = np.exp((inv_scores - dists / temperature) / 2)
+        weights = weights / (np.sum(weights) + 1e-8)
+        
+        # Stochastic selection
+        next_idx = np.random.choice(len(unvisited), p=weights)
+        next_node = unvisited[next_idx]
+        
+        tour_length += dists[next_idx]
+        visited[next_node] = True
+        current = next_node
+    
+    # Quality score based on expected performance
+    expected_length = max_depth * stats['mean_dist']
+    score = expected_length / (tour_length + 1e-8)
+    
+    return min(score, 2.5)
+
+def _compute_optimized_weights(distance_matrix: np.ndarray, stats: dict) -> dict:
+    """Optimized weight adaptation with convex hull consideration."""
+    n = stats['n']
+    cv = stats['cv_dist']
+    sparsity = stats['sparsity']
+    cluster = stats['cluster_tendency']
+    hull = stats['hull_score']
+    
+    # Base weights with instance-specific adjustments
+    weights = {
+        'w_inv': 1.0,  # Always important
+        
+        # Regret weight: higher for varied instances
+        'w_regret': 0.4 + 0.3 * cv,
+        
+        # Density weight: depends on clustering
+        'w_density': 0.2 + 0.4 * cluster,
+        
+        # Simulation weight: more for structured instances
+        'w_simulation': 0.1 + 0.4 * sparsity,
+        
+        # Hull weight: depends on hull importance
+        'w_hull': 0.3 * hull,
+        
+        # MST weight: decreases with size but increases with structure
+        'w_mst': max(0.1, 0.6 - 0.02 * n + 0.2 * sparsity)
+    }
+    
+    # Ensure minimum weights
+    for key in weights:
+        weights[key] = max(weights[key], 0.05)
+    
+    # Normalize to maintain overall scale
+    total = sum(weights.values())
+    scale_factor = 6 / total  # Target sum of 6
+    for key in weights:
+        weights[key] *= scale_factor
+    
+    return weights
+
+def _build_enhanced_candidate_mask(distance_matrix: np.ndarray, stats: dict, 
+                                  factors: dict) -> np.ndarray:
+    """Build candidate mask using multiple criteria."""
+    n = stats['n']
+    mask = np.zeros((n, n), dtype=bool)
+    
+    # Base neighbor count
+    base_k = min(12, max(4, int(np.log2(n) * 3.5)))
+    k = int(base_k * (1 + stats['sparsity']))
+    k = min(k, n - 1)
+    
+    # Include k-nearest neighbors
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if k < len(dists):
+            nearest = np.argpartition(dists, k)[:k]
+        else:
+            nearest = np.arange(n)
+            nearest = nearest[nearest != i]
+        
+        mask[i, nearest] = True
+    
+    # Include promising edges from other factors
+    threshold = 0.3
+    
+    # Regret-based candidates
+    regret_promising = factors['regret'] > threshold
+    mask = mask | regret_promising
+    
+    # Hull-based candidates
+    hull_promising = factors['hull'] > threshold
+    mask = mask | hull_promising
+    
+    # Ensure symmetry and remove diagonal
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    # Ensure minimum connectivity
+    min_conn = min(4, n - 1)
+    for i in range(n):
+        if mask[i].sum() < min_conn:
+            # Add nearest missing neighbors
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nearest_all = np.argsort(dists)[:min_conn]
+            mask[i, nearest_all] = True
+            mask[nearest_all, i] = True
+    
+    return mask
+
+def _post_process_v3(heuristics: np.ndarray, distance_matrix: np.ndarray, 
+                    stats: dict, factors: dict) -> np.ndarray:
+    """Final post-processing with enhanced smoothing."""
+    n = stats['n']
+    
+    # Ensure minimum values for promising edges
+    promising_mask = factors['inv_dist'] > np.percentile(factors['inv_dist'][~np.eye(n, dtype=bool)], 70)
+    for i in range(n):
+        for j in range(i+1, n):
+            if promising_mask[i, j] and heuristics[i, j] == 0:
+                base_score = factors['inv_dist'][i, j]
+                heuristics[i, j] = heuristics[j, i] = base_score
+    
+    # Symmetrize with geometric mean (preserves multiplicative nature)
+    heuristics = np.sqrt(heuristics * heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Smooth extreme values
+    q95 = np.percentile(heuristics[~np.eye(n, dtype=bool)], 95)
+    heuristics = np.minimum(heuristics, q95)
+    
+    # Final normalization
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

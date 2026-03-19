@@ -1,0 +1,180 @@
+```json
+{
+    "algorithm_features": ["Log-Rank Regret Penalization", "Multi-Scale Centrality Fusion", "Hierarchical Sparsification", "Adaptive Instance Profiling"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with refined feature engineering.
+    
+    Key Innovations:
+    1. Log-rank regret penalization for smoother distance sensitivity
+    2. Multi-scale centrality fusion (degree, betweenness, proximity)
+    3. Hierarchical sparsification with MST-preserving guarantees
+    4. Instance-adaptive parameter calibration based on distance distribution
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges for inclusion in optimal tours.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. INSTANCE PROFILING AND ADAPTIVE PARAMETERS ===
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # Adaptive tuning based on instance characteristics
+    mst_boost = 1.6 + 0.6 * np.tanh(2 * dist_cv)  # More MST emphasis for variable instances
+    regret_strength = 1.4 + 0.6 * (1 - np.exp(-1.5 * dist_cv))  # Stronger regret for heterogeneous distances
+    sparsity_aggression = 0.5 + 0.35 * np.tanh((12 - n) / 8)  # More aggressive for larger instances
+    
+    # === 2. MULTI-SCALE CENTRALITY FUSION ===
+    # Degree centrality: inverse average distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        degree_centrality = 1 / np.mean(distance_matrix + np.eye(n) * 1e-12, axis=1)
+    degree_centrality = degree_centrality / np.max(degree_centrality + 1e-12)
+    
+    # Proximity centrality: closeness to geometric center
+    pos_estimate = np.median(distance_matrix, axis=0)  # Robust position estimate
+    proximity_centrality = 1 / (1 + pos_estimate / (dist_mean + 1e-12))
+    proximity_centrality = proximity_centrality / np.max(proximity_centrality + 1e-12)
+    
+    # MST-based betweenness approximation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_degree = np.sum(mst_mask, axis=1)
+    betweenness_centrality = mst_degree / (n - 1)
+    
+    # Fused centrality with instance-adaptive weights
+    cv_weight = min(0.7, 0.4 + 0.3 * dist_cv)  # More proximity weight for variable instances
+    centrality = (
+        0.5 * degree_centrality + 
+        cv_weight * proximity_centrality + 
+        (0.5 - cv_weight) * betweenness_centrality
+    )
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # === 3. LOG-RANK REGRET PENALIZATION ===
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        # Exclude self
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        candidates = np.where(mask)[0]
+        
+        if len(candidates) >= 2:
+            dists_i = distance_matrix[i, candidates]
+            sorted_idx = np.argsort(dists_i)
+            sorted_candidates = candidates[sorted_idx]
+            
+            # Apply log-rank penalty: slower decay for mid-ranked edges
+            for rank, j in enumerate(sorted_candidates):
+                # Logarithmic penalty with regret strength scaling
+                log_penalty = 1 / (1 + regret_strength * np.log2(rank + 2))
+                regret_matrix[i, j] = log_penalty
+    
+    # Symmetrize using geometric mean for multiplicative consistency
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # === 4. ENHANCED LOCAL POTENTIAL ESTIMATION ===
+    local_potential = np.ones((n, n))
+    
+    # Pre-compute nearest neighbor information
+    nn_counts = min(4, n - 1)  # Consider up to 4 nearest neighbors
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:nn_counts+1]
+    nearest_dists = np.take_along_axis(distance_matrix, nearest_indices, axis=1)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Estimate 2-opt potential using nearest neighbors
+            # Find best alternative connection for i (excluding j)
+            i_alts = [k for k in nearest_indices[i] if k != j]
+            if i_alts:
+                alt_i = min(distance_matrix[i, k] for k in i_alts)
+            else:
+                alt_i = np.inf
+            
+            # Find best alternative connection for j (excluding i)
+            j_alts = [k for k in nearest_indices[j] if k != i]
+            if j_alts:
+                alt_j = min(distance_matrix[j, k] for k in j_alts)
+            else:
+                alt_j = np.inf
+            
+            if alt_i < np.inf and alt_j < np.inf:
+                current = distance_matrix[i, j]
+                potential_gain = (alt_i + alt_j) - current
+                
+                if potential_gain > 0:
+                    # Normalized gain with sigmoid activation
+                    gain_norm = min(potential_gain / (dist_mean + 1e-12), 3.0)
+                    local_potential[i, j] = 1.0 + 0.4 * (1 / (1 + np.exp(-gain_norm)))
+    
+    local_potential = np.maximum(local_potential, local_potential.T)
+    
+    # === 5. BASE ATTRACTION WITH ROBUST NORMALIZATION ===
+    # Use soft inverse with instance scaling
+    scale_factor = dist_mean if dist_mean > 0 else 1.0
+    base_attraction = scale_factor / (distance_matrix + scale_factor * 0.1)
+    np.fill_diagonal(base_attraction, 0)
+    
+    # === 6. INTEGRATED HEURISTIC CALCULATION ===
+    heuristics = base_attraction.copy()
+    
+    # Apply multiplicative components
+    heuristics *= regret_matrix
+    heuristics *= centrality_matrix
+    heuristics *= local_potential
+    
+    # Boost MST edges
+    heuristics[mst_mask] *= mst_boost
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 7. HIERARCHICAL SPARSIFICATION ===
+    if sparsity_aggression > 0:
+        # First level: always keep MST edges
+        # Second level: keep top K% of non-MST edges
+        
+        # Separate MST and non-MST edges
+        non_mst_mask = ~mst_mask
+        np.fill_diagonal(non_mst_mask, False)
+        
+        if np.any(non_mst_mask):
+            non_mst_vals = heuristics[non_mst_mask]
+            if len(non_mst_vals) > 0:
+                # Determine keep threshold based on sparsity aggression
+                keep_percentile = 100 * (1 - sparsity_aggression)
+                threshold = np.percentile(non_mst_vals, keep_percentile)
+                
+                # Zero out non-MST edges below threshold
+                to_zero = non_mst_mask & (heuristics < threshold)
+                heuristics[to_zero] = 0
+    
+    # === 8. FINAL REFINEMENT ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize non-zero values to [0, 1] range
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = heuristics[non_zero_mask].max()
+        min_val = heuristics[non_zero_mask].min()
+        if max_val > min_val:
+            heuristics[non_zero_mask] = (heuristics[non_zero_mask] - min_val) / (max_val - min_val)
+    
+    return heuristics
+```

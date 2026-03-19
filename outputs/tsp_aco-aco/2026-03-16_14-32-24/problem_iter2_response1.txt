@@ -1,0 +1,212 @@
+```json
+{
+    "algorithm_features": ["Closeness Centrality Weighting", "Approximated Triangle Inequality Penalty", "Adaptive Multiplicative Fusion", "Dynamic Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge prioritization.
+    
+    Combines multiple sophisticated factors to score edge promise:
+    1. Closeness centrality-weighted inverse distance
+    2. Efficient approximated triangle inequality penalty
+    3. Nearest-neighbor connections with adaptive k
+    4. Minimum spanning tree structural bias
+    5. Dynamic sparsification with connectivity preservation
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # Preprocess: avoid self-loops and division issues
+    eps = 1e-12
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # 1. Base inverse distance (normalized)
+    inv_dist = 1 / (safe_dist + eps)
+    inv_dist = inv_dist / (inv_dist.max() + eps)
+    
+    # 2. Closeness centrality for hub prioritization
+    # Closeness centrality: 1 / (average distance to all other nodes)
+    closeness = np.zeros(n)
+    for i in range(n):
+        # Avoid including infinity (self-distance) in average
+        valid_distances = np.delete(safe_dist[i], i)
+        if len(valid_distances) > 0:
+            closeness[i] = 1 / (np.mean(valid_distances) + eps)
+    
+    # Normalize closeness centrality
+    if closeness.max() > 0:
+        closeness = closeness / closeness.max()
+    
+    # Create centrality matrix: edges connecting high-centrality nodes get bonus
+    centrality_bonus = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            centrality_score = (closeness[i] + closeness[j]) / 2
+            centrality_bonus[i, j] = centrality_bonus[j, i] = centrality_score
+    
+    # 3. Nearest neighbor bonus with adaptive k
+    k_nn = max(2, min(10, n // 5))  # Top 20% or at least 2
+    nn_bonus = np.zeros((n, n))
+    for i in range(n):
+        sorted_idx = np.argsort(safe_dist[i])[:k_nn]
+        nn_bonus[i, sorted_idx] = 1.0 - 0.3 * np.arange(len(sorted_idx)) / len(sorted_idx)
+    
+    # 4. Minimum Spanning Tree structural bias
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bias = (mst + mst.T) > 0
+    
+    # 5. Efficient triangle inequality penalty approximation
+    # Instead of O(n³) full calculation, use sampling of intermediate nodes
+    tri_penalty = np.ones((n, n))
+    
+    # For each node, precompute its k nearest neighbors for approximation
+    k_tri = min(15, n - 1)
+    nearest_nodes = []
+    for i in range(n):
+        nearest_nodes.append(np.argsort(safe_dist[i])[1:k_tri+1])  # Exclude self
+    
+    # Compute approximate triangle inequality violation
+    for i in range(n):
+        for j in range(i+1, n):
+            # Consider only promising intermediate nodes from both endpoints
+            candidate_k = np.union1d(nearest_nodes[i], nearest_nodes[j])
+            
+            if len(candidate_k) > 0:
+                # Vectorized computation for efficiency
+                indirect_dists = safe_dist[i, candidate_k] + safe_dist[candidate_k, j]
+                min_indirect = np.min(indirect_dists) if len(indirect_dists) > 0 else np.inf
+                direct = safe_dist[i, j]
+                
+                if min_indirect < direct - eps:
+                    # Penalize edges that violate triangle inequality
+                    violation_ratio = direct / (min_indirect + eps)
+                    # Stronger penalty for greater violations
+                    tri_penalty[i, j] = tri_penalty[j, i] = np.sqrt(violation_ratio)
+    
+    # 6. Multiplicative combination of factors
+    # Use adaptive weights based on instance size
+    w_inv = 0.4
+    w_centrality = 0.2
+    w_nn = 0.15
+    w_mst = 0.25
+    
+    heuristics_matrix = (
+        (inv_dist ** w_inv) *
+        ((1 + centrality_bonus) ** w_centrality) *
+        ((1 + nn_bonus) ** w_nn) *
+        ((1 + mst_bias) ** w_mst) *
+        ((1 / tri_penalty) ** 0.5)  # Triangle inequality penalty
+    )
+    
+    # 7. Dynamic sparsification with connectivity guarantee
+    # Determine sparsity level adaptively
+    target_density = min(0.3, 5.0 / n)  # Aim for ~5 edges per node or 30% density
+    candidate_threshold = np.percentile(heuristics_matrix, 100 * (1 - target_density))
+    
+    mask = heuristics_matrix > candidate_threshold
+    
+    # Ensure each node has at least min_edges connections
+    min_edges = max(2, n // 10)  # At least 2, up to 10% of nodes
+    for i in range(n):
+        row_mask = mask[i]
+        if np.sum(row_mask) < min_edges:
+            # Keep top min_edges edges for this node (excluding self)
+            sorted_indices = np.argsort(heuristics_matrix[i])[::-1]
+            valid_indices = [idx for idx in sorted_indices if idx != i][:min_edges]
+            mask[i, valid_indices] = True
+    
+    # Ensure symmetric connectivity
+    mask = mask | mask.T
+    
+    # 8. Final refinement: boost edges that appear in multiple heuristics
+    consensus_bonus = np.zeros((n, n))
+    consensus_threshold = 0.5  # Consider top 50% of each heuristic
+    
+    inv_dist_mask = inv_dist > np.percentile(inv_dist, 50)
+    nn_mask = nn_bonus > 0
+    mst_mask = mst_bias > 0
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if mask[i, j]:
+                consensus = sum([inv_dist_mask[i, j], nn_mask[i, j], mst_mask[i, j]])
+                if consensus >= 2:  # Edge appears in at least 2 heuristics
+                    consensus_bonus[i, j] = consensus_bonus[j, i] = 0.1 * consensus
+    
+    heuristics_matrix = heuristics_matrix * mask + consensus_bonus
+    
+    # Final symmetrization and zero diagonal
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+
+
+# Validation and demonstration function (optional)
+def validate_heuristics(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Validation and demonstration of the heuristics function.
+    """
+    n = distance_matrix.shape[0]
+    heuristics = heuristics_v2(distance_matrix)
+    
+    print(f"Matrix shape: {heuristics.shape}")
+    print(f"Non-zero entries: {np.count_nonzero(heuristics)} / {n*n}")
+    print(f"Non-zero percentage: {100*np.count_nonzero(heuristics)/(n*n):.1f}%")
+    if np.any(heuristics > 0):
+        print(f"Min non-zero value: {heuristics[heuristics>0].min():.4f}")
+    else:
+        print("Min non-zero value: 0")
+    print(f"Max value: {heuristics.max():.4f}")
+    if np.any(heuristics > 0):
+        print(f"Mean non-zero: {heuristics[heuristics>0].mean():.4f}")
+    else:
+        print("Mean non-zero: 0")
+    
+    return heuristics
+
+
+# Example usage with a small TSP instance
+if __name__ == "__main__":
+    # Create a sample distance matrix (10 cities)
+    np.random.seed(42)
+    n_cities = 10
+    
+    # Generate random city coordinates
+    coords = np.random.rand(n_cities, 2) * 100
+    
+    # Compute Euclidean distance matrix
+    dist_matrix = np.zeros((n_cities, n_cities))
+    for i in range(n_cities):
+        for j in range(n_cities):
+            if i != j:
+                dist_matrix[i, j] = np.linalg.norm(coords[i] - coords[j])
+    
+    print("Original distance matrix shape:", dist_matrix.shape)
+    print("\nFirst 5x5 block of distance matrix:")
+    print(dist_matrix[:5, :5])
+    
+    print("\n" + "="*50)
+    print("Heuristics Matrix Analysis")
+    print("="*50)
+    
+    heuristics_matrix = validate_heuristics(dist_matrix)
+    
+    print("\nFirst 5x5 block of heuristics matrix:")
+    print(heuristics_matrix[:5, :5])
+    
+    # Show sparsity pattern
+    print(f"\nSparsity pattern (1=non-zero, 0=zero):")
+    sparsity_display = (heuristics_matrix[:5, :5] > 0).astype(int)
+    print(sparsity_display)
+```

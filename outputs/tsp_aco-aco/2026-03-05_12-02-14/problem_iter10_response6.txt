@@ -1,0 +1,176 @@
+```json
+{
+    "algorithm_features": ["Inverse Distance Weighting", "Closeness Centrality", "Edge Sparsification", "Row-wise Normalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic matrix for TSP edge selection with robust components
+    and adaptive sparsity control.
+    
+    Key improvements:
+    1. Clean separation of heuristic components with fixed, interpretable weights
+    2. Efficient centrality computation using only row sums (no O(n³) Floyd-Warshall)
+    3. Adaptive sparsification that preserves MST edges and scales with problem size
+    4. Guaranteed row-normalization for direct use in stochastic sampling
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Row-normalized heuristic matrix of same shape indicating edge promise.
+        Each row sums to 1 (except diagonal), suitable for stochastic sampling.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    if n == 2:
+        heuristic = np.array([[0, 1], [1, 0]], dtype=float)
+        return heuristic
+    
+    # ========== 1. BASE COMPONENTS ==========
+    
+    # Component 1: Reciprocal distances (inverse weighting)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    np.fill_diagonal(reciprocal, 0)
+    
+    # Normalize by maximum value (preserves relative differences)
+    if np.max(reciprocal) > 0:
+        reciprocal_norm = reciprocal / np.max(reciprocal)
+    else:
+        reciprocal_norm = reciprocal
+    
+    # Component 2: Node centrality (closeness approximation)
+    # Use inverse of average distance as centrality measure
+    row_sums = np.sum(distance_matrix, axis=1)
+    # Avoid division by zero for isolated nodes
+    with np.errstate(divide='ignore', invalid='ignore'):
+        node_centrality = (n - 1) / (row_sums + 1e-10)
+        node_centrality[np.isinf(node_centrality)] = 0
+        node_centrality = np.nan_to_num(node_centrality, nan=0)
+    
+    # Create centrality matrix as product of node centralities
+    # This favors connections between central nodes
+    centrality_matrix = np.outer(node_centrality, node_centrality)
+    np.fill_diagonal(centrality_matrix, 0)
+    
+    if np.max(centrality_matrix) > 0:
+        centrality_norm = centrality_matrix / np.max(centrality_matrix)
+    else:
+        centrality_norm = centrality_matrix
+    
+    # Component 3: Minimum Spanning Tree edges
+    # MST edges form the backbone of good solutions
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_array = mst.toarray()
+        mst_indicator = (mst_array > 0).astype(float)
+    except Exception:
+        # Fallback: use a simple greedy approximation
+        mst_indicator = np.zeros_like(distance_matrix)
+        for i in range(n):
+            if i < n-1:
+                mst_indicator[i, i+1] = 1
+                mst_indicator[i+1, i] = 1
+    
+    # ========== 2. COMBINE COMPONENTS ==========
+    
+    # Fixed weights: reciprocal > centrality > MST
+    # These weights are empirically determined for good performance
+    combined = (0.7 * reciprocal_norm + 
+                0.2 * centrality_norm + 
+                0.1 * mst_indicator)
+    
+    # Ensure symmetry
+    combined = np.maximum(combined, combined.T)
+    np.fill_diagonal(combined, 0)
+    
+    # ========== 3. ADAPTIVE SPARSIFICATION ==========
+    
+    # Determine number of edges to keep per node based on problem size
+    # Small: keep all, Medium: O(sqrt(n)), Large: O(log(n))
+    if n < 30:
+        edges_per_node = n - 1  # Keep all edges for small problems
+    elif n < 200:
+        edges_per_node = int(2.5 * np.sqrt(n))
+    else:
+        edges_per_node = int(5 * np.log(n + 1))
+    
+    edges_per_node = max(2, min(edges_per_node, n - 1))
+    
+    # Preserve MST edges as they are essential
+    preserved_edges = set()
+    mst_edges = np.where(mst_indicator > 0)
+    for i, j in zip(*mst_edges):
+        if i != j:
+            preserved_edges.add((i, j))
+            preserved_edges.add((j, i))
+    
+    # Create sparsified matrix
+    sparsified = np.zeros_like(combined)
+    
+    # First, preserve all MST edges with full weight
+    for i, j in preserved_edges:
+        sparsified[i, j] = combined[i, j]
+    
+    # For each node, select top additional edges
+    for i in range(n):
+        # Count how many MST edges this node already has
+        mst_count = sum(1 for j in range(n) if (i, j) in preserved_edges)
+        
+        # How many additional edges we can add
+        max_additional = max(0, edges_per_node - mst_count)
+        
+        if max_additional <= 0:
+            continue
+            
+        # Get candidate edges (excluding self and already preserved MST edges)
+        row_weights = combined[i].copy()
+        row_weights[i] = -np.inf  # Exclude self
+        
+        # Mask out MST edges
+        for j in range(n):
+            if (i, j) in preserved_edges:
+                row_weights[j] = -np.inf
+        
+        # Get indices of top candidates
+        candidate_indices = np.argsort(row_weights)[-max_additional:]
+        
+        # Apply exponential decay based on rank
+        for rank, j in enumerate(candidate_indices[::-1]):  # Reverse to get descending order
+            if row_weights[j] > -np.inf:  # Valid candidate
+                # More gentle decay for better exploration
+                decay = np.exp(-rank / 4.0)
+                sparsified[i, j] = combined[i, j] * decay
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # ========== 4. ROW-WISE NORMALIZATION ==========
+    
+    # Add small constant to avoid zero rows (ensures exploration)
+    sparsified = sparsified + 1e-10
+    
+    # Row-normalize for direct use in stochastic sampling
+    row_sums = sparsified.sum(axis=1, keepdims=True)
+    # Handle any zero rows (shouldn't happen with the constant added)
+    row_sums[row_sums == 0] = 1
+    normalized = sparsified / row_sums
+    
+    # Zero out diagonal explicitly
+    np.fill_diagonal(normalized, 0)
+    
+    return normalized
+```

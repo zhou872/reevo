@@ -1,0 +1,188 @@
+```json
+{
+    "algorithm_features": ["Regret-Based Prioritization", "Clustering Density Bonus", "Two-Step Lookahead Scoring", "Adaptive Multiplicative Integration"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection.
+    
+    Integrates regret-based prioritization, clustering bonuses, and lookahead
+    spatial scoring to better identify promising edges for stochastic sampling.
+    
+    Args:
+        distance_matrix: Symmetric square matrix of pairwise distances.
+    
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Preprocessing: avoid self-loops
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Base inverse distance (geometric priority)
+    inv_dist = 1 / safe_dist
+    
+    # 2. Dynamic nearest neighbor selection
+    k_nn = max(2, n // 10)
+    nn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        top_k = np.argsort(safe_dist[i])[:k_nn]
+        nn_mask[i, top_k] = True
+    nn_bonus = nn_mask.astype(float)
+    
+    # 3. Regret-based prioritization
+    # Measures how much worse the second-best option is compared to the best
+    regret_matrix = np.zeros((n, n))
+    for i in range(n):
+        sorted_dists = np.sort(safe_dist[i])
+        if len(sorted_dists) >= 3:
+            best_dist = sorted_dists[0]
+            second_best_dist = sorted_dists[1]
+            regret_range = second_best_dist - best_dist + eps
+            
+            for j in range(n):
+                if i != j:
+                    # Regret score: how much worse is edge (i,j) than the best?
+                    # High regret when edge is much worse than best alternative
+                    regret = (safe_dist[i, j] - best_dist) / regret_range
+                    # Convert to priority (low regret → high priority)
+                    regret_priority = 1.0 / (1.0 + np.exp(2 * regret))
+                    regret_matrix[i, j] = regret_priority
+    
+    # 4. Clustering density bonus
+    # Identify dense clusters via local distance variance
+    density_bonus = np.ones((n, n))
+    local_density = np.zeros(n)
+    k_density = max(2, n // 15)
+    
+    for i in range(n):
+        # Local density as inverse of average distance to k-nearest neighbors
+        nearest_dists = np.sort(safe_dist[i])[:k_density]
+        local_density[i] = 1.0 / (np.mean(nearest_dists) + eps)
+    
+    # Normalize densities
+    if np.max(local_density) > 0:
+        local_density = local_density / np.max(local_density)
+    
+    # Bonus for edges within dense clusters
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Edge connects two nodes in the same dense region
+            density_score = np.sqrt(local_density[i] * local_density[j])
+            # Additional bonus if both nodes have high density
+            if density_score > 0.7:
+                density_bonus[i, j] = 1.5
+                density_bonus[j, i] = 1.5
+            elif density_score > 0.4:
+                density_bonus[i, j] = 1.2
+                density_bonus[j, i] = 1.2
+    
+    # 5. Two-step lookahead spatial scoring
+    # Considers potential continuations after taking an edge
+    lookahead_matrix = np.ones((n, n))
+    k_lookahead = max(2, n // 20)
+    
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Consider best possible continuation from j (excluding i)
+                mask = np.ones(n, dtype=bool)
+                mask[[i, j]] = False
+                if np.any(mask):
+                    # Best continuation distance from j
+                    best_continuation = np.min(safe_dist[j, mask])
+                    # Total two-step cost
+                    two_step_cost = safe_dist[i, j] + best_continuation
+                    # Compare to direct connection (triangle inequality check)
+                    min_direct = np.min(safe_dist[i, mask])
+                    if two_step_cost < 1.8 * min_direct:  # Allow some slack
+                        lookahead_matrix[i, j] = 1.3  # Bonus for good continuations
+                    elif two_step_cost > 2.5 * min_direct:
+                        lookahead_matrix[i, j] = 0.7  # Penalty for poor continuations
+    
+    # 6. Minimum Spanning Tree structural bias
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bias = ((mst + mst.T) > 0).astype(float)
+    
+    # 7. Triangular inequality penalty (efficient computation)
+    tri_penalty = np.ones((n, n))
+    # Sample intermediate nodes for efficiency
+    k_intermediate = min(20, n)
+    
+    for i in range(n):
+        # Get candidate intermediate nodes (closest to either endpoint)
+        candidates_i = set(np.argsort(safe_dist[i])[:k_intermediate])
+        for j in range(n):
+            if i != j:
+                candidates_j = set(np.argsort(safe_dist[j])[:k_intermediate])
+                candidates = list(candidates_i.union(candidates_j) - {i, j})
+                
+                if candidates:
+                    # Find minimum indirect path through candidates
+                    indirect_dists = safe_dist[i, candidates] + safe_dist[candidates, j]
+                    min_indirect = np.min(indirect_dists) if len(indirect_dists) > 0 else np.inf
+                    direct = safe_dist[i, j]
+                    
+                    if min_indirect < direct * 0.95:  # Significant violation
+                        tri_penalty[i, j] = direct / (min_indirect + eps)
+    
+    # 8. Multiplicative integration of factors
+    heuristics_matrix = (
+        inv_dist *                      # Base geometric priority
+        (1.0 + 0.3 * nn_bonus) *        # Nearest neighbor bonus
+        (1.0 + 0.4 * regret_matrix) *   # Regret-based prioritization
+        density_bonus *                  # Clustering bonus
+        lookahead_matrix *               # Two-step lookahead
+        (1.0 + 0.5 * mst_bias) *        # MST structural bias
+        (1.0 / np.sqrt(tri_penalty))    # Triangle violation penalty
+    )
+    
+    # 9. Adaptive sparsification with connectivity guarantee
+    # Keep top edges based on node-specific thresholds
+    sparsity_level = 0.35  # Target keeping ~35% of edges per node
+    
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Determine adaptive threshold
+        sorted_vals = np.sort(row)[::-1]
+        k_keep = max(2, int(sparsity_level * (n - 1)))
+        if k_keep < len(sorted_vals):
+            threshold = sorted_vals[k_keep]
+        else:
+            threshold = sorted_vals[-1] if len(sorted_vals) > 0 else -np.inf
+        
+        # Apply threshold
+        mask = row >= threshold
+        # Ensure at least 2 edges are kept
+        if np.sum(mask) < 2:
+            top_indices = np.argsort(row)[-2:]
+            mask = np.zeros(n, dtype=bool)
+            mask[top_indices] = True
+        
+        heuristics_matrix[i, ~mask] = 0
+    
+    # 10. Symmetrize and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Final normalization
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

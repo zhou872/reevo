@@ -1,0 +1,207 @@
+```json
+{
+    "algorithm_features": ["Rank-Based Regret Incentive", "Density-Aware Regret Penalization", "Multi-Criteria Edge Sparsification", "Cluster-Aware Similarity Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with refined
+    regret-based incentives and intelligent multi-criteria sparsification.
+    
+    Core improvements:
+    1. Rank-Based Regret Incentive: Dynamic scaling based on rank percentile
+       rather than fixed bonuses
+    2. Density-Aware Regret Penalization: Combines local density with
+       alternative cost analysis to identify high-regret edges
+    3. Multi-Criteria Edge Sparsification: Adaptive thresholding based on
+       rank, density similarity, and regret scores
+    4. Cluster-Aware Similarity Scoring: Gaussian similarity kernel for
+       density differences with adaptive bandwidth
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # ==================== 1. RANK-BASED REGRET INCENTIVE ====================
+    rank_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Sort and get percentile ranks
+        sorted_indices = np.argsort(distances)
+        sorted_distances = distances[sorted_indices]
+        
+        # Compute rank percentiles
+        valid_distances = sorted_distances[sorted_distances < np.inf]
+        if len(valid_distances) == 0:
+            continue
+            
+        # Assign scores based on rank percentile
+        for rank_idx, j in enumerate(sorted_indices):
+            if i == j or distances[j] == np.inf:
+                continue
+                
+            percentile = rank_idx / max(1, len(valid_distances) - 1)
+            # Higher score for better ranks with non-linear decay
+            rank_matrix[i, j] = 1.0 + 0.8 * (1.0 - percentile) ** 1.5
+    
+    # ==================== 2. LOCAL DENSITY COMPUTATION ====================
+    k = max(3, int(0.12 * n))
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        valid_distances = distances[distances < np.inf]
+        
+        if len(valid_distances) > k:
+            # Get k nearest neighbors
+            k_nearest = np.partition(valid_distances, min(k, len(valid_distances)-1))[:k]
+            local_density[i] = 1.0 / (np.mean(k_nearest) + 1e-8)
+        elif len(valid_distances) > 0:
+            local_density[i] = 1.0 / (np.mean(valid_distances) + 1e-8)
+        else:
+            local_density[i] = 1.0
+    
+    # Normalize densities
+    if np.max(local_density) > np.min(local_density):
+        local_density = (local_density - np.min(local_density)) / (np.max(local_density) - np.min(local_density))
+    
+    # ==================== 3. DENSITY-AWARE REGRET PENALIZATION ====================
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Compute best alternatives for both nodes
+            dist_i = distance_matrix[i, :].copy()
+            dist_i[i] = np.inf
+            dist_i[j] = np.inf
+            best_alt_i = np.min(dist_i[dist_i < np.inf]) if np.any(dist_i < np.inf) else distance_matrix[i, j]
+            
+            dist_j = distance_matrix[j, :].copy()
+            dist_j[j] = np.inf
+            dist_j[i] = np.inf
+            best_alt_j = np.min(dist_j[dist_j < np.inf]) if np.any(dist_j < np.inf) else distance_matrix[i, j]
+            
+            # Compute regret ratios
+            regret_i = (best_alt_i - distance_matrix[i, j]) / (best_alt_i + 1e-8)
+            regret_j = (best_alt_j - distance_matrix[i, j]) / (best_alt_j + 1e-8)
+            
+            # Combine with density similarity
+            density_sim = 1.0 - abs(local_density[i] - local_density[j])
+            regret_combined = (regret_i + regret_j) / 2.0
+            
+            # Apply density-aware adjustment
+            regret_matrix[i, j] = 1.0 + 0.6 * regret_combined * (0.3 + 0.7 * density_sim)
+            regret_matrix[j, i] = regret_matrix[i, j]
+    
+    # ==================== 4. CLUSTER-AWARE SIMILARITY SCORING ====================
+    similarity_matrix = np.ones((n, n))
+    
+    # Adaptive bandwidth for Gaussian kernel
+    density_std = np.std(local_density) if n > 1 else 1.0
+    bandwidth = max(0.1, density_std)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            density_diff = abs(local_density[i] - local_density[j])
+            # Gaussian similarity kernel
+            similarity = np.exp(-density_diff ** 2 / (2 * bandwidth ** 2))
+            similarity_matrix[i, j] = 0.7 + 0.6 * similarity
+            similarity_matrix[j, i] = similarity_matrix[i, j]
+    
+    # ==================== 5. MINIMUM SPANNING TREE PRIORITY ====================
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_boost = np.where(mst_mask, 1.25, 1.0)
+    
+    # ==================== 6. COMBINE COMPONENTS ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Inverse distance with adaptive regularization
+        mean_dist = np.mean(distance_matrix[distance_matrix > 0])
+        inv_dist = 1.0 / (distance_matrix + 0.05 * mean_dist)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    heuristic = inv_dist * rank_matrix * regret_matrix * similarity_matrix * mst_boost
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # ==================== 7. MULTI-CRITERIA SPARSIFICATION ====================
+    final_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    final_mask = final_mask | mst_mask
+    
+    # Compute adaptive thresholds
+    avg_nn_dist = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        valid = distances[distances < np.inf]
+        avg_nn_dist[i] = np.mean(valid) if len(valid) > 0 else 1.0
+    
+    for i in range(n):
+        # Criterion 1: Top edges by combined heuristic
+        node_heuristic = heuristic[i, :].copy()
+        node_heuristic[i] = -np.inf
+        top_k = max(2, int(0.2 * n))
+        if top_k < len(node_heuristic):
+            threshold_val = np.partition(node_heuristic, -top_k)[-top_k]
+            final_mask[i, node_heuristic >= threshold_val] = True
+        
+        # Criterion 2: Spatial proximity (dynamic threshold)
+        spatial_threshold = 1.6 * avg_nn_dist[i]
+        within_spatial = distance_matrix[i, :] <= spatial_threshold
+        within_spatial[i] = False
+        final_mask[i, within_spatial] = True
+        
+        # Criterion 3: High regret-penalty edges
+        node_regret = regret_matrix[i, :].copy()
+        node_regret[i] = -np.inf
+        regret_threshold = np.percentile(node_regret[node_regret > -np.inf], 70)
+        high_regret = node_regret >= regret_threshold
+        final_mask[i, high_regret] = True
+    
+    # Ensure symmetry
+    final_mask = final_mask | final_mask.T
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(final_mask[i, :])[0]
+        connected = connected[connected != i]
+        if len(connected) < 2:
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            nearest = np.argsort(distances)[:2]
+            final_mask[i, nearest] = True
+            final_mask[nearest, i] = True
+    
+    # Apply sparsification
+    heuristic = heuristic * final_mask
+    
+    # Normalize
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    return heuristic
+```

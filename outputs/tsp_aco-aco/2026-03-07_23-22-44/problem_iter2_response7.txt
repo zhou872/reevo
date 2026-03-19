@@ -1,0 +1,171 @@
+```json
+{
+    "algorithm_features": ["Regret-based Edge Criticality", "Two-step Lookahead Spatial Averaging", "Cluster Density Bonus", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection incorporating:
+    1. Regret-based edge criticality: Prioritizes edges with fewer good alternatives
+    2. Two-step lookahead spatial averaging: Estimates future path impact
+    3. Cluster density bonus: Rewards edges within dense local clusters
+    4. Adaptive sparsification: Intelligently prunes unlikely edges
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape indicating edge promise
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base inverse distance with numerical stability
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Regret-based edge criticality scoring
+    regret_scores = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get all distances from node i (excluding self)
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find k best alternatives for each potential edge (i,j)
+        k_alternatives = min(5, n - 2)
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Mask out current edge and self
+            alt_mask = np.ones(n, dtype=bool)
+            alt_mask[[i, j]] = False
+            
+            # Find distances to alternatives
+            alt_dists = dists_i[alt_mask]
+            
+            # Calculate regret as difference between edge (i,j) and best k alternatives
+            if len(alt_dists) > 0:
+                k_best = np.partition(alt_dists, k_alternatives - 1)[:k_alternatives]
+                avg_best = np.mean(k_best)
+                regret = max(0, avg_best - distance_matrix[i, j])
+                regret_scores[i, j] = 1.0 / (1.0 + np.exp(-regret / (avg_best + 1e-8)))
+    
+    # 3. Two-step lookahead spatial averaging
+    lookahead_scores = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Consider potential next steps after edge (i,j)
+            remaining_nodes = [k for k in range(n) if k not in (i, j)]
+            if len(remaining_nodes) == 0:
+                lookahead_scores[i, j] = 1.0
+                continue
+            
+            # Calculate average distances from j to remaining nodes
+            next_dists = [distance_matrix[j, k] for k in remaining_nodes]
+            avg_next_dist = np.mean(next_dists)
+            
+            # Also consider distances from remaining nodes back to i (for tour completion)
+            return_dists = [distance_matrix[k, i] for k in remaining_nodes]
+            avg_return_dist = np.mean(return_dists)
+            
+            # Combined lookahead estimate
+            lookahead_estimate = 0.6 * avg_next_dist + 0.4 * avg_return_dist
+            lookahead_scores[i, j] = 1.0 / (lookahead_estimate + 1e-8)
+    
+    # 4. Cluster density detection and bonus
+    density_scores = np.ones_like(distance_matrix)
+    
+    # Detect local clusters using adaptive radius
+    if n > 3:
+        # Calculate median distance as base for cluster detection
+        upper_triangle = distance_matrix[np.triu_indices(n, 1)]
+        median_dist = np.median(upper_triangle)
+        
+        for i in range(n):
+            # Find nodes within cluster radius
+            cluster_radius = 1.5 * median_dist
+            in_cluster = distance_matrix[i] < cluster_radius
+            in_cluster[i] = False
+            
+            # Calculate intra-cluster density bonus
+            if np.any(in_cluster):
+                cluster_dists = distance_matrix[i, in_cluster]
+                cluster_density = 1.0 / (np.mean(cluster_dists) + 1e-8)
+                density_bonus = 1.0 + 0.5 * np.tanh(cluster_density / (median_dist + 1e-8))
+                density_scores[i, in_cluster] = density_bonus
+    
+    # 5. Minimum Spanning Tree connectivity reinforcement
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # 6. Combine all factors with weighted composition
+    base_score = inv_dist * regret_scores * lookahead_scores * density_scores
+    
+    # Boost MST edges significantly
+    mst_boost = np.where(mst_edges, 2.0, 1.0)
+    enhanced_scores = base_score * mst_boost
+    
+    # 7. Symmetrize (TSP is undirected)
+    symmetric_scores = (enhanced_scores + enhanced_scores.T) / 2
+    
+    # 8. Adaptive intelligent sparsification
+    sparsified = np.zeros_like(symmetric_scores)
+    
+    # Determine adaptive keep count based on problem size and score distribution
+    base_keep = max(2, int(0.25 * (n - 1)))
+    for i in range(n):
+        row_scores = symmetric_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Calculate score statistics for adaptive thresholding
+        score_mean = np.mean(row_scores[row_scores > 0])
+        score_std = np.std(row_scores[row_scores > 0])
+        
+        if score_std > 0:
+            # Keep edges with scores significantly above average
+            threshold = score_mean + 0.5 * score_std
+            keep_mask = row_scores >= max(threshold, 0)
+            
+            # Ensure we keep at least base_keep edges
+            if np.sum(keep_mask) < base_keep:
+                indices = np.argsort(row_scores)[-base_keep:]
+                keep_mask = np.zeros_like(row_scores, dtype=bool)
+                keep_mask[indices] = True
+        else:
+            # Fallback: keep top edges
+            keep_count = min(base_keep, n - 1)
+            indices = np.argsort(row_scores)[-keep_count:]
+            keep_mask = np.zeros_like(row_scores, dtype=bool)
+            keep_mask[indices] = True
+        
+        keep_mask[i] = False  # Ensure self not included
+        sparsified[i][keep_mask] = symmetric_scores[i][keep_mask]
+    
+    # 9. Final distance-based attenuation
+    max_dist = np.max(distance_matrix)
+    distance_attenuation = np.exp(-distance_matrix / (0.3 * max_dist + 1e-8))
+    final_scores = sparsified * distance_attenuation
+    
+    # 10. Normalize to [0, 1] range
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    return final_scores
+```

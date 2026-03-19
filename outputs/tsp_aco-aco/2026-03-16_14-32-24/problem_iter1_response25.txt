@@ -1,0 +1,207 @@
+```json
+{
+    "algorithm_features": ["Spatial Cluster Density Bonus", "Distance-Constrained Node Saturation", "Regret-Based Penalty", "Two-Hop Lookahead Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection combining multiple factors:
+    1. Spatial cluster density bonus
+    2. Distance-constrained node saturation scores  
+    3. Regret-based penalty for long edges
+    4. Two-hop lookahead scoring
+    
+    Returns a matrix where higher values indicate more promising edges.
+    Unpromising edges are set to zero via thresholding.
+    """
+    n = len(distance_matrix)
+    heuristics = np.zeros((n, n))
+    
+    if n < 4:
+        return 1 / (distance_matrix + 1e-10)
+    
+    # 1. Spatial cluster analysis using KDTree
+    coords = _distance_matrix_to_coords(distance_matrix)
+    kdtree = KDTree(coords)
+    
+    # Local density estimation (average distance to k nearest neighbors)
+    k_neighbors = min(10, n - 1)
+    densities = np.zeros(n)
+    for i in range(n):
+        distances, _ = kdtree.query(coords[i], k=k_neighbors + 1)
+        densities[i] = 1 / (np.mean(distances[1:]) + 1e-10)
+    
+    density_norm = densities / np.max(densities)
+    
+    # 2. Distance-constrained node saturation scores
+    # For each node, identify promising nearby nodes
+    candidate_edges = min(7, n - 1)
+    node_candidates = np.argsort(distance_matrix, axis=1)[:, 1:candidate_edges + 1]
+    
+    # 3. Two-hop lookahead scoring
+    for i in range(n):
+        for idx_j, j in enumerate(node_candidates[i]):
+            if i >= j:  # Process each edge once (symmetric matrix)
+                continue
+                
+            base_score = 1 / (distance_matrix[i, j] + 1e-10)
+            
+            # Density bonus: favor edges between dense regions
+            density_bonus = 0.5 * (density_norm[i] + density_norm[j])
+            
+            # Regret penalty: avoid edges that block many good alternatives
+            regret_penalty = _calculate_regret_penalty(
+                i, j, distance_matrix, node_candidates
+            )
+            
+            # Two-hop lookahead: consider connections beyond immediate edge
+            lookahead_score = _two_hop_lookahead(
+                i, j, distance_matrix, node_candidates
+            )
+            
+            # Combined score with weights
+            combined = (
+                0.4 * base_score +
+                0.2 * density_bonus * base_score +
+                0.3 * lookahead_score -
+                0.1 * regret_penalty
+            )
+            
+            heuristics[i, j] = heuristics[j, i] = max(0, combined)
+    
+    # 4. Sparsification: keep only top edges per node
+    return _sparsify_heuristics(heuristics, distance_matrix)
+
+def _distance_matrix_to_coords(distance_matrix: np.ndarray) -> np.ndarray:
+    """Convert distance matrix to approximate 2D coordinates using MDS-like approach."""
+    n = len(distance_matrix)
+    if n <= 2:
+        return np.zeros((n, 2))
+    
+    # Simple metric embedding using two reference points
+    ref1, ref2 = 0, min(1, n - 1)
+    coords = np.zeros((n, 2))
+    
+    for i in range(n):
+        d1 = distance_matrix[i, ref1]
+        d2 = distance_matrix[i, ref2]
+        d_ref = distance_matrix[ref1, ref2]
+        
+        # Law of cosines approximation
+        if d_ref > 0:
+            cos_angle = (d1**2 + d_ref**2 - d2**2) / (2 * d1 * d_ref)
+            cos_angle = np.clip(cos_angle, -1, 1)
+            angle = np.arccos(cos_angle)
+            
+            coords[i, 0] = d1 * np.cos(angle)
+            coords[i, 1] = d1 * np.sin(angle)
+    
+    return coords
+
+def _calculate_regret_penalty(
+    i: int, j: int, 
+    distance_matrix: np.ndarray,
+    node_candidates: np.ndarray
+) -> float:
+    """
+    Calculate regret penalty for choosing edge (i,j).
+    Higher penalty if this edge blocks many good alternatives for both nodes.
+    """
+    n = len(distance_matrix)
+    penalty = 0.0
+    
+    # For each node, look at its top alternatives
+    top_k = min(5, n - 1)
+    
+    # Get best alternatives for i (excluding j)
+    i_alts = node_candidates[i, :top_k]
+    i_best = distance_matrix[i, i_alts[0]] if len(i_alts) > 0 else 0
+    
+    # Get best alternatives for j (excluding i)
+    j_alts = node_candidates[j, :top_k]
+    j_best = distance_matrix[j, j_alts[0]] if len(j_alts) > 0 else 0
+    
+    # Penalize if choosing (i,j) forces abandonment of much better alternatives
+    if i_best > 0:
+        penalty += max(0, distance_matrix[i, j] / (i_best + 1e-10) - 1)
+    
+    if j_best > 0:
+        penalty += max(0, distance_matrix[j, i] / (j_best + 1e-10) - 1)
+    
+    return penalty / 2
+
+def _two_hop_lookahead(
+    i: int, j: int,
+    distance_matrix: np.ndarray,
+    node_candidates: np.ndarray
+) -> float:
+    """
+    Score edge based on quality of potential two-hop paths through it.
+    """
+    n = len(distance_matrix)
+    lookahead_k = min(3, n - 1)
+    
+    # Find best continuations from j (excluding i)
+    j_candidates = [c for c in node_candidates[j, :lookahead_k] if c != i]
+    
+    if not j_candidates:
+        return 0
+    
+    # Average quality of two-hop paths i->j->k
+    scores = []
+    for k in j_candidates:
+        if k != i:
+            path_score = 1 / (distance_matrix[i, j] + distance_matrix[j, k] + 1e-10)
+            scores.append(path_score)
+    
+    return np.mean(scores) if scores else 0
+
+def _sparsify_heuristics(
+    heuristics: np.ndarray,
+    distance_matrix: np.ndarray
+) -> np.ndarray:
+    """
+    Sparsify the heuristic matrix by keeping only promising edges.
+    """
+    n = len(heuristics)
+    sparsified = np.zeros((n, n))
+    
+    # Determine number of edges to keep per node
+    edges_per_node = max(3, min(8, n // 4))
+    
+    for i in range(n):
+        # Get all potential edges from i
+        potential_edges = []
+        for j in range(n):
+            if i != j and heuristics[i, j] > 0:
+                potential_edges.append((j, heuristics[i, j]))
+        
+        if not potential_edges:
+            # Fallback: use inverse distance for top edges
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            top_indices = np.argsort(distances)[:edges_per_node]
+            for j in top_indices:
+                sparsified[i, j] = 1 / (distance_matrix[i, j] + 1e-10)
+            continue
+        
+        # Sort by heuristic value
+        potential_edges.sort(key=lambda x: x[1], reverse=True)
+        
+        # Keep top edges
+        keep_count = min(edges_per_node, len(potential_edges))
+        for idx in range(keep_count):
+            j, score = potential_edges[idx]
+            sparsified[i, j] = score
+    
+    # Symmetrize the matrix
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+```

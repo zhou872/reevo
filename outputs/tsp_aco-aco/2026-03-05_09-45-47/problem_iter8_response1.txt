@@ -1,0 +1,319 @@
+```json
+{
+    "algorithm_features": ["Adaptive MDS-based Clustering", "Dynamic MST Heuristics", "Efficient Triangle Boosting", "Size-adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.manifold import MDS
+from sklearn.neighbors import KDTree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection combining:
+    1. Reciprocal distance with adaptive scaling
+    2. Size-adaptive spatial clustering (MDS for small, landmarks for large)
+    3. Dynamic MST heuristics with local connectivity
+    4. Efficient triangle boosting with sampling for large instances
+    
+    Returns:
+        Edge promise matrix with values in [0, 1], same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+            return result
+    
+    # 1. Base reciprocal heuristic with adaptive scaling
+    reciprocal_weights = _compute_reciprocal_weights(distance_matrix, n)
+    
+    # 2. Adaptive spatial clustering
+    spatial_promising = _compute_adaptive_spatial_clustering(distance_matrix, n)
+    
+    # 3. Dynamic MST heuristics
+    mst_promising = _compute_dynamic_mst_heuristics(distance_matrix, n)
+    
+    # 4. Combine with learned weights based on graph size
+    combined = _combine_heuristics(
+        reciprocal_weights, spatial_promising, mst_promising, 
+        distance_matrix, n
+    )
+    
+    # 5. Size-adaptive sparsification
+    sparsified = _size_adaptive_sparsification(combined, n)
+    
+    # 6. Efficient triangle boosting
+    boosted = _efficient_triangle_boosting(sparsified, n)
+    
+    # Final normalization
+    np.fill_diagonal(boosted, 0)
+    max_val = np.max(boosted)
+    if max_val > 0:
+        boosted = boosted / max_val
+    
+    return boosted
+
+def _compute_reciprocal_weights(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute base reciprocal weights with adaptive scaling."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        safe_dist = distance_matrix + np.eye(n) * 1e-12
+        reciprocal = 1 / safe_dist
+        np.fill_diagonal(reciprocal, 0)
+    
+    # Adaptive scaling based on graph size
+    if n > 1000:
+        # For very large graphs, use more aggressive scaling
+        reciprocal = np.log1p(reciprocal)
+    elif n > 100:
+        # For medium graphs, use sqrt scaling
+        reciprocal = np.sqrt(reciprocal)
+    
+    # Normalize each row separately for better balance
+    row_max = reciprocal.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    reciprocal = reciprocal / row_max
+    
+    return reciprocal
+
+def _compute_adaptive_spatial_clustering(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute spatial clustering factor with size-adaptive methods.
+    Uses MDS for small/medium graphs and landmark-based approximation for large graphs.
+    """
+    spatial_promising = np.zeros((n, n), dtype=float)
+    
+    # Adaptive neighborhood size
+    k_neighbors = max(3, min(int(np.log2(n)) + 2, n - 1))
+    
+    if n <= 300:
+        # MDS-based approach for accurate coordinates (small/medium graphs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Use faster MDS with fewer components for speed
+            n_components = min(2, n-1) if n > 50 else min(3, n-1)
+            mds = MDS(
+                n_components=n_components,
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=2,  # Reduced for speed
+                max_iter=30,
+                eps=1e-3
+            )
+            coords = mds.fit_transform(distance_matrix)
+            tree = KDTree(coords)
+            
+            for i in range(n):
+                distances, indices = tree.query(coords[i], k=k_neighbors + 1)
+                # Exclude self if it's in the results
+                indices = indices[1:] if indices[0] == i else indices[:k_neighbors]
+                spatial_promising[i, indices] = 1.0
+    
+    elif n <= 2000:
+        # Distance-based approach for medium/large graphs
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            indices = np.argpartition(dists, k_neighbors)[:k_neighbors]
+            spatial_promising[i, indices] = 1.0
+    
+    else:
+        # Landmark-based approximation for very large graphs
+        landmarks = min(150, n // 15)
+        landmark_indices = np.random.choice(n, landmarks, replace=False)
+        
+        # Assign each node to nearest landmark cluster
+        landmark_dists = distance_matrix[:, landmark_indices]
+        closest_landmarks = np.argmin(landmark_dists, axis=1)
+        
+        # For each landmark cluster, connect nodes within cluster
+        for l in range(landmarks):
+            cluster_nodes = np.where(closest_landmarks == l)[0]
+            if len(cluster_nodes) > 1:
+                # Connect each node to k nearest within cluster
+                for i in cluster_nodes:
+                    cluster_dists = distance_matrix[i, cluster_nodes]
+                    cluster_dists[cluster_nodes == i] = np.inf
+                    if len(cluster_dists) > k_neighbors:
+                        indices = np.argpartition(cluster_dists, k_neighbors)[:k_neighbors]
+                        actual_indices = cluster_nodes[indices]
+                    else:
+                        actual_indices = cluster_nodes[cluster_nodes != i]
+                    spatial_promising[i, actual_indices] = 1.0
+    
+    return spatial_promising
+
+def _compute_dynamic_mst_heuristics(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute MST-based heuristics with dynamic enhancement.
+    For large graphs, uses approximate MST on a sample for efficiency.
+    """
+    if n <= 500:
+        # Exact MST for small/medium graphs
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_edges = (mst.toarray() > 0).astype(float)
+        mst_promising = mst_edges + mst_edges.T
+    else:
+        # Approximate MST for large graphs using sample
+        sample_size = min(500, n // 2)
+        sample_indices = np.random.choice(n, sample_size, replace=False)
+        sample_dist = distance_matrix[np.ix_(sample_indices, sample_indices)]
+        
+        mst_sample = minimum_spanning_tree(sample_dist)
+        mst_sample_edges = (mst_sample.toarray() > 0).astype(float)
+        
+        # Map back to full matrix
+        mst_promising = np.zeros((n, n), dtype=float)
+        for i in range(sample_size):
+            for j in range(sample_size):
+                if mst_sample_edges[i, j] > 0:
+                    orig_i, orig_j = sample_indices[i], sample_indices[j]
+                    mst_promising[orig_i, orig_j] = 1.0
+                    mst_promising[orig_j, orig_i] = 1.0
+    
+    # Enhance MST with local connectivity
+    local_k = min(2, n - 1)
+    for i in range(n):
+        if np.sum(mst_promising[i] > 0) < 2:  # Poorly connected in MST
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            closest = np.argpartition(dists, local_k)[:local_k]
+            for j in closest:
+                if mst_promising[i, j] == 0:
+                    mst_promising[i, j] = 0.5
+    
+    return mst_promising
+
+def _combine_heuristics(reciprocal: np.ndarray, spatial: np.ndarray, 
+                        mst: np.ndarray, distance_matrix: np.ndarray, 
+                        n: int) -> np.ndarray:
+    """
+    Combine heuristic factors with dynamic weights based on graph size.
+    """
+    # Dynamic weight adjustment based on graph size
+    if n <= 100:
+        # Small graphs: balanced weights
+        w_rec, w_spat, w_mst = 0.4, 0.35, 0.25
+    elif n <= 1000:
+        # Medium graphs: favor spatial clustering
+        w_rec, w_spat, w_mst = 0.3, 0.45, 0.25
+    else:
+        # Large graphs: strong spatial, reduced reciprocal
+        w_rec, w_spat, w_mst = 0.2, 0.55, 0.25
+    
+    # Apply weights
+    combined = (w_rec * reciprocal + 
+                w_spat * spatial + 
+                w_mst * mst)
+    
+    # Boost very short edges more aggressively for large graphs
+    if n > 500:
+        percentile = 10
+    else:
+        percentile = 20
+    
+    threshold = np.percentile(distance_matrix[np.triu_indices(n, k=1)], percentile)
+    short_mask = distance_matrix < threshold
+    combined[short_mask] *= 1.5
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+def _size_adaptive_sparsification(heuristics_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Adaptive sparsification based on graph size.
+    Keeps more edges for smaller graphs, fewer for larger ones.
+    """
+    if n <= 15:
+        return heuristics_matrix.copy()
+    
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    # Dynamic edges per node based on graph size
+    if n <= 50:
+        edges_per_node = max(4, n // 3)
+    elif n <= 200:
+        edges_per_node = max(5, int(np.sqrt(n)))
+    elif n <= 1000:
+        edges_per_node = max(6, int(np.log2(n)) * 2)
+    else:
+        edges_per_node = max(8, int(np.log10(n)) * 3)
+    
+    edges_per_node = min(edges_per_node, n - 1)
+    
+    # Keep top edges for each node
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        
+        if np.any(row > 0):
+            top_indices = np.argpartition(-row, edges_per_node)[:edges_per_node]
+            sparsified[i, top_indices] = heuristics_matrix[i, top_indices]
+    
+    # Ensure symmetry by taking union
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+
+def _efficient_triangle_boosting(heuristics_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Boost edges that form triangles, with efficient computation strategies.
+    Uses exact computation for small graphs and sampling for large ones.
+    """
+    boosted = heuristics_matrix.copy()
+    
+    if n <= 100:
+        # Exact computation for small graphs
+        binary_mask = (heuristics_matrix > 0).astype(float)
+        common_neighbors = binary_mask @ binary_mask.T
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if heuristics_matrix[i, j] > 0:
+                    common = common_neighbors[i, j]
+                    if common > 0:
+                        boost = 1 + 0.2 * min(common, 4)
+                        boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    elif n <= 1000:
+        # Sampling-based approach for medium graphs
+        sample_size = min(200, n // 4)
+        
+        # Sample nodes to check for triangles
+        for _ in range(sample_size):
+            i = np.random.randint(n)
+            neighbors_i = set(np.where(heuristics_matrix[i] > 0)[0])
+            
+            for j in neighbors_i:
+                if j <= i:
+                    continue
+                
+                # Check for common neighbors
+                neighbors_j = set(np.where(heuristics_matrix[j] > 0)[0])
+                common = len(neighbors_i & neighbors_j)
+                
+                if common > 0:
+                    boost = 1 + 0.15 * min(common, 3)
+                    boosted[i, j] = boosted[j, i] = max(
+                        boosted[i, j], heuristics_matrix[i, j] * boost
+                    )
+    
+    # For very large graphs (n > 1000), skip triangle boosting for efficiency
+    # but apply a small uniform boost to edges in dense areas
+    elif n <= 5000:
+        # Quick density estimate
+        edge_density = np.sum(heuristics_matrix > 0) / (n * (n - 1))
+        if edge_density > 0.1:  # Dense enough
+            boost = 1.1
+            boosted[heuristics_matrix > 0] *= boost
+    
+    return boosted
+```

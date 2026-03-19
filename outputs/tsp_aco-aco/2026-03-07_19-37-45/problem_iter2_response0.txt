@@ -1,0 +1,170 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Prior", "Convex Hull Edge Bonus", "Multiplicative Factor Fusion", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import ConvexHull
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics incorporating convex hull edges and
+    multi-factor dynamic weighting.
+    
+    Key innovations:
+    1. Convex hull edges: Edges on the convex hull (if Euclidean) receive priority
+    2. Adaptive weight tuning based on problem characteristics
+    3. Multiplicative fusion of complementary heuristics
+    4. Smart sparsification preserving connectivity
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+    
+    Returns:
+        Heuristic matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # Base reciprocal distance with robust handling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # 1. Minimum Spanning Tree prior
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 2. Convex Hull Edge detection (if distance matrix appears Euclidean)
+    hull_mask = np.zeros_like(distance_matrix, dtype=bool)
+    try:
+        # Attempt to reconstruct 2D coordinates from distance matrix
+        # Using classical multidimensional scaling for approximate positions
+        from sklearn.manifold import MDS
+        if n >= 4 and n <= 1000:  # Practical limits for MDS
+            mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+            coords = mds.fit_transform(distance_matrix)
+            
+            # Compute convex hull in 2D
+            hull = ConvexHull(coords)
+            hull_edges = set()
+            for simplex in hull.simplices:
+                for i in range(len(simplex)):
+                    u, v = simplex[i], simplex[(i+1) % len(simplex)]
+                    hull_edges.add((min(u, v), max(u, v)))
+            
+            # Mark hull edges in mask
+            for u, v in hull_edges:
+                hull_mask[u, v] = True
+                hull_mask[v, u] = True
+    except:
+        # Fallback: use distance-based hull approximation
+        # Identify "extreme" nodes based on distance to centroid
+        centroid = np.mean(distance_matrix, axis=0)
+        extremes = np.argsort(centroid)[:min(10, n//2)]
+        for i in extremes:
+            for j in extremes:
+                if i != j:
+                    hull_mask[i, j] = True
+    
+    # 3. Local clustering coefficient
+    k_local = max(2, min(5, n // 8))
+    local_density = np.zeros(n)
+    for i in range(n):
+        sorted_dists = np.sort(distance_matrix[i])
+        local_density[i] = 1.0 / np.mean(sorted_dists[1:k_local+1]) if k_local > 0 else 1.0
+    
+    # 4. Symmetry and centrality measure
+    centrality = np.mean(distance_matrix, axis=1)
+    centrality_norm = centrality / np.max(centrality) if np.max(centrality) > 0 else np.ones(n)
+    sym_matrix = 1.0 / (1.0 + 5.0 * np.abs(centrality_norm[:, None] - centrality_norm[None, :]))
+    
+    # 5. Dynamic weight adjustment based on problem characteristics
+    # Measure problem "spread" and "regularity"
+    std_dist = np.std(distance_matrix[np.triu_indices(n, 1)])
+    mean_dist = np.mean(distance_matrix[np.triu_indices(n, 1)])
+    spread_ratio = std_dist / (mean_dist + 1e-10)
+    
+    # Adjust weights based on problem characteristics
+    if spread_ratio > 0.5:  # Irregular/spread-out problem
+        w_inv = 1.0
+        w_mst = 1.3
+        w_hull = 1.4
+        w_local = 0.8
+        w_sym = 0.4
+    else:  # More regular/dense problem
+        w_inv = 0.9
+        w_mst = 1.1
+        w_hull = 1.2
+        w_local = 1.0
+        w_sym = 0.6
+    
+    # Additional scaling for problem size
+    size_factor = min(1.0, 100.0 / n)
+    w_hull *= (1.0 + 0.3 * size_factor)  # Hull more important for smaller problems
+    
+    # 6. Multiplicative combination of factors
+    heuristics_matrix = np.ones_like(distance_matrix)
+    
+    # Apply factors multiplicatively
+    heuristics_matrix *= (inv_dist ** w_inv)
+    
+    # MST factor: boost MST edges, penalize others slightly
+    mst_factor = np.where(mst_mask, w_mst, 0.7)
+    heuristics_matrix *= mst_factor
+    
+    # Convex hull factor
+    hull_factor = np.where(hull_mask, w_hull, 1.0)
+    heuristics_matrix *= hull_factor
+    
+    # Local density factor (edges between dense nodes)
+    density_product = np.sqrt(local_density[:, None] * local_density[None, :])
+    heuristics_matrix *= (1.0 + (w_local - 1.0) * density_product)
+    
+    # Symmetry factor
+    heuristics_matrix *= (sym_matrix ** w_sym)
+    
+    # Zero out diagonal
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # 7. Adaptive sparsification with connectivity guarantee
+    # Determine target sparsity based on problem size
+    target_density = min(0.3, max(0.05, 10.0 / n))
+    target_edges = int(target_density * n * (n - 1) / 2)
+    
+    if target_edges > 0:
+        # Keep top edges globally
+        flat_values = heuristics_matrix[np.triu_indices(n, 1)]
+        if len(flat_values) > target_edges:
+            threshold = np.partition(flat_values, -target_edges)[-target_edges]
+            mask = heuristics_matrix >= threshold
+            # Ensure symmetry
+            mask = mask | mask.T
+            heuristics_matrix = heuristics_matrix * mask
+    
+    # 8. Ensure minimum connectivity for each node
+    min_connections = min(3, n - 1)
+    for i in range(n):
+        connected = np.nonzero(heuristics_matrix[i])[0]
+        if len(connected) < min_connections:
+            # Connect to nearest unconnected nodes
+            sorted_idx = np.argsort(distance_matrix[i])
+            for j in sorted_idx:
+                if j != i and heuristics_matrix[i, j] == 0:
+                    heuristics_matrix[i, j] = inv_dist[i, j] * 0.5  # Reduced weight for forced connections
+                    heuristics_matrix[j, i] = heuristics_matrix[i, j]
+                    if len(np.nonzero(heuristics_matrix[i])[0]) >= min_connections:
+                        break
+    
+    # 9. Final normalization
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

@@ -1,0 +1,416 @@
+```json
+{
+    "algorithm_features": ["Dynamic Programming Regret Lookahead", "Mutual Rank Harmonic Weighting", "MST-based Cluster Partitioning", "Topological Convex Hull Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import ConvexHull
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with dynamic programming regret, harmonic mutual ranking,
+    MST-based clustering, and convex hull topological analysis.
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. ADAPTIVE PARAMETER LEARNING ===
+    triu_mask = ~np.eye(n, dtype=bool)
+    distances = distance_matrix[triu_mask]
+    
+    if len(distances) > 0:
+        # Statistical learning from instance
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        q25, median_dist, q75 = np.percentile(distances, [25, 50, 75])
+        
+        # Adaptive k for nearest neighbors based on instance density
+        density_factor = std_dist / (mean_dist + 1e-12)
+        min_k = max(2, n // 20)  # More conservative lower bound
+        max_k = min(15, n // 2)
+        k = int(np.clip(
+            min_k + (max_k - min_k) * (1 - np.exp(-density_factor)),
+            min_k, max_k
+        ))
+        
+        # Dynamic programming depth based on instance size
+        lookahead = 2 if n > 15 else (1 if n > 5 else 0)
+    else:
+        k = min(8, n - 1)
+        lookahead = 1
+        q25 = median_dist = q75 = 1.0
+    
+    # === 2. HARMONIC MUTUAL RANK WEIGHTING ===
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    positions = np.argsort(sorted_indices, axis=1)
+    
+    harmonic_score = np.ones((n, n))
+    
+    # Vectorized computation for efficiency
+    for i in range(n):
+        for j in range(i + 1, n):
+            pos_i_j = positions[i, j]
+            pos_j_i = positions[j, i]
+            
+            # Harmonic mean of reciprocal ranks with smoothing
+            if pos_i_j < k and pos_j_i < k:
+                # Both in top-k: strong harmonic weighting
+                harmonic_mean = 2.0 / (1/(pos_i_j + 1) + 1/(pos_j_i + 1))
+                harmonic_score[i, j] = harmonic_score[j, i] = 1.0 + 2.0 / (harmonic_mean + 1)
+            elif pos_i_j < k or pos_j_i < k:
+                # One-way top-k: weighted harmonic mean
+                min_pos = min(pos_i_j, pos_j_i)
+                max_pos = max(pos_i_j, pos_j_i)
+                if min_pos < k:
+                    weighted_harmonic = (1/(min_pos + 1) + 0.5/(max_pos + 1)) / 1.5
+                    harmonic_score[i, j] = harmonic_score[j, i] = 1.0 + 1.0 / (weighted_harmonic + 1)
+    
+    # === 3. DYNAMIC PROGRAMMING REGRET LOOKAHEAD ===
+    regret_score = np.ones((n, n))
+    
+    if lookahead > 0:
+        # Precompute k-nearest neighbors for efficient lookahead
+        knn_indices = np.argsort(distance_matrix, axis=1)[:, 1:k+3]  # Extra for robustness
+        
+        # Dynamic programming tables for 2-step and 3-step paths
+        two_step_regret = np.full((n, n), np.inf)
+        three_step_regret = np.full((n, n), np.inf) if lookahead > 1 else None
+        
+        # Compute 2-step regrets efficiently
+        for i in range(n):
+            for t in knn_indices[i]:
+                if t == i:
+                    continue
+                for j in range(n):
+                    if j == i or j == t:
+                        continue
+                    alt_cost = distance_matrix[i, t] + distance_matrix[t, j]
+                    two_step_regret[i, j] = min(two_step_regret[i, j], alt_cost)
+        
+        # Compute 3-step regrets if enabled
+        if lookahead > 1 and n > 10:
+            for i in range(n):
+                for t1 in knn_indices[i][:max(3, k//2)]:
+                    if t1 == i:
+                        continue
+                    for t2 in knn_indices[t1][:max(2, k//3)]:
+                        if t2 == i or t2 == t1:
+                            continue
+                        for j in range(n):
+                            if j == i or j == t1 or j == t2:
+                                continue
+                            alt_cost = (distance_matrix[i, t1] + 
+                                      distance_matrix[t1, t2] + 
+                                      distance_matrix[t2, j])
+                            three_step_regret[i, j] = min(three_step_regret[i, j], alt_cost)
+        
+        # Convert regrets to scores
+        for i in range(n):
+            for j in range(i + 1, n):
+                if distance_matrix[i, j] > 0:
+                    # Take minimum of available regret calculations
+                    best_alternative = two_step_regret[i, j]
+                    if lookahead > 1 and three_step_regret is not None:
+                        best_alternative = min(best_alternative, three_step_regret[i, j])
+                    
+                    if best_alternative < np.inf:
+                        regret_ratio = best_alternative / distance_matrix[i, j]
+                        # Non-linear mapping: high score when direct edge is much better
+                        if regret_ratio > 1.5:
+                            score = 1.5 - 0.5 * np.log(regret_ratio - 0.5)
+                        elif regret_ratio > 1.0:
+                            score = 2.0 - regret_ratio
+                        else:
+                            score = 1.0 + (1.0 - regret_ratio)
+                        regret_score[i, j] = regret_score[j, i] = np.clip(score, 0.5, 1.8)
+    
+    # === 4. MST-BASED CLUSTER PARTITIONING ===
+    cluster_score = np.ones((n, n))
+    
+    if n >= 8:
+        # Use MST to identify natural clusters
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_edges = mst.toarray()
+        mst_edges = mst_edges + mst_edges.T  # Make symmetric
+        
+        # Find long MST edges as potential cluster boundaries
+        mst_edge_weights = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if mst_edges[i, j] > 0:
+                    mst_edge_weights.append(distance_matrix[i, j])
+        
+        if len(mst_edge_weights) > 0:
+            # Cut longest edges to form clusters
+            cut_threshold = np.percentile(mst_edge_weights, 75)
+            
+            # Initialize clusters with each node as its own cluster
+            clusters = np.arange(n)
+            
+            # Merge clusters across short MST edges
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if mst_edges[i, j] > 0 and distance_matrix[i, j] <= cut_threshold:
+                        # Merge clusters
+                        cluster_i = clusters[i]
+                        cluster_j = clusters[j]
+                        clusters[clusters == cluster_j] = cluster_i
+            
+            # Reassign cluster IDs sequentially
+            unique_clusters = np.unique(clusters)
+            cluster_map = {old: new for new, old in enumerate(unique_clusters)}
+            clusters = np.array([cluster_map[c] for c in clusters])
+            
+            # Adjust scores based on clustering
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if clusters[i] == clusters[j]:
+                        # Intra-cluster: boost based on relative distance
+                        cluster_distances = []
+                        for x in range(n):
+                            if clusters[x] == clusters[i]:
+                                for y in range(x + 1, n):
+                                    if clusters[y] == clusters[i]:
+                                        cluster_distances.append(distance_matrix[x, y])
+                        
+                        if cluster_distances:
+                            cluster_median = np.median(cluster_distances)
+                            rel_dist = distance_matrix[i, j] / cluster_median
+                            if rel_dist < 0.8:
+                                cluster_score[i, j] = cluster_score[j, i] = 1.4
+                            elif rel_dist < 1.2:
+                                cluster_score[i, j] = cluster_score[j, i] = 1.1
+                            else:
+                                cluster_score[i, j] = cluster_score[j, i] = 0.8
+                    else:
+                        # Inter-cluster: moderate penalty for very long edges
+                        if distance_matrix[i, j] > q75 * 1.5:
+                            cluster_score[i, j] = cluster_score[j, i] = 0.7
+                        elif distance_matrix[i, j] > median_dist * 1.2:
+                            cluster_score[i, j] = cluster_score[j, i] = 0.9
+                        else:
+                            cluster_score[i, j] = cluster_score[j, i] = 1.1
+    
+    # === 5. TOPOLOGICAL CONVEX HULL ANALYSIS ===
+    hull_score = np.ones((n, n))
+    
+    if n >= 4:
+        try:
+            # Estimate coordinates via multidimensional scaling (simplified)
+            # Use the first 3 dimensions for stability
+            from sklearn.manifold import MDS
+            mds = MDS(n_components=min(3, n-1), dissimilarity='precomputed', 
+                     random_state=42, normalized_stress='auto')
+            coords = mds.fit_transform(distance_matrix)
+            
+            # Compute convex hull
+            hull = ConvexHull(coords)
+            
+            # Identify hull vertices
+            hull_vertices = set(hull.vertices)
+            
+            # Score edges based on hull membership and proximity
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Boost edges between hull vertices
+                    if i in hull_vertices and j in hull_vertices:
+                        # Check if this edge is part of hull simplices
+                        is_hull_edge = False
+                        for simplex in hull.simplices:
+                            if (i in simplex and j in simplex):
+                                is_hull_edge = True
+                                break
+                        
+                        if is_hull_edge:
+                            hull_score[i, j] = hull_score[j, i] = 1.6
+                        else:
+                            hull_score[i, j] = hull_score[j, i] = 1.3
+                    
+                    # Moderate boost for edges connecting hull to interior
+                    elif i in hull_vertices or j in hull_vertices:
+                        hull_score[i, j] = hull_score[j, i] = 1.1
+                        
+        except (ImportError, ValueError, RuntimeError):
+            # Fallback: use graph centrality as proxy for hull
+            degree_centrality = np.sum(distance_matrix < np.percentile(distances, 25), axis=1)
+            high_centrality = degree_centrality > np.median(degree_centrality)
+            
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if high_centrality[i] and high_centrality[j]:
+                        hull_score[i, j] = hull_score[j, i] = 1.2
+    
+    # === 6. BASE DISTANCE WEIGHTING ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        eps = np.percentile(distances, 10) * 0.01 if len(distances) > 0 else 1e-12
+        inv_dist = 1.0 / (distance_matrix + eps * np.eye(n))
+    
+    np.fill_diagonal(inv_dist, 0)
+    max_inv = np.max(inv_dist[triu_mask], initial=0)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # === 7. INTEGRATED SCORING ===
+    heuristics = inv_dist * harmonic_score * regret_score * cluster_score * hull_score
+    
+    # === 8. CRITICAL EDGE ENHANCEMENT ===
+    # MST edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    heuristics[mst_mask] *= 1.5
+    
+    # Mutual top-k edges
+    mutual_top_k = (positions < k) & (positions.T < k)
+    heuristics[mutual_top_k] *= 1.4
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 9. ADAPTIVE SPARSIFICATION ===
+    # Compute edge importance scores
+    edge_importance = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Importance based on multiple factors
+            factors = []
+            if mutual_top_k[i, j]:
+                factors.append(2.0)
+            if mst_mask[i, j]:
+                factors.append(1.8)
+            if heuristics[i, j] > np.percentile(heuristics[triu_mask], 75):
+                factors.append(1.5)
+            
+            if factors:
+                edge_importance[i, j] = edge_importance[j, i] = np.mean(factors)
+            else:
+                edge_importance[i, j] = edge_importance[j, i] = 1.0
+    
+    # Sparsify while preserving connectivity
+    preserved_edges = set()
+    
+    # Always preserve MST edges
+    mst_edges = np.argwhere(mst_mask & triu_mask)
+    for i, j in mst_edges:
+        preserved_edges.add((min(i, j), max(i, j)))
+    
+    # Preserve mutual top-k edges
+    mutual_edges = np.argwhere(mutual_top_k & triu_mask)
+    for i, j in mutual_edges:
+        preserved_edges.add((min(i, j), max(i, j)))
+    
+    # Add important edges per node
+    for i in range(n):
+        # Get candidate edges for this node
+        candidates = []
+        for j in range(n):
+            if j != i:
+                candidates.append((j, heuristics[i, j] * edge_importance[i, j]))
+        
+        # Sort by weighted score
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Preserve top edges: adaptive number based on node degree in preserved graph
+        current_degree = sum(1 for (a, b) in preserved_edges if a == i or b == i)
+        target_degree = min(max(3, k), n // 3)
+        
+        for j, score in candidates:
+            if current_degree >= target_degree:
+                break
+            edge = (min(i, j), max(i, j))
+            if edge not in preserved_edges:
+                preserved_edges.add(edge)
+                current_degree += 1
+    
+    # Create final sparse matrix
+    final_heuristics = np.zeros((n, n))
+    for i, j in preserved_edges:
+        final_heuristics[i, j] = final_heuristics[j, i] = heuristics[i, j]
+    
+    # === 10. ROBUST NORMALIZATION ===
+    non_zero = final_heuristics[triu_mask & (final_heuristics > 0)]
+    if len(non_zero) > 0:
+        # Use sigmoid normalization for better spread
+        median_val = np.median(non_zero)
+        iqr = np.percentile(non_zero, 75) - np.percentile(non_zero, 25)
+        
+        if iqr > 0:
+            # Robust z-score with sigmoid
+            z_scores = (final_heuristics - median_val) / (iqr + 1e-12)
+            sigmoid = 1.0 / (1.0 + np.exp(-z_scores))
+            final_heuristics = sigmoid
+        else:
+            # Linear normalization
+            max_val = np.max(non_zero)
+            if max_val > 0:
+                final_heuristics = final_heuristics / max_val
+    
+    np.fill_diagonal(final_heuristics, 0)
+    
+    return final_heuristics
+
+
+if __name__ == "__main__":
+    # Test with different instance types
+    np.random.seed(42)
+    
+    for instance_type in ["cluster", "uniform", "mixed"]:
+        if instance_type == "cluster":
+            n = 50
+            coords = np.random.randn(n, 2) * 5
+            coords[:30] += np.array([30, 30])
+            coords[30:] += np.array([70, 70])
+        elif instance_type == "uniform":
+            n = 50
+            coords = np.random.rand(n, 2) * 100
+        else:  # mixed
+            n = 50
+            coords = np.zeros((n, 2))
+            coords[:20] = np.random.randn(20, 2) * 5 + [20, 20]
+            coords[20:40] = np.random.rand(20, 2) * 60 + [40, 40]
+            coords[40:] = np.random.rand(10, 2) * 100
+        
+        dist_matrix = squareform(pdist(coords))
+        heuristics = heuristics_v2(dist_matrix)
+        
+        print(f"\n=== {instance_type.upper()} Instance (n={n}) ===")
+        print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+        
+        edges_per_node = np.sum(heuristics > 0, axis=1)
+        print(f"Edges per node: min={edges_per_node.min()}, "
+              f"max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+        
+        # Verify symmetry
+        is_symmetric = np.allclose(heuristics, heuristics.T)
+        print(f"Symmetric: {is_symmetric}")
+        
+        # Check that diagonal is zero
+        diag_zero = np.allclose(np.diag(heuristics), 0)
+        print(f"Diagonal zero: {diag_zero}")
+        
+        # Sample scores
+        print("Sample edge scores:")
+        sample_edges = [(0, 1), (0, n//4), (n//2, n//2 + n//4), (n-2, n-1)]
+        for i, j in sample_edges:
+            if i < n and j < n:
+                print(f"  ({i}, {j}): dist={dist_matrix[i, j]:6.2f}, "
+                      f"score={heuristics[i, j]:.4f}")
+```

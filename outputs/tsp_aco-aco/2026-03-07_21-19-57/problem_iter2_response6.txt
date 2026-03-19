@@ -1,0 +1,237 @@
+```json
+{
+    "algorithm_features": ["Adaptive Factor Weighting", "Hybrid Sampling-Aggregation Centrality", "Spatial Distribution-Aware Sparsification", "Dynamic Neighborhood Connectivity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge scoring with optimized betweenness computation
+    and adaptive factor weighting based on problem characteristics.
+    
+    Core improvements:
+    1. Adaptive factor weighting based on problem size and density
+    2. Hybrid sampling-aggregation for betweenness approximation (O(n²√n) → O(n²))
+    3. Spatial distribution-aware sparsification
+    4. Dynamic neighborhood connectivity modeling
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + 1e-10)
+    
+    # ===== 1. PROBLEM CHARACTERIZATION =====
+    # Analyze problem characteristics for adaptive weighting
+    density = np.mean(distance_matrix) / (np.std(distance_matrix) + 1e-10)
+    is_dense = density > 0.5  # Heuristic threshold
+    
+    # ===== 2. ADAPTIVE NEIGHBORHOOD SELECTION =====
+    # Dynamic k based on spatial distribution
+    dist_std = np.std(distance_matrix[np.triu_indices(n, k=1)])
+    k_neighbors = max(2, min(8, int(np.log2(n) * (2 if dist_std > np.mean(distance_matrix) else 1))))
+    
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        indices = np.argsort(distance_matrix[i])[1:k_neighbors+1]
+        nn_mask[i, indices] = True
+        nn_mask[indices, i] = True
+    
+    # ===== 3. OPTIMIZED BETWEENNESS APPROXIMATION =====
+    # Hybrid approach: combine sampling with efficient aggregation
+    betweenness = _efficient_betweenness_approx(distance_matrix, 
+                                                sample_size=max(3, int(np.sqrt(n))), 
+                                                use_sampling=n > 50)
+    
+    # ===== 4. MINIMUM SPANNING TREE ENHANCEMENT =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Enhance MST with degree-aware filtering
+    mst_degrees = mst_mask.sum(axis=1)
+    high_degree_nodes = np.where(mst_degrees > 3)[0]
+    
+    # Penalize MST edges connecting very high-degree nodes
+    mst_penalty = np.ones_like(distance_matrix)
+    for i in high_degree_nodes:
+        for j in range(i+1, n):
+            if mst_mask[i, j] and (mst_degrees[i] > 3 and mst_degrees[j] > 2):
+                mst_penalty[i, j] = mst_penalty[j, i] = 0.8
+    
+    # ===== 5. ADAPTIVE FACTOR WEIGHTING =====
+    # Dynamic weights based on problem characteristics
+    if n < 20:
+        weights = {'base': 0.4, 'betweenness': 0.3, 'mst': 0.3, 'spatial': 0.0}
+    elif is_dense:
+        weights = {'base': 0.3, 'betweenness': 0.4, 'mst': 0.2, 'spatial': 0.1}
+    else:  # Sparse/balanced
+        weights = {'base': 0.5, 'betweenness': 0.2, 'mst': 0.2, 'spatial': 0.1}
+    
+    # ===== 6. BASE HEURISTIC WITH SPATIAL AWARENESS =====
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1 / (distance_matrix + 1e-10)
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # Spatial distribution factor (cluster awareness)
+    spatial_factor = _compute_spatial_factor(distance_matrix, nn_mask)
+    
+    # ===== 7. COMBINED HEURISTIC MATRIX =====
+    heuristic_matrix = np.zeros_like(distance_matrix)
+    
+    # Combine factors with adaptive weights
+    for i in range(n):
+        for j in range(i+1, n):
+            if nn_mask[i, j] or mst_mask[i, j]:
+                # Weighted combination
+                combined = (
+                    weights['base'] * base_heuristic[i, j] +
+                    weights['betweenness'] * betweenness[i, j] +
+                    weights['mst'] * (2.0 if mst_mask[i, j] else 1.0) * mst_penalty[i, j] +
+                    weights['spatial'] * spatial_factor[i, j]
+                )
+                
+                # Degree normalization (dynamic based on local connectivity)
+                local_degree_i = nn_mask[i].sum()
+                local_degree_j = nn_mask[j].sum()
+                degree_factor = 1 + 1 / (local_degree_i + local_degree_j + 1)
+                
+                heuristic_matrix[i, j] = heuristic_matrix[j, i] = combined * degree_factor
+    
+    # ===== 8. INTELLIGENT SPARSIFICATION =====
+    # Spatial distribution-aware thresholding
+    heuristic_matrix = _adaptive_sparsification(heuristic_matrix, distance_matrix, 
+                                               nn_mask, mst_mask, is_dense)
+    
+    # ===== 9. NORMALIZATION =====
+    max_val = np.max(heuristic_matrix)
+    if max_val > 0:
+        heuristic_matrix /= max_val
+    
+    return heuristic_matrix
+
+
+def _efficient_betweenness_approx(dist_matrix: np.ndarray, 
+                                 sample_size: int = 10,
+                                 use_sampling: bool = True) -> np.ndarray:
+    """
+    Efficient betweenness approximation using hybrid sampling-aggregation.
+    
+    Time complexity: O(sample_size * n²) instead of O(n³)
+    """
+    n = dist_matrix.shape[0]
+    betweenness = np.zeros_like(dist_matrix)
+    
+    if use_sampling and sample_size < n:
+        # Sample-based approximation
+        samples = np.random.choice(n, size=min(sample_size, n), replace=False)
+        
+        for s in samples:
+            # Simplified 2-hop betweenness estimation
+            for i in range(n):
+                if i == s:
+                    continue
+                for j in range(i+1, n):
+                    if j == s:
+                        continue
+                    # Check if edge (i,j) participates in shortest paths through s
+                    if (dist_matrix[i, s] + dist_matrix[s, j] < 
+                        dist_matrix[i, j] * 1.1):
+                        betweenness[i, j] += 1
+                        betweenness[j, i] += 1
+        
+        # Scale to full betweenness estimate
+        betweenness *= (n / len(samples))
+    else:
+        # Exact computation for small instances
+        for s in range(n):
+            for i in range(n):
+                if i == s:
+                    continue
+                for j in range(i+1, n):
+                    if j == s:
+                        continue
+                    if (dist_matrix[i, s] + dist_matrix[s, j] < 
+                        dist_matrix[i, j] * 1.1):
+                        betweenness[i, j] += 1
+                        betweenness[j, i] += 1
+    
+    # Normalize betweenness scores
+    max_between = betweenness.max()
+    if max_between > 0:
+        betweenness /= max_between
+    
+    return betweenness
+
+
+def _compute_spatial_factor(dist_matrix: np.ndarray, 
+                           nn_mask: np.ndarray) -> np.ndarray:
+    """
+    Compute spatial distribution factor to identify cluster structures.
+    """
+    n = dist_matrix.shape[0]
+    spatial_factor = np.ones_like(dist_matrix)
+    
+    # Local density estimation
+    local_density = np.zeros(n)
+    for i in range(n):
+        local_density[i] = 1 / (np.mean(dist_matrix[i, nn_mask[i]]) + 1e-10)
+    
+    # Cluster connectivity bonus
+    for i in range(n):
+        for j in range(i+1, n):
+            if nn_mask[i, j]:
+                # Bonus for connecting nodes with similar local densities
+                density_similarity = 1 / (1 + abs(local_density[i] - local_density[j]))
+                spatial_factor[i, j] = spatial_factor[j, i] = 1.0 + 0.5 * density_similarity
+    
+    return spatial_factor
+
+
+def _adaptive_sparsification(heuristic_matrix: np.ndarray,
+                            dist_matrix: np.ndarray,
+                            nn_mask: np.ndarray,
+                            mst_mask: np.ndarray,
+                            is_dense: bool) -> np.ndarray:
+    """
+    Intelligent sparsification based on spatial distribution and connectivity.
+    """
+    n = heuristic_matrix.shape[0]
+    result = heuristic_matrix.copy()
+    
+    # Row-wise adaptive thresholding
+    for i in range(n):
+        row = result[i]
+        non_zero = row[row > 0]
+        
+        if len(non_zero) > 0:
+            if is_dense:
+                # For dense problems, keep fewer edges
+                threshold = np.percentile(non_zero, 75)  # Top 25%
+            else:
+                # For sparse problems, keep more edges
+                threshold = np.percentile(non_zero, 60)  # Top 40%
+            
+            # Preserve MST edges regardless of threshold
+            mst_indices = np.where(mst_mask[i])[0]
+            keep_mask = (row >= threshold) | np.isin(np.arange(n), mst_indices)
+            
+            result[i, ~keep_mask] = 0
+            result[~keep_mask, i] = 0
+    
+    # Global pruning of isolated edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if result[i, j] > 0:
+                # Check if edge has sufficient support in both rows
+                row_i_nonzero = np.sum(result[i] > 0)
+                row_j_nonzero = np.sum(result[j] > 0)
+                
+                if row_i_nonzero < 2 or row_j_nonzero < 2:
+                    # Edge is isolated, reduce score
+                    result[i, j] = result[j, i] *= 0.5
+    
+    return result
+```

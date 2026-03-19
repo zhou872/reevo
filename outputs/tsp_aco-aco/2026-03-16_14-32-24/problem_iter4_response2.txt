@@ -1,0 +1,196 @@
+```json
+{
+    "algorithm_features": ["Entropy-Guided Candidate Sparsification", "Dynamic Rank-Based Regret Penalty", "Reciprocal Rank Weighting", "Adaptive Density Bonus"]
+}
+```
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import entropy as scipy_entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with entropy-guided sparsification and
+    dynamic regret thresholds based on node degree characteristics.
+    
+    Features:
+    1. Entropy-guided candidate list: Adjust candidate count per node based on 
+       distance entropy to balance exploration vs exploitation
+    2. Dynamic rank-based regret: Use entropy-adjusted rank for regret threshold
+    3. Reciprocal rank weighting: 1/(rank+1) for distance-based prioritization
+    4. Adaptive density bonus: Bonus for edges in dense local neighborhoods
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix (avoid self-loops)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Entropy-guided candidate sparsification
+    node_entropies = np.zeros(n)
+    for i in range(n):
+        valid_dists = safe_dist[i][safe_dist[i] < np.inf]
+        if len(valid_dists) > 1:
+            # Add small epsilon to avoid zero probabilities
+            prob_dists = 1.0 / (valid_dists + eps)
+            prob_dists = prob_dists / np.sum(prob_dists)
+            node_entropies[i] = scipy_entropy(prob_dists)
+    
+    # Normalize entropies to [0,1]
+    if node_entropies.max() > 0:
+        norm_entropies = node_entropies / node_entropies.max()
+    else:
+        norm_entropies = np.ones(n)
+    
+    # Dynamic candidate count based on entropy
+    # High entropy -> more uniform distances -> explore more candidates
+    # Low entropy -> skewed distances -> exploit fewer candidates
+    min_candidates = max(2, int(np.sqrt(n) * 0.5))
+    max_candidates = max(4, int(np.sqrt(n) * 2))
+    candidate_counts = (min_candidates + 
+                       norm_entropies * (max_candidates - min_candidates)).astype(int)
+    
+    # Ensure candidate counts don't exceed n-1
+    candidate_counts = np.minimum(candidate_counts, n - 1)
+    
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        neighbors = np.argsort(safe_dist[i])[:candidate_counts[i]]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 2. Dynamic rank-based regret penalty
+    mean_dist = np.mean(safe_dist[safe_dist < np.inf])
+    regret_penalty = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        if len(dists) >= 2:
+            # Dynamic regret rank based on entropy
+            # Low entropy: use lower rank (more strict regret)
+            # High entropy: use higher rank (more forgiving regret)
+            base_rank = 2  # Minimum rank for regret comparison
+            entropy_rank = int(np.ceil((1 - norm_entropies[i]) * 3))  # 0-3 additional ranks
+            regret_rank = min(base_rank + entropy_rank, len(dists) - 1)
+            
+            # Get threshold distance at regret_rank
+            threshold_dist = np.partition(dists, regret_rank)[regret_rank]
+            
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    edge_dist = dists[j]
+                    # Compute regret relative to threshold
+                    regret = max(0, edge_dist - threshold_dist) / (mean_dist + eps)
+                    # Exponential decay penalty
+                    regret_penalty[i, j] = np.exp(-regret)
+    
+    # 3. Reciprocal rank weighting
+    rank_weights = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get sorted indices by distance
+        sorted_idx = np.argsort(safe_dist[i])
+        # Assign reciprocal rank weights: 1/(rank+1)
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = 1.0 / (rank + 1)
+    
+    # 4. Adaptive neighbor density bonus
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute median distance for each node
+    median_distances = np.zeros(n)
+    for i in range(n):
+        valid_dists = safe_dist[i][safe_dist[i] < np.inf]
+        median_distances[i] = np.median(valid_dists) if len(valid_dists) > 0 else mean_dist
+    
+    # Compute density for each node (nodes within median distance)
+    node_densities = np.zeros(n)
+    for i in range(n):
+        within_threshold = (safe_dist[i] <= median_distances[i]) & (safe_dist[i] < np.inf)
+        node_densities[i] = np.sum(within_threshold)
+    
+    # Normalize densities and adjust by entropy
+    # Nodes with high entropy get reduced density bonus (more exploration needed)
+    if node_densities.max() > 0:
+        node_densities = node_densities / node_densities.max()
+    
+    # Apply density bonus to candidate edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Geometric mean of endpoint densities, reduced by entropy
+                geo_mean = np.sqrt(node_densities[i] * node_densities[j] + eps)
+                # High entropy reduces density bonus to encourage exploration
+                entropy_factor = 1.0 - (norm_entropies[i] + norm_entropies[j]) / 2.0
+                density_bonus[i, j] = 0.2 * geo_mean * (0.5 + 0.5 * entropy_factor)
+    
+    # Make symmetric
+    density_bonus = np.maximum(density_bonus, density_bonus.T)
+    
+    # 5. Minimum Spanning Tree bias
+    if n <= 1000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_bias = (mst + mst.T) > 0
+            mst_bonus = mst_bias * 0.15
+        except:
+            mst_bonus = np.zeros_like(distance_matrix)
+    else:
+        mst_bonus = np.zeros_like(distance_matrix)
+    
+    # 6. Combine factors
+    # Base inverse distance (normalized by mean)
+    inv_dist = 1.0 / safe_dist
+    inv_dist = inv_dist * mean_dist
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Combined score
+    base_score = inv_dist * rank_weights
+    score_with_regret = base_score * regret_penalty
+    heuristics_matrix = score_with_regret * (1.0 + density_bonus) * (1.0 + mst_bonus)
+    
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # 7. Ensure minimum connectivity
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_count = np.count_nonzero(row)
+        
+        if nonzero_count < 2:
+            # Find top 2 edges by base score
+            base_row = score_with_regret[i].copy()
+            base_row[i] = -np.inf  # Exclude self
+            top_indices = np.argsort(base_row)[-2:]
+            for idx in top_indices:
+                if idx != i:
+                    boost_val = np.max(heuristics_matrix[i]) * 1.5 if np.max(heuristics_matrix[i]) > 0 else 0.1
+                    heuristics_matrix[i, idx] = boost_val
+                    heuristics_matrix[idx, i] = boost_val
+    
+    # 8. Symmetrize and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

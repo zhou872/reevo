@@ -1,0 +1,234 @@
+```json
+{
+    "algorithm_features": ["Stochastic Sampling", "Centrality-Based Filtering", "Adaptive Edge Pruning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Optimized TSP edge heuristics using stochastic solution sampling and centrality-based filtering.
+    
+    Key improvements over v1:
+    - Simplified strategy focusing on sampling and centrality
+    - Reduced computational overhead by removing complex betweenness calculations
+    - More aggressive sparsification based on statistical edge significance
+    - Adaptive thresholding based on instance characteristics
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    distances_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / (dist_mean + 1e-10)
+    
+    # Size-adaptive parameters
+    log_n = np.log(n + 1)
+    density_factor = min(1.0, n / 50.0)
+    
+    # ===== 2. STOCHASTIC SOLUTION SAMPLING =====
+    def generate_tour(method='random'):
+        """Generate tour using simple construction heuristics."""
+        if method == 'random':
+            return np.random.permutation(n)
+        elif method == 'nearest':
+            # Simplified nearest neighbor
+            tour = [np.random.randint(0, n)]
+            unvisited = set(range(n)) - {tour[0]}
+            while unvisited:
+                current = tour[-1]
+                nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+            return np.array(tour)
+        return np.random.permutation(n)
+    
+    def fast_2opt(tour, iterations=20):
+        """Fast 2-opt improvement with limited iterations."""
+        if n <= 3:
+            return tour
+        
+        best_tour = tour.copy()
+        best_len = sum(distance_matrix[best_tour[i], best_tour[(i+1)%n]] for i in range(n))
+        
+        for _ in range(iterations):
+            improved = False
+            for i in range(n-1):
+                for j in range(i+2, n):
+                    if j == n-1 and i == 0:
+                        continue
+                    
+                    a, b = best_tour[i], best_tour[(i+1)%n]
+                    c, d = best_tour[j], best_tour[(j+1)%n]
+                    
+                    gain = distance_matrix[a, b] + distance_matrix[c, d] - \
+                           distance_matrix[a, c] - distance_matrix[b, d]
+                    
+                    if gain > 1e-10:
+                        # Perform swap
+                        new_tour = best_tour.copy()
+                        new_tour[i+1:j+1] = best_tour[i+1:j+1][::-1]
+                        
+                        # Update if better
+                        new_len = best_len - gain
+                        if new_len < best_len:
+                            best_tour = new_tour
+                            best_len = new_len
+                            improved = True
+                            break
+                if improved:
+                    break
+            if not improved:
+                break
+        
+        return best_tour
+    
+    # Generate diverse sample tours
+    num_samples = min(10, max(3, n // 5))
+    tours = []
+    
+    for _ in range(num_samples):
+        # Mix of methods
+        if np.random.random() < 0.6:
+            tour = generate_tour('nearest')
+        else:
+            tour = generate_tour('random')
+        
+        # Apply limited improvement
+        tour = fast_2opt(tour, iterations=int(15 * density_factor))
+        tours.append(tour)
+    
+    # Compute edge frequency
+    edge_freq = np.zeros_like(distance_matrix)
+    for tour in tours:
+        for i in range(n):
+            j = (i + 1) % n
+            u, v = tour[i], tour[j]
+            edge_freq[u, v] += 1
+            edge_freq[v, u] += 1
+    
+    # Normalize edge frequency
+    if edge_freq.max() > 0:
+        edge_freq = edge_freq / edge_freq.max()
+    
+    # ===== 3. SIMPLIFIED CENTRALITY MEASURES =====
+    # Inverse distance matrix (for local information)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Node centrality as inverse of average distance
+    centrality = 1.0 / (np.sum(distance_matrix, axis=1) + 1e-10)
+    centrality = centrality / (np.sum(centrality) + 1e-10)
+    
+    # Edge centrality potential (product of node centralities)
+    edge_centrality = np.outer(centrality, centrality)
+    
+    # ===== 4. MST-BASED IMPORTANCE =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # ===== 5. ADAPTIVE COMBINATION =====
+    # Weights based on instance characteristics
+    w_freq = 0.5 + 0.3 * min(1.0, cv)  # More weight to sampling when distances vary
+    w_dist = 0.3 - 0.2 * min(1.0, cv)  # Less weight to inverse distance when distances vary
+    w_cent = 0.2 + 0.1 * density_factor  # More centrality for larger instances
+    
+    # Normalize weights
+    total_w = w_freq + w_dist + w_cent
+    w_freq /= total_w
+    w_dist /= total_w
+    w_cent /= total_w
+    
+    # Combine components
+    heuristics_matrix = (
+        w_freq * edge_freq +
+        w_dist * (inv_dist / (inv_dist.max() + 1e-10)) +
+        w_cent * edge_centrality
+    )
+    
+    # Boost edges that are in MST
+    heuristics_matrix[mst_mask] *= (1.2 + 0.3 * density_factor)
+    
+    # ===== 6. AGGRESSIVE SPARSIFICATION =====
+    # Determine number of edges to keep per node
+    base_edges = max(2, int(np.log2(n) + 1))
+    if n <= 20:
+        keep_edges = base_edges
+    elif n <= 50:
+        keep_edges = base_edges + 1
+    else:
+        keep_edges = base_edges + 2
+    
+    keep_edges = min(keep_edges, n - 1)
+    
+    # Create sparsity mask
+    sparsity_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get scores for this node
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf  # Exclude diagonal
+        
+        # Keep top edges, but ensure MST edges are included
+        threshold = np.sort(scores)[-keep_edges]
+        node_mask = scores >= threshold
+        
+        # Also include nearest neighbors (for connectivity)
+        if n > 3:
+            nn_count = min(3, n-1)
+            nearest = np.argsort(distance_matrix[i])[1:nn_count+1]
+            node_mask[nearest] = True
+        
+        sparsity_mask[i] = node_mask
+    
+    # Ensure symmetry and include MST
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    sparsity_mask = sparsity_mask | mst_mask
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # ===== 7. FINAL PROCESSING =====
+    # Ensure symmetry
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    
+    # Zero diagonal
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Robust normalization
+    non_zero = heuristics_matrix[heuristics_matrix > 0]
+    if len(non_zero) > 0:
+        # Use robust scaling (ignore outliers)
+        p25, p75 = np.percentile(non_zero, [25, 75])
+        if p75 > p25:
+            heuristics_matrix = np.clip(heuristics_matrix, p25, p75)
+            max_val = heuristics_matrix.max()
+            if max_val > 0:
+                heuristics_matrix = heuristics_matrix / max_val
+    
+    # Final sparsification: remove very low values
+    if heuristics_matrix.max() > 0:
+        threshold = 0.1 * heuristics_matrix.max()
+        heuristics_matrix[heuristics_matrix < threshold] = 0
+    
+    return heuristics_matrix
+```

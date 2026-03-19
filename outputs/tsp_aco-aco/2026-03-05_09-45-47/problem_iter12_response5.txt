@@ -1,0 +1,347 @@
+```json
+{
+    "algorithm_features": ["Reciprocal Distance", "MST Prioritization", "Nearest Neighbor Sparsification", "Triangle Quality Boosting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Optimized TSP edge selection heuristic focusing on essential components.
+    
+    Core strategies:
+    1. Reciprocal distance as foundation
+    2. MST edge prioritization (Christofides-inspired)
+    3. Nearest neighbor sparsification for scalability
+    4. Triangle quality boosting based on local geometry
+    5. Adaptive parameter tuning based on instance statistics
+    
+    Returns edge promise matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+        return result
+    
+    # 1. Base reciprocal heuristic
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_base = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal_base, 0)
+    
+    # 2. Instance analysis for adaptive parameters
+    instance_stats = _analyze_instance_v2(distance_matrix, n)
+    
+    # 3. MST-based heuristic (Christofides-inspired)
+    mst_heuristic = _compute_mst_heuristic_v2(distance_matrix, n, instance_stats)
+    
+    # 4. Nearest neighbor clustering
+    nn_heuristic = _compute_nearest_neighbor_heuristic(distance_matrix, n, instance_stats)
+    
+    # 5. Combine heuristics with adaptive weights
+    combined = _combine_heuristics_v2(
+        reciprocal_base, mst_heuristic, nn_heuristic, 
+        distance_matrix, instance_stats
+    )
+    
+    # 6. Intelligent sparsification
+    sparsified = _intelligent_sparsification(combined, distance_matrix, n, instance_stats)
+    
+    # 7. Local triangle optimization
+    enhanced = _local_triangle_optimization(sparsified, distance_matrix, n, instance_stats)
+    
+    # 8. Final processing
+    np.fill_diagonal(enhanced, 0)
+    max_val = np.max(enhanced)
+    if max_val > 0:
+        enhanced = enhanced / max_val
+    
+    return enhanced
+
+
+def _analyze_instance_v2(dist_mat: np.ndarray, n: int) -> dict:
+    """Compute instance statistics for adaptive parameter tuning."""
+    if n <= 1:
+        return {'mean_dist': 1.0, 'median_dist': 1.0, 'cv': 0.0, 'log_n': 0}
+    
+    # Extract upper triangle distances
+    triu_indices = np.triu_indices(n, k=1)
+    distances = dist_mat[triu_indices]
+    
+    # Basic statistics
+    median_dist = np.median(distances) if len(distances) > 0 else 1.0
+    mean_dist = np.mean(distances) if len(distances) > 0 else 1.0
+    std_dist = np.std(distances) if len(distances) > 0 else 0.0
+    
+    stats = {
+        'median_dist': median_dist,
+        'mean_dist': mean_dist,
+        'std_dist': std_dist,
+        'cv': std_dist / (mean_dist + 1e-12),  # Coefficient of variation
+        'log_n': np.log2(n + 1),
+        'sqrt_n': int(np.sqrt(n)),
+        'n': n
+    }
+    
+    # Adaptive neighbor counts
+    if n <= 50:
+        stats['k_nn'] = min(10, n - 1)
+        stats['k_triangle'] = min(5, n - 1)
+    elif n <= 200:
+        stats['k_nn'] = min(15, n - 1)
+        stats['k_triangle'] = min(8, n - 1)
+    else:
+        stats['k_nn'] = max(5, min(20, int(10 * np.log10(n))))
+        stats['k_triangle'] = max(3, min(10, int(5 * np.log10(n))))
+    
+    # Graph density estimation
+    if n > 1:
+        # Quick density estimate based on distance distribution
+        close_threshold = median_dist * 0.8
+        stats['density'] = np.sum(distances < close_threshold) / len(distances)
+    else:
+        stats['density'] = 0.0
+    
+    return stats
+
+
+def _compute_mst_heuristic_v2(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Compute MST-based heuristic with Christofides-inspired extensions."""
+    mst_promising = np.zeros((n, n))
+    
+    if n < 2:
+        return mst_promising
+    
+    # Minimum Spanning Tree
+    try:
+        mst = minimum_spanning_tree(dist_mat)
+        mst_edges = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_promising[mst_edges] = 1.0  # Highest priority for MST edges
+    except:
+        # Fallback: use nearest neighbors
+        for i in range(n):
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            nearest = np.argmin(dists)
+            mst_promising[i, nearest] = mst_promising[nearest, i] = 1.0
+    
+    # Add nearest non-MST edges (inspired by Christofides matching)
+    if n > 2:
+        for i in range(n):
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            
+            # Find nearest neighbors not in MST
+            non_mst_mask = ~(mst_promising[i] > 0) & (np.arange(n) != i)
+            if np.any(non_mst_mask):
+                non_mst_indices = np.where(non_mst_mask)[0]
+                if len(non_mst_indices) > 0:
+                    # Take a few nearest non-MST edges
+                    k_near = min(3, len(non_mst_indices))
+                    dists_subset = dists[non_mst_indices]
+                    nearest_idx = np.argpartition(dists_subset, k_near)[:k_near]
+                    nearest_non_mst = non_mst_indices[nearest_idx]
+                    
+                    # Assign decreasing weights based on distance
+                    sorted_by_dist = nearest_non_mst[np.argsort(dists[nearest_non_mst])]
+                    for rank, j in enumerate(sorted_by_dist):
+                        weight = 0.8 / (rank + 1)  # Decaying weights
+                        current_val = mst_promising[i, j]
+                        if weight > current_val:
+                            mst_promising[i, j] = mst_promising[j, i] = weight
+    
+    return mst_promising
+
+
+def _compute_nearest_neighbor_heuristic(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Compute nearest neighbor clustering heuristic."""
+    nn_heuristic = np.zeros((n, n))
+    k = stats['k_nn']
+    
+    if n <= 2:
+        if n == 2:
+            nn_heuristic[0, 1] = nn_heuristic[1, 0] = 1.0
+        return nn_heuristic
+    
+    # For each node, mark its k nearest neighbors
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        
+        if k < n - 1:
+            # Use argpartition for efficiency
+            nn_indices = np.argpartition(dists, k)[:k]
+        else:
+            nn_indices = np.where(dists < np.inf)[0]
+        
+        # Assign weights based on rank
+        sorted_nn = nn_indices[np.argsort(dists[nn_indices])]
+        for rank, j in enumerate(sorted_nn):
+            # Exponential decay based on rank
+            weight = np.exp(-rank / 3.0)
+            nn_heuristic[i, j] = weight
+    
+    # Make symmetric and enhance mutual nearest neighbors
+    symmetric_nn = (nn_heuristic + nn_heuristic.T) / 2
+    
+    # Boost mutual nearest neighbors
+    for i in range(n):
+        for j in range(i + 1, n):
+            if symmetric_nn[i, j] > 0 and symmetric_nn[j, i] > 0:
+                # Both consider each other as neighbors
+                symmetric_nn[i, j] = symmetric_nn[j, i] = symmetric_nn[i, j] * 1.3
+    
+    return symmetric_nn
+
+
+def _combine_heuristics_v2(reciprocal: np.ndarray, mst: np.ndarray, 
+                          nn: np.ndarray, dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """Combine heuristic factors with adaptive weighting."""
+    n = reciprocal.shape[0]
+    
+    # Base combination: reciprocal distance weighted by other factors
+    combined = reciprocal.copy()
+    
+    # Apply MST factor (strong boost for MST edges)
+    mst_boost = np.where(mst > 0, 2.0, 1.0)
+    combined *= mst_boost
+    
+    # Apply nearest neighbor factor
+    nn_factor = 1.0 + 0.5 * nn  # Additive boost for NN edges
+    combined *= nn_factor
+    
+    # Distance-based adjustment: favor edges close to median distance
+    # (following the observation that optimal TSP edges often cluster around median distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dist_ratio = dist_mat / (stats['median_dist'] + 1e-12)
+        # Bell curve centered at 1.0 (median distance)
+        dist_factor = np.exp(-0.5 * (dist_ratio - 1.0)**2)
+    
+    combined *= dist_factor
+    
+    # Normalize by node (so each node's edges sum to roughly similar values)
+    row_sums = np.sum(combined, axis=1, keepdims=True) + 1e-12
+    combined = combined / row_sums
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    return combined
+
+
+def _intelligent_sparsification(heuristics_mat: np.ndarray, dist_mat: np.ndarray, 
+                               n: int, stats: dict) -> np.ndarray:
+    """Intelligent edge sparsification focusing on most promising connections."""
+    if n <= 10:
+        return heuristics_mat.copy()
+    
+    sparsified = np.zeros_like(heuristics_mat)
+    
+    # Adaptive edge retention
+    if stats['cv'] < 0.3:  # Uniform distances
+        edges_per_node = max(3, min(10, n // 5))
+    elif stats['cv'] < 0.7:  # Moderate variation
+        edges_per_node = max(4, min(15, n // 4))
+    else:  # High variation
+        edges_per_node = max(5, min(20, n // 3))
+    
+    # Keep top edges for each node
+    for i in range(n):
+        row = heuristics_mat[i].copy()
+        row[i] = -np.inf
+        
+        if edges_per_node < n:
+            # Get top edges_per_node edges
+            threshold_idx = min(edges_per_node, n - 1)
+            threshold = np.partition(row, -threshold_idx)[-threshold_idx]
+            keep_mask = row >= threshold
+        else:
+            keep_mask = np.ones(n, dtype=bool)
+            keep_mask[i] = False
+        
+        sparsified[i, keep_mask] = heuristics_mat[i, keep_mask]
+    
+    # Ensure symmetry (keep edge if selected by either endpoint)
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Connectivity check and repair
+    for i in range(n):
+        if np.sum(sparsified[i] > 0) == 0:
+            # Connect to nearest neighbor
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            nearest = np.argmin(dists)
+            sparsified[i, nearest] = sparsified[nearest, i] = np.max(heuristics_mat[i, nearest], 
+                                                                    heuristics_mat[nearest, i])
+    
+    return sparsified
+
+
+def _local_triangle_optimization(sparse_mat: np.ndarray, dist_mat: np.ndarray, 
+                                n: int, stats: dict) -> np.ndarray:
+    """Optimize edges based on local triangle quality."""
+    enhanced = sparse_mat.copy()
+    
+    if n < 3:
+        return enhanced
+    
+    k_triangle = stats['k_triangle']
+    
+    # For each node, examine its local neighborhood
+    for i in range(n):
+        # Get promising edges from i
+        edges_i = np.where(enhanced[i] > 0)[0]
+        if len(edges_i) < 2:
+            continue
+        
+        # Limit to top k_triangle edges for efficiency
+        if len(edges_i) > k_triangle:
+            edge_weights = enhanced[i, edges_i]
+            top_indices = np.argsort(-edge_weights)[:k_triangle]
+            edges_i = edges_i[top_indices]
+        
+        # Examine triangles formed with these edges
+        for idx_j, j in enumerate(edges_i):
+            if j <= i:  # Process each pair once
+                continue
+            
+            # Get promising edges from j
+            edges_j = np.where(enhanced[j] > 0)[0]
+            
+            # Find common neighbors (potential triangle completion)
+            common = np.intersect1d(edges_i, edges_j, assume_unique=True)
+            common = common[common != i]
+            common = common[common != j]
+            
+            if len(common) > 0:
+                # Evaluate triangle quality
+                triangle_qualities = []
+                for k in common[:min(3, len(common))]:  # Limit to top 3
+                    # Triangle perimeter (lower is better)
+                    perimeter = dist_mat[i, j] + dist_mat[i, k] + dist_mat[j, k]
+                    # Triangle inequality satisfaction (closer to 1 is better)
+                    max_edge = max(dist_mat[i, j], dist_mat[i, k], dist_mat[j, k])
+                    inequality_ratio = perimeter / (2 * max_edge + 1e-12)
+                    
+                    # Combined quality metric
+                    quality = (stats['median_dist'] * 3) / (perimeter + 1e-12) * min(inequality_ratio, 1.5)
+                    triangle_qualities.append(quality)
+                
+                if triangle_qualities:
+                    avg_quality = np.mean(triangle_qualities)
+                    # Boost edge if it forms good triangles
+                    if avg_quality > 1.0:
+                        boost = 1.0 + 0.2 * min(avg_quality - 1.0, 2.0)
+                        enhanced[i, j] = enhanced[j, i] = enhanced[i, j] * boost
+    
+    return enhanced
+```

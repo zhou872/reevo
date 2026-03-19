@@ -1,0 +1,590 @@
+```json
+{
+    "algorithm_features": ["Adaptive Spatial Granularity", "Multi-operator Pattern Extraction", "Regret-Modulated Clustering", "Confidence-based Edge Pruning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple, Optional
+import random
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with adaptive spatial partitioning and multi-operator
+    local search for improved edge scoring.
+    
+    Core Innovations:
+    1. Adaptive Spatial Granularity: Dynamically adjusts cluster resolution based on
+       distance distribution and problem geometry
+    2. Multi-operator Pattern Extraction: Uses 2-opt and 3-opt moves from diverse
+       starting points to extract robust edge patterns
+    3. Regret-Modulated Clustering: Combines spatial proximity with regret-based
+       scoring for both intra-cluster and inter-cluster edges
+    4. Confidence-based Edge Pruning: Intelligently sparsifies the graph while
+       preserving essential connectivity structure
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # ==================== 1. DISTRIBUTION ANALYSIS ====================
+    # Analyze distance distribution to adapt parameters
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_median = np.median(flat_dists)
+    dist_q1 = np.percentile(flat_dists, 25)
+    dist_q3 = np.percentile(flat_dists, 75)
+    iqr = dist_q3 - dist_q1
+    
+    # Detect problem characteristics
+    is_uniform = iqr / (dist_median + 1e-8) < 0.5
+    has_long_tails = np.percentile(flat_dists, 90) > 3 * dist_median
+    
+    # ==================== 2. ADAPTIVE SPATIAL PARTITIONING ====================
+    def adaptive_spatial_partition() -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Create spatial partitions with adaptive granularity"""
+        if n <= 15:
+            # Small instances: use all-to-all connectivity
+            partition_scores = np.ones((n, n))
+            partition_labels = None
+        else:
+            # Compute MST for spatial understanding
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = []
+            for i in range(n):
+                for j in range(i+1, n):
+                    if mst[i, j] > 0:
+                        mst_edges.append((i, j, mst[i, j]))
+            
+            # Determine optimal partition count adaptively
+            if is_uniform:
+                base_partitions = max(2, int(np.sqrt(n) * 0.7))
+            elif has_long_tails:
+                base_partitions = max(2, int(np.sqrt(n) * 1.3))
+            else:
+                base_partitions = max(2, int(np.sqrt(n)))
+            
+            # Refine based on MST structure
+            if mst_edges:
+                mst_weights = [w for _, _, w in mst_edges]
+                mst_iqr = np.percentile(mst_weights, 75) - np.percentile(mst_weights, 25)
+                if mst_iqr > 2 * dist_median:
+                    base_partitions = min(base_partitions + 2, n // 4)
+            
+            # Generate partitions using distance-based clustering
+            partition_scores = np.zeros((n, n))
+            partition_labels = np.zeros(n, dtype=int)
+            
+            # Use farthest-first traversal for seed selection
+            seeds = []
+            remaining = set(range(n))
+            
+            # First seed: median-distance point
+            center_distances = np.sum(distance_matrix, axis=1)
+            first_seed = np.argmin(np.abs(center_distances - np.median(center_distances)))
+            seeds.append(first_seed)
+            remaining.remove(first_seed)
+            
+            # Add additional seeds using max-min distance criterion
+            for _ in range(min(base_partitions - 1, len(remaining))):
+                max_min_dist = -1
+                best_candidate = -1
+                for candidate in remaining:
+                    min_dist_to_seeds = min(distance_matrix[candidate, s] for s in seeds)
+                    if min_dist_to_seeds > max_min_dist:
+                        max_min_dist = min_dist_to_seeds
+                        best_candidate = candidate
+                if best_candidate != -1:
+                    seeds.append(best_candidate)
+                    remaining.remove(best_candidate)
+            
+            # Assign nodes to nearest seed
+            for i in range(n):
+                if i in seeds:
+                    partition_labels[i] = seeds.index(i) + 1
+                else:
+                    nearest_seed = min(seeds, key=lambda s: distance_matrix[i, s])
+                    partition_labels[i] = seeds.index(nearest_seed) + 1
+            
+            # Score edges based on partition membership
+            n_partitions = len(seeds)
+            for i in range(n):
+                for j in range(i+1, n):
+                    if partition_labels[i] == partition_labels[j]:
+                        # Intra-cluster: boost based on relative distance
+                        cluster_indices = np.where(partition_labels == partition_labels[i])[0]
+                        if len(cluster_indices) > 1:
+                            cluster_dists = distance_matrix[i, cluster_indices]
+                            cluster_median = np.median(cluster_dists[cluster_dists > 0])
+                            rel_dist = distance_matrix[i, j] / (cluster_median + 1e-8)
+                            partition_scores[i, j] = np.exp(-rel_dist)
+                        else:
+                            partition_scores[i, j] = 1.0
+                    else:
+                        # Inter-cluster: moderate score with distance decay
+                        base_score = 0.3 + 0.2 * (1 / (1 + abs(partition_labels[i] - partition_labels[j])))
+                        distance_decay = np.exp(-distance_matrix[i, j] / (2 * dist_median + 1e-8))
+                        partition_scores[i, j] = base_score * distance_decay
+            
+            partition_scores = np.maximum(partition_scores, partition_scores.T)
+        
+        return partition_scores, partition_labels
+    
+    spatial_scores, cluster_labels = adaptive_spatial_partition()
+    
+    # ==================== 3. ENHANCED REGRET SCORING ====================
+    def enhanced_regret_scoring() -> np.ndarray:
+        """Compute regret scores with spatial awareness"""
+        regret_scores = np.zeros((n, n))
+        
+        # Adaptive neighbor count
+        k_neighbors = min(max(5, n // 10), 20)
+        
+        for i in range(n):
+            # Get distances and sort
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            
+            # Find nearest neighbors
+            neighbor_indices = np.argsort(dists_i)[:k_neighbors]
+            
+            for j in neighbor_indices:
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                
+                # Spatial-aware regret: consider alternatives in same/different clusters
+                best_same_cluster_alt = float('inf')
+                best_diff_cluster_alt = float('inf')
+                
+                for k in range(n):
+                    if k == i or k == j:
+                        continue
+                    
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    
+                    # Classify alternatives by spatial relationship
+                    if cluster_labels is not None:
+                        same_cluster_i_k = (cluster_labels[i] == cluster_labels[k])
+                        same_cluster_k_j = (cluster_labels[k] == cluster_labels[j])
+                        
+                        if same_cluster_i_k and same_cluster_k_j:
+                            # All nodes in same cluster
+                            if alt_cost < best_same_cluster_alt:
+                                best_same_cluster_alt = alt_cost
+                        elif not same_cluster_i_k and not same_cluster_k_j:
+                            # Bridge between clusters
+                            if alt_cost < best_diff_cluster_alt:
+                                best_diff_cluster_alt = alt_cost
+                    else:
+                        # No clusters, use overall best
+                        if alt_cost < best_same_cluster_alt:
+                            best_same_cluster_alt = alt_cost
+                
+                # Compute regret with adaptive weighting
+                if best_same_cluster_alt < float('inf'):
+                    regret_same = max(0, best_same_cluster_alt - direct_cost)
+                else:
+                    regret_same = 0
+                
+                if best_diff_cluster_alt < float('inf'):
+                    regret_diff = max(0, best_diff_cluster_alt - direct_cost)
+                else:
+                    regret_diff = 0
+                
+                # Weight regrets based on spatial context
+                if cluster_labels is not None and cluster_labels[i] == cluster_labels[j]:
+                    # Intra-cluster: emphasize same-cluster alternatives
+                    total_regret = 0.8 * regret_same + 0.2 * regret_diff
+                else:
+                    # Inter-cluster: balance both types
+                    total_regret = 0.5 * regret_same + 0.5 * regret_diff
+                
+                # Normalize and convert to score
+                norm_regret = total_regret / (dist_median + 1e-8)
+                regret_scores[i, j] = 1.0 - np.exp(-norm_regret)
+        
+        # Symmetrize and apply spatial weighting
+        regret_scores = (regret_scores + regret_scores.T) / 2
+        regret_scores *= spatial_scores
+        
+        return regret_scores
+    
+    regret_scores = enhanced_regret_scoring()
+    
+    # ==================== 4. MULTI-OPERATOR PATTERN EXTRACTION ====================
+    def multi_operator_patterns() -> np.ndarray:
+        """Extract edge patterns using 2-opt and 3-opt operators"""
+        pattern_scores = np.zeros((n, n))
+        
+        if n < 4:
+            return pattern_scores
+        
+        # Adaptive number of tours based on problem size
+        n_tours = min(15, max(5, n // 4))
+        
+        for tour_idx in range(n_tours):
+            # Generate starting tour with different strategies
+            if tour_idx == 0:
+                # Nearest neighbor
+                tour = [0]
+                unvisited = set(range(1, n))
+                while unvisited:
+                    current = tour[-1]
+                    nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                    tour.append(nearest)
+                    unvisited.remove(nearest)
+            elif tour_idx == 1:
+                # Farthest insertion
+                tour = [np.random.randint(n)]
+                unvisited = set(range(n)) - set(tour)
+                while unvisited:
+                    farthest = max(unvisited, 
+                                 key=lambda x: min(distance_matrix[x, t] for t in tour))
+                    # Insert at best position
+                    best_pos = 0
+                    best_increase = float('inf')
+                    for pos in range(len(tour)):
+                        i, j = tour[pos-1], tour[pos]
+                        increase = (distance_matrix[i, farthest] + 
+                                  distance_matrix[farthest, j] - distance_matrix[i, j])
+                        if increase < best_increase:
+                            best_increase = increase
+                            best_pos = pos
+                    tour.insert(best_pos, farthest)
+                    unvisited.remove(farthest)
+            else:
+                # Random with nearest neighbor bias
+                start = np.random.randint(n)
+                tour = [start]
+                unvisited = set(range(n)) - {start}
+                while unvisited:
+                    current = tour[-1]
+                    candidates = list(unvisited)
+                    # Bias toward nearer nodes
+                    if len(candidates) > 5:
+                        candidates.sort(key=lambda x: distance_matrix[current, x])
+                        candidates = candidates[:max(3, len(candidates) // 2)]
+                    next_node = random.choice(candidates)
+                    tour.append(next_node)
+                    unvisited.remove(next_node)
+            
+            tour.append(tour[0])  # Close the tour
+            
+            # Apply 2-opt improvement
+            improved_tour = quick_two_opt(tour, distance_matrix, max_iterations=min(50, n*2))
+            
+            # Apply 3-opt for sufficiently large instances
+            if n >= 10 and tour_idx < n_tours // 2:
+                improved_tour = quick_three_opt(improved_tour, distance_matrix, 
+                                              max_iterations=min(20, n))
+            
+            # Record edges in improved tour
+            for k in range(len(improved_tour)-1):
+                i, j = improved_tour[k], improved_tour[k+1]
+                pattern_scores[i, j] += 1.0
+                pattern_scores[j, i] += 1.0
+        
+        # Normalize and enhance with spatial information
+        if np.max(pattern_scores) > 0:
+            pattern_scores = pattern_scores / np.max(pattern_scores)
+        
+        # Boost edges that appear frequently and are spatially coherent
+        if cluster_labels is not None:
+            for i in range(n):
+                for j in range(i+1, n):
+                    if pattern_scores[i, j] > 0:
+                        if cluster_labels[i] == cluster_labels[j]:
+                            pattern_scores[i, j] *= 1.2
+                        pattern_scores[j, i] = pattern_scores[i, j]
+        
+        return pattern_scores
+    
+    def quick_two_opt(tour: List[int], dist_matrix: np.ndarray, 
+                     max_iterations: int) -> List[int]:
+        """Perform 2-opt improvements"""
+        current_tour = tour[:-1]
+        n_nodes = len(current_tour)
+        improved = True
+        iterations = 0
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            best_gain = 0
+            best_i, best_j = -1, -1
+            
+            # Check a subset of possible swaps (adaptive window)
+            window_size = min(10, n_nodes // 4)
+            for i in range(n_nodes):
+                for offset in range(2, window_size + 1):
+                    j = (i + offset) % n_nodes
+                    if j == i:
+                        continue
+                    
+                    a, b = current_tour[i], current_tour[(i + 1) % n_nodes]
+                    c, d = current_tour[j], current_tour[(j + 1) % n_nodes]
+                    
+                    current_cost = dist_matrix[a, b] + dist_matrix[c, d]
+                    new_cost = dist_matrix[a, c] + dist_matrix[b, d]
+                    gain = current_cost - new_cost
+                    
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_i, best_j = i, j
+            
+            if best_gain > 0:
+                # Perform the best swap
+                i, j = best_i, best_j
+                if i < j:
+                    current_tour[i+1:j+1] = reversed(current_tour[i+1:j+1])
+                else:
+                    # Handle wrap-around case
+                    segment = current_tour[i+1:] + current_tour[:j+1]
+                    segment.reverse()
+                    current_tour[i+1:] = segment[:len(current_tour)-i-1]
+                    current_tour[:j+1] = segment[len(current_tour)-i-1:]
+                improved = True
+            
+            iterations += 1
+        
+        return current_tour + [current_tour[0]]
+    
+    def quick_three_opt(tour: List[int], dist_matrix: np.ndarray,
+                       max_iterations: int) -> List[int]:
+        """Perform limited 3-opt improvements"""
+        current_tour = tour[:-1]
+        n_nodes = len(current_tour)
+        improved = True
+        iterations = 0
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            best_gain = 0
+            best_move = None
+            
+            # Limited search: check segments within a window
+            window = min(8, n_nodes // 3)
+            for i in range(n_nodes):
+                for j_offset in range(2, window):
+                    j = (i + j_offset) % n_nodes
+                    for k_offset in range(j_offset + 2, min(j_offset + window, n_nodes)):
+                        k = (i + k_offset) % n_nodes
+                        
+                        # Original segments
+                        a, b = current_tour[i], current_tour[(i + 1) % n_nodes]
+                        c, d = current_tour[j], current_tour[(j + 1) % n_nodes]
+                        e, f = current_tour[k], current_tour[(k + 1) % n_nodes]
+                        
+                        current_cost = (dist_matrix[a, b] + dist_matrix[c, d] + 
+                                      dist_matrix[e, f])
+                        
+                        # Try the 4 possible reconnections (reduced from 7 for speed)
+                        # 1. Standard 3-opt
+                        new_cost1 = (dist_matrix[a, d] + dist_matrix[e, b] + 
+                                   dist_matrix[c, f])
+                        gain1 = current_cost - new_cost1
+                        
+                        # 2. Another common 3-opt
+                        new_cost2 = (dist_matrix[a, e] + dist_matrix[d, b] + 
+                                   dist_matrix[c, f])
+                        gain2 = current_cost - new_cost2
+                        
+                        # 3. Yet another
+                        new_cost3 = (dist_matrix[a, c] + dist_matrix[e, d] + 
+                                   dist_matrix[b, f])
+                        gain3 = current_cost - new_cost3
+                        
+                        # Take best gain
+                        max_gain = max(gain1, gain2, gain3)
+                        
+                        if max_gain > best_gain:
+                            best_gain = max_gain
+                            if max_gain == gain1:
+                                best_move = (i, j, k, 1)
+                            elif max_gain == gain2:
+                                best_move = (i, j, k, 2)
+                            else:
+                                best_move = (i, j, k, 3)
+            
+            if best_gain > 0 and best_move:
+                i, j, k, move_type = best_move
+                # Apply the best move
+                if move_type == 1:
+                    # Reorder segments: (i+1..j), (j+1..k), (k+1..i)
+                    seg1 = current_tour[i+1:j+1]
+                    seg2 = current_tour[j+1:k+1]
+                    seg3 = current_tour[k+1:] + current_tour[:i+1]
+                    current_tour = current_tour[:i+1] + seg2 + seg1 + seg3
+                elif move_type == 2:
+                    # Different reordering
+                    seg1 = current_tour[i+1:j+1]
+                    seg2 = current_tour[j+1:k+1]
+                    seg3 = current_tour[k+1:] + current_tour[:i+1]
+                    current_tour = current_tour[:i+1] + seg2[::-1] + seg1[::-1] + seg3
+                else:
+                    # Another reordering
+                    seg1 = current_tour[i+1:j+1]
+                    seg2 = current_tour[j+1:k+1]
+                    seg3 = current_tour[k+1:] + current_tour[:i+1]
+                    current_tour = current_tour[:i+1] + seg1[::-1] + seg2 + seg3
+                
+                improved = True
+            
+            iterations += 1
+        
+        return current_tour + [current_tour[0]]
+    
+    pattern_scores = multi_operator_patterns()
+    
+    # ==================== 5. CONFIDENCE-BASED EDGE PRUNING ====================
+    def confidence_based_pruning(base_scores: np.ndarray) -> np.ndarray:
+        """Intelligently prune low-confidence edges"""
+        sparsified = np.zeros_like(base_scores)
+        
+        # Compute MST for essential connectivity
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_mask = (mst > 0) | (mst.T > 0)
+        
+        # Always include MST edges with boosted confidence
+        sparsified[mst_mask] = base_scores[mst_mask] * 1.5
+        
+        # Adaptive degree targets
+        if n <= 10:
+            target_degree = min(5, n - 1)
+        elif n <= 50:
+            target_degree = min(6, max(4, n // 8))
+        elif n <= 200:
+            target_degree = min(8, max(5, n // 12))
+        else:
+            target_degree = min(10, max(6, n // 20))
+        
+        # Node-specific degree targets based on spatial role
+        if cluster_labels is not None:
+            cluster_sizes = np.bincount(cluster_labels[cluster_labels > 0])
+            if len(cluster_sizes) > 0:
+                avg_cluster_size = np.mean(cluster_sizes)
+        
+        for i in range(n):
+            # Build candidate list with confidence scores
+            candidates = []
+            for j in range(n):
+                if i != j and not mst_mask[i, j] and base_scores[i, j] > 0:
+                    # Confidence combines base score, distance, and spatial context
+                    dist_factor = np.exp(-distance_matrix[i, j] / dist_median)
+                    
+                    if cluster_labels is not None:
+                        if cluster_labels[i] == cluster_labels[j]:
+                            spatial_factor = 1.2
+                        else:
+                            # Boost edges that connect different clusters
+                            cluster_i_size = np.sum(cluster_labels == cluster_labels[i])
+                            cluster_j_size = np.sum(cluster_labels == cluster_labels[j])
+                            size_factor = min(cluster_i_size, cluster_j_size) / avg_cluster_size
+                            spatial_factor = 0.8 + 0.4 * size_factor
+                    else:
+                        spatial_factor = 1.0
+                    
+                    confidence = (base_scores[i, j] * 0.6 + 
+                                dist_factor * 0.3 + 
+                                spatial_factor * 0.1)
+                    candidates.append((confidence, j))
+            
+            # Sort by confidence
+            candidates.sort(reverse=True, key=lambda x: x[0])
+            
+            # Determine actual degree target for this node
+            if cluster_labels is not None:
+                cluster_size = np.sum(cluster_labels == cluster_labels[i])
+                if cluster_size > 0:
+                    # Nodes in larger clusters can have more connections
+                    node_target = int(target_degree * (1 + np.log1p(cluster_size) / 10))
+                else:
+                    node_target = target_degree
+            else:
+                node_target = target_degree
+            
+            node_target = min(node_target, len(candidates))
+            
+            # Select top edges
+            for idx in range(node_target):
+                _, j = candidates[idx]
+                sparsified[i, j] = base_scores[i, j]
+        
+        # Ensure symmetry
+        sparsified = np.maximum(sparsified, sparsified.T)
+        
+        return sparsified
+    
+    # ==================== 6. DYNAMIC COMPOSITE SCORING ====================
+    # Base inverse distance scoring
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # Dynamic weighting based on problem characteristics and size
+    if n <= 20:
+        w_regret, w_spatial, w_pattern, w_inv = 0.35, 0.25, 0.25, 0.15
+    elif n <= 100:
+        if is_uniform:
+            w_regret, w_spatial, w_pattern, w_inv = 0.30, 0.35, 0.20, 0.15
+        else:
+            w_regret, w_spatial, w_pattern, w_inv = 0.40, 0.30, 0.20, 0.10
+    else:
+        w_regret, w_spatial, w_pattern, w_inv = 0.25, 0.40, 0.20, 0.15
+    
+    # Combine components
+    composite = (
+        w_regret * regret_scores +
+        w_spatial * spatial_scores +
+        w_pattern * pattern_scores +
+        w_inv * inv_dist
+    )
+    
+    # Apply confidence-based pruning
+    sparsified = confidence_based_pruning(composite)
+    
+    # ==================== 7. FINAL REFINEMENT ====================
+    # Ensure symmetry and non-negativity
+    symmetric = (sparsified + sparsified.T) / 2
+    symmetric = np.maximum(symmetric, 0)
+    
+    # Apply distance-based refinement
+    avg_dist = np.mean(distance_matrix[np.triu_indices(n, 1)])
+    if avg_dist > 0:
+        # Soft penalty for very long edges
+        long_edge_threshold = 3 * avg_dist
+        if np.any(distance_matrix > long_edge_threshold):
+            long_penalty = np.where(distance_matrix > long_edge_threshold,
+                                   np.exp(-(distance_matrix - long_edge_threshold) / avg_dist),
+                                   1.0)
+            symmetric *= long_penalty
+    
+    # Boost MST edges one final time
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    symmetric[mst_mask] *= 1.2
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(symmetric)
+    if max_val > 0:
+        symmetric = symmetric / max_val
+    
+    np.fill_diagonal(symmetric, 0)
+    
+    return symmetric
+```

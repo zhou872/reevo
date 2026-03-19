@@ -1,0 +1,290 @@
+```json
+{
+    "algorithm_features": ["Christofides-informed structural bonus", "Dynamic lookahead depth via regret analysis", "Multiplicative regret-MST fusion", "Hierarchical sparsification with connectivity assurance"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Optional
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  min_lookahead: int = 1,
+                  max_lookahead: int = 3,
+                  christofides_weight: float = 0.3) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with Christofides algorithm insights and adaptive
+    lookahead depth based on local regret analysis.
+    
+    Key innovations:
+    1. Christofides-informed structural bonuses: Identifies edges likely to appear in
+       minimum perfect matchings for odd-degree MST vertices
+    2. Dynamic lookahead depth: Adjusts lookahead complexity based on local edge criticality
+       using regret analysis
+    3. Regret-MST multiplicative fusion: Combines opportunity cost with structural importance
+       via product rather than weighted sum
+    4. Hierarchical sparsification: Progressively prunes edges while ensuring connectivity
+       constraints from Christofides construction
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        min_lookahead: Minimum lookahead depth for all edges (1=triangle, 2=2-opt, 3=3-opt)
+        max_lookahead: Maximum lookahead depth (adaptively assigned based on criticality)
+        christofides_weight: Influence of Christofides structural analysis [0, 1]
+        
+    Returns:
+        Matrix of edge priorities in [0,1], same shape as input
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # ==================== ADAPTIVE PARAMETER TUNING ====================
+    off_diag = distance_matrix[~np.eye(n, dtype=bool)]
+    median_dist = np.median(off_diag) if len(off_diag) > 0 else 1.0
+    temperature = max(1e-6, median_dist * 0.5)
+    
+    # ==================== 1. DENSITY-WEIGHTED INVERSE DISTANCE ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Adaptive local density (k = sqrt(n) neighbors)
+    k_density = max(2, min(10, int(np.sqrt(n))))
+    local_density = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        k_nearest = np.partition(dists, k_density)[:k_density]
+        local_density[i] = 1.0 / (np.mean(k_nearest) + 1e-12)
+    
+    density_weight = np.outer(local_density, local_density) ** 0.5
+    base_scores = inv_dist * density_weight
+    
+    # ==================== 2. MST STRUCTURE WITH ODD-DEGREE ANALYSIS ====================
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Compute MST degrees for Christofides analysis
+    mst_degrees = np.sum(mst_mask, axis=1)
+    odd_vertices = np.where(mst_degrees % 2 == 1)[0]
+    
+    # Christofides matching heuristic: prioritize edges between odd-degree vertices
+    christofides_bonus = np.ones_like(distance_matrix)
+    if len(odd_vertices) >= 2:
+        odd_indices = odd_vertices[:, np.newaxis]
+        # Compute pairwise distances between odd vertices
+        odd_distances = distance_matrix[odd_indices, odd_vertices.T]
+        
+        # Greedy matching heuristic: for each odd vertex, boost connection to nearest other odd
+        for i in odd_vertices:
+            # Find nearest odd vertex (excluding self)
+            odd_mask = (odd_vertices != i)
+            if np.any(odd_mask):
+                available_odd = odd_vertices[odd_mask]
+                dists_to_odd = distance_matrix[i, available_odd]
+                if len(dists_to_odd) > 0:
+                    nearest_odd = available_odd[np.argmin(dists_to_odd)]
+                    # Bonus decays with distance relative to median
+                    dist_factor = np.exp(-distance_matrix[i, nearest_odd] / (2 * median_dist))
+                    bonus = 1.0 + christofides_weight * dist_factor
+                    christofides_bonus[i, nearest_odd] = bonus
+                    christofides_bonus[nearest_odd, i] = bonus
+    
+    # MST distance-aware bonus
+    mst_median = np.median(distance_matrix[mst_mask]) if np.any(mst_mask) else median_dist
+    mst_norm = np.exp(-distance_matrix / (mst_median + 1e-12))
+    mst_bonus = 1.0 + np.where(mst_mask, 1.2 * mst_norm, 0)
+    
+    # ==================== 3. ADAPTIVE REGRET ANALYSIS ====================
+    # Multi-scale regret: compare to k nearest alternatives
+    regret_scores = np.ones_like(distance_matrix)
+    k_regret = max(2, min(6, n // 5))
+    
+    for i in range(n):
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        if len(dists_i) > 1:
+            # Find k nearest alternatives for each edge
+            nearest_indices = np.argsort(dists_i)[:k_regret]
+            nearest_dists = dists_i[nearest_indices]
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct = distance_matrix[i, j]
+                # Regret as minimum alternative path through nearest neighbors
+                min_alternative = np.inf
+                for alt in nearest_indices:
+                    if alt == j:
+                        continue
+                    alternative = distance_matrix[i, alt] + distance_matrix[alt, j]
+                    min_alternative = min(min_alternative, alternative)
+                
+                if min_alternative < np.inf and min_alternative > direct:
+                    # Normalized regret score (higher regret = more promising edge)
+                    regret = min_alternative - direct
+                    regret_penalty = np.exp(-regret / (temperature + 1e-12))
+                    regret_scores[i, j] = regret_penalty
+    
+    regret_scores = (regret_scores + regret_scores.T) / 2
+    
+    # ==================== 4. DYNAMIC LOOKAHEAD SCORING ====================
+    lookahead_scores = np.ones_like(distance_matrix)
+    
+    if n > 3:
+        # Precompute nearest neighbors for efficiency
+        nn_count = min(8, n - 2)
+        nearest = np.argsort(distance_matrix, axis=1)[:, 1:nn_count + 1]
+        
+        # Critical edge identification using combined score
+        combined_pre = base_scores * mst_bonus * christofides_bonus * regret_scores
+        upper_triu = np.triu_indices(n, 1)
+        
+        # Classify edges into criticality tiers
+        if len(upper_triu[0]) > 0:
+            pre_scores = combined_pre[upper_triu]
+            mst_edges = mst_mask[upper_triu]
+            
+            # MST edges are always critical
+            critical_threshold = np.percentile(pre_scores[~mst_edges], 85) if np.any(~mst_edges) else 0
+            critical_mask = np.zeros((n, n), dtype=bool)
+            critical_mask[upper_triu] = mst_edges | (pre_scores >= critical_threshold)
+            critical_mask = critical_mask | critical_mask.T
+            
+            # Assign lookahead depth based on criticality
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if not critical_mask[i, j]:
+                        continue
+                    
+                    # Determine lookahead depth (1-3)
+                    if mst_mask[i, j]:
+                        depth = max_lookahead  # MST edges get deepest lookahead
+                    else:
+                        # Adaptive depth based on regret and distance
+                        regret_val = regret_scores[i, j]
+                        dist_ratio = distance_matrix[i, j] / median_dist
+                        depth = min_lookahead + int((1 - regret_val) * (max_lookahead - min_lookahead))
+                        depth = min(max_lookahead, max(min_lookahead, depth))
+                    
+                    # Apply lookahead based on depth
+                    best_improvement = 0
+                    
+                    if depth >= 1:  # Triangle lookahead
+                        # Check triangles through nearest neighbors
+                        candidates = set(nearest[i][:4]).union(set(nearest[j][:4]))
+                        candidates.discard(i)
+                        candidates.discard(j)
+                        
+                        for k in candidates:
+                            triangle_cost = distance_matrix[i, j] + distance_matrix[j, k] + distance_matrix[k, i]
+                            improvement = 3 * distance_matrix[i, j] - triangle_cost
+                            best_improvement = max(best_improvement, improvement)
+                    
+                    if depth >= 2 and n >= 4:  # 2-opt lookahead
+                        i_neighbors = [nbr for nbr in nearest[i] if nbr != j][:3]
+                        j_neighbors = [nbr for nbr in nearest[j] if nbr != i][:3]
+                        
+                        for k in i_neighbors:
+                            for l in j_neighbors:
+                                if k == l or k == j or l == i:
+                                    continue
+                                current = distance_matrix[i, j] + distance_matrix[k, l]
+                                alternative = distance_matrix[i, k] + distance_matrix[j, l]
+                                improvement = current - alternative
+                                best_improvement = max(best_improvement, improvement)
+                    
+                    if depth >= 3 and n >= 6:  # Simplified 3-opt lookahead
+                        # Limited 3-opt: check if breaking edge improves triangle
+                        i_neighbors = [nbr for nbr in nearest[i] if nbr != j][:2]
+                        j_neighbors = [nbr for nbr in nearest[j] if nbr != i][:2]
+                        
+                        for k in i_neighbors:
+                            for l in j_neighbors:
+                                if k == l or k == j or l == i:
+                                    continue
+                                # Find m that connects k and l well
+                                kl_candidates = set(nearest[k][:3]).union(set(nearest[l][:3]))
+                                kl_candidates.discard(i)
+                                kl_candidates.discard(j)
+                                kl_candidates.discard(k)
+                                kl_candidates.discard(l)
+                                
+                                for m in kl_candidates:
+                                    if m == i or m == j:
+                                        continue
+                                    original = (distance_matrix[i, j] + distance_matrix[k, l] + 
+                                                distance_matrix[m, nearest[m][0]])
+                                    # One 3-opt alternative
+                                    alternative = (distance_matrix[i, k] + distance_matrix[j, m] + 
+                                                   distance_matrix[l, nearest[m][0]])
+                                    improvement = original - alternative
+                                    best_improvement = max(best_improvement, improvement)
+                    
+                    # Convert improvement to multiplicative factor
+                    if best_improvement > 0:
+                        lookahead_factor = np.exp(best_improvement / (temperature + 1e-12))
+                        lookahead_scores[i, j] = lookahead_scores[j, i] = lookahead_factor
+    
+    # ==================== 5. MULTIPLICATIVE COMBINATION ====================
+    enhanced_scores = (base_scores * mst_bonus * christofides_bonus * 
+                       regret_scores * lookahead_scores)
+    
+    # ==================== 6. HIERARCHICAL SPARSIFICATION ====================
+    # Phase 1: Keep MST edges and Christofides connections
+    sparsified = np.zeros_like(enhanced_scores)
+    sparsified[mst_mask] = enhanced_scores[mst_mask]
+    
+    # Add Christofides bonus edges (connections between odd vertices)
+    christofides_edges = christofides_bonus > 1.0
+    sparsified[christofides_edges] = np.maximum(sparsified[christofides_edges], 
+                                                 enhanced_scores[christofides_edges])
+    
+    # Phase 2: Add critical edges based on combined score
+    upper_triu = np.triu_indices(n, 1)
+    remaining_mask = ~(mst_mask | christofides_edges)
+    
+    if np.any(remaining_mask):
+        remaining_scores = enhanced_scores[remaining_mask]
+        if len(remaining_scores) > 0:
+            # Adaptive threshold: keep enough edges for 2-connectivity
+            target_edges = min(n * 3, len(remaining_scores) // 2)
+            if target_edges > 0:
+                threshold = np.partition(remaining_scores, -target_edges)[-target_edges]
+                to_keep = remaining_mask & (enhanced_scores >= threshold)
+                sparsified[to_keep] = enhanced_scores[to_keep]
+    
+    # Phase 3: Ensure each vertex has at least 2 connections
+    for i in range(n):
+        connections = np.sum(sparsified[i] > 0)
+        if connections < 2:
+            # Add best missing edges
+            row_scores = enhanced_scores[i].copy()
+            row_scores[i] = -np.inf
+            row_scores[sparsified[i] > 0] = -np.inf  # Already included
+            
+            needed = 2 - connections
+            if needed > 0 and np.any(row_scores > -np.inf):
+                best_indices = np.argsort(row_scores)[-needed:]
+                sparsified[i, best_indices] = enhanced_scores[i, best_indices]
+                sparsified[best_indices, i] = enhanced_scores[best_indices, i]
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    symmetric = (sparsified + sparsified.T) / 2
+    np.fill_diagonal(symmetric, 0)
+    
+    # Apply exponential distance decay
+    dist_decay = np.exp(-distance_matrix / (median_dist * 2 + 1e-12))
+    symmetric *= dist_decay
+    
+    # Global normalization to [0,1]
+    max_val = np.max(symmetric)
+    if max_val > 0:
+        symmetric = symmetric / max_val
+    
+    return symmetric
+```

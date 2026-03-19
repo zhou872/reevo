@@ -1,0 +1,150 @@
+```json
+{
+    "algorithm_features": ["Adaptive Mutual Nearest Neighbors", "Simplified Regret Penalty", "Local Density Parameter Tuning", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with adaptive mutual nearest neighbors,
+    simplified regret penalty, and local density parameter tuning.
+    
+    Returns a matrix where higher values indicate more promising edges
+    for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    # Base inverse distance heuristic
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 1. Adaptive mutual nearest neighbor detection with local density metrics
+    # Compute local density for each node as average distance to k nearest neighbors
+    k_density = min(5, n - 1)
+    sorted_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_density+1]
+    sorted_distances = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+    local_density = np.mean(sorted_distances, axis=1)
+    
+    # Normalize local densities to [0, 1] range
+    if np.max(local_density) - np.min(local_density) > epsilon:
+        normalized_density = (local_density - np.min(local_density)) / (np.max(local_density) - np.min(local_density))
+    else:
+        normalized_density = np.ones(n) * 0.5
+    
+    # Adaptive k_mutual based on local density: use more neighbors in sparse regions
+    base_k = max(3, int(np.sqrt(n)))
+    k_mutual = np.clip(base_k + (1 - normalized_density).astype(int) * 2, 3, n // 2)
+    
+    # Mutual nearest neighbor mask
+    mutual_nn_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Get k_mutual[i] nearest neighbors for node i
+        i_neighbors = np.argsort(distance_matrix[i])[1:k_mutual[i] + 1]
+        # Mark as mutual if j is in i's neighbors and i is in j's neighbors
+        for j in i_neighbors:
+            if i < j:  # Check each pair only once
+                j_neighbors = np.argsort(distance_matrix[j])[1:k_mutual[j] + 1]
+                if i in j_neighbors:
+                    mutual_nn_mask[i, j] = True
+                    mutual_nn_mask[j, i] = True
+    
+    # 2. Simplified regret penalty calculation
+    # For each node, compute regret as difference between 2nd and 1st nearest distances
+    # normalized by the 1st nearest distance
+    if n > 2:
+        sorted_dist_all = np.sort(distance_matrix, axis=1)
+        nearest_dist = sorted_dist_all[:, 1]  # 1st nearest (excluding self)
+        second_nearest_dist = sorted_dist_all[:, 2] if n > 2 else nearest_dist
+        
+        # Regret for each node: how much worse the second best option is
+        node_regret = (second_nearest_dist - nearest_dist) / (nearest_dist + epsilon)
+        
+        # Edge regret penalty: average of endpoint regrets
+        # Higher regret means the edge is more critical (less good alternatives)
+        regret_matrix = (node_regret[:, np.newaxis] + node_regret[np.newaxis, :]) / 2
+    else:
+        regret_matrix = np.ones((n, n))
+    
+    # 3. MST integration
+    mst_edges = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = mst_edges > 0
+    
+    # 4. Combine factors with calibrated weights
+    heuristics = inv_dist.copy()
+    
+    # Strong boost for mutual nearest neighbors (bidirectional preference)
+    heuristics[mutual_nn_mask] *= 2.4
+    
+    # Moderate boost for MST edges
+    heuristics[mst_mask] *= 1.7
+    
+    # Adjust with regret penalty: edges with high regret get additional boost
+    regret_weight = 0.3
+    heuristics *= (1.0 + regret_weight * regret_matrix)
+    
+    # 5. Dynamic sparsification with connectivity guarantees
+    min_connections = 2
+    
+    # First pass: per-node adaptive thresholding
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = 0  # Ensure diagonal stays zero
+        
+        if np.count_nonzero(row) > min_connections:
+            # Adaptive threshold based on local density: stricter in dense regions
+            density_factor = 0.3 + 0.4 * normalized_density[i]  # [0.3, 0.7]
+            adaptive_k = max(min_connections, int(density_factor * np.count_nonzero(row)))
+            
+            if adaptive_k < np.count_nonzero(row):
+                # Find threshold for top adaptive_k edges
+                threshold_idx = -adaptive_k
+                threshold = np.partition(row[row > 0], threshold_idx)[threshold_idx] if len(row[row > 0]) > adaptive_k else 0
+                row[row < threshold] = 0
+        
+        heuristics[i] = row
+    
+    # Ensure symmetry: keep edge if either endpoint considers it important
+    heuristics_sym = np.maximum(heuristics, heuristics.T * 0.75)
+    
+    # Additional global sparsification
+    non_zero_vals = heuristics_sym[heuristics_sym > 0]
+    if len(non_zero_vals) > 0:
+        # Keep top edges globally, with threshold adaptive to graph size
+        keep_percentage = max(25, min(50, 1000 // n))  # Keep more edges for smaller graphs
+        global_threshold = np.percentile(non_zero_vals, keep_percentage)
+        heuristics_sym[heuristics_sym < global_threshold] = 0
+    
+    # Final connectivity check and repair
+    for i in range(n):
+        row_nonzero = np.nonzero(heuristics_sym[i])[0]
+        if len(row_nonzero) < min_connections:
+            # Add back strongest missing edges to reach min_connections
+            row_vals = inv_dist[i].copy()  # Use original inverse distances
+            row_vals[row_nonzero] = 0
+            row_vals[i] = 0
+            
+            if np.any(row_vals > 0):
+                needed = min_connections - len(row_nonzero)
+                top_indices = np.argsort(row_vals)[-needed:]
+                for idx in top_indices:
+                    if row_vals[idx] > 0:
+                        # Add with symmetric consideration
+                        heuristics_sym[i, idx] = row_vals[idx]
+                        heuristics_sym[idx, i] = max(heuristics_sym[idx, i], row_vals[idx] * 0.7)
+    
+    # Ensure diagonal is zero and normalize to [0, 1]
+    np.fill_diagonal(heuristics_sym, 0)
+    max_val = np.max(heuristics_sym)
+    if max_val > epsilon:
+        heuristics_sym /= max_val
+    
+    return heuristics_sym
+```

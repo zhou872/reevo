@@ -1,0 +1,207 @@
+```json
+{
+    "algorithm_features": ["Rank-Regret Hybrid Penalty", "Adaptive Borda Weighting", "Topological Clustering Bonus", "Multi-Objective Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge evaluation combining hybrid regret modeling,
+    adaptive Borda weighting, topological clustering, and multi-objective sparsification.
+    
+    Key Innovations:
+    1. Rank-Regret Hybrid Penalty: Combines absolute regret with relative rank penalty
+    2. Adaptive Borda Weighting: Uses tournament-style scoring rather than exponential decay
+    3. Topological Clustering Bonus: Identifies natural clusters via MST-based connectivity
+    4. Multi-Objective Sparsification: Balances connectivity, symmetry, and sparsity
+    """
+    n = distance_matrix.shape[0]
+    if n < 4:
+        # Trivial case: return uniform matrix for very small instances
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix with self-distances masked
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Dynamic candidate selection with multi-criteria filtering
+    # Use O(log n) candidates per node, bounded between 4 and 15
+    k_candidate = max(4, min(15, int(np.log2(n) * 3)))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Select candidates based on multiple criteria
+        distances = safe_dist[i]
+        
+        # Criterion 1: Top k by raw distance
+        top_by_distance = np.argsort(distances)[:k_candidate]
+        
+        # Criterion 2: Top k by relative improvement over median
+        median_dist = np.median(distances[distances < np.inf])
+        relative_scores = median_dist / (distances + eps)
+        top_by_relative = np.argsort(relative_scores)[-k_candidate:]
+        
+        # Combine criteria
+        candidates = np.union1d(top_by_distance, top_by_relative)
+        candidate_mask[i, candidates] = True
+    
+    # Enforce symmetric candidate list
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 2. Rank-Regret Hybrid Penalty
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    # Precompute local statistics for each node
+    for i in range(n):
+        dists = safe_dist[i]
+        valid_dists = dists[dists < np.inf]
+        
+        if len(valid_dists) >= 3:
+            sorted_dists = np.sort(valid_dists)
+            
+            # Compute rank-based regret
+            ranks = np.searchsorted(sorted_dists, dists)
+            rank_penalty = ranks / (len(valid_dists) - 1 + eps)
+            
+            # Compute absolute regret normalized by interquartile range
+            q1 = np.percentile(valid_dists, 25)
+            q3 = np.percentile(valid_dists, 75)
+            iqr = q3 - q1 + eps
+            absolute_regret = np.clip((dists - q1) / iqr, 0, 3)
+            
+            # Hybrid penalty: weighted combination
+            hybrid_penalty = 0.6 * rank_penalty + 0.4 * absolute_regret
+            
+            # Apply soft thresholding
+            regret_matrix[i] = np.tanh(hybrid_penalty * 2) * 0.5 + 0.5
+    
+    # 3. Adaptive Borda Weighting (tournament scoring)
+    borda_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # For each node j, compute how many nodes are closer to i than j
+        dists_i = safe_dist[i]
+        borda_scores = np.zeros(n)
+        
+        for j in range(n):
+            if i != j:
+                # Count nodes closer to i than j
+                closer_count = np.sum(dists_i < dists_i[j])
+                borda_scores[j] = closer_count / (n - 2 + eps)
+        
+        # Transform Borda scores to weights using inverse sigmoid
+        borda_weights[i] = 1.0 / (1.0 + np.exp(3.0 * (borda_scores - 0.5)))
+    
+    # 4. Topological Clustering Bonus via MST segmentation
+    cluster_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute MST and identify natural clusters
+    if n <= 1000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst + mst.T) > 0
+            
+            # Identify connected components in MST
+            visited = np.zeros(n, dtype=bool)
+            clusters = []
+            
+            for node in range(n):
+                if not visited[node]:
+                    # BFS to find cluster
+                    cluster = []
+                    stack = [node]
+                    while stack:
+                        curr = stack.pop()
+                        if not visited[curr]:
+                            visited[curr] = True
+                            cluster.append(curr)
+                            neighbors = np.where(mst_edges[curr])[0]
+                            stack.extend(neighbors)
+                    if len(cluster) > 1:
+                        clusters.append(cluster)
+            
+            # Assign bonuses based on intra-cluster connectivity
+            for cluster in clusters:
+                cluster_size = len(cluster)
+                if cluster_size > 1:
+                    # Higher bonus for edges within the cluster
+                    for i_idx, i in enumerate(cluster):
+                        for j in cluster[i_idx+1:]:
+                            if candidate_mask[i, j]:
+                                # Bonus inversely proportional to cluster size
+                                # (smaller clusters get stronger bonuses)
+                                bonus = 0.2 * np.sqrt(5.0 / cluster_size)
+                                cluster_bonus[i, j] = bonus
+                                cluster_bonus[j, i] = bonus
+        except:
+            pass
+    
+    # 5. Combine factors with attention to candidate edges
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base attractiveness: inverse distance with Borda weighting
+    inv_dist = 1.0 / safe_dist
+    mean_dist = np.mean(safe_dist[safe_dist < np.inf])
+    scaled_inv_dist = inv_dist * mean_dist
+    
+    base_score = scaled_inv_dist * borda_weights
+    
+    # Apply regret penalty with diminishing returns
+    regret_factor = 1.0 - 0.7 * regret_matrix
+    score_with_regret = base_score * regret_factor
+    
+    # Add cluster bonus multiplicatively
+    heuristics_matrix = score_with_regret * (1.0 + cluster_bonus)
+    
+    # 6. Multi-Objective Sparsification
+    # Apply candidate mask first
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure minimum connectivity while preserving asymmetry
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero = np.nonzero(row)[0]
+        
+        if len(nonzero) < 2:
+            # Find promising edges not already in candidate mask
+            potential_edges = np.argsort(base_score[i])[-5:]
+            needed = 2 - len(nonzero)
+            added = 0
+            
+            for j in potential_edges:
+                if i != j and added < needed:
+                    # Boost these edges moderately
+                    boost = base_score[i, j] * 0.8
+                    heuristics_matrix[i, j] = max(heuristics_matrix[i, j], boost)
+                    added += 1
+    
+    # 7. Asymmetric to symmetric transformation with preservation
+    # Take geometric mean of both directions
+    symmetric_heuristics = np.sqrt(
+        np.maximum(heuristics_matrix, eps) * 
+        np.maximum(heuristics_matrix.T, eps)
+    )
+    
+    # Apply final sparsification: keep only top 2*k_candidate edges per node
+    for i in range(n):
+        row = symmetric_heuristics[i]
+        threshold = np.partition(row, -2*k_candidate)[-2*k_candidate]
+        symmetric_heuristics[i, row < threshold] = 0
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(symmetric_heuristics)
+    if max_val > 0:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+```

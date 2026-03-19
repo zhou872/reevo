@@ -1,0 +1,402 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret Lookahead", "Online RL-inspired Weight Adaptation", "Spectral Embedding Spatial Analysis", "Conditional Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform, pdist
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with online RL-inspired weight adaptation, multi-step regret 
+    lookahead, spectral embedding for spatial analysis, and conditional sparsification.
+    
+    Core innovations:
+    1. Online RL-inspired Weight Adaptation: Dynamically adjusts component weights
+       using performance feedback on a sampled subproblem
+    2. Multi-step Regret Lookahead: Evaluates edges by comparing against best alternative
+       paths of varying lengths (2, 3, and 4 steps)
+    3. Spectral Embedding Spatial Analysis: Uses Laplacian eigenvectors to capture
+       global manifold structure for cluster detection
+    4. Conditional Sparsification: Applies different sparsity levels based on edge
+       category and local topology
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # ==================== 1. ONLINE WEIGHT ADAPTATION ====================
+    # Sample a small subproblem for online weight optimization
+    if n > 50:
+        sample_size = min(40, n // 2)
+        sample_idx = np.random.choice(n, sample_size, replace=False)
+        sample_dists = distance_matrix[np.ix_(sample_idx, sample_idx)]
+        best_weights = _optimize_weights_online(sample_dists)
+    else:
+        # For small problems, use pre-optimized weights
+        best_weights = {
+            'inv_dist': 1.0, 'rank': 0.9, 'density': 0.8, 
+            'lookahead': 0.6, 'mst': 1.0, 'spectral': 0.7
+        }
+    
+    # ==================== 2. EFFICIENT COMPONENT COMPUTATION ====================
+    # Precompute sorted distances for all nodes
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_distances = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+    
+    # 2.1 Base inverse distance with adaptive regularization
+    global_mean = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    reg_factor = global_mean * 0.05
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg_factor)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2.2 Rank-based scoring with exponential decay
+    rank_matrix = np.ones((n, n))
+    for i in range(n):
+        # Get ranks (0 = best, n-2 = worst)
+        ranks = np.zeros(n, dtype=int)
+        # Skip diagonal in sorted_indices
+        valid_idx = sorted_indices[i, sorted_indices[i] != i]
+        ranks[valid_idx] = np.arange(len(valid_idx))
+        
+        # Exponential decay: best edges get highest bonus
+        rank_bonus = 1.0 + np.exp(-ranks / max(1, n/15))
+        rank_matrix[i] = rank_bonus
+    
+    # 2.3 Local density estimation using adaptive bandwidth
+    density_matrix = np.ones((n, n))
+    
+    # Compute kernel density estimate for each node
+    bandwidth = np.percentile(distance_matrix[np.triu_indices(n, k=1)], 25)
+    local_density = np.zeros(n)
+    for i in range(n):
+        # Gaussian kernel density
+        kernel_vals = np.exp(-(distance_matrix[i] ** 2) / (2 * bandwidth ** 2))
+        kernel_vals[i] = 0
+        local_density[i] = np.sum(kernel_vals)
+    
+    # Normalize and compute similarity
+    if np.max(local_density) > np.min(local_density):
+        local_density = (local_density - np.min(local_density)) / \
+                       (np.max(local_density) - np.min(local_density) + 1e-8)
+    
+    # Density similarity: favor edges between similarly dense regions
+    density_sim = 1.0 - np.abs(local_density[:, None] - local_density[None, :])
+    density_matrix = 0.8 + 0.4 * density_sim
+    np.fill_diagonal(density_matrix, 1.0)
+    
+    # 2.4 MULTI-STEP REGRET LOOKAHEAD (2, 3, and 4 steps)
+    lookahead_matrix = np.ones((n, n))
+    
+    # Determine lookahead depth based on problem size
+    if n <= 100:
+        max_steps = 3  # Allow deeper lookahead for smaller problems
+    else:
+        max_steps = 2  # Limit for larger problems
+    
+    # Precompute top candidates for each node
+    candidate_count = min(8, n-2) if n > 50 else min(12, n-2)
+    top_candidates = sorted_indices[:, 1:candidate_count+1]
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            direct_cost = distance_matrix[i, j]
+            best_alternatives = []
+            
+            # 2-step lookahead (single intermediate)
+            if max_steps >= 2:
+                for k in top_candidates[i]:
+                    if k != j:
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternatives.append(alt_cost)
+            
+            # 3-step lookahead (two intermediates) with pruning
+            if max_steps >= 3 and n > 20:
+                for k in top_candidates[i]:
+                    if k == j:
+                        continue
+                    # Prune: only consider top candidates of k
+                    for l in top_candidates[k]:
+                        if l != i and l != j:
+                            alt_cost = distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                            best_alternatives.append(alt_cost)
+            
+            # 4-step lookahead (three intermediates) - heavily pruned
+            if max_steps >= 4 and n <= 50:
+                for k in top_candidates[i]:
+                    if k == j:
+                        continue
+                    for l in top_candidates[k]:
+                        if l == i or l == j:
+                            continue
+                        # Only consider top candidate of l
+                        m_candidate = top_candidates[l, 0]
+                        if m_candidate != i and m_candidate != j and m_candidate != k:
+                            alt_cost = (distance_matrix[i, k] + distance_matrix[k, l] + 
+                                       distance_matrix[l, m_candidate] + distance_matrix[m_candidate, j])
+                            best_alternatives.append(alt_cost)
+            
+            if best_alternatives:
+                best_alt = min(best_alternatives)
+                # Regret ratio: how much worse is alternative?
+                regret_ratio = best_alt / (direct_cost + 1e-8)
+                
+                # Sigmoid transformation: high regret ratio -> high value
+                lookahead_score = 0.7 + 0.6 / (1 + np.exp(-2 * (regret_ratio - 1.2)))
+                lookahead_matrix[i, j] = lookahead_score
+    
+    # Symmetrize lookahead matrix
+    lookahead_matrix = (lookahead_matrix + lookahead_matrix.T) / 2
+    
+    # 2.5 Minimum Spanning Tree prior
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost = np.where(mst_mask, 1.25, 1.0)
+    except:
+        mst_boost = np.ones((n, n))
+    
+    # 2.6 SPECTRAL EMBEDDING SPATIAL ANALYSIS
+    spectral_matrix = np.ones((n, n))
+    
+    if n >= 10:
+        # Create similarity matrix from distances
+        sigma = np.median(distance_matrix[np.triu_indices(n, k=1)])
+        similarity = np.exp(-distance_matrix ** 2 / (2 * sigma ** 2))
+        np.fill_diagonal(similarity, 0)
+        
+        # Compute normalized Laplacian
+        D = np.diag(np.sum(similarity, axis=1))
+        D_inv_sqrt = np.sqrt(np.linalg.inv(D))
+        L_norm = np.eye(n) - D_inv_sqrt @ similarity @ D_inv_sqrt
+        
+        # Compute first few eigenvectors
+        k_eigen = min(5, n-2)
+        try:
+            eigenvalues, eigenvectors = eigh(L_norm)
+            # Take eigenvectors corresponding to smallest non-zero eigenvalues
+            spectral_embedding = eigenvectors[:, 1:k_eigen+1]
+            
+            # Compute pairwise distances in spectral space
+            spectral_dists = np.zeros((n, n))
+            for i in range(n):
+                for j in range(i+1, n):
+                    diff = spectral_embedding[i] - spectral_embedding[j]
+                    spectral_dists[i, j] = spectral_dists[j, i] = np.sqrt(np.sum(diff ** 2))
+            
+            # Convert spectral distances to similarity
+            spectral_sim = np.exp(-spectral_dists / np.median(spectral_dists[np.triu_indices(n, k=1)]))
+            spectral_matrix = 0.6 + 0.8 * spectral_sim
+        except:
+            # Fallback to simple clustering if spectral embedding fails
+            pass
+    
+    # ==================== 3. WEIGHTED COMBINATION ====================
+    # Apply optimized weights
+    weighted_components = (
+        np.power(inv_dist, best_weights['inv_dist']) *
+        np.power(rank_matrix, best_weights['rank']) *
+        np.power(density_matrix, best_weights['density']) *
+        np.power(lookahead_matrix, best_weights['lookahead']) *
+        np.power(mst_boost, best_weights['mst']) *
+        np.power(spectral_matrix, best_weights['spectral'])
+    )
+    
+    np.fill_diagonal(weighted_components, 0)
+    weighted_components = (weighted_components + weighted_components.T) / 2
+    
+    # ==================== 4. CONDITIONAL SPARSIFICATION ====================
+    # Different sparsity strategies based on edge type
+    keep_mask = np.ones((n, n), dtype=bool)
+    np.fill_diagonal(keep_mask, False)
+    
+    # Always keep MST edges
+    if 'mst_mask' in locals():
+        keep_mask = keep_mask & mst_mask
+    
+    # Category 1: High regret edges (no good alternatives)
+    high_regret_mask = lookahead_matrix > np.percentile(lookahead_matrix[keep_mask], 80)
+    keep_mask = keep_mask & high_regret_mask
+    
+    # Category 2: Intra-cluster edges (similar spectral embedding)
+    if 'spectral_dists' in locals():
+        spectral_threshold = np.median(spectral_dists[keep_mask])
+        intra_cluster = spectral_dists < spectral_threshold
+        keep_mask = keep_mask & intra_cluster
+    
+    # Category 3: Top-ranked edges per node
+    edges_per_node = min(6, max(3, int(np.sqrt(n))))
+    for i in range(n):
+        node_scores = weighted_components[i].copy()
+        node_scores[i] = -np.inf
+        node_scores[~keep_mask[i]] = -np.inf
+        
+        # Keep top edges
+        if np.sum(keep_mask[i]) > edges_per_node:
+            threshold_idx = np.argpartition(node_scores, -edges_per_node)[-edges_per_node]
+            threshold = node_scores[threshold_idx]
+            keep_mask[i] = keep_mask[i] & (node_scores >= threshold)
+            keep_mask[:, i] = keep_mask[i]  # Symmetrize
+    
+    # Ensure minimum connectivity: each node connects to at least 2 others
+    for i in range(n):
+        connected = np.where(keep_mask[i])[0]
+        if len(connected) < 2:
+            # Add nearest neighbors not already connected
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            distances[keep_mask[i]] = np.inf
+            if np.any(distances < np.inf):
+                for _ in range(2 - len(connected)):
+                    nearest = np.argmin(distances)
+                    keep_mask[i, nearest] = True
+                    keep_mask[nearest, i] = True
+                    distances[nearest] = np.inf
+    
+    # Apply sparsification
+    sparse_heuristic = weighted_components * keep_mask
+    
+    # ==================== 5. FINAL ENHANCEMENTS ====================
+    # Row-wise softmax normalization
+    row_max = np.max(sparse_heuristic, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    sparse_heuristic = sparse_heuristic / row_max
+    
+    # Boost edges that appear in multiple categories
+    category_boost = np.zeros((n, n))
+    if 'mst_mask' in locals():
+        category_boost[mst_mask] += 0.1
+    if 'high_regret_mask' in locals():
+        category_boost[high_regret_mask] += 0.1
+    if 'intra_cluster' in locals():
+        category_boost[intra_cluster] += 0.1
+    
+    sparse_heuristic = np.minimum(sparse_heuristic + category_boost, 1.0)
+    
+    # Global scaling
+    max_val = np.max(sparse_heuristic)
+    if max_val > 0:
+        sparse_heuristic = sparse_heuristic / max_val
+    
+    np.fill_diagonal(sparse_heuristic, 0)
+    
+    return sparse_heuristic
+
+
+def _optimize_weights_online(sample_dists: np.ndarray) -> dict:
+    """
+    Online weight optimization using simple regret minimization on sampled subproblem.
+    
+    Args:
+        sample_dists: Distance matrix for sampled subproblem
+        
+    Returns:
+        Optimized weight dictionary
+    """
+    n_sample = sample_dists.shape[0]
+    
+    # Define weight candidates
+    weight_candidates = [
+        {'inv_dist': 1.0, 'rank': 0.8, 'density': 0.7, 'lookahead': 0.5, 'mst': 1.0, 'spectral': 0.6},
+        {'inv_dist': 0.8, 'rank': 1.0, 'density': 0.9, 'lookahead': 0.7, 'mst': 1.1, 'spectral': 0.8},
+        {'inv_dist': 1.2, 'rank': 0.7, 'density': 0.6, 'lookahead': 0.4, 'mst': 0.9, 'spectral': 0.5},
+        {'inv_dist': 0.9, 'rank': 0.9, 'density': 0.8, 'lookahead': 0.6, 'mst': 1.0, 'spectral': 0.7}
+    ]
+    
+    # Evaluate each weight profile using simple greedy tour construction
+    best_score = -np.inf
+    best_weights = weight_candidates[0]
+    
+    for weights in weight_candidates:
+        # Compute heuristic with current weights (simplified version)
+        heuristic = _compute_heuristic_with_weights(sample_dists, weights)
+        
+        # Evaluate with greedy tour construction
+        tour_length = _greedy_tour_length(sample_dists, heuristic)
+        score = 1.0 / (tour_length + 1e-8)
+        
+        if score > best_score:
+            best_score = score
+            best_weights = weights
+    
+    return best_weights
+
+
+def _compute_heuristic_with_weights(dist_matrix: np.ndarray, weights: dict) -> np.ndarray:
+    """Simplified heuristic computation for weight optimization."""
+    n = dist_matrix.shape[0]
+    
+    # Basic components
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (dist_matrix + np.median(dist_matrix[np.triu_indices(n, k=1)]) * 0.1)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Simple rank component
+    rank_mat = np.ones((n, n))
+    for i in range(n):
+        sorted_idx = np.argsort(dist_matrix[i])
+        ranks = np.zeros(n)
+        ranks[sorted_idx] = np.arange(n)
+        rank_mat[i] = 1.0 + 0.5 * np.exp(-ranks / max(1, n/10))
+    
+    # Simple MST component
+    try:
+        mst = minimum_spanning_tree(dist_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost = np.where(mst_mask, 1.2, 1.0)
+    except:
+        mst_boost = np.ones((n, n))
+    
+    # Combine with weights
+    heuristic = (
+        np.power(inv_dist, weights['inv_dist']) *
+        np.power(rank_mat, weights['rank']) *
+        np.power(mst_boost, weights['mst'])
+    )
+    
+    np.fill_diagonal(heuristic, 0)
+    return (heuristic + heuristic.T) / 2
+
+
+def _greedy_tour_length(dist_matrix: np.ndarray, heuristic: np.ndarray) -> float:
+    """Construct greedy tour using heuristic scores."""
+    n = dist_matrix.shape[0]
+    best_length = np.inf
+    
+    # Try multiple starting points
+    for start in range(min(5, n)):
+        visited = [start]
+        current = start
+        
+        while len(visited) < n:
+            # Get unvisited nodes
+            unvisited = [j for j in range(n) if j not in visited]
+            # Choose next with highest heuristic score
+            next_node = max(unvisited, key=lambda j: heuristic[current, j])
+            visited.append(next_node)
+            current = next_node
+        
+        # Complete tour
+        tour_length = 0
+        for i in range(n-1):
+            tour_length += dist_matrix[visited[i], visited[i+1]]
+        tour_length += dist_matrix[visited[-1], visited[0]]
+        
+        best_length = min(best_length, tour_length)
+    
+    return best_length
+```

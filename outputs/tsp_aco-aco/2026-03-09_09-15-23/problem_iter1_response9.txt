@@ -1,0 +1,191 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Edge Prioritization", "Distance-Adaptive k-Nearest Neighbor Bonus", "Normalized Cluster Density Reward", "Progressive Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining MST, local connectivity,
+    cluster density, and progressive sparsification.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes.
+        
+    Returns:
+        Priority matrix of same shape, where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) / (distance_matrix + 1e-12)
+    
+    # 1. Base inverse distance (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    inv_dist[np.eye(n, dtype=bool)] = 0
+    
+    # 2. Minimum Spanning Tree edges get high priority
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # 3. Adaptive k-nearest neighbors bonus
+    knn_bonus = _compute_knn_bonus(distance_matrix, base_k=max(2, n//10))
+    
+    # 4. Cluster density reward
+    density_bonus = _compute_density_bonus(distance_matrix)
+    
+    # Combine factors with adaptive weights
+    mst_weight = 3.0 + 2.0 * np.log1p(n) / n  # Decays with n
+    knn_weight = 1.5
+    density_weight = 0.8
+    
+    priorities = inv_dist * (
+        1.0 + 
+        mst_weight * mst_mask + 
+        knn_weight * knn_bonus + 
+        density_weight * density_bonus
+    )
+    
+    # 5. Progressive sparsification
+    priorities = _progressive_sparsify(priorities, n)
+    
+    # Ensure symmetry and zero diagonal
+    priorities = (priorities + priorities.T) / 2
+    priorities[np.eye(n, dtype=bool)] = 0
+    
+    return priorities
+
+def _compute_mst_mask(dist_matrix: np.ndarray) -> np.ndarray:
+    """Return binary mask of edges in Minimum Spanning Tree."""
+    n = dist_matrix.shape[0]
+    mask = np.zeros_like(dist_matrix, dtype=float)
+    
+    if n <= 1:
+        return mask
+    
+    # Prim's algorithm for MST
+    in_mst = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    # Start from node 0
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        # Find minimum edge to growing MST
+        u = -1
+        min_val = np.inf
+        for v in range(n):
+            if not in_mst[v] and min_edge[v] < min_val:
+                min_val = min_edge[v]
+                u = v
+        
+        if u == -1:
+            break
+        
+        in_mst[u] = True
+        if parent[u] != -1:
+            mask[u, parent[u]] = 1
+            mask[parent[u], u] = 1
+        
+        # Update min edges
+        for v in range(n):
+            if not in_mst[v] and dist_matrix[u, v] < min_edge[v]:
+                min_edge[v] = dist_matrix[u, v]
+                parent[v] = u
+    
+    return mask
+
+def _compute_knn_bonus(dist_matrix: np.ndarray, base_k: int) -> np.ndarray:
+    """Bonus based on adaptive k-nearest neighbors with distance weighting."""
+    n = dist_matrix.shape[0]
+    bonus = np.zeros_like(dist_matrix)
+    
+    # Adaptive k: smaller for larger graphs, but at least 2
+    k = min(base_k, max(2, n // 5))
+    
+    for i in range(n):
+        # Get k+1 neighbors (including self)
+        indices = np.argsort(dist_matrix[i])[:k+1]
+        # Remove self if present
+        indices = indices[indices != i][:k]
+        
+        # Weight by relative position in sorted order
+        for rank, j in enumerate(indices):
+            weight = (k - rank) / k  # Linear decay
+            # Inverse distance weighting within neighborhood
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = weight / dist_matrix[i, j]
+    
+    # Symmetrize and normalize
+    bonus = (bonus + bonus.T) / 2
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+def _compute_density_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """Reward edges within dense clusters."""
+    n = dist_matrix.shape[0]
+    if n <= 3:
+        return np.zeros_like(dist_matrix)
+    
+    # Estimate local density for each node
+    densities = np.zeros(n)
+    for i in range(n):
+        # Median distance as density estimator
+        distances = np.sort(dist_matrix[i])[1:4]  # 3 nearest (excluding self)
+        densities[i] = 1.0 / (np.median(distances) + 1e-12)
+    
+    # Normalize densities
+    if densities.max() > 0:
+        densities = densities / densities.max()
+    
+    # Bonus is geometric mean of endpoint densities
+    bonus = np.zeros_like(dist_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = np.sqrt(densities[i] * densities[j]) / dist_matrix[i, j]
+    
+    bonus = bonus + bonus.T
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+def _progressive_sparsify(priorities: np.ndarray, n: int) -> np.ndarray:
+    """Progressively sparsify matrix based on node degree and edge importance."""
+    result = priorities.copy()
+    
+    if n <= 10:
+        # Keep top 50% for very small graphs
+        threshold = np.percentile(result[result > 0], 50) if np.any(result > 0) else 0
+    else:
+        # Adaptive sparsification based on graph size
+        keep_ratio = max(0.1, 20.0 / n)  # Keep decreasing percentage for larger graphs
+        if np.any(result > 0):
+            threshold = np.percentile(result[result > 0], 100 * (1 - keep_ratio))
+        else:
+            threshold = 0
+    
+    # Apply threshold
+    result[result < threshold] = 0
+    
+    # Ensure each node has at least 2 connections
+    for i in range(n):
+        non_zero = np.where(result[i] > 0)[0]
+        if len(non_zero) < 2:
+            # Add back top edges if needed
+            top_indices = np.argsort(priorities[i])[-2:]
+            for idx in top_indices:
+                if idx != i:
+                    result[i, idx] = priorities[i, idx]
+                    result[idx, i] = priorities[idx, i]
+    
+    return result
+```

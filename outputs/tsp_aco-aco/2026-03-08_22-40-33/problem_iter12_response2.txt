@@ -1,0 +1,558 @@
+```json
+{
+    "algorithm_features": ["Hierarchical Spatial Clustering", "MST-based Tour Length Estimation", "Cluster-Aware Multi-hop Regret", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with global structural insights.
+    
+    Key innovations:
+    1. Hierarchical spatial clustering using distance-based connectivity
+    2. MST-based tour length estimation for regret scaling
+    3. Cluster-aware multi-hop lookahead with adaptive depth
+    4. Connectivity-preserving sparsification with global structure awareness
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges. Values normalized to [0, 1].
+    """
+    
+    def _hierarchical_clustering(dist_mat: np.ndarray, n: int, dist_cv: float) -> np.ndarray:
+        """Perform hierarchical clustering based on distance connectivity."""
+        if n <= 8 or dist_cv < 0.25:
+            return np.zeros(n, dtype=int)
+        
+        # Sort distances for percentile calculations
+        triu_indices = np.triu_indices(n, k=1)
+        sorted_dists = np.sort(dist_mat[triu_indices])
+        
+        # Adaptive thresholds based on distribution
+        if dist_cv < 0.5:
+            merge_threshold = np.percentile(sorted_dists, 20)
+            split_threshold = np.percentile(sorted_dists, 60)
+        else:
+            merge_threshold = np.percentile(sorted_dists, 15)
+            split_threshold = np.percentile(sorted_dists, 40)
+        
+        # Initial clustering: each node starts in its own cluster
+        cluster_labels = np.arange(n)
+        
+        # Phase 1: Merge very close nodes
+        merged = True
+        while merged:
+            merged = False
+            unique_clusters = np.unique(cluster_labels)
+            
+            for i in range(len(unique_clusters)):
+                cluster_i = unique_clusters[i]
+                nodes_i = np.where(cluster_labels == cluster_i)[0]
+                
+                # Find closest other cluster
+                min_dist = np.inf
+                best_cluster = -1
+                
+                for j in range(i + 1, len(unique_clusters)):
+                    cluster_j = unique_clusters[j]
+                    nodes_j = np.where(cluster_labels == cluster_j)[0]
+                    
+                    # Calculate minimum distance between clusters
+                    cross_dists = dist_mat[nodes_i[:, None], nodes_j]
+                    current_min = np.min(cross_dists)
+                    
+                    if current_min < min_dist and current_min < merge_threshold:
+                        min_dist = current_min
+                        best_cluster = cluster_j
+                
+                if best_cluster != -1:
+                    # Merge clusters
+                    cluster_labels[cluster_labels == best_cluster] = cluster_i
+                    merged = True
+                    break
+        
+        # Phase 2: Ensure cluster separation
+        unique_clusters = np.unique(cluster_labels)
+        for i in range(len(unique_clusters)):
+            for j in range(i + 1, len(unique_clusters)):
+                cluster_i = unique_clusters[i]
+                cluster_j = unique_clusters[j]
+                
+                nodes_i = np.where(cluster_labels == cluster_i)[0]
+                nodes_j = np.where(cluster_labels == cluster_j)[0]
+                
+                # Calculate separation
+                cross_dists = dist_mat[nodes_i[:, None], nodes_j]
+                min_sep = np.min(cross_dists)
+                
+                if min_sep < split_threshold:
+                    # Merge weakly separated clusters
+                    cluster_labels[cluster_labels == cluster_j] = cluster_i
+        
+        # Reindex clusters starting from 0
+        unique_clusters = np.unique(cluster_labels)
+        cluster_map = {old: new for new, old in enumerate(unique_clusters)}
+        cluster_labels = np.array([cluster_map[label] for label in cluster_labels])
+        
+        # Ensure reasonable number of clusters
+        n_clusters = len(np.unique(cluster_labels))
+        if n_clusters == 1 and n > 15:
+            # Force binary split based on distance to centroid
+            median_dist = np.median(sorted_dists)
+            centroid_distances = np.mean(dist_mat, axis=1)
+            cluster_labels = (centroid_distances > median_dist).astype(int)
+        
+        return cluster_labels
+    
+    def _analyze_clusters(cluster_labels: np.ndarray, dist_mat: np.ndarray) -> dict:
+        """Analyze cluster properties for informed weighting."""
+        n_clusters = len(np.unique(cluster_labels))
+        if n_clusters <= 1:
+            return {'n_clusters': 1, 'sizes': [len(cluster_labels)], 
+                    'separations': [0], 'intra_density': [1.0]}
+        
+        cluster_sizes = [np.sum(cluster_labels == i) for i in range(n_clusters)]
+        
+        # Calculate intra-cluster density (average normalized distance)
+        intra_densities = []
+        for i in range(n_clusters):
+            cluster_mask = cluster_labels == i
+            if np.sum(cluster_mask) <= 1:
+                intra_densities.append(1.0)
+                continue
+            
+            # Get distances within cluster
+            intra_dists = dist_mat[cluster_mask][:, cluster_mask]
+            upper = intra_dists[np.triu_indices_from(intra_dists, k=1)]
+            if len(upper) == 0:
+                intra_densities.append(1.0)
+            else:
+                # Normalize by median of all distances
+                all_dists = dist_mat[np.triu_indices_from(dist_mat, k=1)]
+                median_all = np.median(all_dists)
+                intra_densities.append(np.median(upper) / (median_all + 1e-12))
+        
+        # Calculate inter-cluster separation
+        separations = []
+        for i in range(n_clusters):
+            intra_mask = cluster_labels == i
+            inter_mask = ~intra_mask
+            if np.any(intra_mask) and np.any(inter_mask):
+                min_dists = []
+                for idx in np.where(intra_mask)[0]:
+                    inter_dists = dist_mat[idx, inter_mask]
+                    if len(inter_dists) > 0:
+                        min_dists.append(np.min(inter_dists))
+                separations.append(np.mean(min_dists) if min_dists else 0)
+            else:
+                separations.append(0)
+        
+        return {
+            'n_clusters': n_clusters,
+            'sizes': cluster_sizes,
+            'separations': separations,
+            'intra_density': intra_densities
+        }
+    
+    def _compute_mst_with_length(dist_mat: np.ndarray):
+        """Compute Minimum Spanning Tree and its total length."""
+        n = dist_mat.shape[0]
+        mst_mask = np.zeros((n, n), dtype=bool)
+        
+        if n <= 1:
+            return 0, mst_mask
+        
+        # Prim's algorithm
+        visited = np.zeros(n, dtype=bool)
+        min_edge = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        
+        min_edge[0] = 0
+        mst_length = 0
+        
+        for _ in range(n):
+            u = -1
+            min_val = np.inf
+            for i in range(n):
+                if not visited[i] and min_edge[i] < min_val:
+                    min_val = min_edge[i]
+                    u = i
+            
+            if u == -1:
+                break
+            
+            visited[u] = True
+            if parent[u] != -1:
+                mst_mask[u, parent[u]] = True
+                mst_mask[parent[u], u] = True
+                mst_length += dist_mat[u, parent[u]]
+            
+            for v in range(n):
+                if not visited[v] and dist_mat[u, v] < min_edge[v]:
+                    min_edge[v] = dist_mat[u, v]
+                    parent[v] = u
+        
+        return mst_length, mst_mask
+    
+    def _compute_global_informed_regret(dist_mat: np.ndarray, n: int, 
+                                       cluster_labels: np.ndarray, 
+                                       cluster_info: dict, 
+                                       dist_cv: float,
+                                       avg_edge_est: float,
+                                       mst_length: float) -> np.ndarray:
+        """Compute regret penalty informed by both local ranking and global tour estimates."""
+        regret_penalty = np.ones((n, n))
+        
+        # Adaptive base power
+        base_power = 1.4 + 0.6 * np.tanh(1.5 * dist_cv)
+        
+        # Global factor based on MST structure
+        mst_factor = 1.0 + 0.3 * np.tanh(1 - dist_cv)  # Higher for uniform
+        
+        # Precompute neighbor rankings for efficiency
+        neighbor_rankings = []
+        for i in range(n):
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+            candidates = np.where(mask)[0]
+            dists = dist_mat[i, candidates]
+            sorted_idx = np.argsort(dists)
+            neighbor_rankings.append((candidates[sorted_idx], dists[sorted_idx]))
+        
+        for i in range(n):
+            candidates, dists = neighbor_rankings[i]
+            if len(candidates) < 2:
+                continue
+            
+            best_dist = dists[0]
+            
+            for rank, j in enumerate(candidates):
+                current_dist = dists[rank]
+                
+                if rank == 0:
+                    regret_penalty[i, j] = 1.0
+                else:
+                    # Local regret component
+                    norm_rank = rank / (len(candidates) - 1)
+                    dist_ratio = current_dist / (best_dist + 1e-12)
+                    
+                    # Global regret component based on tour estimate
+                    global_ratio = current_dist / (avg_edge_est + 1e-12)
+                    global_component = np.tanh(global_ratio - 1)  # Positive if above average
+                    
+                    # Cluster-aware adjustment
+                    same_cluster = cluster_labels[i] == cluster_labels[j]
+                    if same_cluster and cluster_info['n_clusters'] > 1:
+                        cluster_idx = cluster_labels[i]
+                        density_factor = cluster_info['intra_density'][cluster_idx]
+                        # In dense clusters, be more selective
+                        cluster_mult = 1.2 / (0.7 + density_factor)
+                    else:
+                        cluster_mult = 1.0
+                    
+                    # Combine components
+                    local_component = base_power * norm_rank * np.sqrt(dist_ratio)
+                    global_component_scaled = 0.4 * global_component * mst_factor
+                    
+                    total_power = local_component + global_component_scaled
+                    penalty = 1 / (1 + cluster_mult * total_power)
+                    regret_penalty[i, j] = penalty
+        
+        # Symmetrize using geometric mean
+        regret_penalty = np.sqrt(regret_penalty * regret_penalty.T)
+        
+        return regret_penalty
+    
+    def _compute_adaptive_multi_hop_lookahead(dist_mat: np.ndarray, n: int,
+                                             cluster_labels: np.ndarray,
+                                             cluster_info: dict,
+                                             tsp_estimate: float) -> np.ndarray:
+        """Compute lookahead score with adaptive multi-hop depth based on instance structure."""
+        lookahead_score = np.ones((n, n))
+        
+        if n < 4:
+            return lookahead_score
+        
+        # Determine adaptive neighbor counts
+        base_neighbors = min(max(3, int(np.sqrt(n))), n - 1)
+        
+        # Precompute nearest neighbors for each node
+        nearest_indices = []
+        for i in range(n):
+            if cluster_info['n_clusters'] > 1:
+                cluster_size = cluster_info['sizes'][cluster_labels[i]]
+                n_neighbors = min(base_neighbors + int(np.log2(cluster_size + 1)), n - 1)
+            else:
+                n_neighbors = base_neighbors
+            nearest_indices.append(np.argsort(dist_mat[i])[1:n_neighbors + 1])
+        
+        # Vectorized computation for efficiency
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_dist = dist_mat[i, j]
+                if direct_dist == 0:
+                    continue
+                
+                # Determine lookahead depth adaptively
+                same_cluster = cluster_labels[i] == cluster_labels[j]
+                if same_cluster and cluster_info['n_clusters'] > 1:
+                    cluster_size = cluster_info['sizes'][cluster_labels[i]]
+                    max_depth = min(4, max(2, int(np.log2(cluster_size))))
+                else:
+                    max_depth = 3 if n > 15 else 2
+                
+                best_alternative = np.inf
+                
+                # Explore paths of increasing depth
+                for depth in range(2, max_depth + 1):
+                    if depth == 2:
+                        candidates = set(nearest_indices[i].tolist() + nearest_indices[j].tolist())
+                    else:
+                        # Expand from previous candidates
+                        new_candidates = set()
+                        for k in candidates:
+                            if k != i and k != j:
+                                new_candidates.update(nearest_indices[k].tolist())
+                        candidates = candidates.union(new_candidates)
+                    
+                    # Remove start and end nodes
+                    candidates.discard(i)
+                    candidates.discard(j)
+                    
+                    # If we have candidates at this depth, evaluate
+                    if candidates:
+                        candidate_list = list(candidates)
+                        
+                        if depth == 2:
+                            # Direct two-hop paths
+                            for k in candidate_list:
+                                alt_path = dist_mat[i, k] + dist_mat[k, j]
+                                best_alternative = min(best_alternative, alt_path)
+                        else:
+                            # For deeper paths, use limited combinatorial search
+                            if len(candidate_list) > 10:
+                                # Score candidates by average distance to i and j
+                                scores = []
+                                for k in candidate_list:
+                                    score = dist_mat[i, k] + dist_mat[k, j]
+                                    scores.append(score)
+                                top_idx = np.argsort(scores)[:10]
+                                candidate_list = [candidate_list[idx] for idx in top_idx]
+                            
+                            # Evaluate paths through combinations of intermediate nodes
+                            if len(candidate_list) >= 2:
+                                # Take two closest nodes to each endpoint
+                                close_to_i = sorted(candidate_list, 
+                                                  key=lambda k: dist_mat[i, k])[:2]
+                                close_to_j = sorted(candidate_list,
+                                                  key=lambda k: dist_mat[j, k])[:2]
+                                
+                                # Evaluate combinations
+                                for k in close_to_i:
+                                    for l in close_to_j:
+                                        if k != l:
+                                            alt_path = (dist_mat[i, k] + 
+                                                       dist_mat[k, l] + 
+                                                       dist_mat[l, j])
+                                            best_alternative = min(best_alternative, alt_path)
+                
+                # Convert efficiency to score using adaptive sigmoid
+                if best_alternative < np.inf:
+                    efficiency_ratio = best_alternative / direct_dist
+                    
+                    # Adaptive parameters based on instance and clustering
+                    if same_cluster:
+                        center = 1.3 + 0.2 * np.tanh(3 - cluster_info['intra_density'][cluster_labels[i]])
+                        scale = 1.6
+                    else:
+                        center = 1.5
+                        scale = 1.4
+                    
+                    # Sigmoid-like transformation
+                    sigmoid_arg = scale * (efficiency_ratio - center)
+                    score = 1.0 + 0.5 * np.tanh(sigmoid_arg)
+                    
+                    # Additional penalty for very inefficient paths
+                    if efficiency_ratio > 2.0:
+                        score *= 0.8
+                    
+                    lookahead_score[i, j] = lookahead_score[j, i] = np.clip(score, 0.3, 1.5)
+        
+        return lookahead_score
+    
+    def _cluster_conscious_sparsification(heuristics: np.ndarray,
+                                         dist_mat: np.ndarray,
+                                         mst_mask: np.ndarray,
+                                         n: int,
+                                         cluster_labels: np.ndarray,
+                                         cluster_info: dict) -> np.ndarray:
+        """Perform sparsification that preserves cluster connectivity."""
+        result = heuristics.copy()
+        
+        # Always keep MST edges
+        result[mst_mask] = heuristics[mst_mask]
+        
+        # Base number of edges to keep per node
+        if cluster_info['n_clusters'] > 1:
+            base_intra = max(3, int(np.sqrt(n)))
+            base_inter = max(2, int(np.sqrt(n) / 2))
+        else:
+            base_intra = max(3, int(np.sqrt(n) * 0.8))
+            base_inter = 0
+        
+        # Calculate local density for adjustment
+        densities = np.zeros(n)
+        k_density = min(max(2, n // 10), 5)
+        for i in range(n):
+            distances = np.partition(dist_mat[i], k_density + 1)[:k_density + 1]
+            distances = distances[distances > 0]
+            densities[i] = np.mean(distances) if len(distances) > 0 else 1.0
+        
+        # Normalize densities
+        if np.max(densities) > 0:
+            densities = densities / np.max(densities)
+        
+        for i in range(n):
+            row = result[i].copy()
+            row[i] = -np.inf
+            
+            # Identify same-cluster and different-cluster nodes
+            same_cluster_mask = cluster_labels == cluster_labels[i]
+            diff_cluster_mask = ~same_cluster_mask
+            same_cluster_mask[i] = False  # Exclude self
+            
+            # Determine how many edges to keep
+            same_cluster_count = np.sum(same_cluster_mask)
+            diff_cluster_count = np.sum(diff_cluster_mask)
+            
+            # Adjust based on local density
+            density_factor = 0.6 + 0.4 * densities[i]
+            
+            keep_same = min(same_cluster_count, int(base_intra * density_factor))
+            keep_diff = min(diff_cluster_count, base_inter)
+            
+            # Keep top intra-cluster edges
+            if keep_same > 0 and same_cluster_count > 0:
+                same_scores = row[same_cluster_mask]
+                same_indices = np.where(same_cluster_mask)[0]
+                top_same_idx = np.argsort(same_scores)[-keep_same:]
+                keep_same_indices = set(same_indices[top_same_idx])
+            else:
+                keep_same_indices = set()
+            
+            # Keep top inter-cluster edges
+            if keep_diff > 0 and diff_cluster_count > 0:
+                diff_scores = row[diff_cluster_mask]
+                diff_indices = np.where(diff_cluster_mask)[0]
+                top_diff_idx = np.argsort(diff_scores)[-keep_diff:]
+                keep_diff_indices = set(diff_indices[top_diff_idx])
+            else:
+                keep_diff_indices = set()
+            
+            # Always keep MST edges for this node
+            mst_indices = set(np.where(mst_mask[i])[0])
+            
+            # Combine all edges to keep
+            all_keep = keep_same_indices | keep_diff_indices | mst_indices
+            
+            # Zero out non-kept edges
+            for j in range(n):
+                if j != i and j not in all_keep:
+                    result[i, j] = 0
+        
+        # Ensure symmetry while preserving kept edges
+        result = np.maximum(result, result.T)
+        
+        # Final connectivity check: ensure each node has at least 2 edges
+        for i in range(n):
+            if np.sum(result[i] > 0) < 2:
+                # Add back the best missing edge
+                row = heuristics[i].copy()
+                row[i] = -np.inf
+                row[result[i] > 0] = -np.inf  # Exclude already kept edges
+                
+                if np.max(row) > -np.inf:
+                    best_j = np.argmax(row)
+                    result[i, best_j] = heuristics[i, best_j]
+                    result[best_j, i] = heuristics[best_j, i]
+        
+        return result
+    
+    # === MAIN FUNCTION BODY ===
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. INSTANCE CHARACTERIZATION ===
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # === 2. HIERARCHICAL SPATIAL CLUSTERING ===
+    cluster_labels = _hierarchical_clustering(distance_matrix, n, dist_cv)
+    cluster_info = _analyze_clusters(cluster_labels, distance_matrix)
+    
+    # === 3. MST-BASED GLOBAL TOUR LENGTH ESTIMATION ===
+    mst_length, mst_mask = _compute_mst_with_length(distance_matrix)
+    # Estimate TSP tour length using Christofides-like factor
+    tsp_estimate = mst_length * (1.35 + 0.15 * np.tanh(dist_cv - 0.5))
+    avg_edge_est = tsp_estimate / n if n > 0 else 0
+    
+    # === 4. BASE INVERSE DISTANCE WITH GLOBAL SCALING ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Scale by estimated average edge length
+        scale = avg_edge_est if avg_edge_est > 0 else dist_mean
+        inv_dist = scale / (distance_matrix + 0.1 * scale * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 5. GLOBAL-TOUR-INFORMED REGRET WITH CLUSTERING ===
+    regret_penalty = _compute_global_informed_regret(
+        distance_matrix, n, cluster_labels, cluster_info, 
+        dist_cv, avg_edge_est, mst_length
+    )
+    
+    # === 6. ADAPTIVE MULTI-HOP LOOKAHEAD ===
+    lookahead_score = _compute_adaptive_multi_hop_lookahead(
+        distance_matrix, n, cluster_labels, cluster_info, tsp_estimate
+    )
+    
+    # === 7. COMBINE FACTORS ===
+    heuristics = inv_dist.copy()
+    heuristics *= regret_penalty
+    heuristics *= lookahead_score
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 8. MST BOOST WITH TOUR-LENGTH AWARENESS ===
+    mst_weight = 1.5 + 0.3 * np.tanh(2 - dist_cv)  # Higher for uniform instances
+    heuristics[mst_mask] *= mst_weight
+    
+    # === 9. CLUSTER-CONSCIOUS SPARSIFICATION ===
+    if n > 3:
+        heuristics = _cluster_conscious_sparsification(
+            heuristics, distance_matrix, mst_mask, n, 
+            cluster_labels, cluster_info
+        )
+    
+    # === 10. FINAL PROCESSING ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = heuristics[non_zero_mask].max()
+        if max_val > 0:
+            heuristics[non_zero_mask] = heuristics[non_zero_mask] / max_val
+    
+    return heuristics
+```

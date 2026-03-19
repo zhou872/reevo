@@ -1,0 +1,336 @@
+```json
+{
+    "algorithm_features": ["Path-length-bounded dynamic programming", "Harmonic centrality with clustering", "Multi-step regret with alternative routing", "Adaptive topological sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform, pdist
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with path-length-bounded dynamic programming
+    and graph-theoretic centrality measures.
+    
+    Key innovations:
+    1. Path-length-bounded DP: Computes optimal 3-4 step paths using DP with
+       neighbor pruning for better lookahead quality vs efficiency trade-off.
+    2. Harmonic centrality with clustering: Uses harmonic centrality weighted
+       by local clustering coefficient to identify critical hub nodes.
+    3. Multi-step regret analysis: Compares direct edges to best 2-3 step
+       alternative paths with capacity constraints.
+    4. Adaptive topological sparsification: Dynamically prunes edges based on
+       combined scores while preserving topological structure.
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between n nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        if n == 0:
+            return np.zeros_like(distance_matrix)
+        return np.where(np.eye(n, dtype=bool), 0, 1 / (distance_matrix + np.eye(n)))
+    
+    # Preprocess: create working matrix with infinity on diagonal
+    dist = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Base inverse distance scoring
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = np.where(dist < np.inf, 1 / dist, 0)
+    
+    # 2. MST backbone for connectivity guarantee
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 3. Path-length-bounded dynamic programming (up to 4 steps)
+    # Use neighbor pruning for efficiency while maintaining quality
+    K = min(15, max(5, n // 3))  # Adaptive neighbor count
+    if K < 2 and n > 2:
+        K = 2
+    
+    # Get K nearest neighbors for each node
+    neighbor_indices = np.argsort(dist, axis=1)[:, :K]
+    neighbor_distances = np.take_along_axis(dist, neighbor_indices, axis=1)
+    
+    # Precompute neighbor sets for fast lookups
+    neighbor_sets = [set(neighbor_indices[i]) for i in range(n)]
+    
+    # DP tables for 2, 3, 4-step optimal paths
+    dp_2step = np.full_like(dist, np.inf)
+    dp_3step = np.full_like(dist, np.inf)
+    dp_4step = np.full_like(dist, np.inf)
+    
+    # Compute 2-step paths using DP
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            # Consider intermediate nodes from neighbors of i
+            best = np.inf
+            for k in neighbor_indices[i]:
+                if k != i and k != j:
+                    path_len = dist[i, k] + dist[k, j]
+                    if path_len < best:
+                        best = path_len
+            if best < np.inf:
+                dp_2step[i, j] = best
+    
+    # Compute 3-step paths using 2-step results
+    for i in range(n):
+        for j in range(n):
+            if i == j or dp_2step[i, j] == np.inf:
+                continue
+            # Extend 2-step paths by one more step
+            best = np.inf
+            # Get intermediate nodes from the 2-step path endpoints
+            for k in neighbor_indices[i]:
+                if k == i or k == j:
+                    continue
+                if dp_2step[k, j] < np.inf:
+                    path_len = dist[i, k] + dp_2step[k, j]
+                    if path_len < best:
+                        best = path_len
+            if best < np.inf:
+                dp_3step[i, j] = best
+    
+    # Compute 4-step paths using 3-step results (optional, for larger n)
+    if n >= 8:
+        for i in range(n):
+            for j in range(n):
+                if i == j or dp_3step[i, j] == np.inf:
+                    continue
+                best = np.inf
+                for k in neighbor_indices[i]:
+                    if k == i or k == j:
+                        continue
+                    if dp_3step[k, j] < np.inf:
+                        path_len = dist[i, k] + dp_3step[k, j]
+                        if path_len < best:
+                            best = path_len
+                if best < np.inf:
+                    dp_4step[i, j] = best
+    
+    # 4. Multi-step spatial lookahead with exponential decay
+    median_dist = np.median(dist[dist < np.inf])
+    scale = 2.0 * median_dist
+    alpha = 0.65  # Decay factor
+    
+    spatial_scores = np.zeros_like(dist)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            score = np.exp(-dist[i, j] / scale)
+            
+            # Add contributions from multi-step paths
+            if dp_2step[i, j] < np.inf:
+                score += alpha * np.exp(-dp_2step[i, j] / scale)
+            
+            if dp_3step[i, j] < np.inf:
+                score += alpha**2 * np.exp(-dp_3step[i, j] / scale)
+            
+            if n >= 8 and dp_4step[i, j] < np.inf:
+                score += alpha**3 * np.exp(-dp_4step[i, j] / scale)
+            
+            spatial_scores[i, j] = score
+    
+    # Normalize spatial scores
+    max_spatial = spatial_scores.max()
+    if max_spatial > 0:
+        spatial_scores = spatial_scores / max_spatial
+    
+    # 5. Harmonic centrality with local clustering
+    # Compute harmonic centrality
+    harmonic_centrality = np.zeros(n)
+    for i in range(n):
+        valid_dists = dist[i][dist[i] < np.inf]
+        if len(valid_dists) > 0:
+            harmonic_centrality[i] = np.sum(1.0 / (valid_dists + 1e-12))
+    
+    # Compute local clustering coefficient approximation
+    clustering_coeff = np.zeros(n)
+    for i in range(n):
+        neighbors = list(neighbor_sets[i])
+        if len(neighbors) >= 2:
+            triangles = 0
+            possible = len(neighbors) * (len(neighbors) - 1) / 2
+            for idx_a, a in enumerate(neighbors):
+                for b in neighbors[idx_a+1:]:
+                    if b in neighbor_sets[a]:
+                        triangles += 1
+            if possible > 0:
+                clustering_coeff[i] = triangles / possible
+    
+    # Combine centrality with clustering
+    centrality_scores = harmonic_centrality * (1.0 + 0.5 * clustering_coeff)
+    if centrality_scores.max() > 0:
+        centrality_scores = centrality_scores / centrality_scores.max()
+    
+    # 6. Multi-step regret analysis
+    regret_matrix = np.zeros_like(dist)
+    for i in range(n):
+        for j in range(n):
+            if i == j or dist[i, j] == np.inf:
+                continue
+            
+            # Find best alternative path (2 or 3 steps)
+            best_alt = np.inf
+            if dp_2step[i, j] < np.inf:
+                best_alt = min(best_alt, dp_2step[i, j])
+            if dp_3step[i, j] < np.inf:
+                best_alt = min(best_alt, dp_3step[i, j])
+            
+            if best_alt < np.inf:
+                # Regret: relative cost increase of using alternative
+                regret = (best_alt - dist[i, j]) / (dist[i, j] + 1e-12)
+                regret_matrix[i, j] = max(0, min(1.0, regret))
+            else:
+                # Critical edge with no good alternative
+                regret_matrix[i, j] = 1.0
+    
+    # 7. Local density estimation
+    k_density = min(6, n - 1)
+    density_weights = np.zeros(n)
+    for i in range(n):
+        # Get distances to k_density nearest neighbors
+        if n > k_density:
+            neighbor_dists = np.partition(dist[i], k_density)[:k_density+1]
+            neighbor_dists = neighbor_dists[neighbor_dists < np.inf]
+            if len(neighbor_dists) > 0:
+                density_weights[i] = 1.0 / np.mean(neighbor_dists)
+    
+    if density_weights.max() > 0:
+        density_weights = density_weights / density_weights.max()
+    
+    # 8. Adaptive component weighting
+    if n <= 10:
+        base_w, spatial_w, regret_w, centrality_w = 0.5, 0.25, 0.15, 0.1
+    elif n <= 30:
+        base_w, spatial_w, regret_w, centrality_w = 0.4, 0.3, 0.2, 0.1
+    elif n <= 100:
+        base_w, spatial_w, regret_w, centrality_w = 0.3, 0.35, 0.2, 0.15
+    else:
+        base_w, spatial_w, regret_w, centrality_w = 0.25, 0.4, 0.2, 0.15
+    
+    # 9. Combine all factors
+    heuristic_matrix = np.zeros_like(dist, dtype=np.float64)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dist[i, j] == np.inf:
+                continue
+            
+            # Base inverse distance component
+            base_score = base_w * inv_dist[i, j]
+            
+            # MST bonus (critical connectivity edges)
+            if mst_mask[i, j]:
+                base_score *= 2.0
+            
+            # Density factor
+            density_factor = 1.0 + 0.25 * (density_weights[i] + density_weights[j])
+            
+            # Spatial lookahead factor
+            spatial_factor = 1.0 + spatial_w * spatial_scores[i, j]
+            
+            # Regret factor (high regret = critical edge)
+            regret_factor = 1.0 + regret_w * regret_matrix[i, j]
+            
+            # Centrality factor (hub nodes get higher weight)
+            centrality_factor = 1.0 + centrality_w * (centrality_scores[i] + centrality_scores[j])
+            
+            # Combine all factors multiplicatively
+            heuristic_value = (base_score * density_factor * 
+                             spatial_factor * regret_factor * centrality_factor)
+            
+            heuristic_matrix[i, j] = heuristic_matrix[j, i] = heuristic_value
+    
+    # 10. Adaptive topological sparsification
+    # Keep edges based on combined score while preserving connectivity
+    min_conn = max(2, min(4, n // 5))
+    max_conn = min(15, n - 1)
+    
+    # Create initial mask
+    mask = np.zeros_like(heuristic_matrix, dtype=bool)
+    
+    for i in range(n):
+        row_scores = heuristic_matrix[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Determine connections based on centrality
+        conn_count = min_conn + int(centrality_scores[i] * (max_conn - min_conn))
+        conn_count = min(max(conn_count, min_conn), n - 1)
+        
+        if conn_count > 0:
+            # Get top connections
+            top_indices = np.argpartition(row_scores, -conn_count)[-conn_count:]
+            mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    mask = mask | mask.T
+    
+    # Ensure MST edges are always included
+    mask = mask | mst_mask
+    
+    # Apply mask
+    heuristic_matrix = np.where(mask, heuristic_matrix, 0)
+    
+    # Boost MST edges to ensure they stand out
+    if np.any(mst_mask):
+        mst_values = heuristic_matrix[mst_mask]
+        if len(mst_values) > 0:
+            target_value = np.percentile(heuristic_matrix[heuristic_matrix > 0], 85) if np.any(heuristic_matrix > 0) else 1.0
+            heuristic_matrix[mst_mask] = np.maximum(heuristic_matrix[mst_mask], target_value)
+    
+    # 11. Final adaptive thresholding
+    non_zero = heuristic_matrix[heuristic_matrix > 0]
+    if len(non_zero) > 0:
+        # Keep more edges for small problems, fewer for large ones
+        keep_pct = max(15, min(40, 500 // n))
+        threshold = np.percentile(non_zero, keep_pct)
+        heuristic_matrix[heuristic_matrix < threshold] = 0
+    
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    # 12. Normalization
+    max_val = heuristic_matrix.max()
+    if max_val > 0:
+        heuristic_matrix = heuristic_matrix / max_val
+    
+    return heuristic_matrix
+
+
+# Example usage
+if __name__ == "__main__":
+    # Test with random points
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero edges:", np.count_nonzero(heuristics))
+    print("Max heuristic value:", np.max(heuristics))
+    print("Matrix symmetric:", np.allclose(heuristics, heuristics.T))
+    
+    # Verify MST edges are prioritized
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_heuristics = heuristics[mst_mask]
+    print(f"MST edges have mean heuristic: {np.mean(mst_heuristics):.4f}")
+    print(f"All MST edges have non-zero heuristics: {np.all(mst_heuristics > 0)}")
+```

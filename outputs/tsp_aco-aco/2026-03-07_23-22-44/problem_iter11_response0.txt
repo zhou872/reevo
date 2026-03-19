@@ -1,0 +1,230 @@
+```json
+{
+    "algorithm_features": ["Spectral Clustering Affinity", "Local Density-Weighted Scoring", "Connectivity-Preserving Sparsification", "Fixed Weight Ensemble"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP heuristic with spectral clustering, local density weighting,
+    connectivity-preserving sparsification, and fixed weight ensemble.
+    
+    Core Features:
+    1. Spectral Clustering Affinity: Uses graph Laplacian and Fiedler vector to identify
+       natural clusters, assigning higher scores to edges within clusters.
+    2. Local Density-Weighted Scoring: Uses k-nearest neighbor density to weight inverse
+       distances, with geometric mean of endpoint densities.
+    3. Connectivity-Preserving Sparsification: Intelligently sparsifies while maintaining
+       MST edges and ensuring connectivity.
+    4. Fixed Weight Ensemble: Combines heuristic components with predetermined weights
+       (0.4 inverse distance, 0.3 spectral affinity, 0.3 density-weighted).
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. INVERSE DISTANCE ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ==================== 2. SPECTRAL CLUSTERING AFFINITY ====================
+    def spectral_affinity() -> np.ndarray:
+        """Compute edge affinity using spectral clustering principles"""
+        # Convert distances to similarities (higher values for closer nodes)
+        sigma = np.median(distance_matrix[distance_matrix > 0])
+        similarity = np.exp(-distance_matrix / (sigma + 1e-8))
+        np.fill_diagonal(similarity, 0)
+        
+        # Graph Laplacian
+        degree = np.sum(similarity, axis=1)
+        D = np.diag(degree)
+        laplacian = D - similarity
+        
+        # Compute eigenvalues/vectors (use smallest non-zero eigenvectors)
+        try:
+            # Use efficient eigensolver for larger matrices
+            eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
+        except np.linalg.LinAlgError:
+            # Fallback for ill-conditioned matrices
+            eigenvalues, eigenvectors = np.linalg.eig(laplacian)
+            eigenvalues = eigenvalues.real
+            eigenvectors = eigenvectors.real
+        
+        # Sort by eigenvalue magnitude
+        idx = np.argsort(np.abs(eigenvalues))
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+        
+        # Use Fiedler vector (second smallest eigenvalue)
+        # and optionally a few more eigenvectors for robustness
+        k = min(5, max(2, int(np.sqrt(n))))
+        spectral_embedding = eigenvectors[:, 1:k+1]
+        
+        # Compute edge scores based on spectral similarity
+        spectral_scores = np.ones_like(distance_matrix)
+        
+        for i in range(n):
+            vec_i = spectral_embedding[i]
+            norm_i = np.linalg.norm(vec_i) + 1e-8
+            
+            for j in range(i + 1, n):
+                # Cosine similarity in spectral space
+                vec_j = spectral_embedding[j]
+                norm_j = np.linalg.norm(vec_j) + 1e-8
+                similarity = np.dot(vec_i, vec_j) / (norm_i * norm_j)
+                
+                # Combine with distance-based decay
+                dist_norm = distance_matrix[i, j] / (sigma + 1e-8)
+                decay = np.exp(-dist_norm)
+                
+                # Higher score for similar nodes (within same cluster)
+                spectral_scores[i, j] = 1.0 + similarity * decay
+                spectral_scores[j, i] = spectral_scores[i, j]
+        
+        return spectral_scores
+    
+    spectral_scores = spectral_affinity()
+    
+    # ==================== 3. LOCAL DENSITY-WEIGHTED SCORING ====================
+    def density_weighted_scoring() -> np.ndarray:
+        """Compute density-weighted inverse distances"""
+        # Determine k for k-nearest neighbors
+        k = max(3, min(10, n // 10))
+        
+        # Compute local density for each node
+        densities = np.zeros(n)
+        for i in range(n):
+            # Get distances to all other nodes
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            
+            # Get k smallest distances (nearest neighbors)
+            k_smallest = np.partition(dists, k-1)[:k]
+            k_smallest = k_smallest[k_smallest < np.inf]
+            
+            if len(k_smallest) > 0:
+                # Density is inverse of average distance to k-nearest neighbors
+                densities[i] = 1.0 / (np.mean(k_smallest) + 1e-8)
+        
+        # Normalize densities
+        if np.max(densities) > 0:
+            densities = densities / np.max(densities)
+        
+        # Create density-weighted scores
+        density_scores = np.zeros_like(distance_matrix)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Geometric mean of endpoint densities
+                geo_mean = np.sqrt(densities[i] * densities[j] + 1e-8)
+                
+                # Weight inverse distance by density
+                density_scores[i, j] = inv_dist[i, j] * geo_mean
+                density_scores[j, i] = density_scores[i, j]
+        
+        return density_scores
+    
+    density_scores = density_weighted_scoring()
+    
+    # ==================== 4. FIXED WEIGHT ENSEMBLE ====================
+    # Normalize each component to [0, 1]
+    def normalize_matrix(mat: np.ndarray) -> np.ndarray:
+        """Normalize matrix to [0, 1] range"""
+        max_val = np.max(mat)
+        if max_val > 0:
+            return mat / max_val
+        return mat
+    
+    inv_dist_norm = normalize_matrix(inv_dist)
+    spectral_norm = normalize_matrix(spectral_scores)
+    density_norm = normalize_matrix(density_scores)
+    
+    # Fixed weight combination
+    # Weights: 0.4 inverse distance, 0.3 spectral affinity, 0.3 density-weighted
+    w_inv, w_spec, w_dens = 0.4, 0.3, 0.3
+    combined = (w_inv * inv_dist_norm + 
+                w_spec * spectral_norm + 
+                w_dens * density_norm)
+    
+    # ==================== 5. CONNECTIVITY-PRESERVING SPARSIFICATION ====================
+    def connectivity_preserving_sparsify(scores: np.ndarray) -> np.ndarray:
+        """Sparsify while preserving connectivity via MST"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges for connectivity
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst > 0) | (mst.T > 0)
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine adaptive degree limit
+        if n <= 10:
+            max_degree = 4
+        elif n <= 50:
+            max_degree = min(5, n // 4)
+        else:
+            max_degree = min(6, n // 5)
+        
+        current_degree = np.sum(sparsified > 0, axis=1)
+        
+        # Collect candidate edges (excluding MST edges)
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    # Apply distance-based penalty to prefer shorter edges
+                    median_dist = np.median(distance_matrix[distance_matrix > 0])
+                    dist_penalty = np.exp(-distance_matrix[i, j] / (2 * median_dist))
+                    effective_score = scores[i, j] * dist_penalty
+                    candidates.append((effective_score, i, j))
+        
+        # Sort candidates by effective score
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Greedy selection with degree constraints
+        for score, i, j in candidates:
+            if current_degree[i] < max_degree and current_degree[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[j, i]
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparsified
+    
+    sparsified = connectivity_preserving_sparsify(combined)
+    
+    # ==================== 6. FINAL PROCESSING ====================
+    # Apply final distance-based attenuation
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        # Stronger attenuation for longer distances
+        dist_decay = np.exp(-distance_matrix / (0.5 * max_dist + 1e-8))
+        sparsified *= dist_decay
+    
+    # Ensure symmetry
+    sparsified = (sparsified + sparsified.T) / 2
+    
+    # Normalize to [0, 1]
+    max_score = np.max(sparsified)
+    if max_score > 0:
+        sparsified = sparsified / max_score
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

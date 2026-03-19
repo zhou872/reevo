@@ -1,0 +1,208 @@
+```json
+{
+    "algorithm_features": ["Ensemble Weighting", "Lightweight Statistics", "Stochastic Sparsification", "Online Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection with ensemble-based feature 
+    weighting and online performance adaptation.
+    
+    Features:
+    1. Reciprocal distance (inverse edge weight)
+    2. Node centrality via inverse distance aggregation
+    3. Minimum spanning tree indicator
+    4. Ensemble weighting with performance tracking
+    5. Adaptive stochastic sparsification with online learning
+    
+    Returns: Heuristic matrix of same shape as input, suitable for stochastic sampling
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        result = np.zeros_like(distance_matrix)
+        if n == 2:
+            result[0, 1] = result[1, 0] = 1.0
+        return result
+    
+    # Track performance for online adaptation
+    # We'll maintain simple statistics on feature effectiveness
+    performance_stats = {
+        'reciprocal_score': 0.5,
+        'centrality_score': 0.5,
+        'mst_score': 0.5,
+        'update_count': 0
+    }
+    
+    # 1. Compute instance characteristics
+    mask = ~np.eye(n, dtype=bool)
+    distances = distance_matrix[mask]
+    if len(distances) == 0:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv_dist = std_dist / (mean_dist + 1e-10)
+    
+    # 2. Feature 1: Reciprocal distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # Normalize reciprocal per row for better scaling
+    row_max = reciprocal.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    reciprocal = reciprocal / row_max
+    
+    # 3. Feature 2: Node centrality with instance adaptation
+    centrality = np.zeros(n)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        # Adaptive aggregation based on instance statistics
+        if cv_dist > 1.0:
+            # For variable distances, emphasize closer nodes more
+            centrality[i] = np.sum(np.exp(-row / (mean_dist + 1e-10)))
+        else:
+            centrality[i] = np.sum(1 / (1 + row))
+    
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    centrality_matrix = np.outer(centrality, centrality)
+    centrality_matrix = centrality_matrix * reciprocal  # Weight by distance
+    
+    # 4. Feature 3: MST indicator with structural enhancement
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_indicator = (mst > 0).astype(float)
+        
+        # Enhance MST edges with local structural information
+        for i in range(n):
+            mst_neighbors = np.where(mst_indicator[i] > 0)[0]
+            if len(mst_neighbors) > 0:
+                # Boost edges that connect to nodes with high centrality
+                neighbor_centrality = centrality[mst_neighbors].mean()
+                enhancement = 1 + centrality[i] * neighbor_centrality
+                mst_indicator[i, mst_neighbors] *= enhancement
+    except Exception:
+        mst_indicator = np.zeros_like(distance_matrix)
+    
+    # 5. Ensemble weighting with online adaptation
+    # Base weights from instance characteristics
+    size_factor = min(1.0, np.log1p(n) / np.log1p(100))
+    
+    if cv_dist > 1.0:
+        base_weights = np.array([0.3, 0.4, 0.3])  # Emphasize structural features
+    elif cv_dist < 0.3:
+        base_weights = np.array([0.6, 0.3, 0.1])  # Emphasize local proximity
+    else:
+        base_weights = np.array([0.5 - 0.1*size_factor, 
+                                 0.3 + 0.1*size_factor, 
+                                 0.2])
+    
+    # Blend with performance-based weights
+    perf_weights = np.array([
+        performance_stats['reciprocal_score'],
+        performance_stats['centrality_score'],
+        performance_stats['mst_score']
+    ])
+    perf_weights = perf_weights / (perf_weights.sum() + 1e-10)
+    
+    # Adaptive blending: more weight to performance as we gather data
+    blend_factor = min(0.7, performance_stats['update_count'] / 100.0)
+    weights = (1 - blend_factor) * base_weights + blend_factor * perf_weights
+    weights = weights / weights.sum()
+    
+    # 6. Combine features with ensemble weights
+    combined = (weights[0] * reciprocal + 
+                weights[1] * centrality_matrix + 
+                weights[2] * mst_indicator)
+    
+    # 7. Adaptive stochastic sparsification
+    sparsified = np.zeros_like(combined)
+    
+    # Dynamic edge retention based on instance and performance
+    base_k = max(2, int(np.sqrt(n) * (1 + 0.5 * cv_dist)))
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Determine k adaptively
+        row_mean = np.mean(row[row > -np.inf])
+        row_std = np.std(row[row > -np.inf])
+        if row_std > 0:
+            variability = row_std / (row_mean + 1e-10)
+            k = int(base_k * (1 + 0.5 * min(1.0, variability)))
+        else:
+            k = base_k
+        
+        k = min(max(2, k), n - 1)
+        
+        # Stochastic edge selection with quality-proportional probability
+        if k < n - 1:
+            # Convert to probabilities for sampling
+            row_probs = np.exp(row - np.max(row))
+            row_probs[i] = 0
+            row_probs = row_probs / (row_probs.sum() + 1e-10)
+            
+            # Sample edges with probability proportional to quality
+            # but ensure at least k edges
+            sample_indices = np.random.choice(n, size=k*2, p=row_probs, replace=False)
+            # Take unique indices and limit to k
+            sample_indices = np.unique(sample_indices)[:k]
+        else:
+            sample_indices = np.arange(n)
+            sample_indices = sample_indices[sample_indices != i]
+        
+        # Apply exponential decay based on rank in sampled edges
+        sorted_indices = sample_indices[np.argsort(row[sample_indices])[::-1]]
+        for rank, j in enumerate(sorted_indices):
+            decay = np.exp(-rank / max(1, k/2))
+            # Add small adaptive noise
+            noise = 1 + 0.1 * np.random.randn() * (1 - blend_factor)
+            noise = np.clip(noise, 0.8, 1.2)
+            sparsified[i, j] = combined[i, j] * decay * noise
+    
+    # 8. Symmetrization and final processing
+    symmetric = (sparsified + sparsified.T) / 2
+    
+    # Apply small instance-adaptive smoothing
+    smoothing = 0.01 / (1 + size_factor + cv_dist)
+    symmetric = symmetric * (1 - smoothing) + np.mean(symmetric) * smoothing
+    
+    symmetric = np.maximum(symmetric, 0)
+    
+    # Row normalization for stochastic sampling
+    row_sums = symmetric.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    symmetric = symmetric / row_sums
+    
+    np.fill_diagonal(symmetric, 0)
+    
+    # 9. Optional: Update performance statistics (simulated)
+    # In a real implementation, this would be updated based on actual solution quality
+    # For now, we use a simple heuristic: features that contribute more to high-value edges
+    if performance_stats['update_count'] < 1000:  # Limit updates
+        high_value_mask = symmetric > np.percentile(symmetric[symmetric > 0], 75)
+        if np.sum(high_value_mask) > 0:
+            # Estimate contribution of each feature to high-value edges
+            for idx, feature in enumerate([reciprocal, centrality_matrix, mst_indicator]):
+                contribution = np.mean(feature[high_value_mask])
+                # Update performance score with exponential moving average
+                alpha = 0.1
+                key = ['reciprocal_score', 'centrality_score', 'mst_score'][idx]
+                old_score = performance_stats[key]
+                performance_stats[key] = (1 - alpha) * old_score + alpha * contribution
+        
+        performance_stats['update_count'] += 1
+    
+    return symmetric
+```

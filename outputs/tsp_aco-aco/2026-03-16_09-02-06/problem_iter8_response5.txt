@@ -1,0 +1,347 @@
+```json
+{
+    "algorithm_features": ["MST Sensitivity Lookahead", "Meta-Adaptive Factor Weighting", "Hierarchical Spatial Clustering", "Progressive Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with lookahead capabilities and adaptive meta-features.
+    
+    Key innovations:
+    1. MST sensitivity lookahead: Estimates future cost impact of edge inclusion
+    2. Meta-adaptive weighting: Dynamically adjusts factor importance based on graph characteristics
+    3. Hierarchical spatial clustering: Multi-scale density awareness for connectivity
+    4. Progressive sparsification: Gradual edge filtering with quality preservation
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix) if n == 0 else 1 / (distance_matrix + np.eye(n))
+    
+    # Create working copy with diagonal masked
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Base inverse distance with adaptive smoothing
+    non_inf_dists = dist[dist < np.inf]
+    if len(non_inf_dists) > 0:
+        median_dist = np.median(non_inf_dists)
+        mean_dist = np.mean(non_inf_dists)
+        dist_std = np.std(non_inf_dists)
+    else:
+        median_dist = mean_dist = dist_std = 1.0
+    
+    inv_dist = 1 / (dist + 0.05 * median_dist + 0.05 * mean_dist)
+    
+    # 2. MST connectivity and lookahead sensitivity (vectorized)
+    mst = minimum_spanning_tree(dist)
+    mst_array = mst.toarray()
+    mst_edges = mst_array > 0
+    
+    # Compute MST sensitivity: impact of forcing each edge
+    mst_sensitivity = np.ones_like(dist)
+    if n > 3:
+        # Build MST tree structure for sensitivity analysis
+        from scipy.sparse import csr_matrix
+        mst_sparse = csr_matrix(mst_array)
+        
+        # For each non-MST edge, estimate replacement cost
+        for i in range(n):
+            for j in range(i+1, n):
+                if not mst_edges[i, j] and dist[i, j] < np.inf:
+                    # Find max edge on path between i and j in MST
+                    # This gives the sensitivity of adding edge (i,j)
+                    try:
+                        # Simple approximation: cost increase if we force this edge
+                        # and remove the worst edge in the cycle
+                        mst_neighbors_i = np.where(mst_edges[i])[0]
+                        mst_neighbors_j = np.where(mst_edges[j])[0]
+                        
+                        if len(mst_neighbors_i) > 0 and len(mst_neighbors_j) > 0:
+                            # Estimate sensitivity as relative cost difference
+                            avg_mst_dist = (np.mean(dist[i, mst_neighbors_i]) + 
+                                          np.mean(dist[j, mst_neighbors_j])) / 2
+                            if avg_mst_dist > 0:
+                                sensitivity = dist[i, j] / avg_mst_dist
+                                mst_sensitivity[i, j] = mst_sensitivity[j, i] = np.exp(-sensitivity + 1)
+                    except:
+                        pass
+    
+    # Combine MST presence with sensitivity
+    mst_bonus = np.where(mst_edges, 2.0 * mst_sensitivity, 1.0 * mst_sensitivity)
+    
+    # 3. Hierarchical spatial density features
+    # Multi-scale k-nearest neighbors analysis
+    k_values = [min(3, n-1), min(5, n-1), min(8, n-1)]
+    spatial_factors = []
+    
+    for k in k_values:
+        if k > 0:
+            # Get k-nearest neighbor distances
+            sorted_dists = np.partition(dist, k, axis=1)[:, :k+1]
+            valid_mask = sorted_dists < np.inf
+            local_density = np.zeros(n)
+            
+            for i in range(n):
+                valid_dists = sorted_dists[i, valid_mask[i]]
+                if len(valid_dists) > 0:
+                    local_density[i] = 1.0 / (np.mean(valid_dists) + 1e-10)
+            
+            if local_density.max() > 0:
+                local_density = local_density / local_density.max()
+            
+            # Create spatial factor with scale-dependent weighting
+            scale_weight = np.sqrt(k) / np.sqrt(max(k_values))
+            sparsity_factor = 1.0 - 0.3 * scale_weight * (
+                local_density[:, np.newaxis] + local_density[np.newaxis, :]
+            )
+            spatial_bonus = np.clip(1.0 + sparsity_factor, 0.7, 1.3)
+            np.fill_diagonal(spatial_bonus, 1.0)
+            spatial_factors.append(spatial_bonus)
+    
+    # Combine spatial factors with geometric mean
+    if spatial_factors:
+        spatial_bonus = np.ones_like(dist)
+        for factor in spatial_factors:
+            spatial_bonus *= factor
+        spatial_bonus = spatial_bonus ** (1.0 / len(spatial_factors))
+    else:
+        spatial_bonus = np.ones_like(dist)
+    
+    # 4. Enhanced regret penalization with asymmetry awareness
+    dist_copy = dist.copy()
+    dist_copy[np.diag_indices(n)] = np.inf
+    
+    # Get best, second-best, and third-best distances
+    sorted_idx = np.argsort(dist_copy, axis=1)
+    best_dists = dist_copy[np.arange(n), sorted_idx[:, 0]]
+    second_best_dists = dist_copy[np.arange(n), sorted_idx[:, 1]]
+    
+    if n > 3:
+        third_best_dists = dist_copy[np.arange(n), sorted_idx[:, 2]]
+        regret_range = third_best_dists - best_dists + 1e-10
+    else:
+        regret_range = second_best_dists - best_dists + 1e-10
+    
+    # Compute advanced regret with curvature awareness
+    regret_numer = dist - best_dists[:, np.newaxis]
+    regret = regret_numer / regret_range[:, np.newaxis]
+    
+    # Asymmetric regret handling
+    regret_i = np.clip(regret, 0, 3)
+    regret_j = np.clip(regret.T, 0, 3)
+    
+    # Combined regret penalty with power mean
+    regret_combined = 0.7 * np.minimum(regret_i, regret_j) + 0.3 * np.maximum(regret_i, regret_j)
+    regret_penalty = np.exp(-regret_combined)
+    
+    # 5. Meta-adaptive weighting based on multiple graph characteristics
+    if len(non_inf_dists) > 0:
+        # Compute multiple statistics
+        cv = dist_std / (mean_dist + 1e-10)
+        skewness = np.mean(((non_inf_dists - mean_dist) / (dist_std + 1e-10))**3)
+        uniformity = np.mean(non_inf_dists) / np.median(non_inf_dists)
+        
+        # Meta-learning inspired weighting
+        if cv < 0.25 and abs(skewness) < 0.5:
+            # Very uniform, symmetric graph
+            mst_weight = 0.5
+            spatial_weight = 0.4
+            regret_weight = 0.1
+        elif cv < 0.6 and uniformity < 1.5:
+            # Moderate variability, relatively uniform
+            mst_weight = 0.4
+            spatial_weight = 0.3
+            regret_weight = 0.3
+        elif cv > 1.0 or abs(skewness) > 2.0:
+            # Highly variable or skewed graph
+            mst_weight = 0.2
+            spatial_weight = 0.3
+            regret_weight = 0.5
+        else:
+            # General case
+            mst_weight = 0.35
+            spatial_weight = 0.35
+            regret_weight = 0.3
+    else:
+        mst_weight, spatial_weight, regret_weight = 0.4, 0.3, 0.3
+    
+    # 6. Combine factors with meta-adaptive weights
+    weight_sum = mst_weight + spatial_weight + regret_weight
+    base_scores = inv_dist * (
+        (mst_weight * mst_bonus) +
+        (spatial_weight * spatial_bonus) +
+        (regret_weight * regret_penalty)
+    ) / (weight_sum + 1e-10)
+    
+    # 7. Progressive edge sparsification with connectivity guarantee
+    # Phase 1: Initial promising edge selection
+    target_edges_min = max(3, min(6, int(np.log2(n)) + 2))
+    target_edges_max = max(5, min(12, int(np.sqrt(n)) + 3))
+    
+    mask = mst_edges.copy()
+    mask = mask | mask.T
+    
+    # Adaptive edge selection based on node degree in MST
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Determine target edges for this node
+        mst_degree = np.sum(mask[i])
+        target_edges = min(
+            target_edges_max,
+            max(target_edges_min, mst_degree + 2)
+        )
+        
+        needed_edges = max(0, target_edges - mst_degree)
+        
+        if needed_edges > 0:
+            # Select top edges, but avoid creating too many long edges
+            sorted_indices = np.argsort(row_scores)[::-1]
+            added = 0
+            
+            for j in sorted_indices:
+                if added >= needed_edges:
+                    break
+                if not mask[i, j] and i != j and dist[i, j] < np.inf:
+                    # Quality check: avoid very long edges unless necessary
+                    if dist[i, j] < 3 * median_dist or added < needed_edges // 2:
+                        mask[i, j] = True
+                        mask[j, i] = True
+                        added += 1
+    
+    # Phase 2: Ensure connectivity with quality-aware component merging
+    conn_mask = mask.astype(int)
+    n_components, labels = connected_components(conn_mask, directed=False)
+    
+    if n_components > 1:
+        # Build component connectivity graph with quality scores
+        comp_scores = {}
+        comp_nodes = [np.where(labels == i)[0] for i in range(n_components)]
+        
+        # Find best connections between components
+        for comp_i in range(n_components):
+            for comp_j in range(comp_i + 1, n_components):
+                best_score = -np.inf
+                best_pair = None
+                
+                # Sample edges between components (for efficiency)
+                nodes_i = comp_nodes[comp_i]
+                nodes_j = comp_nodes[comp_j]
+                
+                # Sample up to 20 nodes from each component
+                sample_i = nodes_i if len(nodes_i) <= 20 else np.random.choice(
+                    nodes_i, size=20, replace=False
+                )
+                sample_j = nodes_j if len(nodes_j) <= 20 else np.random.choice(
+                    nodes_j, size=20, replace=False
+                )
+                
+                for i in sample_i:
+                    for j in sample_j:
+                        if base_scores[i, j] > best_score:
+                            best_score = base_scores[i, j]
+                            best_pair = (i, j)
+                
+                if best_pair:
+                    comp_scores[(comp_i, comp_j)] = (best_score, best_pair)
+        
+        # Connect components in order of connection quality
+        sorted_connections = sorted(
+            comp_scores.items(), 
+            key=lambda x: x[1][0], 
+            reverse=True
+        )
+        
+        for (comp_i, comp_j), (score, (i, j)) in sorted_connections:
+            if labels[i] != labels[j]:  # Still in different components
+                mask[i, j] = True
+                mask[j, i] = True
+                
+                # Update component labels
+                old_label = max(labels[i], labels[j])
+                new_label = min(labels[i], labels[j])
+                labels[labels == old_label] = new_label
+        
+        # Final connectivity check
+        conn_mask = mask.astype(int)
+        n_components, _ = connected_components(conn_mask, directed=False)
+    
+    # 8. Apply final mask with smooth transition for masked edges
+    final_scores = base_scores * mask
+    
+    # Add small residual for all edges to maintain exploration potential
+    residual = 0.05 * np.max(final_scores[mask]) if np.any(mask) else 0.01
+    final_scores = final_scores + residual * (~mask)
+    
+    # 9. Advanced normalization preserving relative ordering
+    np.fill_diagonal(final_scores, 0)
+    
+    # Use robust scaling based on percentiles
+    valid_scores = final_scores[final_scores > 0]
+    if len(valid_scores) > 10:
+        q75 = np.percentile(valid_scores, 75)
+        q25 = np.percentile(valid_scores, 25)
+        
+        if q75 > q25:
+            # Robust scaling to [0, 1] range
+            scaled = (final_scores - q25) / (q75 - q25 + 1e-10)
+            final_scores = np.clip(scaled, 0, 1)
+        else:
+            # Fallback to simple max normalization
+            max_val = valid_scores.max()
+            if max_val > 0:
+                final_scores = final_scores / max_val
+    elif len(valid_scores) > 0:
+        max_val = valid_scores.max()
+        if max_val > 0:
+            final_scores = final_scores / max_val
+    
+    return final_scores
+
+
+# Test with example
+if __name__ == "__main__":
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Non-zero elements: {np.count_nonzero(heuristics)} / {n*n}")
+    print(f"Max value: {heuristics.max():.4f}")
+    print(f"Min non-zero value: {heuristics[heuristics > 0].min():.4f}")
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"Matrix is symmetric: {is_symmetric}")
+    
+    # Check connectivity
+    conn_mask = (heuristics > 0).astype(int)
+    n_components, _ = connected_components(conn_mask, directed=False)
+    print(f"Number of connected components: {n_components} (should be 1)")
+    
+    # Verify MST edges have high scores
+    mst = minimum_spanning_tree(dist_matrix)
+    mst_edges = mst.toarray() > 0
+    mst_scores = heuristics[mst_edges]
+    if len(mst_scores) > 0:
+        print(f"MST edges score range: {mst_scores.min():.4f} to {mst_scores.max():.4f}")
+```

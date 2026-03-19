@@ -1,0 +1,240 @@
+```json
+{
+    "algorithm_features": ["Adaptive Lookahead Depth", "Multiplicative Factor Fusion", "Dynamic Regret Thresholds", "Local Density Scaling"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from sklearn.manifold import MDS
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with adaptive components.
+    
+    Features:
+    1. Adaptive lookahead depth based on local connectivity structure
+    2. Multiplicative fusion of complementary factors
+    3. Dynamic regret thresholds using edge centrality
+    4. Local density scaling based on spatial distribution
+    
+    Returns a priority matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base inverse distance (closer is better)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    inv_dist = 1.0 / safe_dist
+    
+    # 2. Adaptive lookahead scoring with depth based on local structure
+    lookahead_scores = np.zeros_like(distance_matrix)
+    
+    # Determine optimal lookahead depth for each node based on its distance distribution
+    lookahead_depths = np.zeros(n, dtype=int)
+    for i in range(n):
+        # Compute distance quartiles to assess local structure
+        dists = safe_dist[i].copy()
+        q1, q3 = np.percentile(dists, [25, 75])
+        iqr = q3 - q1
+        
+        if iqr < np.median(dists) * 0.2:  # Uniform distribution
+            lookahead_depths[i] = min(3, n-1)
+        elif iqr < np.median(dists) * 0.5:  # Moderate variation
+            lookahead_depths[i] = min(5, n-1)
+        else:  # High variation
+            lookahead_depths[i] = min(8, n-1)
+    
+    # Compute adaptive lookahead scores
+    for i in range(n):
+        depth_i = lookahead_depths[i]
+        if depth_i == 0:
+            continue
+            
+        # Get i's nearest neighbors (excluding self)
+        neighbors_i = np.argsort(safe_dist[i])[1:depth_i+1]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            depth_j = lookahead_depths[j]
+            if depth_j == 0:
+                lookahead_scores[i, j] = inv_dist[i, j]
+                continue
+            
+            # Get j's nearest neighbors (excluding self and i)
+            neighbors_j = np.argsort(safe_dist[j])[1:depth_j+1]
+            neighbors_j = [nj for nj in neighbors_j if nj != i][:depth_j]
+            
+            # Compute two-step connectivity score
+            two_step_score = inv_dist[i, j]
+            
+            # Consider i's best alternative connection
+            if len(neighbors_i) > 0:
+                alt_i = neighbors_i[0] if neighbors_i[0] != j else (neighbors_i[1] if len(neighbors_i) > 1 else i)
+                two_step_score += 0.2 * inv_dist[i, alt_i]
+            
+            # Consider j's best alternative connection
+            if len(neighbors_j) > 0:
+                alt_j = neighbors_j[0]
+                two_step_score += 0.2 * inv_dist[j, alt_j]
+            
+            # Bonus if i and j share common neighbors
+            common_neighbors = set(neighbors_i) & set(neighbors_j)
+            if common_neighbors:
+                two_step_score += 0.1 * len(common_neighbors)
+            
+            lookahead_scores[i, j] = two_step_score
+    
+    # 3. Dynamic regret-based penalty with edge centrality consideration
+    regret_penalty = np.ones_like(distance_matrix)
+    
+    # Compute edge centrality (how central each edge is in the nearest neighbor graph)
+    edge_centrality = np.zeros_like(distance_matrix)
+    for i in range(n):
+        k = min(5, n-1)
+        nearest = np.argsort(safe_dist[i])[1:k+1]
+        for j in nearest:
+            edge_centrality[i, j] += 1
+    
+    # Symmetrize centrality
+    edge_centrality = (edge_centrality + edge_centrality.T) / 2
+    
+    for i in range(n):
+        # Sort edges by quality
+        sorted_indices = np.argsort(inv_dist[i])[::-1]
+        valid_indices = [idx for idx in sorted_indices if idx != i]
+        
+        if len(valid_indices) >= 3:
+            # Dynamic threshold based on edge centrality
+            high_centrality = edge_centrality[i] > np.percentile(edge_centrality[i], 75)
+            
+            # Different treatment for high vs low centrality edges
+            for rank, j in enumerate(valid_indices):
+                if i != j:
+                    # High centrality edges get more lenient treatment
+                    if high_centrality[j]:
+                        threshold_rank = int(0.4 * len(valid_indices))
+                    else:
+                        threshold_rank = int(0.25 * len(valid_indices))
+                    
+                    if rank > threshold_rank:
+                        # Also check if this edge is equally bad for j
+                        j_rank = np.where(np.argsort(inv_dist[j])[::-1] == i)[0][0]
+                        j_threshold = int(0.3 * (n-1))
+                        
+                        if j_rank > j_threshold:
+                            # Apply graduated penalty based on how far beyond threshold
+                            penalty = max(0.05, 1.0 - (rank - threshold_rank) / len(valid_indices))
+                            regret_penalty[i, j] = penalty
+    
+    # 4. Enhanced cluster density with local scaling
+    density_bonus = np.ones_like(distance_matrix)
+    
+    try:
+        # Use MDS to get approximate coordinates from distance matrix
+        mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
+        coords = mds.fit_transform(distance_matrix)
+        
+        # Build KDTree for efficient spatial queries
+        tree = KDTree(coords)
+        
+        # Adaptive radius based on local density
+        local_radii = np.zeros(n)
+        for i in range(n):
+            # Find distance to 5th nearest neighbor
+            if n > 5:
+                dists, _ = tree.query(coords[i], k=6)
+                local_radii[i] = dists[-1]
+            else:
+                local_radii[i] = np.median(distance_matrix[i])
+        
+        # Compute local density scores
+        density_scores = np.zeros(n)
+        for i in range(n):
+            neighbors = tree.query_ball_point(coords[i], r=local_radii[i])
+            density_scores[i] = len(neighbors) / n
+        
+        # Apply density bonus with local normalization
+        max_density = np.max(density_scores)
+        min_density = np.min(density_scores)
+        
+        if max_density > min_density:
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        # Bonus based on geometric mean of local densities
+                        geo_mean_density = np.sqrt(density_scores[i] * density_scores[j])
+                        normalized_density = (geo_mean_density - min_density) / (max_density - min_density)
+                        density_bonus[i, j] = 1.0 + 0.6 * normalized_density
+    
+    except Exception:
+        # Fallback: use distance-based density estimation
+        for i in range(n):
+            k = min(10, n-1)
+            dists = np.sort(safe_dist[i])[:k]
+            avg_local_dist = np.mean(dists)
+            
+            for j in range(n):
+                if i != j:
+                    # Bonus inversely proportional to average distance ratio
+                    ratio = distance_matrix[i, j] / (avg_local_dist + 1e-10)
+                    density_bonus[i, j] = 1.0 + 0.3 * np.exp(-ratio)
+    
+    # 5. Multiplicative factor fusion with learned weights
+    # Weights optimized for complementary information
+    priority = (
+        inv_dist ** 0.4 *          # Base distance factor
+        lookahead_scores ** 0.3 *  # Adaptive lookahead
+        regret_penalty ** 0.2 *    # Dynamic regret penalty
+        density_bonus ** 0.1       # Local density
+    )
+    
+    # 6. Intelligent sparsification with adaptive thresholds
+    sparse_priority = np.zeros_like(priority)
+    
+    for i in range(n):
+        row = priority[i].copy()
+        row[i] = -np.inf
+        
+        # Determine sparsification level based on node's connectivity pattern
+        if lookahead_depths[i] < 4:  # Uniform/structured neighborhood
+            keep_ratio = 0.4
+        else:  # Variable neighborhood
+            keep_ratio = 0.25
+        
+        # Calculate adaptive threshold
+        n_valid = np.sum(row > -np.inf)
+        if n_valid > 0:
+            # Keep top k edges
+            k_keep = max(2, int(keep_ratio * n_valid))
+            sorted_vals = np.sort(row[row > -np.inf])[::-1]
+            if k_keep <= len(sorted_vals):
+                threshold = sorted_vals[k_keep-1]
+            else:
+                threshold = sorted_vals[-1] if len(sorted_vals) > 0 else 0
+            
+            # Apply threshold
+            mask = row >= threshold
+            sparse_priority[i, mask] = row[mask]
+    
+    # 7. Final symmetrization and cleanup
+    # Keep edge if promising for at least one endpoint
+    sparse_priority = np.maximum(sparse_priority, sparse_priority.T)
+    
+    # Ensure non-negativity
+    sparse_priority = np.maximum(sparse_priority, 0)
+    np.fill_diagonal(sparse_priority, 0)
+    
+    # Normalize for consistent scale
+    max_val = np.max(sparse_priority)
+    if max_val > 0:
+        sparse_priority = sparse_priority / max_val
+    
+    return sparse_priority
+```

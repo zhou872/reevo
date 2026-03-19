@@ -1,0 +1,190 @@
+```json
+{
+    "algorithm_features": ["Dynamic k-Nearest Neighbors with Cluster Detection", "Two-step Path Lookahead Efficiency", "Spatial Harmonic Averaging with Adaptive Density", "Regret-Normalized Edge Boosting"]
+}
+```
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection with dynamic k-neighbor selection,
+    path-based lookahead, and cluster-aware scoring.
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix with non-negative entries
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance heuristic ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Dynamic k-neighbor selection via cluster detection ===
+    # Compute local density for each node
+    dist_with_inf = distance_matrix.copy()
+    np.fill_diagonal(dist_with_inf, np.inf)
+    
+    # Get nearest neighbor distances
+    first_nn_dist = np.min(dist_with_inf, axis=1)
+    avg_nn_dist = np.mean(first_nn_dist)
+    
+    # Adaptive k based on local density and global statistics
+    density_factor = first_nn_dist / (avg_nn_dist + epsilon)
+    base_k = int(np.clip(np.sqrt(n), 5, 15))
+    
+    # Dynamic k_i for each node: more neighbors for sparse regions
+    k_per_node = np.clip(
+        base_k * (1.5 - 0.5 * np.tanh(density_factor - 1)),
+        3, n - 1
+    ).astype(int)
+    
+    # === 3. Enhanced regret calculation with dynamic k ===
+    # Sort distances for each node
+    sorted_indices = np.argsort(dist_with_inf, axis=1)
+    sorted_distances = np.take_along_axis(dist_with_inf, sorted_indices, axis=1)
+    
+    # Compute regret relative to best alternative paths
+    best_dists = sorted_distances[:, 0]
+    second_best_dists = sorted_distances[:, 1]
+    
+    # Normalized regret that considers local competition
+    regret_i = (second_best_dists - best_dists) / (best_dists + epsilon)
+    regret_matrix = 0.5 * (regret_i[:, np.newaxis] + regret_i[np.newaxis, :])
+    
+    # === 4. Spatial harmonic averaging with adaptive neighborhood ===
+    spatial_scores = np.ones_like(distance_matrix)
+    for i in range(n):
+        k_i = k_per_node[i]
+        if k_i > 0:
+            # Harmonic mean of distances to k_i nearest neighbors
+            nn_dists_i = sorted_distances[i, :k_i]
+            if np.any(nn_dists_i > 0):
+                harmonic_i = k_i / np.sum(1 / (nn_dists_i + epsilon))
+                # Influence decays with distance
+                for j in range(n):
+                    if i != j:
+                        decay = np.exp(-distance_matrix[i, j] / (2 * harmonic_i + epsilon))
+                        spatial_scores[i, j] *= decay
+    
+    np.fill_diagonal(spatial_scores, 0)
+    
+    # === 5. Two-step path lookahead efficiency ===
+    two_step_factor = np.ones_like(distance_matrix)
+    for i in range(n):
+        k_i = min(k_per_node[i] * 2, n - 2)
+        if k_i > 0:
+            # Consider k_i nearest neighbors as intermediate nodes
+            candidates = sorted_indices[i, 1:k_i+1]
+            for j in range(n):
+                if i != j:
+                    # Find best two-step path i->k->j
+                    best_two_step = np.inf
+                    for k in candidates:
+                        if k != j:
+                            two_step_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                            if two_step_cost < best_two_step:
+                                best_two_step = two_step_cost
+                    
+                    if best_two_step < np.inf:
+                        # Efficiency ratio: direct vs best two-step
+                        ratio = distance_matrix[i, j] / (best_two_step + epsilon)
+                        # Penalize edges with inefficient two-step alternatives
+                        two_step_factor[i, j] = np.exp(-max(0, ratio - 1))
+    
+    # === 6. Mutual nearest neighbors with dynamic thresholds ===
+    mnn_boost = np.zeros_like(distance_matrix)
+    for i in range(n):
+        k_i = k_per_node[i]
+        if k_i > 0:
+            nn_i = set(sorted_indices[i, :k_i])
+            for j in nn_i:
+                if j < n and i != j:
+                    k_j = k_per_node[j]
+                    if k_j > 0:
+                        nn_j = set(sorted_indices[j, :k_j])
+                        if i in nn_j:
+                            # Stronger boost for mutually close nodes
+                            closeness = 1.0 / (distance_matrix[i, j] + epsilon)
+                            mnn_boost[i, j] = 1.5 * closeness * (1.0 + regret_matrix[i, j])
+    
+    # === 7. MST-based connectivity boost ===
+    mst_boost = np.zeros_like(distance_matrix)
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_present = (mst_dense > 0) | (mst_dense.T > 0)
+            # MST edges get boost scaled by spatial score and regret
+            mst_boost[mst_present] = 2.0 * spatial_scores[mst_present] * (1.0 + regret_matrix[mst_present])
+        except:
+            # Fallback: approximate MST with nearest neighbor chain
+            pass
+    
+    # === 8. Cluster-aware degree balancing ===
+    # Estimate cluster centers via local density peaks
+    centrality = np.sum(1 / (distance_matrix + epsilon), axis=1)
+    centrality_norm = (centrality - np.min(centrality)) / (np.max(centrality) - np.min(centrality) + epsilon)
+    
+    # Penalize connections between high-centrality nodes (already well-connected)
+    cluster_penalty = 1.0 - 0.4 * np.sqrt(np.outer(centrality_norm, centrality_norm))
+    np.fill_diagonal(cluster_penalty, 0)
+    
+    # === 9. Multiplicative fusion of components ===
+    heuristics = inv_dist.copy()
+    heuristics *= (1.0 + mnn_boost)
+    heuristics *= (1.0 + mst_boost)
+    heuristics *= two_step_factor
+    heuristics *= spatial_scores
+    heuristics *= cluster_penalty
+    heuristics *= (1.0 + 0.3 * regret_matrix)  # Regret as soft boost
+    
+    # === 10. Intelligent sparsification ===
+    for i in range(n):
+        row = heuristics[i].copy()
+        
+        # Always keep mutual nearest neighbors
+        keep_mask = (mnn_boost[i] > 0)
+        
+        # Keep top edges based on regret-adjusted score
+        adaptive_k = max(3, min(10, k_per_node[i]))
+        regret_adjusted = row * (1.0 + 0.5 * regret_matrix[i])
+        
+        if adaptive_k < n - 1:
+            top_k_idx = np.argpartition(regret_adjusted, -adaptive_k)[-adaptive_k:]
+            keep_mask[top_k_idx] = True
+        
+        # Ensure minimal connectivity
+        if np.sum(keep_mask) < 2:
+            top2_idx = np.argsort(row)[-2:]
+            keep_mask[top2_idx] = True
+        
+        row[~keep_mask] = 0
+        heuristics[i] = row
+    
+    # === 11. Symmetrization and normalization ===
+    # Use geometric mean for symmetry
+    heuristics_sym = np.sqrt(heuristics * heuristics.T + epsilon)
+    np.fill_diagonal(heuristics_sym, 0)
+    
+    # Ensure non-negativity and normalize
+    heuristics_sym = np.maximum(heuristics_sym, 0)
+    max_val = np.max(heuristics_sym)
+    if max_val > 0:
+        heuristics_sym = heuristics_sym / max_val
+    
+    return heuristics_sym
+```

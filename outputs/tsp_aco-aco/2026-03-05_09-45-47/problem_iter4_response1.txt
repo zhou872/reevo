@@ -1,0 +1,449 @@
+```json
+{
+    "algorithm_features": ["Adaptive Meta-Parameters", "Spectral Community Detection", "Hybrid Ensemble", "Dynamic Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from sklearn.manifold import MDS
+from sklearn.cluster import SpectralClustering
+import warnings
+from typing import Tuple, Dict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with adaptive meta-parameters,
+    community detection, and hybrid ensemble strategies.
+    
+    Features:
+    1. Dynamic parameter tuning based on instance characteristics
+    2. Spectral community detection for targeted edge boosting
+    3. Hybrid ensemble of complementary heuristic strategies
+    4. Adaptive sparsification with connection preservation
+    
+    Returns:
+        Edge promise matrix with values in [0, 1], same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+            # Normalize
+            max_val = np.max(result)
+            if max_val > 0:
+                result = result / max_val
+            return result
+    
+    # Phase 1: Compute instance characteristics for adaptive tuning
+    instance_stats = _compute_instance_statistics(distance_matrix, n)
+    
+    # Phase 2: Generate diverse heuristic perspectives
+    heuristic_ensemble = _generate_heuristic_ensemble(
+        distance_matrix, n, instance_stats
+    )
+    
+    # Phase 3: Community detection for targeted enhancement
+    communities = _detect_communities(distance_matrix, n, instance_stats)
+    
+    # Phase 4: Combine ensemble with community-aware weighting
+    combined = _combine_with_communities(
+        heuristic_ensemble, communities, distance_matrix, instance_stats
+    )
+    
+    # Phase 5: Dynamic sparsification preserving connectivity
+    sparsified = _dynamic_sparsification(combined, n, instance_stats)
+    
+    # Phase 6: Community-aware triangle boosting
+    boosted = _community_triangle_boosting(
+        sparsified, communities, n, instance_stats
+    )
+    
+    # Final normalization
+    np.fill_diagonal(boosted, 0)
+    max_val = np.max(boosted)
+    if max_val > 0:
+        boosted = boosted / max_val
+    
+    return boosted
+
+
+def _compute_instance_statistics(
+    distance_matrix: np.ndarray, n: int
+) -> Dict[str, float]:
+    """Compute statistics about the TSP instance for adaptive parameter tuning."""
+    stats = {}
+    
+    # Basic statistics
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    stats['distance_mean'] = np.mean(distances)
+    stats['distance_std'] = np.std(distances)
+    stats['distance_cv'] = stats['distance_std'] / (stats['distance_mean'] + 1e-12)
+    stats['size_factor'] = np.log10(n) / np.log10(100)  # Normalized by n=100
+    
+    # Sparsity pattern (how many edges are relatively short)
+    median_dist = np.median(distances)
+    stats['density_factor'] = np.mean(distances < 0.5 * median_dist)
+    
+    # Clustering tendency via MST statistics
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_dists = mst.data[mst.data > 0]
+    stats['mst_skew'] = np.mean(mst_dists) / (np.median(mst_dists) + 1e-12)
+    
+    # Compute graph properties
+    k = min(5, n-1)
+    local_dists = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        local_dists[i] = np.mean(np.partition(dists, k)[:k])
+    stats['local_variation'] = np.std(local_dists) / (np.mean(local_dists) + 1e-12)
+    
+    return stats
+
+
+def _generate_heuristic_ensemble(
+    distance_matrix: np.ndarray, n: int, stats: Dict[str, float]
+) -> Dict[str, np.ndarray]:
+    """Generate multiple complementary heuristic perspectives."""
+    ensemble = {}
+    
+    # 1. Base reciprocal heuristic (distance-based)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal, 0)
+        # Adjust sensitivity based on distance variation
+        if stats['distance_cv'] > 1.0:
+            reciprocal = np.power(reciprocal, 0.7)  # Less sensitive for varied distances
+        ensemble['reciprocal'] = reciprocal
+    
+    # 2. MST-based heuristic with enhanced connectivity
+    mst_promising = _enhanced_mst_heuristic(distance_matrix, n, stats)
+    ensemble['mst'] = mst_promising
+    
+    # 3. Spatial clustering heuristic
+    spatial = _adaptive_spatial_clustering(distance_matrix, n, stats)
+    ensemble['spatial'] = spatial
+    
+    # 4. Variance-based heuristic (emphasizes consistent local structure)
+    variance_heuristic = _variance_based_heuristic(distance_matrix, n, stats)
+    ensemble['variance'] = variance_heuristic
+    
+    return ensemble
+
+
+def _enhanced_mst_heuristic(
+    distance_matrix: np.ndarray, n: int, stats: Dict[str, float]
+) -> np.ndarray:
+    """Enhanced MST heuristic with additional connectivity consideration."""
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    # Make symmetric
+    mst_promising = mst_edges + mst_edges.T
+    
+    # Add connections to nearby nodes, scaled by instance characteristics
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Adaptive number of close nodes based on density
+        num_close = min(max(3, int(5 * stats['density_factor'])), n - 1)
+        close_indices = np.argsort(dists)[:num_close]
+        
+        for rank, j in enumerate(close_indices):
+            if mst_promising[i, j] == 0:
+                # Decaying boost based on rank and instance characteristics
+                decay = 0.8 / (1 + 0.5 * rank)
+                density_factor = 0.5 + 0.5 * stats['density_factor']
+                mst_promising[i, j] = decay * density_factor
+    
+    return mst_promising
+
+
+def _adaptive_spatial_clustering(
+    distance_matrix: np.ndarray, n: int, stats: Dict[str, float]
+) -> np.ndarray:
+    """Adaptive spatial clustering using efficient approximations."""
+    spatial_promising = np.zeros_like(distance_matrix)
+    
+    # Adaptive k based on instance characteristics
+    base_k = max(3, min(int(2 * np.log2(n) + 3), n - 1))
+    # Adjust based on density
+    k = int(base_k * (1 + stats['density_factor']))
+    k = min(k, n - 1)
+    
+    if n <= 1000:  # Use MDS for medium instances
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mds = MDS(
+                    n_components=min(10, n-1),
+                    dissimilarity='precomputed',
+                    random_state=42,
+                    n_init=2,
+                    max_iter=150,
+                    normalized_stress='auto'
+                )
+                coords = mds.fit_transform(distance_matrix)
+                tree = KDTree(coords)
+                
+                for i in range(n):
+                    _, indices = tree.query(coords[i].reshape(1, -1), k=k+1)
+                    indices = indices[0][1:]  # Exclude self
+                    spatial_promising[i, indices] = 1.0
+        except:
+            # Fallback to distance-based
+            for i in range(n):
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                indices = np.argpartition(dists, k)[:k]
+                spatial_promising[i, indices] = 1.0
+    else:
+        # Fast distance-based for large instances
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            indices = np.argpartition(dists, k)[:k]
+            spatial_promising[i, indices] = 1.0
+    
+    return spatial_promising
+
+
+def _variance_based_heuristic(
+    distance_matrix: np.ndarray, n: int, stats: Dict[str, float]
+) -> np.ndarray:
+    """Heuristic based on local distance variance patterns."""
+    variance_heuristic = np.ones_like(distance_matrix)
+    
+    # Compute local statistics for each node
+    m = min(8, n - 1)
+    local_means = np.zeros(n)
+    local_vars = np.zeros(n)
+    
+    dists_copy = distance_matrix.copy()
+    np.fill_diagonal(dists_copy, np.inf)
+    
+    # Get m smallest distances for each node
+    sorted_indices = np.argpartition(dists_copy, m, axis=1)[:, :m]
+    sorted_dists = np.take_along_axis(dists_copy, sorted_indices, axis=1)
+    
+    local_means = np.mean(sorted_dists, axis=1)
+    local_vars = np.var(sorted_dists, axis=1) + 1e-12
+    
+    # Compute heuristic values
+    i_indices, j_indices = np.triu_indices(n, k=1)
+    
+    # Similarity in local patterns
+    mean_diff = np.abs(local_means[i_indices] - local_means[j_indices])
+    var_sum = local_vars[i_indices] + local_vars[j_indices]
+    pattern_similarity = np.exp(-mean_diff / np.sqrt(var_sum))
+    
+    # Distance consistency factor
+    edge_dists = distance_matrix[i_indices, j_indices]
+    expected_dist = (local_means[i_indices] + local_means[j_indices]) / 2
+    dist_ratio = edge_dists / (expected_dist + 1e-12)
+    
+    # Combine factors with instance-adaptive weights
+    alpha = 0.7 - 0.3 * stats['local_variation']  # Adjust based on instance
+    variance_vals = (pattern_similarity ** alpha) * np.exp(-0.4 * (dist_ratio - 1) ** 2)
+    
+    # Create symmetric matrix
+    variance_heuristic[i_indices, j_indices] = variance_vals
+    variance_heuristic[j_indices, i_indices] = variance_vals
+    
+    return variance_heuristic
+
+
+def _detect_communities(
+    distance_matrix: np.ndarray, n: int, stats: Dict[str, float]
+) -> np.ndarray:
+    """
+    Detect communities in the TSP instance using spectral clustering.
+    Returns a matrix where C[i,j] = 1 if i and j are in same community.
+    """
+    if n < 10:
+        # All nodes in one community for very small instances
+        return np.ones((n, n))
+    
+    # Adaptive number of communities
+    n_clusters = max(2, min(int(np.sqrt(n)), 10))
+    
+    try:
+        # Build affinity matrix for spectral clustering
+        # Use Gaussian kernel with adaptive bandwidth
+        median_dist = np.median(distance_matrix[np.triu_indices(n, k=1)])
+        gamma = 1.0 / (2 * (median_dist ** 2) + 1e-12)
+        
+        # Apply threshold for sparsity in large instances
+        if n > 500:
+            affinity = np.exp(-gamma * distance_matrix ** 2)
+            # Sparsify
+            threshold = np.percentile(affinity[np.triu_indices(n, k=1)], 70)
+            affinity[affinity < threshold] = 0
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sc = SpectralClustering(
+                n_clusters=n_clusters,
+                affinity='precomputed',
+                random_state=42,
+                assign_labels='discretize',
+                n_init=5
+            )
+            labels = sc.fit_predict(np.exp(-gamma * distance_matrix ** 2))
+    except:
+        # Fallback: simple distance-based clustering
+        labels = np.zeros(n, dtype=int)
+        if n >= 20:
+            # Simple 2-means style initialization
+            centroids = np.random.choice(n, size=min(3, n), replace=False)
+            for i in range(n):
+                labels[i] = np.argmin([distance_matrix[i, c] for c in centroids])
+        else:
+            labels = np.zeros(n, dtype=int)
+    
+    # Create community matrix
+    community_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j and labels[i] == labels[j]:
+                community_matrix[i, j] = 1.0
+    
+    return community_matrix
+
+
+def _combine_with_communities(
+    ensemble: Dict[str, np.ndarray],
+    communities: np.ndarray,
+    distance_matrix: np.ndarray,
+    stats: Dict[str, float]
+) -> np.ndarray:
+    """Combine heuristic ensemble with community-aware weighting."""
+    n = distance_matrix.shape[0]
+    
+    # Get ensemble components
+    reciprocal = ensemble['reciprocal']
+    mst = ensemble['mst']
+    spatial = ensemble['spatial']
+    variance = ensemble['variance']
+    
+    # Initialize combined matrix
+    combined = reciprocal.copy()
+    
+    # Instance-adaptive weights
+    w_mst = 0.8 + 0.4 * (1 - stats['mst_skew'])  # Higher if MST is balanced
+    w_spatial = 0.7 + 0.6 * stats['density_factor']  # Higher for dense instances
+    w_variance = 0.6 + 0.8 * stats['local_variation']  # Higher for varied instances
+    
+    # Apply MST component
+    combined[mst > 0] *= (1 + w_mst * mst[mst > 0])
+    
+    # Apply spatial component with distance-based decay
+    spatial_mask = spatial > 0
+    dist_decay = np.exp(-distance_matrix[spatial_mask] / stats['distance_mean'])
+    combined[spatial_mask] *= (1 + w_spatial * spatial[spatial_mask] * dist_decay)
+    
+    # Apply variance component
+    combined *= variance ** (w_variance / 2)
+    
+    # Community enhancement: boost intra-community edges
+    intra_boost = 1.2 + 0.3 * stats['size_factor']
+    combined[communities > 0] *= intra_boost
+    
+    # Additional enhancement for very short edges within communities
+    short_threshold = 0.3 * stats['distance_mean']
+    short_in_community = (distance_matrix < short_threshold) & (communities > 0)
+    combined[short_in_community] *= 1.5
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+
+def _dynamic_sparsification(
+    heuristics_matrix: np.ndarray, n: int, stats: Dict[str, float]
+) -> np.ndarray:
+    """Dynamic sparsification preserving essential connectivity."""
+    if n <= 10:
+        return heuristics_matrix.copy()
+    
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    # Adaptive sparsity based on instance characteristics
+    if stats['density_factor'] > 0.7:
+        # Dense instance: keep more edges
+        base_ratio = 0.25
+    else:
+        # Sparse instance: keep fewer edges
+        base_ratio = 0.15
+    
+    # Adjust for instance size
+    size_factor = min(1.0, stats['size_factor'])
+    keep_ratio = base_ratio * (1 + 0.3 * size_factor)
+    
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Determine number of edges to keep
+        num_to_keep = max(4, int(keep_ratio * n))
+        num_to_keep = min(num_to_keep, n - 1)
+        
+        if np.any(row > 0):
+            # Use efficient selection
+            top_indices = np.argpartition(-row, num_to_keep)[:num_to_keep]
+            sparsified[i, top_indices] = heuristics_matrix[i, top_indices]
+    
+    # Ensure symmetry and preserve MST connectivity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+
+
+def _community_triangle_boosting(
+    heuristics_matrix: np.ndarray,
+    communities: np.ndarray,
+    n: int,
+    stats: Dict[str, float]
+) -> np.ndarray:
+    """Triangle boosting enhanced with community awareness."""
+    if n < 3:
+        return heuristics_matrix.copy()
+    
+    boosted = heuristics_matrix.copy()
+    
+    # Create binary adjacency matrix
+    binary_mask = (heuristics_matrix > 0).astype(float)
+    
+    # Count common neighbors
+    common_neighbors = binary_mask @ binary_mask.T
+    
+    # Boost parameters adjusted by instance characteristics
+    base_boost = 0.2 + 0.1 * stats['density_factor']
+    community_multiplier = 1.3 + 0.4 * (1 - stats['local_variation'])
+    
+    # Boost edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if heuristics_matrix[i, j] > 0:
+                common = common_neighbors[i, j]
+                if common > 0:
+                    # Base boost
+                    boost = 1 + base_boost * min(common, 6) / (1 + 0.15 * common)
+                    
+                    # Additional community boost
+                    if communities[i, j] > 0:
+                        boost *= community_multiplier
+                    
+                    boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    return boosted
+```

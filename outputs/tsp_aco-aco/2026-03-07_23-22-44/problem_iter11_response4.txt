@@ -1,0 +1,246 @@
+```json
+{
+    "algorithm_features": ["Spectral Fiedler Smoothing", "Fixed Ensemble Weighting", "Density-Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Efficient TSP heuristic combining spectral graph analysis, fixed-weight ensemble,
+    and adaptive density-based sparsification.
+    
+    Core Innovations:
+    1. Spectral Fiedler Smoothing: Uses only Fiedler vector for cluster-aware edge scoring
+    2. Fixed Ensemble Weighting: Pre-defined component weights (0.3 regret, 0.4 inverse distance, 0.3 spectral)
+    3. Density-Adaptive Sparsification: Local neighborhood density guides edge retention
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. BASE COMPONENTS ====================
+    # Inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distance
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # ==================== 2. SIMPLIFIED REGRET SCORING ====================
+    def compute_regret() -> np.ndarray:
+        """Fast regret approximation using nearest neighbor alternatives"""
+        regret_scores = np.zeros((n, n))
+        
+        # Pre-sort distances for each node
+        sorted_indices = np.argsort(distance_matrix, axis=1)
+        sorted_dists = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best alternative path using k-nearest neighbors
+                k = min(5, n - 1)
+                
+                # Alternative from i to j through another node
+                best_alternative = float('inf')
+                
+                # Check alternatives through i's nearest neighbors (excluding j)
+                for alt_idx in range(1, min(k + 1, n)):
+                    k_node = sorted_indices[i, alt_idx]
+                    if k_node == j:
+                        continue
+                    
+                    alt_cost = sorted_dists[i, alt_idx] + distance_matrix[k_node, j]
+                    best_alternative = min(best_alternative, alt_cost)
+                
+                # Check alternatives through j's nearest neighbors (excluding i)
+                for alt_idx in range(1, min(k + 1, n)):
+                    k_node = sorted_indices[j, alt_idx]
+                    if k_node == i:
+                        continue
+                    
+                    alt_cost = sorted_dists[j, alt_idx] + distance_matrix[k_node, i]
+                    best_alternative = min(best_alternative, alt_cost)
+                
+                # Calculate normalized regret score
+                if best_alternative < float('inf'):
+                    regret = max(0, best_alternative - direct_cost)
+                    # Softmax-like transformation
+                    median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+                    regret_norm = regret / (median_dist + 1e-8)
+                    regret_scores[i, j] = np.exp(-regret_norm)
+                    regret_scores[j, i] = regret_scores[i, j]
+        
+        return regret_scores
+    
+    regret_scores = compute_regret()
+    
+    # ==================== 3. SPECTRAL FIEDLER SMOOTHING ====================
+    def fiedler_smoothing() -> np.ndarray:
+        """Use Fiedler vector for natural cluster detection with distance attenuation"""
+        # Graph Laplacian
+        degree_matrix = np.diag(np.sum(distance_matrix, axis=1))
+        laplacian = degree_matrix - distance_matrix
+        
+        # Compute only the two smallest eigenvalues/vectors
+        eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
+        
+        # Fiedler vector (second smallest eigenvector)
+        idx = np.argsort(eigenvalues)[1]  # Index of second smallest eigenvalue
+        fiedler = eigenvectors[:, idx]
+        
+        # Compute spectral affinity scores
+        spectral_scores = np.ones((n, n))
+        
+        # Normalize distances for decay factor
+        median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Spectral similarity based on Fiedler values
+                spectral_diff = abs(fiedler[i] - fiedler[j])
+                spectral_sim = 1.0 / (1.0 + spectral_diff)
+                
+                # Distance-based decay
+                dist_norm = distance_matrix[i, j] / (2.0 * median_dist)
+                decay = np.exp(-dist_norm)
+                
+                # Combined score
+                spectral_scores[i, j] = spectral_sim * decay
+                spectral_scores[j, i] = spectral_scores[i, j]
+        
+        # Normalize
+        if np.max(spectral_scores) > 0:
+            spectral_scores = spectral_scores / np.max(spectral_scores)
+        
+        return spectral_scores
+    
+    spectral_scores = fiedler_smoothing()
+    
+    # ==================== 4. DENSITY-ADAPTIVE WEIGHTING ====================
+    def compute_density_weights() -> np.ndarray:
+        """Compute adaptive weights based on local neighborhood density"""
+        density_weights = np.ones((n, n))
+        
+        # Local density estimation using k-nearest neighbors
+        k = max(2, min(5, n // 4))
+        
+        # Compute density for each node
+        node_density = np.zeros(n)
+        for i in range(n):
+            # Get distances to k nearest neighbors (excluding self)
+            sorted_dists = np.sort(distance_matrix[i])[1:k+1]
+            node_density[i] = 1.0 / (np.mean(sorted_dists) + 1e-8)
+        
+        # Normalize densities
+        if np.max(node_density) > 0:
+            node_density = node_density / np.max(node_density)
+        
+        # Apply density weighting to edges
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Geometric mean of endpoint densities
+                density_factor = np.sqrt(node_density[i] * node_density[j])
+                density_weights[i, j] = density_factor
+                density_weights[j, i] = density_factor
+        
+        return density_weights
+    
+    density_weights = compute_density_weights()
+    
+    # ==================== 5. FIXED WEIGHT ENSEMBLE ====================
+    # Fixed weights: 0.3 regret, 0.4 inverse distance, 0.3 spectral
+    fixed_weights = [0.3, 0.4, 0.3]
+    
+    # Apply density weighting to inverse distance component
+    weighted_inv_dist = inv_dist * density_weights
+    
+    # Combine components
+    combined_scores = (
+        fixed_weights[0] * regret_scores +
+        fixed_weights[1] * weighted_inv_dist +
+        fixed_weights[2] * spectral_scores
+    )
+    
+    # ==================== 6. INTELLIGENT SPARSIFICATION ====================
+    def density_aware_sparsification(scores: np.ndarray) -> np.ndarray:
+        """Sparsify matrix while preserving connectivity and considering local density"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges for connectivity
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst > 0) | (mst.T > 0)
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Adaptive degree limit based on problem size and density
+        if n <= 20:
+            max_degree = 4
+        elif n <= 100:
+            max_degree = min(5, n // 8)
+        else:
+            max_degree = min(6, n // 10)
+        
+        current_degree = np.sum(sparsified > 0, axis=1)
+        
+        # Collect candidate edges (excluding MST edges)
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    # Prioritize edges connecting dense regions
+                    density_bonus = density_weights[i, j]
+                    adjusted_score = scores[i, j] * density_bonus
+                    candidates.append((adjusted_score, i, j))
+        
+        # Sort by adjusted score
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Greedy selection with degree constraints
+        for adjusted_score, i, j in candidates:
+            if current_degree[i] < max_degree and current_degree[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[j, i]
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparsified
+    
+    sparsified_scores = density_aware_sparsification(combined_scores)
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    # Ensure symmetry
+    symmetric_scores = (sparsified_scores + sparsified_scores.T) / 2
+    
+    # Apply final distance-based smoothing
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        dist_smooth = np.exp(-distance_matrix / (0.5 * max_dist + 1e-8))
+        symmetric_scores *= dist_smooth
+    
+    # Normalize to [0, 1]
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

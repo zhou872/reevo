@@ -1,0 +1,205 @@
+```json
+{
+    "algorithm_features": ["Two-Step Regret with Adaptive Lookahead", "Global Criticality via MST Augmentation", "Regret-Weighted Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with two-step regret analysis, global criticality
+    assessment via MST, and regret-weighted adaptive sparsification.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix (non-negative)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    epsilon = 1e-12
+    
+    # === 1. Base Inverse Distance ===
+    base_heuristics = 1.0 / (distance_matrix + epsilon)
+    np.fill_diagonal(base_heuristics, 0)
+    
+    # === 2. Two-Step Regret with Adaptive Lookahead ===
+    # Compute regret considering two-step alternatives with adaptive lookahead depth
+    regret_scores = np.ones_like(distance_matrix)
+    
+    # Adaptive lookahead based on problem size
+    lookahead_depth = min(5, max(2, int(np.sqrt(n))))
+    
+    for i in range(n):
+        # Get distances from node i, excluding self
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find lookahead_depth + 1 nearest neighbors for lookahead
+        nearest_indices = np.argsort(dists_i)[:lookahead_depth + 1]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            # Find best alternative two-step path: i -> k -> j
+            best_alternative = np.inf
+            for k in nearest_indices:
+                if k != j and k != i:
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alternative = min(best_alternative, alt_cost)
+            
+            if best_alternative < np.inf:
+                # Compute proportional regret
+                regret = (best_alternative - d_ij) / (d_ij + epsilon)
+                # Apply sigmoid to bound the effect (range: [1, 2])
+                regret_scores[i, j] = 1.0 + 1.0 / (1.0 + np.exp(-regret + 1.0))
+    
+    # === 3. Mutual Nearest Neighbor Criticality ===
+    criticality_scores = np.ones_like(distance_matrix)
+    
+    # Determine adaptive neighborhood size
+    k_mutual = min(max(3, int(np.sqrt(n))), n - 1)
+    
+    # Find k-nearest neighbors for each node
+    nn_masks = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest_indices = np.argsort(dists)[:k_mutual]
+        nn_masks[i, nearest_indices] = True
+    
+    # Identify mutual nearest neighbors and compute criticality
+    mutual_mask = nn_masks & nn_masks.T
+    
+    # Criticality boost: stronger for mutual nearest neighbors in dense regions
+    row_densities = np.zeros(n)
+    for i in range(n):
+        valid_dists = distance_matrix[i][distance_matrix[i] > 0]
+        if len(valid_dists) > 0:
+            row_densities[i] = 1.0 / np.mean(valid_dists)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mutual_mask[i, j]:
+                # Criticality increases with average density and regret
+                density_factor = 0.5 * (row_densities[i] + row_densities[j]) / np.mean(row_densities + epsilon)
+                regret_factor = 0.5 * (regret_scores[i, j] + regret_scores[j, i])
+                criticality_scores[i, j] = criticality_scores[j, i] = 1.0 + 0.5 * density_factor * regret_factor
+    
+    # === 4. Global Criticality via MST Augmentation ===
+    # Identify edges that are critical for global connectivity
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_binary = (mst > 0) | (mst.T > 0)
+    
+    # Compute global criticality for MST edges
+    mst_criticality = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_binary[i, j]:
+                # Measure how critical this edge is by comparing to alternative connections
+                d_ij = distance_matrix[i, j]
+                
+                # Find best alternative connection between i's and j's neighborhoods
+                best_alternative = np.inf
+                
+                # Check connections through neighbors
+                i_neighbors = np.where(nn_masks[i])[0]
+                j_neighbors = np.where(nn_masks[j])[0]
+                
+                for a in i_neighbors:
+                    if a == j:
+                        continue
+                    for b in j_neighbors:
+                        if b == i or b == a:
+                            continue
+                        alt_cost = distance_matrix[i, a] + distance_matrix[a, b] + distance_matrix[b, j]
+                        best_alternative = min(best_alternative, alt_cost)
+                
+                if best_alternative < np.inf:
+                    # Global criticality: how much worse is the alternative
+                    global_regret = (best_alternative - d_ij) / (d_ij + epsilon)
+                    mst_criticality[i, j] = mst_criticality[j, i] = 1.0 + np.tanh(global_regret)
+    
+    # === 5. Combine Components with Adaptive Weights ===
+    heuristics = base_heuristics.copy()
+    heuristics *= regret_scores
+    heuristics *= criticality_scores
+    heuristics *= mst_criticality
+    
+    # === 6. Regret-Weighted Adaptive Sparsification ===
+    # Keep edges based on regret-weighted thresholds that adapt to local density
+    for i in range(n):
+        row_heuristics = heuristics[i].copy()
+        row_heuristics[i] = 0
+        
+        if np.sum(row_heuristics > 0) <= 3:
+            continue
+        
+        # Compute regret-weighted scores
+        regret_weighted = row_heuristics * (0.5 * (regret_scores[i] + regret_scores[:, i]))
+        
+        # Determine adaptive threshold based on regret-weighted distribution
+        positive_mask = row_heuristics > 0
+        if np.sum(positive_mask) > 0:
+            positive_values = regret_weighted[positive_mask]
+            
+            # Use quantiles for robust thresholding
+            q25 = np.percentile(positive_values, 25)
+            q75 = np.percentile(positive_values, 75)
+            
+            # Threshold adapts to spread: tighter distribution requires higher threshold
+            spread = max(epsilon, q75 - q25)
+            threshold = q25 + 0.5 * spread
+            
+            # Always keep top edges and edges above threshold
+            keep_indices = np.where((row_heuristics > 0) & 
+                                   ((regret_weighted >= threshold) | 
+                                    (row_heuristics >= np.percentile(row_heuristics[positive_mask], 75))))[0]
+            
+            # Ensure minimum connectivity
+            min_keep = min(3, n - 1)
+            if len(keep_indices) < min_keep:
+                top_indices = np.argsort(row_heuristics)[-min_keep:]
+                keep_indices = np.unique(np.concatenate([keep_indices, top_indices]))
+            
+            # Zero out non-essential edges (soft reduction for borderline cases)
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep_indices] = True
+            
+            # Soft reduction for edges near threshold
+            borderline_mask = (row_heuristics > 0) & ~keep_mask & (regret_weighted >= 0.7 * threshold)
+            row_heuristics[borderline_mask] *= 0.3
+            row_heuristics[~keep_mask & ~borderline_mask] = 0
+            
+            heuristics[i] = row_heuristics
+    
+    # === 7. Symmetrization and Final Processing ===
+    # Ensure symmetry by taking maximum (preserving critical edges from both directions)
+    symmetric_heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Soft normalization preserving relative differences
+    max_val = np.max(symmetric_heuristics)
+    if max_val > epsilon:
+        symmetric_heuristics = symmetric_heuristics / max_val
+        # Gentle compression to reduce extreme dominance
+        symmetric_heuristics = np.power(symmetric_heuristics, 0.9)
+    
+    return symmetric_heuristics
+```

@@ -1,0 +1,161 @@
+```json
+{
+    "algorithm_features": ["Bidirectional Regret Penalization", "Cluster-Aware Density Scoring", "Multi-Path Candidate Generation", "Exponential Distance Decay"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges with bidirectional regret and cluster analysis.
+    
+    Key innovations:
+    1. Bidirectional regret calculation considering both endpoints
+    2. Cluster-based density scoring to identify regional connectivity patterns
+    3. Multi-path candidate generation using k-nearest neighbors
+    4. Adaptive exponential decay based on percentile distances
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix of shape (n, n)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base reciprocal distance with stability
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_scores = 1.0 / (distance_matrix + 1e-10)
+    np.fill_diagonal(base_scores, 0)
+    
+    # 2. Bidirectional regret calculation
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        min_row = np.min(row_dists)
+        
+        if min_row > 0:
+            # Regret from i's perspective
+            regret_i = (distance_matrix[i] - min_row) / (min_row + 1e-10)
+            # Apply exponential decay to regret
+            regret_matrix[i] *= np.exp(-regret_i / 2)
+    
+    # Symmetrize by taking geometric mean of both directions
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # 3. Cluster-aware density scoring
+    density_scores = np.ones_like(distance_matrix)
+    
+    if n >= 5:
+        # Calculate local density for each node (median of k-nearest distances)
+        k_neighbors = min(4, n - 1)
+        for i in range(n):
+            neighbor_dists = np.partition(distance_matrix[i], k_neighbors)[:k_neighbors+1]
+            local_density = np.median(neighbor_dists[neighbor_dists > 0])
+            
+            if local_density > 0:
+                # Boost edges within dense regions, penalize long edges
+                density_ratio = local_density / (distance_matrix[i] + 1e-10)
+                density_scores[i] = np.minimum(density_ratio, 3.0)
+    
+    density_scores = (density_scores + density_scores.T) / 2
+    
+    # 4. Multi-path candidate generation using adaptive exponential decay
+    # Calculate distance percentiles for adaptive scaling
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    if len(flat_dists) > 0:
+        p25 = np.percentile(flat_dists, 25)
+        p75 = np.percentile(flat_dists, 75)
+        scale_factor = max(p25, 1e-10)
+    else:
+        scale_factor = 1.0
+    
+    # Stronger decay for longer distances
+    distance_penalty = np.exp(-distance_matrix / (0.3 * scale_factor))
+    np.fill_diagonal(distance_penalty, 0)
+    
+    # 5. MST connectivity guarantee
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 6. Combine all components with balanced weighting
+    combined_scores = (base_scores * regret_matrix * density_scores * 
+                      distance_penalty)
+    
+    # Apply MST guarantee
+    combined_scores[mst_mask] = np.maximum(combined_scores[mst_mask], 1e-4)
+    
+    # 7. Intelligent sparsification with candidate preservation
+    sparsified = np.zeros_like(combined_scores)
+    
+    for i in range(n):
+        row_scores = combined_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Always preserve MST edges for connectivity
+        mst_edges = mst_mask[i]
+        
+        # Adaptive candidate pool size
+        if n <= 5:
+            candidate_count = min(3, n - 1)
+        else:
+            # Logarithmic scaling: more candidates for larger problems
+            candidate_count = min(int(2 * np.log2(n)), n - 1)
+            candidate_count = max(3, candidate_count)
+        
+        # Preserve MST edges plus top candidates
+        mst_count = np.sum(mst_edges)
+        non_mst_needed = max(0, candidate_count - mst_count)
+        
+        if non_mst_needed > 0:
+            # Get non-MST scores
+            non_mst_mask = ~mst_edges
+            non_mst_mask[i] = False  # Exclude self
+            non_mst_scores = row_scores.copy()
+            non_mst_scores[~non_mst_mask] = -np.inf
+            
+            if np.any(non_mst_scores > -np.inf):
+                # Select top non-MST edges
+                valid_scores = non_mst_scores[non_mst_scores > -np.inf]
+                if len(valid_scores) >= non_mst_needed:
+                    threshold = np.partition(valid_scores, -non_mst_needed)[-non_mst_needed]
+                else:
+                    threshold = np.min(valid_scores) - 1e-6
+                
+                top_non_mst = non_mst_scores >= threshold
+                keep_mask = mst_edges | top_non_mst
+            else:
+                keep_mask = mst_edges
+        else:
+            keep_mask = mst_edges
+        
+        # Apply selection with boundary protection
+        keep_mask[i] = False  # Never keep self-edge
+        sparsified[i][keep_mask] = combined_scores[i][keep_mask]
+    
+    # 8. Symmetrize final scores
+    final_scores = np.maximum(sparsified, sparsified.T)
+    
+    # 9. Normalize and ensure numerical stability
+    max_val = np.max(final_scores)
+    if max_val > 0:
+        final_scores = final_scores / max_val
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    # Apply final clipping to remove extreme values
+    final_scores = np.clip(final_scores, 0, 1)
+    
+    return final_scores
+```

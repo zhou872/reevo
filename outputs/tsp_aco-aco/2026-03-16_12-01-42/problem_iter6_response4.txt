@@ -1,0 +1,572 @@
+```json
+{
+    "algorithm_features": ["Centrality-Informed Edge Scoring", "Gradient-Aware Parameter Tuning", "Two-Hop Lookahead Propagation", "Cluster-Aware Connectivity"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple, Dict, Any
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics incorporating global graph metrics,
+    adaptive parameter tuning, and multi-edge sequence evaluation.
+    
+    Key innovations:
+    1. Centrality-informed edge scoring using betweenness and closeness measures
+    2. Gradient-aware parameter adaptation based on instance characteristics
+    3. Two-hop lookahead propagation for sequence-aware edge evaluation
+    4. Cluster-aware connectivity with automated density detection
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # Trivial case: return uniform scores
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    epsilon = 1e-12
+    
+    # === 1. INSTANCE CHARACTERIZATION AND PARAMETER TUNING ===
+    # Analyze global graph properties to adapt heuristic parameters
+    instance_stats = _characterize_instance(distance_matrix, n)
+    
+    # Dynamic parameter adjustment based on instance characteristics
+    params = _adapt_parameters(instance_stats)
+    
+    # === 2. GLOBAL CENTRALITY MEASURES ===
+    # Compute betweenness and closeness centrality approximations
+    centrality_scores = _compute_centrality_measures(distance_matrix, n, epsilon, params)
+    
+    # === 3. DYNAMIC REGRET WITH CENTRALITY AWARENESS ===
+    # Enhanced regret computation considering node centrality
+    regret_weights = _compute_centrality_aware_regret(distance_matrix, n, epsilon, 
+                                                    centrality_scores, params)
+    
+    # === 4. CLUSTER-AWARE NEIGHBORHOOD ANALYSIS ===
+    # Detect natural clusters and score edges based on intra/inter-cluster properties
+    cluster_scores = _compute_cluster_aware_scores(distance_matrix, n, epsilon, params)
+    
+    # === 5. TWO-HOP LOOKAHEAD SEQUENCE EVALUATION ===
+    # Evaluate edge sequences of length 2 for better local path quality estimation
+    lookahead_scores = _compute_two_hop_lookahead(distance_matrix, n, epsilon, 
+                                                centrality_scores, params)
+    
+    # === 6. MUTUAL CONNECTIVITY WITH CLUSTER AWARENESS ===
+    # Enhanced mutual nearest neighbor detection considering cluster structure
+    connectivity_boost = _compute_cluster_aware_connectivity(distance_matrix, n, 
+                                                          cluster_scores, params)
+    
+    # === 7. BASE INVERSE DISTANCE WITH CENTRALITY SCALING ===
+    # Base scores weighted by centrality of endpoints
+    base_scores = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(base_scores, 0)
+    
+    # Scale by combined centrality of endpoints
+    centrality_weight = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Geometric mean of centrality scores
+                centrality_weight[i, j] = np.sqrt(
+                    centrality_scores[i] * centrality_scores[j] + epsilon
+                )
+    
+    # Normalize centrality weights
+    if np.max(centrality_weight) > 0:
+        centrality_weight = centrality_weight / np.max(centrality_weight)
+    
+    base_scores *= (0.5 + 0.5 * centrality_weight)
+    
+    # === 8. INTEGRATED SCORING ===
+    # Multiplicative combination with learned weights from instance characteristics
+    heuristics = base_scores.copy()
+    
+    # Apply component weights based on instance characteristics
+    component_weights = params['component_weights']
+    
+    heuristics *= np.power(regret_weights, component_weights['regret'])
+    heuristics *= np.power(cluster_scores, component_weights['cluster'])
+    heuristics *= np.power(lookahead_scores, component_weights['lookahead'])
+    heuristics *= np.power(connectivity_boost, component_weights['connectivity'])
+    
+    # === 9. ADAPTIVE SPARSIFICATION ===
+    # Node-specific sparsification based on centrality and cluster properties
+    heuristics = _adaptive_sparsification(heuristics, distance_matrix, n,
+                                        centrality_scores, cluster_scores, params)
+    
+    # === 10. SYMMETRY ENFORCEMENT WITH CONSISTENCY CHECK ===
+    # Take geometric mean for symmetry, boost consistent edges
+    symmetric_heuristics = np.zeros_like(heuristics)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                if heuristics[i, j] > 0 and heuristics[j, i] > 0:
+                    symmetric_heuristics[i, j] = np.sqrt(
+                        heuristics[i, j] * heuristics[j, i]
+                    )
+                else:
+                    symmetric_heuristics[i, j] = 0
+    
+    # Boost edges with high consistency from both directions
+    consistency_mask = (
+        (heuristics > np.percentile(heuristics, params['consistency_percentile'])) &
+        (heuristics.T > np.percentile(heuristics, params['consistency_percentile']))
+    )
+    symmetric_heuristics[consistency_mask] *= params['consistency_boost']
+    
+    # === 11. FINAL PROCESSING ===
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Ensure non-negativity
+    symmetric_heuristics = np.maximum(symmetric_heuristics, 0)
+    
+    # Adaptive normalization preserving distribution shape
+    max_val = np.max(symmetric_heuristics)
+    if max_val > 0:
+        # Use power scaling based on instance uniformity
+        power_exp = params['normalization_power']
+        symmetric_heuristics = (symmetric_heuristics / max_val) ** power_exp
+    
+    return symmetric_heuristics
+
+
+def _characterize_instance(distance_matrix: np.ndarray, n: int) -> Dict[str, Any]:
+    """Analyze TSP instance characteristics for adaptive parameter tuning."""
+    stats = {}
+    
+    # Extract upper triangular distances (excluding diagonal)
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # Basic statistics
+    stats['n'] = n
+    stats['mean_dist'] = np.mean(distances)
+    stats['std_dist'] = np.std(distances)
+    stats['cv_dist'] = stats['std_dist'] / (stats['mean_dist'] + 1e-12)
+    
+    # Sparsity/Uniformity measure
+    stats['uniformity'] = 1.0 - min(1.0, stats['cv_dist'])
+    
+    # Density estimation (how clustered points are)
+    # Use nearest neighbor distance ratio
+    if n > 3:
+        nn_ratios = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            sorted_dists = np.sort(dists)[:2]  # Two smallest
+            if len(sorted_dists) >= 2 and sorted_dists[0] > 0:
+                nn_ratios.append(sorted_dists[1] / sorted_dists[0])
+        stats['clustering'] = np.mean(nn_ratios) if nn_ratios else 1.0
+    else:
+        stats['clustering'] = 1.0
+    
+    # Distance distribution skewness
+    stats['skewness'] = np.mean((distances - stats['mean_dist'])**3) / (stats['std_dist']**3 + 1e-12)
+    
+    return stats
+
+
+def _adapt_parameters(instance_stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Dynamically adjust heuristic parameters based on instance characteristics."""
+    n = instance_stats['n']
+    uniformity = instance_stats['uniformity']
+    clustering = instance_stats['clustering']
+    
+    params = {}
+    
+    # Component weights adaptation
+    # More uniform instances benefit from lookahead and regret
+    # Clustered instances benefit from cluster-aware components
+    params['component_weights'] = {
+        'regret': 0.7 + 0.3 * uniformity,
+        'cluster': 0.5 + 0.5 * (1.0 - clustering),
+        'lookahead': 0.8 + 0.2 * uniformity,
+        'connectivity': 0.6 + 0.4 * clustering
+    }
+    
+    # Centrality computation parameters
+    params['centrality_k'] = max(3, min(8, n // 4))
+    params['centrality_alpha'] = 0.7  # Weight for closeness vs betweenness
+    
+    # Lookahead parameters
+    params['lookahead_depth'] = 2
+    params['lookahead_breadth'] = max(2, min(5, n // 10))
+    
+    # Cluster detection
+    params['cluster_k'] = max(3, min(10, n // 5))
+    params['cluster_threshold'] = 0.3 + 0.4 * clustering
+    
+    # Sparsification
+    params['min_edges'] = max(3, min(8, int(np.sqrt(n))))
+    params['max_edges'] = max(6, min(15, n // 3))
+    
+    # Consistency and normalization
+    params['consistency_percentile'] = 75
+    params['consistency_boost'] = 1.2
+    params['normalization_power'] = 0.85 + 0.15 * uniformity  # Higher for uniform instances
+    
+    return params
+
+
+def _compute_centrality_measures(distance_matrix: np.ndarray, n: int, 
+                               epsilon: float, params: Dict[str, Any]) -> np.ndarray:
+    """Compute approximate centrality measures for each node."""
+    k = params['centrality_k']
+    alpha = params['centrality_alpha']
+    
+    centrality = np.zeros(n)
+    
+    for i in range(n):
+        # Closeness centrality approximation (inverse of average distance to k nearest)
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest_indices = np.argpartition(dists, k)[:k]
+        avg_near_dist = np.mean(dists[nearest_indices])
+        closeness = 1.0 / (avg_near_dist + epsilon)
+        
+        # Betweenness centrality approximation (bridge potential)
+        # Estimate how often node i lies on shortest paths between other nodes
+        bridge_score = 0.0
+        if n > 4:
+            # Sample pairs of other nodes
+            sample_pairs = min(20, n * (n-1) // 4)
+            for _ in range(sample_pairs):
+                # Randomly select two distinct nodes j, k (not i)
+                j, k = np.random.choice([x for x in range(n) if x != i], 2, replace=False)
+                d_jk = distance_matrix[j, k]
+                d_ji_ik = distance_matrix[j, i] + distance_matrix[i, k]
+                # If i provides a competitive alternative path
+                if d_ji_ik < 1.3 * d_jk + epsilon:
+                    bridge_score += 1.0
+            bridge_score = bridge_score / sample_pairs
+        
+        # Combine measures
+        centrality[i] = alpha * closeness + (1 - alpha) * bridge_score
+    
+    # Normalize to [0, 1]
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    return centrality
+
+
+def _compute_centrality_aware_regret(distance_matrix: np.ndarray, n: int, 
+                                   epsilon: float, centrality: np.ndarray,
+                                   params: Dict[str, Any]) -> np.ndarray:
+    """Compute regret scores weighted by node centrality."""
+    regret_weights = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        # Adaptive k based on centrality (central nodes have more alternatives)
+        k_regret = max(3, min(8, int(5 + 3 * centrality[i])))
+        k_regret = min(k_regret, n - 1)
+        
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Get distances to k_regret nearest neighbors
+        if k_regret > 0:
+            nearest_indices = np.argpartition(dists_i, k_regret)[:k_regret]
+            nearest_dists = dists_i[nearest_indices]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            # Find best alternative (excluding j)
+            alternatives = []
+            for idx, d in zip(nearest_indices, nearest_dists):
+                if idx != j:
+                    alternatives.append(d)
+            
+            if alternatives:
+                best_alt = np.min(alternatives)
+                # Regret ratio weighted by centrality
+                regret_ratio = max(0, (best_alt - d_ij) / (d_ij + epsilon))
+                
+                # Central nodes: regret matters more (more alternatives)
+                centrality_factor = 0.5 + 1.0 * centrality[i]
+                
+                # For edges to central nodes: alternative quality matters less
+                target_centrality = centrality[j]
+                target_factor = 1.5 - 0.5 * target_centrality
+                
+                regret_weights[i, j] = 1.0 + centrality_factor * regret_ratio * target_factor
+            else:
+                regret_weights[i, j] = 1.0
+    
+    return regret_weights
+
+
+def _compute_cluster_aware_scores(distance_matrix: np.ndarray, n: int,
+                                epsilon: float, params: Dict[str, Any]) -> np.ndarray:
+    """Score edges based on intra-cluster and inter-cluster properties."""
+    k_cluster = params['cluster_k']
+    threshold = params['cluster_threshold']
+    
+    # Simple cluster detection via shared nearest neighbors
+    cluster_affinity = np.zeros((n, n))
+    
+    # Precompute k nearest neighbors for each node
+    nn_lists = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest = np.argpartition(dists, k_cluster)[:k_cluster]
+        nn_lists.append(set(nearest))
+    
+    # Compute cluster affinity based on shared neighbors
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            shared = len(nn_lists[i].intersection(nn_lists[j]))
+            total = len(nn_lists[i].union(nn_lists[j]))
+            
+            if total > 0:
+                jaccard = shared / total
+                # High jaccard = likely same cluster
+                cluster_affinity[i, j] = jaccard
+    
+    # Score edges
+    cluster_scores = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            affinity = cluster_affinity[i, j]
+            d_ij = distance_matrix[i, j]
+            
+            if affinity > threshold:
+                # Intra-cluster edge: prefer shorter edges
+                # Compute average distance within cluster
+                cluster_members = [idx for idx in range(n) 
+                                 if cluster_affinity[i, idx] > threshold]
+                if len(cluster_members) > 1:
+                    intra_dists = [distance_matrix[i, k] for k in cluster_members if k != i]
+                    avg_intra = np.mean(intra_dists) if intra_dists else d_ij
+                    # Score relative to cluster average
+                    intra_score = 1.0 + (avg_intra - d_ij) / (avg_intra + epsilon)
+                    cluster_scores[i, j] = max(0.5, min(2.0, intra_score))
+                else:
+                    cluster_scores[i, j] = 1.0
+            else:
+                # Inter-cluster edge: prefer edges that connect close clusters
+                # Measure how well this edge connects different clusters
+                bridge_quality = 0.0
+                if n > 3:
+                    # Check if this edge connects nodes that are bridges between clusters
+                    # by examining their neighbors' cluster affiliations
+                    i_neighbors = [k for k in nn_lists[i] if k != j]
+                    j_neighbors = [k for k in nn_lists[j] if k != i]
+                    
+                    if i_neighbors and j_neighbors:
+                        # Average distance from i's neighbors to j's cluster
+                        i_to_j_cluster = np.mean([min([distance_matrix[k, m] for m in j_neighbors] 
+                                                    + [np.inf]) for k in i_neighbors])
+                        # Average distance from j's neighbors to i's cluster  
+                        j_to_i_cluster = np.mean([min([distance_matrix[k, m] for m in i_neighbors] 
+                                                    + [np.inf]) for k in j_neighbors])
+                        
+                        bridge_quality = (i_to_j_cluster + j_to_i_cluster) / (2 * d_ij + epsilon)
+                        bridge_quality = min(2.0, max(0.5, 1.0 / (bridge_quality + epsilon)))
+                
+                cluster_scores[i, j] = bridge_quality if bridge_quality > 0 else 1.0
+    
+    return cluster_scores
+
+
+def _compute_two_hop_lookahead(distance_matrix: np.ndarray, n: int,
+                             epsilon: float, centrality: np.ndarray,
+                             params: Dict[str, Any]) -> np.ndarray:
+    """Evaluate edges considering two-hop sequences."""
+    depth = params['lookahead_depth']
+    breadth = params['lookahead_breadth']
+    
+    if depth != 2 or breadth < 1 or n < 4:
+        return np.ones_like(distance_matrix)
+    
+    lookahead_scores = np.ones_like(distance_matrix)
+    
+    # Precompute base scores for efficiency
+    base_scores = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(base_scores, 0)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            # Lookahead from j (excluding i)
+            dists_j = distance_matrix[j].copy()
+            dists_j[i] = np.inf  # Don't go back to i
+            dists_j[j] = np.inf  # Exclude self
+            
+            # Get potential next nodes
+            if breadth < n - 2:
+                next_candidates = np.argpartition(dists_j, breadth)[:breadth]
+            else:
+                next_candidates = [k for k in range(n) if k != i and k != j]
+            
+            # Evaluate best continuation
+            best_continuation = 0
+            for k in next_candidates:
+                if k == i or k == j:
+                    continue
+                    
+                # Two-hop sequence i->j->k
+                sequence_score = base_scores[i, j] + base_scores[j, k]
+                
+                # Penalty for potential backtracking
+                # Check if k is close to i (would create small cycle)
+                d_ik = distance_matrix[i, k]
+                cycle_penalty = 1.0 / (1.0 + np.exp(-5.0 * (d_ik / d_ij - 1.0)))
+                
+                adjusted_score = sequence_score * (1.0 - 0.3 * cycle_penalty)
+                best_continuation = max(best_continuation, adjusted_score)
+            
+            if best_continuation > 0:
+                # Normalize by base score
+                lookahead_scores[i, j] = 1.0 + 0.5 * (best_continuation / 
+                                                    (base_scores[i, j] + epsilon) - 1.0)
+                lookahead_scores[i, j] = max(0.5, min(2.0, lookahead_scores[i, j]))
+    
+    return lookahead_scores
+
+
+def _compute_cluster_aware_connectivity(distance_matrix: np.ndarray, n: int,
+                                      cluster_scores: np.ndarray,
+                                      params: Dict[str, Any]) -> np.ndarray:
+    """Compute mutual connectivity boost considering cluster structure."""
+    connectivity_boost = np.ones_like(distance_matrix)
+    
+    # Multi-scale mutual nearest neighbors
+    for k in [2, 3, 4, 6]:
+        if k >= n:
+            continue
+            
+        nn_masks = np.zeros((n, n), dtype=bool)
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            if k < n - 1:
+                nearest_indices = np.argpartition(dists, k)[:k]
+                nn_masks[i, nearest_indices] = True
+        
+        # Mutual nearest neighbors
+        mutual_mask = nn_masks & nn_masks.T
+        
+        # Boost value depends on cluster affinity
+        base_boost = 1.0 + 0.5 / np.log2(k + 1)
+        
+        for i in range(n):
+            for j in range(n):
+                if mutual_mask[i, j]:
+                    # Additional boost for intra-cluster mutual neighbors
+                    cluster_affinity = cluster_scores[i, j]
+                    if cluster_affinity > params['cluster_threshold']:
+                        connectivity_boost[i, j] *= base_boost * 1.2
+                    else:
+                        connectivity_boost[i, j] *= base_boost
+    
+    return connectivity_boost
+
+
+def _adaptive_sparsification(heuristics: np.ndarray, distance_matrix: np.ndarray,
+                           n: int, centrality: np.ndarray, cluster_scores: np.ndarray,
+                           params: Dict[str, Any]) -> np.ndarray:
+    """Perform node-specific adaptive sparsification."""
+    min_edges = params['min_edges']
+    max_edges = params['max_edges']
+    
+    for i in range(n):
+        row_scores = heuristics[i].copy()
+        row_scores[i] = 0
+        
+        # Determine number of edges to keep based on centrality
+        # Central nodes need more connections, peripheral nodes fewer
+        centrality_factor = 0.5 + 1.0 * centrality[i]
+        adaptive_k = int(min_edges + (max_edges - min_edges) * centrality_factor)
+        adaptive_k = min(max(min_edges, adaptive_k), max_edges)
+        
+        # Always keep top edges by score
+        sorted_indices = np.argsort(row_scores)[::-1]
+        keep_mask = np.zeros(n, dtype=bool)
+        
+        # Keep top adaptive_k edges
+        top_indices = sorted_indices[:adaptive_k]
+        keep_mask[top_indices] = True
+        
+        # Also keep important intra-cluster edges
+        cluster_threshold = params['cluster_threshold']
+        intra_cluster = [j for j in range(n) 
+                        if j != i and cluster_scores[i, j] > cluster_threshold]
+        
+        # Keep top intra-cluster edges (up to adaptive_k//2)
+        if intra_cluster:
+            intra_scores = [(j, row_scores[j]) for j in intra_cluster]
+            intra_scores.sort(key=lambda x: x[1], reverse=True)
+            keep_intra = min(len(intra_scores), adaptive_k // 2)
+            for j, _ in intra_scores[:keep_intra]:
+                keep_mask[j] = True
+        
+        # Ensure at least one connection to each major cluster
+        if n > 10:
+            # Identify clusters via sampling
+            clusters = []
+            visited = set()
+            for j in range(n):
+                if j != i and j not in visited:
+                    if cluster_scores[i, j] > cluster_threshold:
+                        # This is i's cluster
+                        cluster = [k for k in range(n) 
+                                 if k != i and cluster_scores[i, k] > cluster_threshold]
+                        clusters.append(cluster)
+                        visited.update(cluster)
+                    else:
+                        # Check if j forms a cluster with others
+                        similar = [k for k in range(n) 
+                                 if k != i and cluster_scores[j, k] > cluster_threshold]
+                        if len(similar) > 1:
+                            cluster = [j] + similar
+                            clusters.append(cluster)
+                            visited.update(cluster)
+                        else:
+                            clusters.append([j])
+                            visited.add(j)
+            
+            # Ensure at least one connection to each cluster
+            for cluster in clusters[:5]:  # Limit to 5 largest clusters
+                if not any(keep_mask[j] for j in cluster):
+                    # Add best connection to this cluster
+                    best_in_cluster = max(cluster, key=lambda j: row_scores[j])
+                    keep_mask[best_in_cluster] = True
+        
+        # Apply sparsification with soft reduction
+        reduction_factor = 0.05  # Strong reduction for non-kept edges
+        row_scores[~keep_mask] *= reduction_factor
+        heuristics[i] = row_scores
+    
+    return heuristics
+```

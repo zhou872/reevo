@@ -1,0 +1,233 @@
+```json
+{
+    "algorithm_features": ["Multi-step Lookahead Regret", "Adaptive Ensemble Weighting", "MST Connectivity Enforcement", "Dynamic Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with multi-step lookahead regret, adaptive ensemble 
+    weighting, MST connectivity enforcement, and dynamic edge sparsification.
+    
+    Key Innovations:
+    1. Multi-step Lookahead Regret: Evaluates 2-step and 3-step alternative paths
+    2. Adaptive Ensemble Weighting: Dynamically balances components via problem analysis
+    3. MST Connectivity Enforcement: Guarantees minimum spanning tree edges
+    4. Dynamic Edge Sparsification: Focuses computation on most promising edges
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. CORE COMPONENTS PREPARATION ====================
+    
+    # Inverse distance baseline
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST connectivity enforcement
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. MULTI-STEP LOOKAHEAD REGRET ====================
+    def compute_lookahead_regret() -> np.ndarray:
+        """Compute regret using 2-step and 3-step alternative paths"""
+        regret_matrix = np.ones((n, n))
+        
+        # Precompute nearest neighbors for efficient lookahead
+        k_neighbors = min(10, n - 1)
+        neighbor_indices = np.zeros((n, k_neighbors), dtype=int)
+        neighbor_dists = np.zeros((n, k_neighbors))
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            if n > k_neighbors:
+                idx = np.argpartition(dists, k_neighbors)[:k_neighbors]
+                sorted_idx = idx[np.argsort(dists[idx])]
+                neighbor_indices[i] = sorted_idx
+                neighbor_dists[i] = dists[sorted_idx]
+            else:
+                valid = np.arange(n) != i
+                neighbor_indices[i, :sum(valid)] = np.where(valid)[0]
+                neighbor_dists[i, :sum(valid)] = dists[valid]
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # 2-step alternative: i -> k -> j
+                two_step_alt = np.inf
+                for k_idx in range(k_neighbors):
+                    k = neighbor_indices[i, k_idx]
+                    if k == j:
+                        continue
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    two_step_alt = min(two_step_alt, alt_cost)
+                
+                # 3-step alternative: i -> k -> l -> j
+                three_step_alt = np.inf
+                for k_idx in range(min(5, k_neighbors)):
+                    k = neighbor_indices[i, k_idx]
+                    if k == j:
+                        continue
+                    for l_idx in range(min(3, k_neighbors)):
+                        l = neighbor_indices[k, l_idx]
+                        if l == i or l == j:
+                            continue
+                        alt_cost = (distance_matrix[i, k] + 
+                                   distance_matrix[k, l] + 
+                                   distance_matrix[l, j])
+                        three_step_alt = min(three_step_alt, alt_cost)
+                
+                # Take best alternative (minimum cost)
+                best_alternative = min(two_step_alt, three_step_alt)
+                
+                if best_alternative < np.inf:
+                    # Compute regret (opportunity cost)
+                    regret = max(0, best_alternative - direct_cost)
+                    # Exponential decay with adaptive scaling
+                    scale = max(np.percentile(distance_matrix[i], 25), 1e-8)
+                    regret_score = np.exp(-regret / scale)
+                    
+                    regret_matrix[i, j] = regret_score
+                    regret_matrix[j, i] = regret_score
+                else:
+                    regret_matrix[i, j] = 0.5  # Default for isolated edges
+                    regret_matrix[j, i] = 0.5
+        
+        return regret_matrix
+    
+    regret_scores = compute_lookahead_regret()
+    
+    # ==================== 3. ADAPTIVE ENSEMBLE WEIGHTING ====================
+    def compute_adaptive_weights() -> Tuple[float, float, float]:
+        """Compute component weights based on problem structure"""
+        
+        # Problem size adaptation
+        size_factor = min(1.0, np.log(n) / np.log(100))
+        
+        # Distance distribution analysis
+        triu_indices = np.triu_indices(n, 1)
+        distances = distance_matrix[triu_indices]
+        
+        if len(distances) < 2:
+            return 0.4, 0.3, 0.3
+        
+        dist_std = np.std(distances)
+        dist_mean = np.mean(distances)
+        cv = dist_std / (dist_mean + 1e-8)
+        
+        # Complexity indicators
+        uniformity = 1.0 - min(1.0, cv)
+        sparsity = min(1.0, np.sqrt(n) / 50)  # Approximate sparsity
+        
+        # Base weights with problem-adaptive adjustments
+        w_regret = 0.4 + 0.2 * size_factor - 0.1 * uniformity
+        w_inv = 0.3 + 0.2 * sparsity + 0.1 * uniformity
+        w_mst = 0.3 + 0.1 * size_factor - 0.1 * sparsity
+        
+        # Ensure non-negative and normalize
+        w_regret = max(0.1, w_regret)
+        w_inv = max(0.1, w_inv)
+        w_mst = max(0.1, w_mst)
+        
+        total = w_regret + w_inv + w_mst
+        return w_regret / total, w_inv / total, w_mst / total
+    
+    w_regret, w_inv, w_mst = compute_adaptive_weights()
+    
+    # ==================== 4. COMPOSITE SCORE WITH MST ENFORCEMENT ====================
+    # Create MST bonus with enhanced connectivity preservation
+    mst_bonus = np.where(mst_edges, 2.0, 1.0)
+    
+    # Weighted combination with MST reinforcement
+    composite_scores = (
+        w_regret * regret_scores +
+        w_inv * inv_dist * mst_bonus
+    )
+    
+    # Strong MST boost for connectivity guarantee
+    composite_scores[mst_edges] *= 1.5
+    
+    # ==================== 5. DYNAMIC EDGE SPARSIFICATION ====================
+    def dynamic_sparsify(scores: np.ndarray) -> np.ndarray:
+        """Intelligently retain most promising edges"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always preserve MST edges for connectivity
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Dynamic candidate selection per node
+        base_candidates = max(3, min(8, int(np.log2(n) * 2)))
+        
+        for i in range(n):
+            node_scores = scores[i].copy()
+            node_scores[i] = -np.inf
+            node_scores[mst_edges[i]] = -np.inf  # Already included
+            
+            # Adaptive number of candidates
+            if n <= 10:
+                k = n - 1
+            else:
+                k = min(base_candidates, n - 1 - np.sum(mst_edges[i]))
+            
+            if k > 0 and np.any(node_scores > -np.inf):
+                # Select top-k non-MST edges
+                valid_scores = node_scores[node_scores > -np.inf]
+                if len(valid_scores) >= k:
+                    threshold = np.partition(valid_scores, -k)[-k]
+                else:
+                    threshold = np.min(valid_scores) - 1e-8
+                
+                top_mask = node_scores >= threshold
+                top_mask[i] = False  # Exclude self
+                
+                # Update sparsified matrix (bidirectional)
+                sparsified[i, top_mask] = scores[i, top_mask]
+                sparsified[top_mask, i] = scores[top_mask, i]
+        
+        return sparsified
+    
+    sparsified_scores = dynamic_sparsify(composite_scores)
+    
+    # ==================== 6. FINAL REFINEMENT ====================
+    # Distance-based attenuation (exponential decay)
+    if n > 1:
+        median_dist = np.median(distance_matrix[triu_indices])
+        if median_dist > 0:
+            dist_weight = np.exp(-distance_matrix / (0.7 * median_dist))
+            sparsified_scores *= dist_weight
+    
+    # Symmetrize using maximum operator to preserve edges
+    symmetric_scores = np.maximum(sparsified_scores, sparsified_scores.T)
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores /= max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    # Smooth saturation for numerical stability
+    symmetric_scores = np.tanh(symmetric_scores * 1.5)
+    
+    return symmetric_scores
+```

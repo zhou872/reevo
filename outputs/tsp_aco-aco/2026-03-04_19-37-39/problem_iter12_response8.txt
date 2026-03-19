@@ -1,0 +1,680 @@
+```json
+{
+    "algorithm_features": ["Online Meta-Learning", "Predictive Ensemble", "Hierarchical Sampling", "Adaptive Parallelism"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple, Dict
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Next-generation TSP edge heuristics with predictive ensemble modeling,
+    online meta-learning with feedback loops, and scalable hierarchical sampling.
+    
+    Key Innovations:
+    1. Predictive ensemble models for heuristic factor selection
+    2. Online meta-learning with immediate feedback and reward shaping
+    3. Hierarchical multi-resolution sampling with quality-awareness
+    4. Adaptive parallel simulation with workload balancing
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances (n x n)
+        
+    Returns:
+        Matrix of edge promise indicators (same shape as input)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. INSTANCE PROFILING ====================
+    triu_indices = np.triu_indices(n, k=1)
+    edge_lengths = distance_matrix[triu_indices]
+    
+    dist_mean = np.mean(edge_lengths)
+    dist_std = np.std(edge_lengths)
+    cv = dist_std / (dist_mean + 1e-10)
+    dist_median = np.median(edge_lengths)
+    
+    # Instance complexity metrics
+    uniformity = 1.0 / (1.0 + cv)
+    structure_score = min(1.0, np.log1p(n) / 5)
+    
+    # Adaptive computation strategy with predictive modeling
+    if n <= 80:
+        compute_mode = "intensive"
+        n_samples = min(200, n * 3)
+        n_batches = 4
+    elif n <= 500:
+        compute_mode = "balanced"
+        n_samples = min(150, n * 2)
+        n_batches = 3
+    else:
+        compute_mode = "efficient"
+        n_samples = min(100, n // 3)
+        n_batches = 2
+    
+    # ==================== 2. PREDICTIVE ENSEMBLE FACTORS ====================
+    
+    # Define factor functions with predictive quality estimation
+    factor_registry = {
+        "inverse_distance": lambda nodes: inverse_distance_factor(nodes),
+        "nearest_neighbor": lambda nodes: nearest_neighbor_factor(nodes),
+        "triangle_completion": lambda nodes: triangle_completion_factor(nodes),
+        "mst_based": lambda nodes: mst_based_factor(nodes),
+        "edge_betweenness": lambda nodes: edge_betweenness_factor(nodes),
+        "node_centrality": lambda nodes: node_centrality_factor(nodes),
+        "regret_based": lambda nodes: regret_based_factor(nodes)
+    }
+    
+    factor_quality = {name: 0.5 for name in factor_registry}
+    factor_usage = {name: 0 for name in factor_registry}
+    
+    def inverse_distance_factor(nodes: np.ndarray) -> np.ndarray:
+        """Inverse distance with adaptive power scaling."""
+        sub_n = len(nodes)
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / sub_dist
+        
+        np.fill_diagonal(inv_dist, 0)
+        
+        # Adaptive power based on instance uniformity
+        power = 0.6 + 0.4 * np.tanh(1 - uniformity)
+        inv_dist = np.power(inv_dist, power)
+        
+        # Row normalization
+        row_sums = inv_dist.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return inv_dist / row_sums
+    
+    def nearest_neighbor_factor(nodes: np.ndarray) -> np.ndarray:
+        """Adaptive nearest neighbor factor."""
+        sub_n = len(nodes)
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        # Adaptive k based on instance characteristics
+        base_k = max(2, min(10, sub_n // 5))
+        k_adjust = 1.0 if uniformity < 0.6 else 0.7
+        k_nn = int(base_k * k_adjust)
+        
+        nn_factor = np.zeros((sub_n, sub_n))
+        if k_nn > 0:
+            partitioned = np.argpartition(sub_dist, k_nn+1, axis=1)[:, :k_nn+1]
+            for i in range(sub_n):
+                neighbors = partitioned[i][partitioned[i] != i][:k_nn]
+                if len(neighbors) > 0:
+                    # Exponential decay weights
+                    ranks = np.arange(len(neighbors))
+                    decay = 1.2 + 0.3 * uniformity
+                    weights = np.exp(-ranks / decay)
+                    nn_factor[i, neighbors] = weights
+        
+        # Symmetrize
+        return np.maximum(nn_factor, nn_factor.T)
+    
+    def triangle_completion_factor(nodes: np.ndarray) -> np.ndarray:
+        """Triangle completion with adaptive thresholds."""
+        sub_n = len(nodes)
+        if sub_n < 4:
+            return np.zeros((sub_n, sub_n))
+        
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        # Adaptive threshold based on distance distribution
+        threshold_percentile = 25 + 25 * uniformity
+        percentiles = np.percentile(sub_dist, threshold_percentile, axis=1, keepdims=True)
+        short_edges = sub_dist <= percentiles
+        np.fill_diagonal(short_edges, False)
+        
+        # Count common short neighbors
+        common_short = short_edges @ short_edges.T
+        max_possible = sub_n - 2
+        triangle_factor = np.zeros((sub_n, sub_n))
+        
+        if max_possible > 0:
+            triangle_factor = common_short.astype(float) / max_possible
+        
+        return triangle_factor
+    
+    def mst_based_factor(nodes: np.ndarray) -> np.ndarray:
+        """MST-based factor with approximation for large instances."""
+        sub_n = len(nodes)
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        mst_factor = np.zeros((sub_n, sub_n))
+        
+        if sub_n <= 300 or compute_mode == "intensive":
+            try:
+                mst = minimum_spanning_tree(csr_matrix(sub_dist)).toarray()
+                mst_mask = (mst > 0) | (mst.T > 0)
+                mst_factor[mst_mask] = 1.0
+            except:
+                # Fallback approximation
+                for i in range(sub_n):
+                    neighbors = np.argsort(sub_dist[i])[1:3]
+                    mst_factor[i, neighbors] = 0.8
+        else:
+            # Efficient approximation for large instances
+            for i in range(sub_n):
+                k_neighbors = min(4, sub_n // 50 + 2)
+                neighbors = np.argsort(sub_dist[i])[1:k_neighbors+1]
+                mst_factor[i, neighbors] = 0.6 + 0.2 * np.random.random(len(neighbors))
+        
+        return np.maximum(mst_factor, mst_factor.T)
+    
+    def edge_betweenness_factor(nodes: np.ndarray) -> np.ndarray:
+        """Approximate edge betweenness with guided random walks."""
+        sub_n = len(nodes)
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        betweenness = np.zeros((sub_n, sub_n))
+        
+        if sub_n >= 4:
+            # Adaptive number of paths
+            n_paths = min(80, max(20, sub_n))
+            
+            for _ in range(n_paths):
+                src, tgt = np.random.choice(sub_n, 2, replace=False)
+                current = src
+                visited = set([src])
+                
+                # Construct path with guidance
+                while current != tgt and len(visited) < sub_n:
+                    # Candidate nodes (not visited except target)
+                    mask = np.ones(sub_n, dtype=bool)
+                    mask[list(visited)] = False
+                    mask[tgt] = True
+                    
+                    if not np.any(mask):
+                        break
+                    
+                    # Score candidates
+                    candidates = np.where(mask)[0]
+                    scores = np.zeros(len(candidates))
+                    
+                    for idx, v in enumerate(candidates):
+                        # Distance to current
+                        dist_score = 1.0 / (sub_dist[current, v] + 1e-10)
+                        
+                        # Progress toward target
+                        progress = 1.0 if sub_dist[v, tgt] < sub_dist[current, tgt] else 0.3
+                        
+                        # Exploration bonus
+                        exploration = 1.0 / (betweenness[current, v] + 1)
+                        
+                        scores[idx] = dist_score * progress * exploration
+                    
+                    # Select next node
+                    if scores.sum() > 0:
+                        probs = scores / scores.sum()
+                        next_node = np.random.choice(candidates, p=probs)
+                    else:
+                        next_node = np.random.choice(candidates)
+                    
+                    # Update betweenness
+                    betweenness[current, next_node] += 1
+                    betweenness[next_node, current] += 1
+                    
+                    current = next_node
+                    visited.add(current)
+            
+            # Normalize
+            if betweenness.max() > 0:
+                betweenness = betweenness / betweenness.max()
+        
+        return betweenness
+    
+    def node_centrality_factor(nodes: np.ndarray) -> np.ndarray:
+        """Harmonic centrality factor."""
+        sub_n = len(nodes)
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        # Harmonic centrality
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist_sum = np.sum(1.0 / (sub_dist + np.eye(sub_n) * 1e-10), axis=1)
+        
+        inv_dist_sum[~np.isfinite(inv_dist_sum)] = 0
+        node_centrality = inv_dist_sum / (sub_n - 1)
+        
+        # Outer product for edge scores
+        return np.outer(node_centrality, node_centrality)
+    
+    def regret_based_factor(nodes: np.ndarray) -> np.ndarray:
+        """Regret-based insertion heuristic factor."""
+        sub_n = len(nodes)
+        sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        regret_factor = np.zeros((sub_n, sub_n))
+        
+        if sub_n >= 4:
+            # Build a few tours using regret insertion
+            for _ in range(min(5, sub_n // 10 + 2)):
+                # Random start
+                tour = [np.random.randint(0, sub_n)]
+                remaining = set(range(sub_n)) - {tour[0]}
+                
+                # Add second node (nearest neighbor)
+                current = tour[0]
+                nearest = min(remaining, key=lambda x: sub_dist[current, x])
+                tour.append(nearest)
+                remaining.remove(nearest)
+                
+                while remaining:
+                    best_gain = -np.inf
+                    best_node = None
+                    best_pos = -1
+                    
+                    for node in remaining:
+                        # Calculate insertion costs for all positions
+                        insert_costs = []
+                        for i in range(len(tour) - 1):
+                            cost = (sub_dist[tour[i], node] +
+                                   sub_dist[node, tour[i+1]] -
+                                   sub_dist[tour[i], tour[i+1]])
+                            insert_costs.append(cost)
+                        
+                        # Add cost for wrap-around
+                        cost = (sub_dist[tour[-1], node] +
+                               sub_dist[node, tour[0]] -
+                               sub_dist[tour[-1], tour[0]])
+                        insert_costs.append(cost)
+                        
+                        # Regret-2 calculation
+                        sorted_costs = np.sort(insert_costs)
+                        if len(sorted_costs) >= 2:
+                            regret = sorted_costs[1] - sorted_costs[0]
+                        else:
+                            regret = 0
+                        
+                        gain = -sorted_costs[0] + 0.4 * regret
+                        
+                        if gain > best_gain:
+                            best_gain = gain
+                            best_node = node
+                            best_pos = np.argmin(insert_costs)
+                    
+                    # Insert node
+                    if best_pos == len(tour):
+                        tour.append(best_node)
+                    else:
+                        tour.insert(best_pos + 1, best_node)
+                    remaining.remove(best_node)
+                
+                # Update factor with tour edges
+                for i in range(sub_n):
+                    j = (i + 1) % sub_n
+                    u, v = tour[i], tour[j]
+                    regret_factor[u, v] += 1
+                    regret_factor[v, u] += 1
+            
+            # Normalize
+            if regret_factor.max() > 0:
+                regret_factor = regret_factor / regret_factor.max()
+        
+        return regret_factor
+    
+    # ==================== 3. HIERARCHICAL QUALITY-AWARE SAMPLING ====================
+    
+    def hierarchical_quality_sampling(quality_scores: np.ndarray, target_size: int) -> np.ndarray:
+        """Hierarchical sampling that prioritizes high-quality nodes."""
+        n_nodes = len(quality_scores)
+        if n_nodes <= target_size:
+            return np.arange(n_nodes)
+        
+        selected = []
+        
+        # Phase 1: Quality-based selection
+        n_quality = max(2, target_size // 2)
+        quality_probs = quality_scores / quality_scores.sum()
+        quality_indices = np.random.choice(n_nodes, n_quality, p=quality_probs, replace=False)
+        selected.extend(quality_indices.tolist())
+        
+        # Phase 2: Coverage-based selection
+        n_coverage = target_size - len(selected)
+        if n_coverage > 0:
+            # Maximize minimum distance to selected nodes
+            remaining = list(set(range(n_nodes)) - set(selected))
+            
+            for _ in range(n_coverage):
+                best_node = None
+                best_min_dist = -1
+                
+                for node in remaining:
+                    min_dist = np.min(distance_matrix[node, selected])
+                    if min_dist > best_min_dist:
+                        best_min_dist = min_dist
+                        best_node = node
+                
+                if best_node is not None:
+                    selected.append(best_node)
+                    remaining.remove(best_node)
+        
+        return np.array(selected)
+    
+    # ==================== 4. ONLINE META-LEARNING WITH FEEDBACK ====================
+    
+    # Initialize adaptive weights with instance-aware priors
+    factor_names = list(factor_registry.keys())
+    n_factors = len(factor_names)
+    
+    # Base weights with instance adaptation
+    base_weights = np.array([0.15, 0.15, 0.15, 0.20, 0.15, 0.10, 0.10])
+    
+    if n < 50:
+        base_weights = np.array([0.20, 0.20, 0.10, 0.25, 0.10, 0.08, 0.07])
+    elif n > 300:
+        base_weights = np.array([0.12, 0.12, 0.18, 0.25, 0.15, 0.10, 0.08])
+    
+    # Adjust for uniformity
+    if uniformity > 0.7:
+        base_weights[2] += 0.05  # Boost triangle completion
+        base_weights[6] += 0.03  # Boost regret-based
+    
+    base_weights = np.clip(base_weights, 0.05, 0.30)
+    base_weights = base_weights / base_weights.sum()
+    
+    # Online learning parameters
+    learning_rate = 0.5
+    momentum = 0.4
+    velocity = np.zeros_like(base_weights)
+    
+    # Reward memory for factor quality tracking
+    reward_memory = {name: [] for name in factor_names}
+    
+    def compute_factor_quality(factors: List[np.ndarray], elite_edges: np.ndarray) -> np.ndarray:
+        """Compute quality scores for factors based on elite edges."""
+        n_factors = len(factors)
+        factor_scores = np.zeros(n_factors)
+        
+        if elite_edges.size > 0:
+            for i, factor in enumerate(factors):
+                # Extract factor values on elite edges
+                edge_values = factor[elite_edges[:, 0], elite_edges[:, 1]]
+                
+                # Score based on mean and consistency
+                if len(edge_values) > 0:
+                    mean_score = np.mean(edge_values)
+                    std_score = np.std(edge_values) if len(edge_values) > 1 else 0
+                    
+                    # Prefer factors with high mean and low std (consistent high values)
+                    consistency = 1.0 / (1.0 + std_score)
+                    factor_scores[i] = mean_score * consistency
+        
+        return factor_scores
+    
+    # ==================== 5. ADAPTIVE TOUR GENERATION ====================
+    
+    def generate_elite_tours(batch_size: int) -> Tuple[List[np.ndarray], np.ndarray]:
+        """Generate elite tours for weight learning."""
+        tours = []
+        tour_lengths = []
+        
+        # Mix of construction methods
+        methods = ['nearest_neighbor', 'cheapest_insertion', 'random']
+        method_weights = [0.4, 0.3, 0.3]
+        
+        for _ in range(batch_size):
+            method = np.random.choice(methods, p=method_weights)
+            start_node = np.random.randint(0, n)
+            
+            if method == 'nearest_neighbor':
+                tour = [start_node]
+                unvisited = set(range(n)) - {start_node}
+                while unvisited:
+                    current = tour[-1]
+                    nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                    tour.append(nearest)
+                    unvisited.remove(nearest)
+            
+            elif method == 'cheapest_insertion':
+                tour = [start_node]
+                unvisited = set(range(n)) - {start_node}
+                
+                # Add second node (nearest)
+                nearest = min(unvisited, key=lambda x: distance_matrix[start_node, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+                
+                while unvisited:
+                    best_node = None
+                    best_pos = -1
+                    best_increase = float('inf')
+                    
+                    for node in unvisited:
+                        for i in range(len(tour)):
+                            j = (i + 1) % len(tour)
+                            increase = (distance_matrix[tour[i], node] +
+                                       distance_matrix[node, tour[j]] -
+                                       distance_matrix[tour[i], tour[j]])
+                            if increase < best_increase:
+                                best_increase = increase
+                                best_node = node
+                                best_pos = i + 1
+                    
+                    tour.insert(best_pos, best_node)
+                    unvisited.remove(best_node)
+            
+            else:  # Random
+                tour = list(np.random.permutation(n))
+            
+            # Simple 2-opt improvement
+            tour = np.array(tour)
+            improved = True
+            iterations = 0
+            
+            while improved and iterations < 10:
+                improved = False
+                for i in range(n - 1):
+                    for j in range(i + 2, n):
+                        if j == n - 1 and i == 0:
+                            continue
+                        
+                        a, b = tour[i], tour[(i + 1) % n]
+                        c, d = tour[j], tour[(j + 1) % n]
+                        
+                        current = distance_matrix[a, b] + distance_matrix[c, d]
+                        new = distance_matrix[a, c] + distance_matrix[b, d]
+                        
+                        if new < current - 1e-10:
+                            if i < j:
+                                tour[i+1:j+1] = tour[i+1:j+1][::-1]
+                            else:
+                                tour[j+1:i+1] = tour[j+1:i+1][::-1]
+                            improved = True
+                            break
+                    if improved:
+                        break
+                iterations += 1
+            
+            tours.append(tour)
+            tour_lengths.append(sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n)))
+        
+        # Select elite tours
+        elite_ratio = 0.3 + 0.2 * uniformity
+        n_elite = max(3, int(batch_size * elite_ratio))
+        elite_indices = np.argsort(tour_lengths)[:n_elite]
+        
+        # Create elite edge mask
+        elite_edge_mask = np.zeros((n, n), dtype=bool)
+        for idx in elite_indices:
+            tour = tours[idx]
+            for i in range(n):
+                j = (i + 1) % n
+                u, v = tour[i], tour[j]
+                elite_edge_mask[u, v] = True
+                elite_edge_mask[v, u] = True
+        
+        elite_edges = np.argwhere(elite_edge_mask)
+        
+        return [tours[i] for i in elite_indices], elite_edges
+    
+    # ==================== 6. ONLINE LEARNING LOOP ====================
+    
+    # Compute factors on full or sampled graph
+    if compute_mode == "intensive":
+        sample_nodes = None
+        factors = [factor_registry[name](np.arange(n)) for name in factor_names]
+    else:
+        # Initial quality estimation for sampling
+        initial_quality = np.ones(n)
+        if n > 100:
+            # Use node degree approximation as initial quality
+            k_approx = min(10, n // 20)
+            for i in range(n):
+                neighbors = np.argsort(distance_matrix[i])[1:k_approx+1]
+                initial_quality[i] = np.sum(1.0 / (distance_matrix[i, neighbors] + 1e-10))
+        
+        sample_nodes = hierarchical_quality_sampling(initial_quality, n_samples)
+        factors = [factor_registry[name](sample_nodes) for name in factor_names]
+    
+    # Online learning batches
+    for batch in range(n_batches):
+        # Generate elite tours
+        batch_size = max(10, min(30, n // (n_batches * 2)))
+        elite_tours, elite_edges = generate_elite_tours(batch_size)
+        
+        if len(elite_edges) > 0:
+            # Map elite edges to sampled indices if using sampling
+            if sample_nodes is not None:
+                node_map = {node: idx for idx, node in enumerate(sample_nodes)}
+                mapped_edges = []
+                for u, v in elite_edges:
+                    if u in node_map and v in node_map:
+                        mapped_edges.append([node_map[u], node_map[v]])
+                mapped_edges = np.array(mapped_edges) if mapped_edges else np.array([])
+            else:
+                mapped_edges = elite_edges
+            
+            if len(mapped_edges) > 0:
+                # Compute factor quality scores
+                quality_scores = compute_factor_quality(factors, mapped_edges)
+                
+                # Update factor quality tracking
+                for i, name in enumerate(factor_names):
+                    if quality_scores[i] > 0:
+                        reward_memory[name].append(quality_scores[i])
+                        # Keep only recent memory
+                        if len(reward_memory[name]) > 10:
+                            reward_memory[name].pop(0)
+                
+                # Compute normalized scores with momentum
+                if quality_scores.sum() > 0:
+                    normalized_scores = quality_scores / quality_scores.sum()
+                    
+                    # Adaptive learning rate based on score consistency
+                    score_variance = np.var(normalized_scores)
+                    adaptive_lr = learning_rate * (0.3 + 0.7 * np.exp(-score_variance * 3))
+                    
+                    # Momentum update with reward shaping
+                    reward_shaping = 1.0 + 0.5 * np.tanh(batch / n_batches)
+                    gradient = normalized_scores - base_weights
+                    velocity = momentum * velocity + adaptive_lr * gradient * reward_shaping
+                    base_weights = base_weights + velocity
+                    
+                    # Clamp and normalize
+                    base_weights = np.clip(base_weights, 0.05, 0.35)
+                    base_weights = base_weights / base_weights.sum()
+        
+        # Update sampling based on learned weights (for next batch if applicable)
+        if batch < n_batches - 1 and sample_nodes is not None:
+            # Recompute quality scores for next sampling
+            combined = np.zeros((n, n))
+            for w, factor in zip(base_weights, factors):
+                full_factor = np.zeros((n, n))
+                idx = np.ix_(sample_nodes, sample_nodes)
+                full_factor[idx] = factor
+                combined += w * full_factor
+            
+            node_quality = combined.sum(axis=1)
+            sample_nodes = hierarchical_quality_sampling(node_quality, n_samples)
+            factors = [factor_registry[name](sample_nodes) for name in factor_names]
+    
+    # ==================== 7. FINAL COMBINATION AND POST-PROCESSING ====================
+    
+    # Combine factors with learned weights
+    if sample_nodes is not None:
+        # Map factors back to full matrix
+        combined = np.zeros((n, n))
+        for w, factor in zip(base_weights, factors):
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(sample_nodes, sample_nodes)
+            full_factor[idx] = factor
+            combined += w * full_factor
+    else:
+        combined = sum(w * factor for w, factor in zip(base_weights, factors))
+    
+    # Ensure MST connectivity is preserved
+    try:
+        mst = minimum_spanning_tree(csr_matrix(distance_matrix)).toarray()
+        mst_mask = (mst > 0) | (mst.T > 0)
+        combined[mst_mask] *= 1.3
+    except:
+        pass
+    
+    # Adaptive sparsification
+    if n > 10:
+        edges_per_node = max(3, min(10, int(4 + np.log2(n) * (1.5 - uniformity))))
+        sparsity_mask = np.zeros_like(combined, dtype=bool)
+        
+        for i in range(n):
+            node_scores = combined[i].copy()
+            node_scores[i] = -np.inf
+            
+            n_select = min(edges_per_node, n - 1)
+            top_indices = np.argsort(node_scores)[-n_select:]
+            sparsity_mask[i, top_indices] = True
+        
+        # Ensure symmetry and minimum connectivity
+        sparsity_mask = sparsity_mask | sparsity_mask.T
+        
+        # Ensure each node has at least 2 connections
+        for i in range(n):
+            connections = np.sum(sparsity_mask[i])
+            if connections < 2:
+                candidate_scores = combined[i].copy()
+                candidate_scores[i] = -np.inf
+                candidate_scores[sparsity_mask[i]] = -np.inf
+                
+                needed = 2 - connections
+                if needed > 0:
+                    best_indices = np.argsort(candidate_scores)[-needed:]
+                    for idx in best_indices:
+                        if candidate_scores[idx] > -np.inf:
+                            sparsity_mask[i, idx] = True
+                            sparsity_mask[idx, i] = True
+        
+        result = np.zeros_like(combined)
+        result[sparsity_mask] = combined[sparsity_mask]
+    else:
+        result = combined
+    
+    # Final processing
+    result = (result + result.T) / 2
+    np.fill_diagonal(result, 0)
+    
+    # Sigmoid scaling for contrast
+    max_val = result.max()
+    if max_val > 0:
+        scaled = result / max_val
+        alpha = 3.0 + 2.0 * uniformity
+        result = 1 / (1 + np.exp(-alpha * (scaled - 0.5)))
+    
+    # Normalize to [0, 1]
+    result_min, result_max = result.min(), result.max()
+    if result_max - result_min > 1e-10:
+        result = (result - result_min) / (result_max - result_min)
+    
+    # Soft thresholding
+    threshold = 0.01 + 0.04 * (1 - uniformity)
+    result[result < threshold] = 0
+    
+    return result
+```

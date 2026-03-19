@@ -1,0 +1,329 @@
+```json
+{
+    "algorithm_features": ["Weighted Multi-Alternative Regret Lookahead", "Fast Graph Clustering Heuristic", "Dynamic Density-Based Sparsification", "Probabilistic Edge Selection"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+import warnings
+from typing import Tuple, Optional
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with weighted multi-alternative regret,
+    fast clustering for global structure, and dynamic sparsification.
+    
+    Core improvements over v1:
+    1. Weighted Multi-Alternative Regret: Considers multiple alternative paths
+       with distance-weighted probabilities, not just the second-best edge.
+    2. Fast Graph Clustering: Uses connected components on thresholded graph
+       to detect clusters and boost intra-cluster edges.
+    3. Dynamic Density-Based Sparsification: Adjusts candidate list size
+       per node based on local neighborhood density.
+    4. Probabilistic Edge Selection: Final scores represent probabilities
+       of edge inclusion in good tours.
+    
+    Returns:
+        Heuristic matrix [0,1] where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix
+    dmat = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(dmat, np.inf)
+    eps = 1e-12
+    
+    # ========== LOCAL DENSITY ANALYSIS ==========
+    # Compute density metrics per node for adaptive sparsification
+    local_densities = np.zeros(n)
+    for i in range(n):
+        # Get distances to all other nodes
+        dists = dmat[i][dmat[i] < np.inf]
+        if len(dists) > 0:
+            # Density measure: inverse of coefficient of variation
+            mean_dist = np.mean(dists)
+            std_dist = np.std(dists)
+            cv = std_dist / (mean_dist + eps)
+            local_densities[i] = 1.0 / (1.0 + cv)  # Higher for uniform neighborhoods
+    
+    # Adaptive candidate list size based on local density
+    base_k = max(4, int(np.sqrt(n)))
+    candidate_sizes = np.zeros(n, dtype=int)
+    for i in range(n):
+        # Dense neighborhoods need fewer candidates (more discriminative)
+        # Sparse neighborhoods need more candidates (less discriminative)
+        adj_factor = 1.5 - local_densities[i]  # 0.5 to 1.5
+        candidate_sizes[i] = min(n-1, max(3, int(base_k * adj_factor)))
+    
+    # ========== FAST GRAPH CLUSTERING ==========
+    # Detect clusters using thresholded connectivity
+    cluster_bonus = np.zeros_like(dmat)
+    if n > 10 and n <= 2000:  # Practical limit for clustering
+        # Adaptive threshold: median of non-diagonal distances
+        flat_dist = dmat[np.isfinite(dmat)]
+        if len(flat_dist) > 0:
+            threshold = np.percentile(flat_dist, 30)  # 30th percentile
+            
+            # Build thresholded adjacency matrix
+            adj = (dmat <= threshold) & (np.isfinite(dmat))
+            
+            # Find connected components (clusters)
+            visited = np.zeros(n, dtype=bool)
+            cluster_id = -np.ones(n, dtype=int)
+            current_cluster = 0
+            
+            for i in range(n):
+                if not visited[i]:
+                    # BFS to find component
+                    stack = [i]
+                    cluster_members = []
+                    
+                    while stack:
+                        node = stack.pop()
+                        if not visited[node]:
+                            visited[node] = True
+                            cluster_members.append(node)
+                            cluster_id[node] = current_cluster
+                            
+                            # Add unvisited neighbors
+                            neighbors = np.where(adj[node] & ~visited)[0]
+                            stack.extend(neighbors)
+                    
+                    # Bonus for intra-cluster edges
+                    if len(cluster_members) > 1:
+                        for idx_i, node_i in enumerate(cluster_members):
+                            for node_j in cluster_members[idx_i+1:]:
+                                # Stronger bonus for closer nodes within cluster
+                                dist_factor = 1.0 / (1.0 + dmat[node_i, node_j] / threshold)
+                                bonus = 0.25 * dist_factor
+                                cluster_bonus[node_i, node_j] = bonus
+                                cluster_bonus[node_j, node_i] = bonus
+                    
+                    current_cluster += 1
+    
+    # ========== WEIGHTED MULTI-ALTERNATIVE REGRET ==========
+    regret_scores = np.zeros_like(dmat)
+    
+    # Precompute sorted neighbor indices for each node
+    sorted_neighbors = np.argsort(dmat, axis=1)
+    
+    # Parameters for regret computation
+    n_alternatives = min(5, n-2)  # Number of alternatives to consider
+    lookahead_depth = 2  # How many steps to look ahead
+    
+    for i in range(min(n, 300)):  # Limit computation for large instances
+        if np.all(np.isinf(dmat[i])):
+            continue
+        
+        # Get candidate edges for this node
+        k_i = candidate_sizes[i]
+        candidates = sorted_neighbors[i, 1:k_i+1]  # Skip self
+        
+        for j in candidates:
+            if i == j or np.isinf(dmat[i, j]):
+                continue
+            
+            direct_cost = dmat[i, j]
+            
+            # Find alternative paths through other nodes
+            alternative_costs = []
+            alternative_weights = []
+            
+            # Get alternative next nodes (excluding j)
+            alt_next_candidates = [n for n in sorted_neighbors[i, 1:n_alternatives+2] 
+                                 if n != j and not np.isinf(dmat[i, n])]
+            
+            for alt in alt_next_candidates:
+                if alt == j:
+                    continue
+                
+                alt_cost = dmat[i, alt]
+                
+                # Look ahead to find continuation from alt
+                if lookahead_depth > 0 and n > 3:
+                    # Get possible continuations from alt (excluding i and j)
+                    possible_contin = [c for c in sorted_neighbors[alt, 1:n_alternatives+2] 
+                                     if c not in [i, j] and not np.isinf(dmat[alt, c])]
+                    
+                    if possible_contin:
+                        # Take the best continuation
+                        best_contin_cost = min(dmat[alt, c] for c in possible_contin[:2])
+                        alt_cost += best_contin_cost
+                
+                alternative_costs.append(alt_cost)
+                
+                # Weight alternatives by inverse distance (better alternatives get higher weight)
+                weight = 1.0 / (alt_cost + eps)
+                alternative_weights.append(weight)
+            
+            if alternative_costs:
+                # Calculate weighted alternative cost
+                alt_weights = np.array(alternative_weights)
+                alt_costs = np.array(alternative_costs)
+                
+                if alt_weights.sum() > eps:
+                    weighted_alt_cost = np.average(alt_costs, weights=alt_weights)
+                    
+                    # Calculate regret: how much worse is direct edge compared to weighted alternative
+                    if direct_cost > eps:
+                        regret = (direct_cost - weighted_alt_cost) / direct_cost
+                        # Transform to [0,1] with sigmoid
+                        regret_scores[i, j] = max(0, 1.0 / (1.0 + np.exp(-5.0 * regret)))
+    
+    # Symmetrize regret scores
+    regret_scores = np.maximum(regret_scores, regret_scores.T)
+    
+    # ========== EXPONENTIAL RANK-WEIGHTED SCORING ==========
+    rank_weights = np.zeros_like(dmat)
+    
+    for i in range(n):
+        k_i = candidate_sizes[i]
+        sorted_idx = sorted_neighbors[i, 1:k_i+1]  # Skip self
+        
+        # Adaptive decay rate based on local density
+        if len(sorted_idx) > 1:
+            # Get distances to top candidates
+            top_dists = dmat[i, sorted_idx[:min(5, len(sorted_idx))]]
+            mean_top = np.mean(top_dists)
+            std_top = np.std(top_dists)
+            cv = std_top / (mean_top + eps)
+            
+            # Higher CV (more varied distances) → faster decay
+            decay_rate = 0.4 + 0.5 / (1.0 + np.exp(-3.0 * (cv - 0.5)))
+        else:
+            decay_rate = 0.7
+        
+        # Apply exponential decay by rank
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # ========== LIGHTWEIGHT MST STRUCTURAL BIAS ==========
+    mst_bonus = np.zeros_like(dmat)
+    if n <= 1000:  # Conservative limit for MST
+        try:
+            mst = minimum_spanning_tree(dmat).toarray()
+            mst_mask = (mst + mst.T) > 0
+            # Variable bonus based on edge length percentile
+            if np.any(mst_mask):
+                mst_edges = dmat[mst_mask]
+                if len(mst_edges) > 0:
+                    # Shorter MST edges get higher bonus
+                    edge_quantiles = np.zeros_like(dmat)
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            if mst_mask[i, j]:
+                                # Lower quantile = shorter edge
+                                quantile = np.sum(dmat[i, j] >= mst_edges) / len(mst_edges)
+                                bonus = 0.15 + 0.1 * (1.0 - quantile)  # 0.15 to 0.25
+                                mst_bonus[i, j] = bonus
+                                mst_bonus[j, i] = bonus
+        except:
+            pass
+    
+    # ========== COMBINE COMPONENTS ==========
+    # Base score using inverse distance (normalized by median)
+    median_dist = np.median(dmat[np.isfinite(dmat)])
+    inv_dist = median_dist / (dmat + 0.1 * median_dist)
+    
+    # Combine components with adaptive weights
+    heuristics_matrix = (
+        inv_dist * 
+        rank_weights * 
+        (1.0 + 0.3 * regret_scores) * 
+        (1.0 + cluster_bonus) * 
+        (1.0 + mst_bonus)
+    )
+    
+    # ========== DYNAMIC SPARSIFICATION ==========
+    # Build candidate mask using adaptive candidate sizes
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    
+    for i in range(n):
+        k_i = candidate_sizes[i]
+        # Get top k_i candidates by heuristic score
+        row_scores = heuristics_matrix[i].copy()
+        row_scores[i] = -np.inf  # Exclude self
+        
+        if np.all(row_scores <= 0):
+            # Fallback to distance-based candidates
+            top_idx = sorted_neighbors[i, 1:k_i+1]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Keep top edges by heuristic score
+            if len(row_scores) >= k_i:
+                threshold = np.partition(row_scores, -k_i)[-k_i]
+                candidate_mask[i, row_scores >= threshold] = True
+            else:
+                candidate_mask[i, row_scores > 0] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # Apply mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure minimum degree of 2 for connectivity
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_count = np.count_nonzero(row)
+        
+        if nonzero_count < 2:
+            # Find additional candidates by distance
+            dist_row = dmat[i].copy()
+            dist_row[i] = np.inf
+            additional = np.argsort(dist_row)[:2-nonzero_count]
+            
+            for j in additional:
+                if heuristics_matrix[i, j] == 0:
+                    # Set to average of existing non-zero values or median
+                    existing_vals = heuristics_matrix[i][heuristics_matrix[i] > 0]
+                    if len(existing_vals) > 0:
+                        new_val = np.median(existing_vals)
+                    else:
+                        # No existing values, use inverse distance
+                        new_val = median_dist / (dmat[i, j] + 0.1 * median_dist)
+                    
+                    heuristics_matrix[i, j] = new_val * 0.8
+                    heuristics_matrix[j, i] = new_val * 0.8
+    
+    # ========== FINAL PROCESSING ==========
+    # Symmetrize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Row-wise softmax for probabilistic interpretation
+    for i in range(n):
+        row = heuristics_matrix[i]
+        if np.sum(row) > eps:
+            # Adaptive temperature based on row variance
+            nonzeros = row[row > eps]
+            if len(nonzeros) > 1:
+                # Higher variance → lower temperature (more peaked distribution)
+                std_val = np.std(nonzeros)
+                mean_val = np.mean(nonzeros)
+                if mean_val > eps:
+                    cv = std_val / mean_val
+                    temperature = max(0.2, min(1.0, 0.5 / (cv + 0.1)))
+                else:
+                    temperature = 0.5
+            else:
+                temperature = 0.5
+            
+            exp_row = np.exp(row / temperature)
+            row_sum = np.sum(exp_row)
+            if row_sum > eps:
+                heuristics_matrix[i] = exp_row / row_sum
+    
+    # Global normalization to [0,1]
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return np.clip(heuristics_matrix, 0.0, 1.0)
+```

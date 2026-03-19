@@ -1,0 +1,187 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP edge heuristic using multiplicative scoring with adaptive masking.
+    
+    Combines multiple geometric and topological indicators to prioritize edges
+    likely to belong to optimal tours. Uses multiplicative combination to better
+    distinguish promising edges and adaptive masks for focused exploration.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances between nodes.
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate edges more
+        promising for inclusion in TSP solutions. Diagonal is zero.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Initialize with safe distances (avoid division by zero)
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # 1. Base reciprocal score (shorter edges = higher score)
+    base_score = 1.0 / safe_dist
+    
+    # 2. Multiplicative triangle quality factor
+    triangle_factor = _compute_triangle_factor(safe_dist, n)
+    
+    # 3. Multiplicative clustering factor
+    cluster_factor = _compute_clustering_factor(safe_dist, n)
+    
+    # 4. Multiplicative local density factor
+    density_factor = _compute_density_factor(safe_dist, n)
+    
+    # 5. Multiplicative combination
+    combined = base_score * triangle_factor * cluster_factor * density_factor
+    
+    # 6. Adaptive multiplicative masks
+    mask_product = _compute_masks(safe_dist, combined, n)
+    
+    # Apply masks multiplicatively (zero out unpromising edges)
+    masked_result = combined * mask_product
+    
+    # 7. Symmetrize and finalize
+    np.fill_diagonal(masked_result, 0)
+    result = (masked_result + masked_result.T) / 2
+    
+    # Normalize if needed
+    max_val = np.max(result)
+    if max_val > 0:
+        result = result / max_val
+    
+    return result
+
+def _compute_triangle_factor(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute factor based on triangle inequality satisfaction."""
+    factor = np.ones_like(dist_matrix)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dist_matrix[i, j] < np.inf:
+                # Find minimum detour through any third node
+                mask = np.ones(n, dtype=bool)
+                mask[[i, j]] = False
+                if np.any(mask):
+                    min_detour = np.min(dist_matrix[i, mask] + dist_matrix[mask, j])
+                    ratio = min_detour / (dist_matrix[i, j] + 1e-10)
+                    
+                    # Multiplicative penalty: edges violating triangle inequality get lower scores
+                    if ratio < 0.8:
+                        factor[i, j] = factor[j, i] = 0.3
+                    elif ratio < 1.0:
+                        factor[i, j] = factor[j, i] = 0.6
+                    elif ratio < 1.2:
+                        factor[i, j] = factor[j, i] = 0.9
+    
+    return factor
+
+def _compute_clustering_factor(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute factor based on local clustering/community structure."""
+    factor = np.ones_like(dist_matrix)
+    
+    if n < 4:
+        return factor
+    
+    # Adaptive threshold based on distance statistics
+    median_dist = np.median(dist_matrix[dist_matrix < np.inf])
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Count shared close neighbors
+            i_close = dist_matrix[i] < median_dist * 1.5
+            j_close = dist_matrix[j] < median_dist * 1.5
+            shared_count = np.sum(i_close & j_close) - 2  # Exclude i and j
+            
+            # Multiplicative boost for edges within clusters
+            if shared_count > 0:
+                boost = 1.0 + 0.4 * min(shared_count / (n - 2), 1.0)
+                factor[i, j] = factor[j, i] = boost
+            else:
+                factor[i, j] = factor[j, i] = 0.7
+    
+    return factor
+
+def _compute_density_factor(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute factor based on local edge density and competition."""
+    factor = np.ones_like(dist_matrix)
+    
+    for i in range(n):
+        # Analyze local neighborhood for each node
+        row_dist = dist_matrix[i].copy()
+        row_dist[i] = np.inf
+        
+        if np.all(row_dist == np.inf):
+            continue
+            
+        # Find k nearest neighbors (adaptive k)
+        k = min(5, n - 1)
+        if k > 0:
+            nearest_mask = np.zeros(n, dtype=bool)
+            nearest_idx = np.argpartition(row_dist, k)[:k]
+            nearest_mask[nearest_idx] = True
+            
+            # Multiplicative adjustment: boost nearest neighbors
+            for j in range(n):
+                if i != j:
+                    if nearest_mask[j]:
+                        # Stronger boost for closer neighbors
+                        rank = np.sum(row_dist[nearest_idx] <= row_dist[j])
+                        factor[i, j] = 1.2 + 0.3 * (1 - (rank - 1) / k)
+                    else:
+                        # Penalty for non-nearest neighbors
+                        factor[i, j] = 0.3 + 0.5 * (np.min(row_dist[nearest_idx]) / (row_dist[j] + 1e-10))
+    
+    # Symmetrize
+    factor = (factor + factor.T) / 2
+    return factor
+
+def _compute_masks(dist_matrix: np.ndarray, score_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Combine multiple binary masks multiplicatively."""
+    mask_product = np.zeros_like(score_matrix)
+    
+    # 1. Nearest neighbor mask (per node)
+    nn_mask = np.zeros_like(score_matrix, dtype=bool)
+    k_nn = max(2, min(5, n // 3))
+    
+    for i in range(n):
+        row = dist_matrix[i].copy()
+        row[i] = np.inf
+        if np.any(row < np.inf):
+            nearest = np.argpartition(row, k_nn)[:k_nn]
+            nn_mask[i, nearest] = True
+    
+    # 2. Minimum spanning tree mask
+    mst_mask = np.zeros_like(nn_mask, dtype=bool)
+    try:
+        mst = minimum_spanning_tree(dist_matrix).toarray()
+        mst_mask = (mst + mst.T) > 0
+    except:
+        # Fallback: use nearest neighbor connections
+        mst_mask = nn_mask.copy()
+    
+    # 3. High score mask (adaptive threshold)
+    score_mask = np.zeros_like(nn_mask, dtype=bool)
+    if n > 2:
+        # Use adaptive percentile based on problem size
+        non_diag = ~np.eye(n, dtype=bool)
+        valid_scores = score_matrix[non_diag]
+        
+        if len(valid_scores) > 0 and np.max(valid_scores) > 0:
+            percentile = max(50, 85 - n // 20)  # More selective for larger problems
+            threshold = np.percentile(valid_scores[valid_scores > 0], percentile)
+            score_mask = score_matrix > threshold
+    
+    # 4. Combined mask (logical OR)
+    combined_mask = nn_mask | mst_mask | score_mask
+    
+    # Convert to multiplicative mask (0 or 1)
+    mask_product[combined_mask] = 1.0
+    
+    return mask_product
+```

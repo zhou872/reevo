@@ -1,0 +1,179 @@
+```json
+{
+    "algorithm_features": ["Adaptive Logarithmic Sparsification", "Rank-Weighted Inverse Distance Scoring", "Normalized Two-Hop Regret Penalty", "Cluster-Aware Edge Scoring"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection combining multiple
+    sophisticated features for improved edge quality assessment.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Adaptive Logarithmic Sparsification ====================
+    # Use logarithmic scaling with minimum threshold for connectivity
+    k = max(4, int(np.log2(n)) + 2)  # Slightly more neighbors for better connectivity
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Pre-compute sorted indices for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        nn_indices = sorted_indices[i, 1:k+1]
+        adjacency_mask[i, nn_indices] = True
+        
+        # Ensure reciprocal connections for better graph connectivity
+        for j in nn_indices:
+            # Check if i is among j's top k neighbors
+            j_top_k = sorted_indices[j, 1:k+1]
+            if i in j_top_k:
+                adjacency_mask[j, i] = True
+    
+    # Ensure symmetry and no self-loops
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Enhanced Rank-Weighted Distance Scoring ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if not np.any(valid_mask):
+            continue
+            
+        # Get distances to neighbors
+        valid_dists = distance_matrix[i, valid_mask]
+        neighbor_indices = np.where(valid_mask)[0]
+        
+        # Compute rank-based weights with exponential decay for closer neighbors
+        ranks = np.argsort(np.argsort(valid_dists)) + 1  # Closest gets rank 1
+        weights = np.exp(-0.5 * (ranks - 1))  # Exponential decay by rank
+        weights = weights / np.sum(weights)  # Normalize to sum to 1
+        
+        # Apply weighted inverse distance with distance normalization
+        inv_vals = 1.0 / (valid_dists + 1e-10)
+        
+        # Incorporate neighbor density: reward nodes with consistently close neighbors
+        neighbor_density = np.mean(1.0 / (valid_dists + 1e-10))
+        density_factor = 1.0 + 0.5 * np.tanh(neighbor_density - 1.0)  # Saturation function
+        
+        inv_dist[i, neighbor_indices] = (inv_vals * weights) * density_factor / len(neighbor_indices)
+    
+    # Symmetrize by taking average (smoother than max)
+    inv_dist = 0.5 * (inv_dist + inv_dist.T)
+    
+    # ==================== 3. Normalized Two-Hop Regret Analysis ====================
+    regret_penalty = np.ones_like(distance_matrix)
+    
+    # Set a reasonable limit for intermediate node exploration
+    check_limit = max(4, int(np.sqrt(n) * 1.5))
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        valid_indices = np.where(valid_mask)[0]
+        
+        for j in valid_indices:
+            if i >= j:
+                continue
+                
+            # Consider intermediate nodes that are neighbors of both i and j
+            i_neighbors = sorted_indices[i, 1:check_limit+1]
+            j_neighbors = sorted_indices[j, 1:check_limit+1]
+            
+            # Candidate intermediate nodes: intersection of neighbors (excluding i and j)
+            candidate_nodes = np.intersect1d(i_neighbors, j_neighbors)
+            candidate_nodes = candidate_nodes[candidate_nodes != i]
+            candidate_nodes = candidate_nodes[candidate_nodes != j]
+            
+            if len(candidate_nodes) > 0:
+                # Vectorized two-hop distance computation
+                two_hop_dists = distance_matrix[i, candidate_nodes] + distance_matrix[candidate_nodes, j]
+                min_two_hop = np.min(two_hop_dists)
+                direct_dist = distance_matrix[i, j]
+                
+                if direct_dist > 1e-10:
+                    # Compute normalized regret: how much worse is the two-hop alternative?
+                    # Positive regret means direct edge is better
+                    regret = (min_two_hop - direct_dist) / direct_dist
+                    
+                    # Convert regret to penalty factor: higher regret -> lower penalty (more promising edge)
+                    # Use sigmoid-like transformation to map regret to [0.2, 1.0]
+                    penalty = 0.6 + 0.4 / (1.0 + np.exp(-2.0 * regret))
+                    regret_penalty[i, j] = regret_penalty[j, i] = np.clip(penalty, 0.2, 1.0)
+    
+    # ==================== 4. Cluster-Aware Edge Scoring ====================
+    # Detect potential clusters by looking at distance distributions
+    cluster_factor = np.ones_like(distance_matrix)
+    
+    if n > 10:
+        # For each node, compute median distance to identify local vs. long-range connections
+        median_dists = np.median(distance_matrix, axis=1)
+        
+        for i in range(n):
+            valid_mask = adjacency_mask[i]
+            valid_indices = np.where(valid_mask)[0]
+            
+            for j in valid_indices:
+                if i >= j:
+                    continue
+                    
+                direct_dist = distance_matrix[i, j]
+                # Check if this is a local connection (within median distance of both nodes)
+                is_local = (direct_dist < 0.7 * median_dists[i]) and (direct_dist < 0.7 * median_dists[j])
+                
+                if is_local:
+                    # Boost local connections within clusters
+                    boost = 1.0 + 0.3 * np.exp(-direct_dist / (0.5 * median_dists[i]))
+                    cluster_factor[i, j] = cluster_factor[j, i] = boost
+    
+    # ==================== 5. Combine All Components ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Base score from enhanced inverse distance
+                score = inv_dist[i, j]
+                
+                # Apply regret penalty (edges with good alternatives get penalized)
+                score *= regret_penalty[i, j]
+                
+                # Apply cluster factor (boost local connections)
+                score *= cluster_factor[i, j]
+                
+                # Add small random component to break ties (epsilon = 1e-8)
+                score += 1e-8 * np.random.random()
+                
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    # ==================== 6. Final Processing ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Symmetrize final matrix
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

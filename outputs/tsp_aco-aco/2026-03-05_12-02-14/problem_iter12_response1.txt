@@ -1,0 +1,263 @@
+```json
+{
+    "algorithm_features": ["Stochastic Solution Sampling", "Edge Frequency Heuristics", "Vectorized Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved TSP edge heuristic using stochastic solution sampling and edge frequency analysis.
+    
+    Key improvements:
+    1. Diverse solution generation using multiple construction heuristics
+    2. Edge promise scoring based on frequency in sampled solutions
+    3. Efficient vectorized operations and minimal overhead
+    4. Adaptive sparsification focused on most promising edges
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Core Structural Features ==========
+    
+    # Minimum Spanning Tree edges (essential connectivity)
+    mst = sparse.csgraph.minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0).astype(float)
+    
+    # Nearest neighbor edges
+    nn_edges = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        for _ in range(min(3, n-1)):
+            j = np.argmin(row)
+            if distance_matrix[i, j] > 0:
+                nn_edges[i, j] = 1.0 / distance_matrix[i, j]
+            row[j] = np.inf
+    
+    # ========== Phase 2: Diverse Solution Sampling ==========
+    
+    edge_promises = np.zeros_like(distance_matrix)
+    sample_count = min(200, max(50, 2 * n))  # Adaptive sampling
+    
+    for _ in range(sample_count):
+        # Mix different construction strategies
+        if np.random.random() < 0.5:
+            tour = _nearest_neighbor_tour(distance_matrix)
+        else:
+            tour = _random_insertion_tour(distance_matrix)
+        
+        # Apply quick local optimization
+        tour = _fast_2opt(tour, distance_matrix)
+        
+        # Score edges in this tour (better tours get higher weight)
+        tour_length = sum(distance_matrix[tour[i], tour[(i+1) % n]] for i in range(n))
+        edge_weight = 1.0 / (1.0 + tour_length / n)
+        
+        for i in range(n):
+            u, v = tour[i], tour[(i+1) % n]
+            edge_promises[u, v] += edge_weight
+            edge_promises[v, u] += edge_weight
+    
+    # ========== Phase 3: Intelligent Combination ==========
+    
+    # Normalize components
+    components = []
+    
+    if mst_mask.max() > 0:
+        components.append(('mst', 0.25, mst_mask))
+    
+    if nn_edges.max() > 0:
+        nn_norm = nn_edges / (nn_edges.max() + 1e-10)
+        components.append(('nn', 0.2, nn_norm))
+    
+    if edge_promises.max() > 0:
+        promises_norm = edge_promises / (edge_promises.max() + 1e-10)
+        components.append(('freq', 0.4, promises_norm))
+    
+    # Baseline inverse distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist = np.nan_to_num(inv_dist, nan=0)
+    
+    if inv_dist.max() > 0:
+        inv_norm = inv_dist / (inv_dist.max() + 1e-10)
+        components.append(('inv', 0.15, inv_norm))
+    
+    # Weighted combination
+    combined = np.zeros_like(distance_matrix)
+    for _, weight, matrix in components:
+        combined += weight * matrix
+    
+    # Ensure symmetry
+    combined = 0.5 * (combined + combined.T)
+    np.fill_diagonal(combined, 0)
+    
+    # ========== Phase 4: Adaptive Sparsification ==========
+    
+    # Vectorized sparsification
+    sparsified = _vectorized_sparsify(combined, distance_matrix, n)
+    
+    # Final row normalization
+    row_sums = sparsified.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    sparsified = sparsified / row_sums
+    
+    return sparsified
+
+def _nearest_neighbor_tour(distance_matrix: np.ndarray) -> list:
+    """Generate tour using nearest neighbor heuristic with random start."""
+    n = distance_matrix.shape[0]
+    start = np.random.randint(n)
+    unvisited = set(range(n))
+    unvisited.remove(start)
+    
+    tour = [start]
+    current = start
+    
+    while unvisited:
+        row = distance_matrix[current].copy()
+        row[list(unvisited)] += np.random.randn(len(unvisited)) * row[list(unvisited)].mean() * 0.1
+        row[list(tour)] = np.inf
+        
+        next_node = np.argmin(row)
+        tour.append(next_node)
+        unvisited.remove(next_node)
+        current = next_node
+    
+    return tour
+
+def _random_insertion_tour(distance_matrix: np.ndarray) -> list:
+    """Generate tour using random insertion heuristic."""
+    n = distance_matrix.shape[0]
+    nodes = list(np.random.permutation(n))
+    
+    # Start with triangle
+    if n >= 3:
+        tour = nodes[:3]
+        remaining = nodes[3:]
+    else:
+        return nodes
+    
+    while remaining:
+        node = np.random.choice(remaining)
+        remaining.remove(node)
+        
+        # Find best insertion position
+        best_cost = np.inf
+        best_pos = -1
+        
+        for i in range(len(tour)):
+            j = (i + 1) % len(tour)
+            cost = (distance_matrix[tour[i], node] + 
+                   distance_matrix[node, tour[j]] - 
+                   distance_matrix[tour[i], tour[j]])
+            
+            if cost < best_cost:
+                best_cost = cost
+                best_pos = j
+        
+        tour.insert(best_pos, node)
+    
+    return tour
+
+def _fast_2opt(tour: list, distance_matrix: np.ndarray, iterations: int = 10) -> list:
+    """Quick 2-opt local search."""
+    n = len(tour)
+    tour = tour.copy()
+    
+    for _ in range(iterations):
+        improved = False
+        
+        i = np.random.randint(0, n)
+        for j in range((i+2) % n, n):
+            if j == i or (j+1) % n == i:
+                continue
+                
+            a1, a2 = tour[i], tour[(i+1) % n]
+            b1, b2 = tour[j], tour[(j+1) % n]
+            
+            current = distance_matrix[a1, a2] + distance_matrix[b1, b2]
+            new = distance_matrix[a1, b1] + distance_matrix[a2, b2]
+            
+            if new < current:
+                # Reverse segment
+                if i < j:
+                    tour[i+1:j+1] = tour[i+1:j+1][::-1]
+                else:
+                    segment = tour[i+1:] + tour[:j+1]
+                    segment = segment[::-1]
+                    tour[i+1:] = segment[:len(tour)-i-1]
+                    tour[:j+1] = segment[len(tour)-i-1:]
+                improved = True
+                break
+        
+        if not improved:
+            break
+    
+    return tour
+
+def _vectorized_sparsify(matrix: np.ndarray, dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Efficient sparsification keeping most promising edges."""
+    result = np.zeros_like(matrix)
+    
+    # Always include MST edges
+    mst = sparse.csgraph.minimum_spanning_tree(dist_matrix).toarray()
+    mst_mask = mst > 0
+    result[mst_mask] = matrix[mst_mask]
+    
+    # Adaptive k per node
+    base_k = max(2, int(np.sqrt(n)))
+    
+    for i in range(n):
+        row = matrix[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Adjust k based on row statistics
+        positive = row[row > 0]
+        if len(positive) == 0:
+            continue
+            
+        k = min(base_k + int(np.std(positive) / (np.mean(positive) + 1e-10)), 
+                len(positive), n - 1)
+        
+        # Get top k edges
+        top_indices = np.argpartition(-row, k)[:k]
+        top_values = row[top_indices]
+        
+        # Apply exponential decay
+        ranks = np.argsort(-top_values)
+        decay = np.exp(-np.arange(len(ranks)) / 2.0)
+        
+        # Assign values (don't override MST edges)
+        for idx, rank in enumerate(ranks):
+            j = top_indices[rank]
+            if not mst_mask[i, j]:
+                result[i, j] = top_values[rank] * decay[idx]
+    
+    # Ensure symmetry
+    result = np.maximum(result, result.T)
+    np.fill_diagonal(result, 0)
+    
+    return result
+```

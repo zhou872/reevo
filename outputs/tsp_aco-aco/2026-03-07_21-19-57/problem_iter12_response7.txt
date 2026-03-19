@@ -1,0 +1,412 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Learning", "Probabilistic Regret Lookahead", "Entropy-driven Edge Sampling", "Multi-criteria Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.special import softmax
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with adaptive weight learning, probabilistic regret lookahead,
+    and entropy-driven edge sampling for optimal exploration-exploitation balance.
+    
+    Core innovations:
+    1. Adaptive weight learning from instance statistics without overfitting
+    2. Probabilistic regret model with soft alternative evaluation
+    3. Entropy-driven edge sampling for balanced exploration-exploitation
+    4. Multi-criteria fusion with uncertainty-aware normalization
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # =====================================================================
+    # 1. INSTANCE STATISTICS FOR ADAPTIVE WEIGHT LEARNING
+    # =====================================================================
+    
+    # Extract global statistics
+    non_diag_mask = ~np.eye(n, dtype=bool)
+    global_dists = distance_matrix[non_diag_mask]
+    global_mean = np.mean(global_dists)
+    global_std = np.std(global_dists)
+    global_cv = global_std / (global_mean + 1e-8)
+    global_skew = np.mean((global_dists - global_mean)**3) / (global_std**3 + 1e-8)
+    
+    # =====================================================================
+    # 2. PROBABILISTIC REGRET LOOKAHEAD
+    # =====================================================================
+    
+    regret_matrix = np.ones((n, n))
+    
+    # Pre-compute sorted distances for efficiency
+    sorted_indices = np.zeros((n, n-1), dtype=int)
+    sorted_dists = np.zeros((n, n-1))
+    
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        sorted_idx = np.argsort(dists)
+        sorted_indices[i] = sorted_idx[:n-1]
+        sorted_dists[i] = dists[sorted_idx[:n-1]]
+    
+    # Probabilistic regret calculation
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist_ij = distance_matrix[i, j]
+            if dist_ij == 0:
+                continue
+            
+            # Get alternative edges with soft probabilistic weights
+            # Exclude current edge
+            alt_mask_i = sorted_indices[i] != j
+            alt_dists_i = sorted_dists[i, alt_mask_i][:min(5, n-2)]
+            
+            # Compute soft regret: weighted average of alternative regrets
+            if len(alt_dists_i) > 0:
+                # Soft weights inversely proportional to rank
+                weights_i = 1.0 / (np.arange(len(alt_dists_i)) + 1)
+                weights_i = weights_i / np.sum(weights_i)
+                
+                # Individual regrets
+                regrets_i = (alt_dists_i - dist_ij) / (dist_ij + 1e-8)
+                
+                # Weighted regret expectation
+                expected_regret_i = np.sum(weights_i * regrets_i)
+            else:
+                expected_regret_i = 0
+            
+            # Same for node j
+            alt_mask_j = sorted_indices[j] != i
+            alt_dists_j = sorted_dists[j, alt_mask_j][:min(5, n-2)]
+            
+            if len(alt_dists_j) > 0:
+                weights_j = 1.0 / (np.arange(len(alt_dists_j)) + 1)
+                weights_j = weights_j / np.sum(weights_j)
+                regrets_j = (alt_dists_j - dist_ij) / (dist_ij + 1e-8)
+                expected_regret_j = np.sum(weights_j * regrets_j)
+            else:
+                expected_regret_j = 0
+            
+            # Combine expected regrets from both endpoints
+            combined_regret = (expected_regret_i + expected_regret_j) / 2
+            
+            # Convert regret to scoring (lower regret -> higher score)
+            # Use sigmoid to map regret to [0.2, 1.8]
+            regret_score = 1.0 + 0.8 * (1.0 - 2.0 / (1.0 + np.exp(-combined_regret)))
+            regret_matrix[i, j] = max(0.2, min(2.0, regret_score))
+    
+    # =====================================================================
+    # 3. ROBUST SPATIAL SCORING WITH UNCERTAINTY AWARENESS
+    # =====================================================================
+    
+    spatial_matrix = np.ones((n, n))
+    
+    # Compute local statistics for each node
+    local_means = np.zeros(n)
+    local_cvs = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        valid_dists = dists[dists < np.inf]
+        local_means[i] = np.mean(valid_dists) if len(valid_dists) > 0 else global_mean
+        local_cvs[i] = np.std(valid_dists) / (local_means[i] + 1e-8) if len(valid_dists) > 1 else global_cv
+    
+    # Spatial scoring with uncertainty adjustment
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist = distance_matrix[i, j]
+            
+            # Baseline scoring based on distance ratio
+            baseline_score = local_means[i] / (dist + 1e-8)
+            
+            # Uncertainty penalty based on local variability
+            local_uncertainty = (local_cvs[i] + local_cvs[j]) / 2
+            uncertainty_factor = 1.0 - 0.3 * np.tanh(local_uncertainty)
+            
+            spatial_matrix[i, j] = baseline_score * uncertainty_factor
+    
+    # =====================================================================
+    # 4. ADAPTIVE DENSITY ESTIMATION WITH MEDIAN-BASED ROBUSTNESS
+    # =====================================================================
+    
+    density_matrix = np.ones((n, n))
+    
+    # Compute robust density estimates
+    k = max(3, min(10, int(0.15 * n)))  # Adaptive k for nearest neighbors
+    local_medians = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        
+        if n > 1:
+            # Get k nearest neighbors
+            kth_idx = min(k, n-2)
+            kth_smallest = np.partition(dists, kth_idx)[kth_idx]
+            nearest_mask = dists <= kth_smallest
+            nearest_dists = dists[nearest_mask]
+            
+            if len(nearest_dists) > 0:
+                local_medians[i] = np.median(nearest_dists)
+            else:
+                local_medians[i] = np.median(dists[dists < np.inf])
+        else:
+            local_medians[i] = global_mean
+    
+    # Normalize and apply exponential similarity bonus
+    median_min, median_max = np.min(local_medians), np.max(local_medians)
+    if median_max > median_min:
+        normalized_medians = (local_medians - median_min) / (median_max - median_min)
+    else:
+        normalized_medians = np.ones(n) * 0.5
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Similarity bonus based on density proximity
+            density_diff = abs(normalized_medians[i] - normalized_medians[j])
+            similarity_bonus = np.exp(-3.0 * density_diff)
+            
+            # Additional bonus for both nodes being in high-density regions
+            density_level = (normalized_medians[i] + normalized_medians[j]) / 2
+            density_factor = 1.0 + 0.4 * (1.0 - density_level)  # Higher bonus for denser regions
+            
+            density_matrix[i, j] = 1.0 + 0.5 * similarity_bonus * density_factor
+    
+    # =====================================================================
+    # 5. ADAPTIVE WEIGHT LEARNING FROM INSTANCE STATISTICS
+    # =====================================================================
+    
+    # Learn weights based on instance characteristics
+    if global_cv < 0.3:  # Uniform instances
+        base_weights = np.array([0.25, 0.35, 0.40])  # [regret, spatial, density]
+    elif global_cv < 0.7:  # Moderate variability
+        base_weights = np.array([0.35, 0.30, 0.35])
+    else:  # High variability
+        base_weights = np.array([0.45, 0.25, 0.30])
+    
+    # Adjust weights based on skewness
+    if abs(global_skew) > 0.5:
+        # Skewed distributions: emphasize regret more
+        base_weights[0] *= 1.2
+        base_weights[1:] /= 1.2
+    
+    # Normalize weights
+    base_weights = base_weights / np.sum(base_weights)
+    
+    # =====================================================================
+    # 6. ENTROPY-DRIVEN EDGE SAMPLING
+    # =====================================================================
+    
+    # Compute entropy of each component for adaptive weighting
+    component_entropies = np.zeros(3)
+    
+    # Flatten component matrices (excluding diagonals)
+    regret_flat = regret_matrix[non_diag_mask]
+    spatial_flat = spatial_matrix[non_diag_mask]
+    density_flat = density_matrix[non_diag_mask]
+    
+    # Normalize to probability distributions
+    for i, comp in enumerate([regret_flat, spatial_flat, density_flat]):
+        comp_norm = comp / (np.sum(comp) + 1e-8)
+        entropy = -np.sum(comp_norm * np.log(comp_norm + 1e-8))
+        max_entropy = np.log(len(comp))
+        component_entropies[i] = entropy / (max_entropy + 1e-8)
+    
+    # Combine base weights with entropy information
+    # Higher entropy components get more weight (more informative)
+    final_weights = base_weights * (0.5 + 0.5 * component_entropies)
+    final_weights = final_weights / np.sum(final_weights)
+    
+    # =====================================================================
+    # 7. MULTI-CRITERIA FUSION WITH UNCERTAINTY-AWARE NORMALIZATION
+    # =====================================================================
+    
+    # Apply learned weights
+    weighted_regret = np.power(regret_matrix, final_weights[0])
+    weighted_spatial = np.power(spatial_matrix, final_weights[1])
+    weighted_density = np.power(density_matrix, final_weights[2])
+    
+    # Initial combination
+    combined = weighted_regret * weighted_spatial * weighted_density
+    np.fill_diagonal(combined, 0)
+    
+    # Add MST boost with adaptive strength
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_strength = 1.3 - 0.1 * global_cv  # Stronger boost for more uniform instances
+    combined[mst_mask] *= mst_strength
+    
+    # =====================================================================
+    # 8. EXPLORATION-EXPLOITATION BALANCED SPARSIFICATION
+    # =====================================================================
+    
+    # Determine target edges per node
+    if n <= 20:
+        min_edges, max_edges = max(3, n//2), n-1
+    elif n <= 100:
+        min_edges, max_edges = max(4, int(0.25*n)), max(8, int(0.35*n))
+    else:
+        min_edges, max_edges = max(5, int(0.2*n)), max(10, int(0.3*n))
+    
+    # Initialize selection mask
+    keep_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    keep_mask = keep_mask | mst_mask
+    
+    # Entropy-driven edge selection for each node
+    for i in range(n):
+        # Get candidate edges
+        candidates = np.arange(n)
+        candidates = candidates[candidates != i]
+        
+        # Compute component scores for candidates
+        comp_scores = np.column_stack([
+            regret_matrix[i, candidates],
+            spatial_matrix[i, candidates],
+            density_matrix[i, candidates]
+        ])
+        
+        # Normalize component scores
+        comp_norm = comp_scores / (np.sum(comp_scores, axis=0, keepdims=True) + 1e-8)
+        
+        # Compute entropy for each candidate (across components)
+        candidate_entropies = -np.sum(comp_norm * np.log(comp_norm + 1e-8), axis=1)
+        candidate_entropies = candidate_entropies / np.log(3)  # Normalize to [0,1]
+        
+        # Combine heuristic score with entropy (exploration bonus)
+        heuristic_scores = combined[i, candidates]
+        combined_scores = heuristic_scores * (0.7 + 0.3 * candidate_entropies)
+        
+        # Select edges: balance between high score and diversity
+        target = min(max_edges, len(candidates))
+        
+        # First, select top edges by combined score
+        top_count = max(min_edges, int(0.7 * target))
+        if top_count > 0:
+            top_idx = np.argpartition(combined_scores, -top_count)[-top_count:]
+            keep_mask[i, candidates[top_idx]] = True
+        
+        # Then, add some high-entropy edges for exploration
+        remaining = np.array([j for j in candidates if not keep_mask[i, j]])
+        if len(remaining) > 0:
+            entropy_idx = np.argsort(candidate_entropies)[-min(3, len(remaining)):]
+            keep_mask[i, candidates[entropy_idx]] = True
+    
+    # Ensure symmetry
+    keep_mask = keep_mask | keep_mask.T
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(keep_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        if len(connected) < min_edges:
+            # Add nearest promising edges
+            candidate_scores = combined[i, :].copy()
+            candidate_scores[i] = -np.inf
+            candidate_scores[keep_mask[i, :]] = -np.inf
+            
+            if np.any(candidate_scores > 0):
+                add_count = min_edges - len(connected)
+                top_candidates = np.argpartition(candidate_scores, -add_count)[-add_count:]
+                keep_mask[i, top_candidates] = True
+                keep_mask[top_candidates, i] = True
+    
+    # Ensure graph connectivity
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        current = stack.pop()
+        neighbors = np.where(keep_mask[current, :])[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                stack.append(neighbor)
+    
+    # Connect disconnected components
+    if not np.all(visited):
+        components = []
+        unvisited = np.where(~visited)[0]
+        
+        while len(unvisited) > 0:
+            comp = []
+            stack = [unvisited[0]]
+            
+            while stack:
+                node = stack.pop()
+                if not visited[node]:
+                    visited[node] = True
+                    comp.append(node)
+                    
+                    # Check distances to find connections
+                    dists = distance_matrix[node, :]
+                    closest = np.argsort(dists)[:min(5, n)]
+                    for neighbor in closest:
+                        if neighbor != node and not visited[neighbor]:
+                            stack.append(neighbor)
+            
+            components.append(comp)
+            unvisited = np.where(~visited)[0]
+        
+        # Connect components with shortest edges
+        for i in range(len(components) - 1):
+            comp_a, comp_b = components[i], components[i+1]
+            
+            best_pair = min(((a, b) for a in comp_a for b in comp_b), 
+                           key=lambda pair: distance_matrix[pair])
+            
+            keep_mask[best_pair] = True
+            keep_mask[best_pair[::-1]] = True
+    
+    # Apply sparsification mask
+    heuristic = combined * keep_mask
+    
+    # =====================================================================
+    # 9. FINAL NORMALIZATION WITH ADAPTIVE TEMPERATURE
+    # =====================================================================
+    
+    # Adaptive temperature based on instance characteristics
+    temperature = 0.8 + 0.4 * global_cv  # Higher temperature for more exploration
+    
+    # Row-wise softmax normalization with temperature
+    for i in range(n):
+        row = heuristic[i, :]
+        mask = row > 0
+        
+        if np.sum(mask) > 0:
+            # Apply temperature scaling
+            scaled_row = row[mask] / temperature
+            
+            # Softmax normalization
+            exp_row = np.exp(scaled_row - np.max(scaled_row))
+            heuristic[i, mask] = exp_row / np.sum(exp_row)
+    
+    # Ensure symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2.0
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

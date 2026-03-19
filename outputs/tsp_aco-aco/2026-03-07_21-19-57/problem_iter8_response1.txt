@@ -1,0 +1,414 @@
+```json
+{
+    "algorithm_features": ["Variance-Calibrated Adaptive Weighting", "Geometric Mean Component Fusion", "Two-Step Lookahead Regret", "Multi-Criteria Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List, Dict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with variance-calibrated adaptive weighting,
+    geometric mean component fusion, and enhanced local structure analysis.
+    
+    Core innovations:
+    1. Variance-calibrated adaptive weighting that adjusts heuristic components
+       based on global distance statistics and local connectivity patterns
+    2. Geometric mean fusion of components for balanced contribution without
+       dominance by any single heuristic
+    3. Two-step lookahead regret mechanism evaluating opportunity costs at
+       both edge endpoints
+    4. Multi-criteria sparsification preserving structural connectivity
+       while focusing computational effort
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more
+        promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # =====================================================================
+    # 1. GLOBAL STATISTICS AND ADAPTIVE PARAMETERS
+    # =====================================================================
+    
+    # Compute global distance statistics
+    non_diag_mask = ~np.eye(n, dtype=bool)
+    global_dists = distance_matrix[non_diag_mask]
+    global_mean = np.mean(global_dists)
+    global_std = np.std(global_dists)
+    global_cv = global_std / (global_mean + 1e-8)  # Coefficient of variation
+    
+    # Problem size factor (logarithmic scaling for robustness)
+    size_factor = np.log10(n + 1) / 2.0
+    
+    # Adaptive parameters based on instance characteristics
+    variance_factor = min(1.5, global_cv * 2.0)  # Scales with variability
+    sparsity_factor = min(1.0, 0.3 + 0.7 * global_cv)  # Higher for more varied
+    
+    # =====================================================================
+    # 2. HEURISTIC COMPONENTS COMPUTATION
+    # =====================================================================
+    
+    # 2.1 Base inverse distance with adaptive regularization
+    reg_coef = 0.01 * global_mean * (1.0 + variance_factor)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg_coef)
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # 2.2 Rank-based regret with two-step lookahead
+    # Pre-sort distances for all nodes
+    sorted_indices = np.zeros((n, n-1), dtype=int)
+    sorted_dists = np.zeros((n, n-1))
+    
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        sorted_idx = np.argsort(dists)
+        sorted_indices[i] = sorted_idx[:n-1]
+        sorted_dists[i] = dists[sorted_idx[:n-1]]
+    
+    # Compute rank-based scores
+    rank_matrix = np.ones((n, n))
+    for i in range(n):
+        best_dist = sorted_dists[i, 0]
+        
+        for rank, j in enumerate(sorted_indices[i]):
+            if i == j:
+                continue
+                
+            current_dist = distance_matrix[i, j]
+            
+            if best_dist > 0:
+                # Base score from distance ratio
+                base_score = best_dist / current_dist
+                
+                # Two-step regret: consider opportunity at both ends
+                # Alternative at i (second best excluding j)
+                alt_i_idx = 0
+                while alt_i_idx < n-1 and sorted_indices[i, alt_i_idx] == j:
+                    alt_i_idx += 1
+                alt_i_dist = sorted_dists[i, alt_i_idx] if alt_i_idx < n-1 else current_dist
+                
+                # Alternative at j (best excluding i)
+                alt_j_idx = 0
+                while alt_j_idx < n-1 and sorted_indices[j, alt_j_idx] == i:
+                    alt_j_idx += 1
+                alt_j_dist = sorted_dists[j, alt_j_idx] if alt_j_idx < n-1 else current_dist
+                
+                # Combined regret factor
+                regret_i = 1.0 + (current_dist - alt_i_dist) / (alt_i_dist + 1e-8)
+                regret_j = 1.0 + (current_dist - alt_j_dist) / (alt_j_dist + 1e-8)
+                combined_regret = (regret_i + regret_j) / 2.0
+                
+                # Rank penalty decays with rank
+                rank_penalty = rank / (n - 2) if n > 2 else 0
+                
+                rank_matrix[i, j] = base_score * (1.0 / combined_regret) * (1.0 - 0.4 * rank_penalty)
+            else:
+                rank_matrix[i, j] = 1.0
+    
+    # 2.3 Local structure analysis with variance calibration
+    # Compute adaptive neighborhood size
+    base_k = max(3, n // 10)
+    k = min(base_k + int(5 * variance_factor), n - 1)
+    
+    local_density = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        
+        if n > k:
+            # Get k-nearest distances
+            kth_dist = np.partition(dists, k)[k]
+            neighbor_mask = dists <= kth_dist
+            neighbor_dists = dists[neighbor_mask]
+        else:
+            neighbor_dists = dists[dists < np.inf]
+        
+        if len(neighbor_dists) > 0:
+            # Density as inverse of average distance
+            local_density[i] = 1.0 / (np.mean(neighbor_dists) + 1e-8)
+        else:
+            local_density[i] = 1.0
+    
+    # Apply variance-aware normalization
+    if np.max(local_density) > np.min(local_density):
+        # More aggressive scaling for high-variance instances
+        scale = 1.0 + 0.5 * variance_factor
+        local_density = scale * (local_density - np.min(local_density)) / (np.max(local_density) - np.min(local_density))
+    
+    # Density similarity component
+    density_matrix = np.ones((n, n))
+    similarity_sigma = 2.0 / (1.0 + variance_factor)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            density_diff = abs(local_density[i] - local_density[j])
+            density_matrix[i, j] = 1.0 + 0.6 * np.exp(-similarity_sigma * density_diff)
+    
+    # 2.4 Spatial proximity with adaptive thresholds
+    proximity_matrix = np.ones((n, n))
+    
+    # Compute adaptive threshold based on local and global statistics
+    threshold_base = 1.2 + 0.3 * variance_factor
+    
+    for i in range(n):
+        # Local reference distance (25th percentile for robustness)
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        local_ref = np.percentile(dists[dists < np.inf], 25) if n > 1 else global_mean
+        
+        threshold = threshold_base * max(local_ref, 0.4 * global_mean)
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            dist = distance_matrix[i, j]
+            
+            if dist <= threshold:
+                # Bonus for edges within threshold
+                proximity_ratio = 1.0 - dist / (threshold + 1e-8)
+                proximity_matrix[i, j] *= 1.0 + 0.5 * proximity_ratio
+            else:
+                # Penalty for edges beyond threshold
+                excess_ratio = dist / (threshold + 1e-8)
+                proximity_matrix[i, j] *= np.exp(1.0 - excess_ratio)
+    
+    # 2.5 Minimum spanning tree structural priority
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost = np.where(mst_mask, 1.3 - 0.1 * size_factor, 1.0)
+    except:
+        mst_boost = np.ones((n, n))
+    
+    # =====================================================================
+    # 3. VARIANCE-CALIBRATED ADAPTIVE WEIGHTING
+    # =====================================================================
+    
+    # Component weights adapt based on instance characteristics
+    # More emphasis on rank/regret for structured instances (low variance)
+    # More emphasis on local structure for complex instances (high variance)
+    
+    # Base weights
+    w_base = {
+        'inv_dist': 0.25,
+        'rank': 0.30,
+        'density': 0.20,
+        'proximity': 0.25
+    }
+    
+    # Adjustment factors based on instance characteristics
+    inv_dist_adj = 1.0 - 0.2 * variance_factor  # Less important in high variance
+    rank_adj = 1.0 + 0.3 * (1.0 - variance_factor)  # More important in low variance
+    density_adj = 1.0 + 0.4 * variance_factor  # More important in high variance
+    proximity_adj = 1.0  # Neutral adjustment
+    
+    # Apply adjustments
+    w_inv_dist = w_base['inv_dist'] * inv_dist_adj
+    w_rank = w_base['rank'] * rank_adj
+    w_density = w_base['density'] * density_adj
+    w_proximity = w_base['proximity'] * proximity_adj
+    
+    # Normalize to sum to 1
+    w_sum = w_inv_dist + w_rank + w_density + w_proximity
+    w_inv_dist /= w_sum
+    w_rank /= w_sum
+    w_density /= w_sum
+    w_proximity /= w_sum
+    
+    # =====================================================================
+    # 4. GEOMETRIC MEAN COMPONENT FUSION
+    # =====================================================================
+    
+    # Use weighted geometric mean for balanced combination
+    # This prevents any single component from dominating
+    
+    # Ensure all components are positive and non-zero
+    inv_dist_pos = np.maximum(inv_dist, 1e-8)
+    rank_pos = np.maximum(rank_matrix, 1e-8)
+    density_pos = np.maximum(density_matrix, 1e-8)
+    proximity_pos = np.maximum(proximity_matrix, 1e-8)
+    
+    # Geometric mean with weights
+    combined = (
+        np.power(inv_dist_pos, w_inv_dist) *
+        np.power(rank_pos, w_rank) *
+        np.power(density_pos, w_density) *
+        np.power(proximity_pos, w_proximity) *
+        mst_boost
+    )
+    
+    # Ensure symmetry and zero diagonal
+    combined = (combined + combined.T) / 2.0
+    np.fill_diagonal(combined, 0)
+    
+    # =====================================================================
+    # 5. MULTI-CRITERIA SPARSIFICATION
+    # =====================================================================
+    
+    # Determine number of edges to keep per node
+    if n <= 15:
+        min_edges = max(3, n // 3)
+        max_edges = n - 1
+    elif n <= 50:
+        min_edges = max(4, int(0.25 * n))
+        max_edges = max(7, int(0.35 * n))
+    else:
+        min_edges = max(5, int(0.2 * n))
+        max_edges = max(10, int(0.3 * n))
+    
+    # Adjust based on sparsity factor
+    min_edges = int(min_edges * (1.0 + 0.3 * sparsity_factor))
+    max_edges = int(max_edges * (1.0 + 0.3 * sparsity_factor))
+    
+    # Create sparsification mask
+    keep_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always keep MST edges for structural integrity
+    if 'mst_mask' in locals():
+        keep_mask = keep_mask | mst_mask
+    
+    # Multi-criteria edge selection
+    edge_scores = np.zeros((n, n))
+    
+    # Criterion 1: Combined heuristic score
+    edge_scores += combined
+    
+    # Criterion 2: Rank-based score (normalized)
+    rank_norm = rank_matrix / np.max(rank_matrix)
+    edge_scores += rank_norm
+    
+    # Criterion 3: Spatial proximity (normalized)
+    proximity_norm = proximity_matrix / np.max(proximity_matrix)
+    edge_scores += proximity_norm
+    
+    # Select edges based on combined criteria
+    for i in range(n):
+        # Get scores for this node
+        scores = edge_scores[i, :].copy()
+        scores[i] = -np.inf
+        
+        # Keep top edges
+        target = min(max_edges, n-1)
+        top_indices = np.argpartition(scores, -target)[-target:]
+        keep_mask[i, top_indices] = True
+        keep_mask[top_indices, i] = True
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        connected = np.where(keep_mask[i, :])[0]
+        connected = connected[connected != i]
+        
+        if len(connected) < min_edges:
+            # Add nearest neighbors to meet minimum
+            dists = distance_matrix[i, :].copy()
+            dists[i] = np.inf
+            
+            # Sort by distance
+            candidates = np.argsort(dists)
+            added = 0
+            for j in candidates:
+                if j != i and not keep_mask[i, j]:
+                    keep_mask[i, j] = True
+                    keep_mask[j, i] = True
+                    added += 1
+                    if len(connected) + added >= min_edges:
+                        break
+    
+    # Ensure global connectivity
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        current = stack.pop()
+        neighbors = np.where(keep_mask[current, :])[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                stack.append(neighbor)
+    
+    # Connect any disconnected components
+    if not np.all(visited):
+        # Find components
+        components = []
+        comp_labels = -np.ones(n, dtype=int)
+        comp_id = 0
+        
+        for i in range(n):
+            if comp_labels[i] == -1:
+                # Start BFS
+                comp = []
+                stack = [i]
+                comp_labels[i] = comp_id
+                
+                while stack:
+                    node = stack.pop()
+                    comp.append(node)
+                    
+                    neighbors = np.where(keep_mask[node, :])[0]
+                    for neighbor in neighbors:
+                        if comp_labels[neighbor] == -1:
+                            comp_labels[neighbor] = comp_id
+                            stack.append(neighbor)
+                
+                components.append(comp)
+                comp_id += 1
+        
+        # Connect components with shortest edges
+        for i in range(len(components) - 1):
+            comp_a = components[i]
+            comp_b = components[i + 1]
+            
+            min_dist = np.inf
+            best_pair = (0, 0)
+            
+            for a in comp_a:
+                for b in comp_b:
+                    dist = distance_matrix[a, b]
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_pair = (a, b)
+            
+            keep_mask[best_pair] = True
+            keep_mask[best_pair[::-1]] = True
+    
+    # Apply sparsification mask
+    heuristic = combined * keep_mask
+    
+    # =====================================================================
+    # 6. FINAL NORMALIZATION
+    # =====================================================================
+    
+    # Softmax normalization per node for probabilistic interpretation
+    for i in range(n):
+        row = heuristic[i, :]
+        mask = row > 0
+        
+        if np.sum(mask) > 0:
+            # Shift for numerical stability
+            row_masked = row[mask]
+            row_masked = row_masked - np.max(row_masked)
+            
+            # Softmax
+            exp_row = np.exp(row_masked)
+            heuristic[i, mask] = exp_row / np.sum(exp_row)
+    
+    # Ensure symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2.0
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

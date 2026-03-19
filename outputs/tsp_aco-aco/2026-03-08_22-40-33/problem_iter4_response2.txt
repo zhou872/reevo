@@ -1,0 +1,247 @@
+```json
+{
+    "algorithm_features": ["Spectral Embedding Centrality", "Multi-opt Local Search Potential", "Clustering-Adaptive Parameter Tuning", "Hierarchical Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import cdist
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.sparse.linalg import eigsh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with spectral methods
+    and clustering-aware parameter adaptation.
+    
+    Features:
+    1. Spectral embedding for robust centrality estimation using graph Laplacian eigenvectors
+    2. Multi-opt (2-opt & 3-opt) move potential estimation with neighbor caching
+    3. Hierarchical clustering for instance subtype identification and parameter tuning
+    4. Hierarchical sparsification preserving cluster connectivity
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges for inclusion in optimal tours.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. INSTANCE ANALYSIS WITH HIERARCHICAL CLUSTERING ===
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # Hierarchical clustering for instance subtype identification
+    Z = linkage(upper_tri, method='ward')
+    clusters = fcluster(Z, t=2, criterion='maxclust')
+    cluster_ratio = np.std(np.bincount(clusters)) / (n + 1e-12)
+    
+    # Adaptive parameters based on clustering structure
+    mst_weight = 1.6 + 0.6 * np.tanh(dist_cv * (1 + cluster_ratio))
+    regret_factor = 1.2 + 0.6 * (1 - np.exp(-dist_cv * cluster_ratio))
+    spectral_weight = 0.4 + 0.3 * np.tanh(cluster_ratio * 3)
+    
+    # === 2. SPECTRAL EMBEDDING FOR CENTRALITY ===
+    # Construct normalized Laplacian
+    W = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(W, 0)
+    D = np.diag(np.sum(W, axis=1))
+    D_inv_sqrt = np.diag(1 / np.sqrt(np.diag(D) + 1e-12))
+    L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+    
+    # Compute eigenvectors (Fiedler vector and next few)
+    try:
+        # Use sparse eigen decomposition for efficiency
+        eigenvalues, eigenvectors = eigsh(L_norm, k=min(4, n-1), which='SM')
+        # Fiedler vector (second smallest eigenvector) for connectivity
+        spectral_centrality = np.abs(eigenvectors[:, 1])
+        # Additional eigenvectors for multidimensional embedding
+        spectral_features = np.abs(eigenvectors[:, 1:4]) if eigenvectors.shape[1] >= 4 else np.abs(eigenvectors[:, 1:])
+        spectral_similarity = spectral_features @ spectral_features.T
+    except:
+        # Fallback to degree centrality if spectral fails
+        spectral_centrality = np.sum(W, axis=1)
+        spectral_similarity = np.outer(spectral_centrality, spectral_centrality)
+    
+    spectral_centrality = spectral_centrality / (np.max(spectral_centrality) + 1e-12)
+    
+    # === 3. MULTI-OPT LOCAL SEARCH POTENTIAL ===
+    # Pre-compute neighbor rankings for efficiency
+    neighbor_rankings = np.argsort(distance_matrix, axis=1)[:, 1:min(6, n)]
+    
+    ls_potential = np.ones((n, n))
+    
+    for i in range(n):
+        i_neighbors = neighbor_rankings[i]
+        for j_idx, j in enumerate(range(i + 1, n)):
+            j_neighbors = neighbor_rankings[j]
+            
+            # Current edge length
+            current = distance_matrix[i, j]
+            
+            # === 2-OPT POTENTIAL ===
+            # Best alternative connection through k
+            best_2opt = np.inf
+            for k in i_neighbors[:3]:
+                if k != j:
+                    alt_length = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_2opt = min(best_2opt, alt_length)
+            
+            # === 3-OPT POTENTIAL (approximated) ===
+            # Consider breaking two additional edges
+            best_3opt = np.inf
+            if len(i_neighbors) >= 3 and len(j_neighbors) >= 3:
+                for a in i_neighbors[:3]:
+                    if a == j:
+                        continue
+                    for b in j_neighbors[:3]:
+                        if b == i or b == a:
+                            continue
+                        # 3-opt pattern: break (i,j), (i,a), (j,b), connect (i,b), (j,a), (a,b)
+                        alt_3opt = (distance_matrix[i, b] + 
+                                  distance_matrix[j, a] + 
+                                  distance_matrix[a, b])
+                        best_3opt = min(best_3opt, alt_3opt)
+            
+            # Take the best improvement potential
+            best_alt = min(best_2opt, best_3opt)
+            if best_alt < np.inf and current > 0:
+                gain_ratio = (best_alt - current) / current
+                # Scale sensitivity based on potential gain
+                sensitivity = 1.0 + 0.4 * np.tanh(max(0, -gain_ratio) / dist_mean)
+                ls_potential[i, j] = min(2.0, max(0.7, sensitivity))
+    
+    # Symmetrize
+    ls_potential = np.maximum(ls_potential, ls_potential.T)
+    
+    # === 4. ENHANCED REGRET WITH CLUSTER-AWARE SCALING ===
+    regret_matrix = np.ones((n, n))
+    cluster_mask = np.outer(clusters, clusters)  # Same cluster indicator
+    
+    for i in range(n):
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        dists = distance_matrix[i, mask]
+        valid_idx = np.where(mask)[0]
+        
+        if len(dists) >= 2:
+            sorted_idx = np.argsort(dists)
+            sorted_dists = dists[sorted_idx]
+            
+            # Compute adaptive regret based on gap distribution
+            if sorted_dists[0] > 0:
+                gaps = np.diff(sorted_dists) / sorted_dists[0]
+                avg_gap = np.mean(gaps[:min(4, len(gaps))])
+                local_regret = regret_factor * (1 + np.tanh(avg_gap))
+            else:
+                local_regret = regret_factor
+            
+            # Apply penalties with cluster awareness
+            for rank, global_idx in enumerate(valid_idx[sorted_idx]):
+                penalty = 1 / (1 + local_regret * rank)
+                # Reduce penalty for intra-cluster edges
+                if clusters[i] == clusters[global_idx]:
+                    penalty = np.sqrt(penalty)
+                regret_matrix[i, global_idx] = penalty
+    
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # === 5. CENTRALITY COMBINATION ===
+    # Degree centrality
+    with np.errstate(divide='ignore', invalid='ignore'):
+        degree_centrality = 1 / np.mean(distance_matrix + np.eye(n) * 1e-12, axis=1)
+    degree_centrality = degree_centrality / np.max(degree_centrality)
+    
+    # MST centrality
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_degree = np.sum(mst_mask, axis=1)
+    mst_centrality = mst_degree / (np.max(mst_degree) + 1e-12)
+    
+    # Combine centrality measures
+    centrality = (0.3 * degree_centrality + 
+                  0.3 * mst_centrality + 
+                  spectral_weight * spectral_centrality)
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # === 6. BASE SCORE CONSTRUCTION ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Combine factors
+    heuristics = inv_dist.copy()
+    heuristics *= regret_matrix
+    heuristics *= centrality_matrix
+    heuristics *= spectral_similarity  # Incorporate spectral embedding similarity
+    heuristics *= ls_potential
+    
+    # Boost MST edges adaptively
+    heuristics[mst_mask] *= mst_weight
+    
+    # Additional boost for intra-cluster edges in clustered instances
+    if cluster_ratio > 0.2:
+        heuristics[cluster_mask] *= (1 + 0.3 * cluster_ratio)
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 7. HIERARCHICAL SPARSIFICATION ===
+    # First level: preserve MST edges
+    preserved = mst_mask.copy()
+    
+    # Second level: preserve intra-cluster connectivity
+    for c in np.unique(clusters):
+        cluster_nodes = np.where(clusters == c)[0]
+        if len(cluster_nodes) > 1:
+            # Keep top edges within cluster
+            cluster_heuristics = heuristics[cluster_nodes][:, cluster_nodes]
+            np.fill_diagonal(cluster_heuristics, 0)
+            threshold = np.percentile(cluster_heuristics[cluster_heuristics > 0], 30)
+            mask = cluster_heuristics > threshold
+            for idx_i, i in enumerate(cluster_nodes):
+                for idx_j, j in enumerate(cluster_nodes):
+                    if idx_i != idx_j and mask[idx_i, idx_j]:
+                        preserved[i, j] = True
+    
+    # Third level: preserve inter-cluster connections
+    if len(np.unique(clusters)) > 1:
+        # Keep best connection between each cluster pair
+        for c1 in np.unique(clusters):
+            for c2 in np.unique(clusters):
+                if c1 >= c2:
+                    continue
+                nodes1 = np.where(clusters == c1)[0]
+                nodes2 = np.where(clusters == c2)[0]
+                if len(nodes1) > 0 and len(nodes2) > 0:
+                    inter_heuristics = heuristics[nodes1][:, nodes2]
+                    max_idx = np.unravel_index(np.argmax(inter_heuristics), inter_heuristics.shape)
+                    preserved[nodes1[max_idx[0]], nodes2[max_idx[1]]] = True
+                    preserved[nodes2[max_idx[1]], nodes1[max_idx[0]]] = True
+    
+    # Zero out non-preserved edges below median
+    non_preserved = ~preserved
+    np.fill_diagonal(non_preserved, False)
+    if np.any(non_preserved):
+        median_val = np.median(heuristics[non_preserved])
+        heuristics[non_preserved & (heuristics < median_val)] = 0
+    
+    # === 8. FINAL PROCESSING ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics /= max_val
+    
+    return heuristics
+```

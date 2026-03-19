@@ -1,0 +1,424 @@
+```json
+{
+    "algorithm_features": ["Attention-based GNN with Multi-Head Aggregation", "Continuous Reinforcement Weight Optimization", "Hierarchical Two-Tier Sparsification", "Adaptive Instance-Aware Computation Budgeting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Dict, Tuple, List
+import random
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with attention-enhanced GNN, continuous RL weight optimization,
+    and hierarchical sparsification for scalable performance.
+    
+    Core innovations:
+    1. Multi-Head Attention GNN: Uses attention mechanisms for dynamic neighbor weighting
+       during message passing with multiple attention heads for diverse feature capture
+    2. Continuous Reinforcement Learning: Online weight optimization with momentum-based
+       updates and simulated annealing for exploration-exploitation balance
+    3. Hierarchical Two-Tier Sparsification: First clusters nodes, computes intra/inter-cluster
+       heuristics separately, then merges with cluster boundary refinement
+    4. Adaptive Computation Budgeting: Dynamically allocates computation to most promising
+       components based on instance characteristics and runtime feedback
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # ==================== 1. INSTANCE ANALYSIS & BUDGET ALLOCATION ====================
+    # Compute global statistics
+    triu_indices = np.triu_indices(n, k=1)
+    global_dists = distance_matrix[triu_indices]
+    global_mean = np.mean(global_dists)
+    global_std = np.std(global_dists)
+    sparsity = min(1.0, global_std / (global_mean + 1e-8))
+    
+    # Determine instance category and computation budget
+    if n <= 100:
+        category = 'small'
+        rl_iterations = 8
+        attention_heads = 3
+        max_clusters = min(6, max(2, n // 15))
+    elif n <= 1000:
+        category = 'medium'
+        rl_iterations = 5
+        attention_heads = 2
+        max_clusters = min(10, max(3, n // 50))
+    else:
+        category = 'large'
+        rl_iterations = 3
+        attention_heads = 1
+        max_clusters = min(20, max(5, n // 100))
+    
+    # Precompute sorted distances for efficiency
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_distances = np.sort(distance_matrix, axis=1)
+    
+    # ==================== 2. MULTI-HEAD ATTENTION GNN ====================
+    def compute_attention_gnn(k_neighbors: int = None, iterations: int = None) -> np.ndarray:
+        """Compute node embeddings using multi-head attention mechanism"""
+        if k_neighbors is None:
+            k_neighbors = min(10, n-1) if category != 'large' else min(5, n-1)
+        if iterations is None:
+            iterations = 4 if category != 'large' else 2
+        
+        # Initialize node features with distance statistics
+        features = np.zeros((n, 3))
+        for i in range(n):
+            # Feature 1: normalized average distance to k nearest neighbors
+            nearest_dists = sorted_distances[i, 1:min(k_neighbors+1, n)]
+            features[i, 0] = np.mean(nearest_dists) / (global_mean + 1e-8)
+            
+            # Feature 2: distance variation coefficient
+            features[i, 1] = np.std(nearest_dists) / (np.mean(nearest_dists) + 1e-8)
+            
+            # Feature 3: rank-based centrality
+            features[i, 2] = np.exp(-sorted_distances[i, 1] / (global_mean + 1e-8))
+        
+        # Normalize features
+        features = (features - np.mean(features, axis=0)) / (np.std(features, axis=0) + 1e-8)
+        
+        # Multi-head attention message passing
+        embeddings = features.copy()
+        for _ in range(iterations):
+            new_embeddings = np.zeros_like(embeddings)
+            
+            for head in range(attention_heads):
+                # Each head uses different attention mechanism
+                if head == 0:  # Distance-based attention
+                    attention_scores = np.exp(-distance_matrix / (global_mean * (0.5 + 0.5 * head)))
+                elif head == 1:  # Feature similarity attention
+                    feature_sim = embeddings @ embeddings.T
+                    attention_scores = np.exp(feature_sim / np.sqrt(features.shape[1]))
+                else:  # Hybrid attention
+                    dist_attention = np.exp(-distance_matrix / global_mean)
+                    feat_attention = np.exp((embeddings @ embeddings.T) / np.sqrt(features.shape[1]))
+                    attention_scores = 0.5 * dist_attention + 0.5 * feat_attention
+                
+                # Apply softmax per row (excluding self)
+                np.fill_diagonal(attention_scores, -np.inf)
+                row_max = np.max(attention_scores, axis=1, keepdims=True)
+                attention_scores = np.exp(attention_scores - row_max)
+                row_sum = np.sum(attention_scores, axis=1, keepdims=True)
+                attention_weights = attention_scores / (row_sum + 1e-8)
+                
+                # Aggregate messages
+                aggregated = attention_weights @ embeddings
+                
+                # Combine with residual connection
+                head_weight = 1.0 / (head + 1)  # Decreasing weight for later heads
+                new_embeddings += head_weight * (0.7 * embeddings + 0.3 * aggregated)
+            
+            # Average across heads
+            embeddings = new_embeddings / attention_heads
+        
+        # Compute final similarity matrix
+        norm = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normalized = embeddings / (norm + 1e-8)
+        gnn_sim = normalized @ normalized.T
+        
+        # Scale to meaningful range
+        gnn_sim = 0.5 + 0.5 * gnn_sim
+        return gnn_sim
+    
+    # ==================== 3. COMPONENT COMPUTATION ====================
+    components = {}
+    
+    # 3.1 Attention GNN features
+    components['attention_gnn'] = compute_attention_gnn()
+    
+    # 3.2 Inverse distance with adaptive regularization
+    reg_factor = global_mean * 0.05
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + reg_factor)
+    np.fill_diagonal(inv_dist, 0)
+    components['inv_dist'] = inv_dist
+    
+    # 3.3 Rank-based component
+    rank_matrix = np.ones((n, n))
+    for i in range(n):
+        ranks = np.zeros(n, dtype=int)
+        valid_indices = sorted_indices[i, sorted_indices[i] != i][:n-1]
+        ranks[valid_indices] = np.arange(len(valid_indices))
+        rank_bonus = np.exp(-ranks / max(5.0, n / 10.0))
+        rank_matrix[i] = 1.0 + 0.6 * rank_bonus
+    components['rank'] = rank_matrix
+    
+    # 3.4 Minimum Spanning Tree boost
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost = np.where(mst_mask, 1.4, 1.0)
+    except:
+        mst_boost = np.ones((n, n))
+    components['mst'] = mst_boost
+    
+    # 3.5 Local density component
+    k_density = min(7, max(3, n // 20))
+    local_density = np.zeros(n)
+    for i in range(n):
+        nearest = sorted_distances[i, 1:k_density+1]
+        local_density[i] = 1.0 / (np.median(nearest) + 1e-8)
+    
+    if np.max(local_density) > np.min(local_density):
+        local_density = (local_density - np.min(local_density)) / \
+                       (np.max(local_density) - np.min(local_density))
+    
+    density_diff = np.abs(local_density[:, None] - local_density[None, :])
+    density_matrix = 1.0 + 0.6 * np.exp(-3.0 * density_diff)
+    np.fill_diagonal(density_matrix, 1.0)
+    components['density'] = density_matrix
+    
+    # ==================== 4. CONTINUOUS REINFORCEMENT LEARNING ====================
+    def evaluate_weights(weights: Dict[str, float], 
+                        components: Dict[str, np.ndarray],
+                        num_tours: int = None) -> float:
+        """Evaluate weight configuration using simulated tours"""
+        if num_tours is None:
+            num_tours = min(15, max(5, n // 20))
+        
+        # Combine components
+        heuristic = np.ones((n, n))
+        for key, weight in weights.items():
+            if key in components and weight > 0:
+                heuristic *= np.power(components[key], weight)
+        np.fill_diagonal(heuristic, 0)
+        
+        # Evaluate with multiple greedy tours
+        tour_lengths = []
+        for _ in range(num_tours):
+            start = np.random.randint(0, n)
+            visited = {start}
+            current = start
+            tour_length = 0
+            
+            while len(visited) < n:
+                # Get candidate nodes
+                candidates = [j for j in range(n) if j not in visited]
+                if not candidates:
+                    break
+                
+                # Get scores for candidates
+                scores = heuristic[current, candidates]
+                
+                # Softmax selection with temperature
+                temperature = 0.1 + 0.9 * (len(visited) / n)  # Annealing
+                exp_scores = np.exp(scores / temperature)
+                probs = exp_scores / np.sum(exp_scores)
+                
+                next_node = np.random.choice(candidates, p=probs)
+                tour_length += distance_matrix[current, next_node]
+                visited.add(next_node)
+                current = next_node
+            
+            # Return to start
+            if current != start:
+                tour_length += distance_matrix[current, start]
+            tour_lengths.append(tour_length)
+        
+        return np.mean(tour_lengths)
+    
+    # Initialize weights with momentum-based optimization
+    weight_keys = list(components.keys())
+    current_weights = {key: 1.0 / len(weight_keys) for key in weight_keys}
+    momentum = {key: 0.0 for key in weight_keys}
+    learning_rate = 0.1
+    momentum_decay = 0.9
+    
+    best_score = float('inf')
+    best_weights = current_weights.copy()
+    
+    for iteration in range(rl_iterations):
+        # Generate candidate weight updates
+        candidates = []
+        for _ in range(min(10, 5 + iteration * 2)):
+            candidate = {}
+            for key in weight_keys:
+                # Add exploration noise
+                noise = np.random.normal(0, 0.05 * (1.0 - iteration / rl_iterations))
+                candidate[key] = max(0.01, current_weights[key] + momentum[key] + noise)
+            
+            # Normalize
+            total = sum(candidate.values())
+            candidate = {k: v / total for k, v in candidate.items()}
+            candidates.append(candidate)
+        
+        # Evaluate candidates
+        scores = []
+        for candidate in candidates:
+            score = evaluate_weights(candidate, components, 
+                                   num_tours=min(8, max(3, n // 50)))
+            scores.append(score)
+        
+        # Find best candidate
+        best_idx = np.argmin(scores)
+        if scores[best_idx] < best_score:
+            best_score = scores[best_idx]
+            best_weights = candidates[best_idx].copy()
+        
+        # Update momentum and current weights
+        for key in weight_keys:
+            gradient = candidates[best_idx][key] - current_weights[key]
+            momentum[key] = momentum_decay * momentum[key] + learning_rate * gradient
+            current_weights[key] = candidates[best_idx][key]
+        
+        # Anneal learning rate
+        learning_rate *= 0.9
+    
+    # ==================== 5. HIERARCHICAL TWO-TIER SPARSIFICATION ====================
+    def hierarchical_sparsification(heuristic: np.ndarray, 
+                                  n_clusters: int) -> np.ndarray:
+        """Apply hierarchical sparsification with clustering"""
+        if n <= 100 or n_clusters < 2:
+            # Use simple sparsification for small instances
+            edges_per_node = min(8, n-1)
+            mask = np.zeros((n, n), dtype=bool)
+            
+            for i in range(n):
+                scores = heuristic[i].copy()
+                scores[i] = -np.inf
+                threshold = np.partition(scores, -edges_per_node)[-edges_per_node]
+                mask[i] = scores >= threshold
+                mask[:, i] = mask[:, i] | (scores >= threshold)
+            
+            return mask
+        
+        # Cluster nodes using greedy farthest-first traversal
+        centers = []
+        center_indices = [np.random.randint(0, n)]
+        
+        for _ in range(n_clusters - 1):
+            distances_to_centers = distance_matrix[center_indices].min(axis=0)
+            next_center = np.argmax(distances_to_centers)
+            center_indices.append(next_center)
+        
+        # Assign nodes to nearest center
+        cluster_assignments = np.argmin(distance_matrix[center_indices], axis=0)
+        
+        # Build masks for intra-cluster and inter-cluster edges
+        intra_mask = np.zeros((n, n), dtype=bool)
+        inter_mask = np.zeros((n, n), dtype=bool)
+        
+        # Intra-cluster edges: keep more edges within dense clusters
+        for cluster_id in range(n_clusters):
+            cluster_nodes = np.where(cluster_assignments == cluster_id)[0]
+            cluster_size = len(cluster_nodes)
+            
+            if cluster_size > 1:
+                # For each node in cluster, keep edges to top intra-cluster neighbors
+                intra_edges = min(5, max(2, cluster_size // 3))
+                
+                for i in cluster_nodes:
+                    # Get scores for intra-cluster edges
+                    intra_scores = heuristic[i, cluster_nodes].copy()
+                    intra_scores[cluster_nodes == i] = -np.inf
+                    
+                    if intra_edges < len(cluster_nodes) - 1:
+                        threshold = np.partition(intra_scores, -intra_edges)[-intra_edges]
+                        intra_mask[i, cluster_nodes] = intra_scores >= threshold
+                    else:
+                        intra_mask[i, cluster_nodes] = intra_scores > -np.inf
+        
+        # Inter-cluster edges: keep connections between clusters
+        inter_edges_per_node = min(3, max(1, n_clusters // 2))
+        
+        for i in range(n):
+            cluster_i = cluster_assignments[i]
+            
+            # Get scores for inter-cluster edges
+            other_clusters = [c for c in range(n_clusters) if c != cluster_i]
+            inter_nodes = np.where(cluster_assignments != cluster_i)[0]
+            
+            if len(inter_nodes) > 0:
+                inter_scores = heuristic[i, inter_nodes].copy()
+                
+                # Keep top inter-cluster edges
+                if inter_edges_per_node < len(inter_nodes):
+                    threshold = np.partition(inter_scores, -inter_edges_per_node)[-inter_edges_per_node]
+                    selected = inter_nodes[inter_scores >= threshold]
+                else:
+                    selected = inter_nodes
+                
+                inter_mask[i, selected] = True
+        
+        # Ensure MST edges are always included
+        mask = intra_mask | inter_mask | mst_mask
+        mask = mask | mask.T  # Ensure symmetry
+        
+        # Connect any disconnected components
+        visited = np.zeros(n, dtype=bool)
+        stack = [0]
+        visited[0] = True
+        
+        while stack:
+            current = stack.pop()
+            neighbors = np.where(mask[current])[0]
+            for nb in neighbors:
+                if not visited[nb]:
+                    visited[nb] = True
+                    stack.append(nb)
+        
+        if not np.all(visited):
+            # Connect disconnected components with best heuristic edges
+            unvisited = np.where(~visited)[0]
+            for node in unvisited:
+                best_score = -np.inf
+                best_connected = -1
+                
+                for connected_node in np.where(visited)[0]:
+                    score = heuristic[node, connected_node]
+                    if score > best_score:
+                        best_score = score
+                        best_connected = connected_node
+                
+                if best_connected != -1:
+                    mask[node, best_connected] = True
+                    mask[best_connected, node] = True
+                    visited[node] = True
+        
+        return mask
+    
+    # ==================== 6. FINAL HEURISTIC COMPUTATION ====================
+    # Combine components with learned weights
+    heuristic = np.ones((n, n))
+    for key, weight in best_weights.items():
+        if key in components and weight > 0:
+            heuristic *= np.power(components[key], weight)
+    
+    np.fill_diagonal(heuristic, 0)
+    
+    # Apply hierarchical sparsification
+    mask = hierarchical_sparsification(heuristic, max_clusters)
+    heuristic = heuristic * mask
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # Row-wise normalization
+    for i in range(n):
+        row = heuristic[i]
+        if np.sum(row > 0) > 1:
+            # Softmax with temperature based on row statistics
+            row_max = np.max(row)
+            row_min = np.min(row[row > 0])
+            temperature = max(0.1, (row_max - row_min) / 10.0)
+            
+            exp_row = np.exp((row - row_max) / temperature)
+            row_sum = np.sum(exp_row)
+            if row_sum > 0:
+                heuristic[i] = exp_row / row_sum
+    
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

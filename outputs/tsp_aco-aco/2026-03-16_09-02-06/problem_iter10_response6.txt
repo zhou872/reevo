@@ -1,0 +1,294 @@
+```json
+{
+    "algorithm_features": ["Three-Step Path Extension Lookahead", "Adaptive Clustering with Spatial Density Bonus", "Progressive Edge Sparsification", "Solution Feedback Integration"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+from scipy.spatial.distance import squareform, pdist
+from scipy.cluster.hierarchy import linkage, fcluster
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with three-step lookahead and solution-aware adjustments.
+    
+    Key improvements over v1:
+    1. Three-step path extension: Evaluates longer alternative paths (i→k→l→j) for better future cost estimation
+    2. Adaptive clustering with spatial density: Adjusts cluster granularity based on local point density
+    3. Progressive edge sparsification: Multi-stage edge selection with connectivity guarantees
+    4. Solution feedback integration: Uses nearest-neighbor tour as reference for edge quality assessment
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        scores = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(scores, 0)
+        return scores
+    
+    # Create working distance matrix
+    dist = distance_matrix.astype(float, copy=True)
+    np.fill_diagonal(dist, np.inf)
+    
+    # Compute basic statistics
+    valid_dists = dist[dist < np.inf]
+    if len(valid_dists) > 0:
+        dist_mean = np.mean(valid_dists)
+        dist_median = np.median(valid_dists)
+        dist_std = np.std(valid_dists)
+    else:
+        dist_mean = dist_median = dist_std = 1.0
+    
+    # 1. Base inverse distance with density-aware smoothing
+    smoothing = 0.1 * dist_mean + 0.05 * dist_std
+    inv_dist = 1 / (dist + smoothing)
+    
+    # 2. MST inclusion bonus
+    mst_input = dist.copy()
+    np.fill_diagonal(mst_input, 0)
+    mst = minimum_spanning_tree(mst_input)
+    mst_mask = mst.toarray() > 0
+    mst_bonus = np.where(mst_mask, 1.6, 1.0)  # 60% bonus for MST edges
+    
+    # 3. Three-step lookahead regret with path extension
+    regret_matrix = np.ones_like(dist)
+    
+    # Precompute k-nearest neighbors for efficient lookahead
+    k_neighbors = min(8, n - 1)
+    neighbor_indices = np.argsort(dist, axis=1)[:, 1:k_neighbors+1]
+    
+    # Solution feedback: Compute nearest-neighbor tour as reference
+    nn_tour = np.zeros(n, dtype=int)
+    visited = np.zeros(n, dtype=bool)
+    current = 0
+    visited[0] = True
+    
+    for step in range(1, n):
+        available = ~visited
+        if not np.any(available):
+            break
+        next_node = neighbor_indices[current, np.searchsorted(neighbor_indices[current], available)]
+        nn_tour[step] = next_node
+        visited[next_node] = True
+        current = next_node
+    
+    # Create tour edge mask
+    tour_mask = np.zeros_like(dist, dtype=bool)
+    for i in range(n):
+        j = nn_tour[(np.where(nn_tour == i)[0][0] + 1) % n]
+        tour_mask[i, j] = tour_mask[j, i] = True
+    
+    # Compute three-step alternative paths
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Base regret (one-step)
+            row_i = dist[i].copy()
+            row_i[i] = np.inf
+            best_i = np.min(row_i)
+            row_i[row_i == best_i] = np.inf
+            second_best_i = np.min(row_i)
+            regret_i = (dist[i, j] - best_i) / max(second_best_i - best_i, 1e-10)
+            
+            row_j = dist[j].copy()
+            row_j[j] = np.inf
+            best_j = np.min(row_j)
+            row_j[row_j == best_j] = np.inf
+            second_best_j = np.min(row_j)
+            regret_j = (dist[j, i] - best_j) / max(second_best_j - best_j, 1e-10)
+            
+            # Two-step regret (i→k→j)
+            i_neighbors = [k for k in neighbor_indices[i] if k != j]
+            j_neighbors = [k for k in neighbor_indices[j] if k != i]
+            
+            two_step_cost = np.inf
+            if i_neighbors and j_neighbors:
+                # Consider connecting through common neighbors
+                for k in set(i_neighbors) & set(j_neighbors):
+                    two_step_cost = min(two_step_cost, dist[i, k] + dist[k, j])
+            
+            # Three-step regret (i→k→l→j) - path extension
+            three_step_cost = np.inf
+            if len(i_neighbors) >= 2 and len(j_neighbors) >= 2:
+                # Sample promising three-step paths
+                for k in i_neighbors[:3]:  # Top 3 neighbors of i
+                    k_neighbors = [l for l in neighbor_indices[k] if l != i and l != j]
+                    for l in k_neighbors[:2]:  # Top 2 neighbors of k
+                        if l in j_neighbors:
+                            cost = dist[i, k] + dist[k, l] + dist[l, j]
+                            three_step_cost = min(three_step_cost, cost)
+            
+            # Combine regrets with weights
+            base_regret = (regret_i + regret_j) / 2
+            
+            two_step_regret = 0
+            if two_step_cost < np.inf:
+                two_step_regret = (dist[i, j] + dist_mean) / (two_step_cost + 1e-10) - 1
+            
+            three_step_regret = 0
+            if three_step_cost < np.inf:
+                three_step_regret = (dist[i, j] + dist_mean * 2) / (three_step_cost + 1e-10) - 1
+            
+            # Weighted combination favoring shorter paths when they exist
+            if two_step_cost < np.inf or three_step_cost < np.inf:
+                combined_regret = base_regret * 0.5 + two_step_regret * 0.3 + three_step_regret * 0.2
+            else:
+                combined_regret = base_regret
+            
+            # Convert to penalty with exponential decay
+            regret_matrix[i, j] = np.exp(-combined_regret)
+    
+    # 4. Adaptive clustering with spatial density bonus
+    if n >= 4:
+        try:
+            # Determine optimal cluster count based on spatial density
+            local_density = np.zeros(n)
+            k_density = min(5, n - 1)
+            for i in range(n):
+                neighbor_dists = np.partition(dist[i], k_density)[:k_density+1]
+                valid_dists = neighbor_dists[neighbor_dists < np.inf]
+                if len(valid_dists) > 0:
+                    local_density[i] = 1.0 / (np.mean(valid_dists) + 1e-10)
+            
+            # Adjust cluster count based on density variation
+            density_cv = np.std(local_density) / (np.mean(local_density) + 1e-10)
+            base_clusters = max(2, min(int(np.sqrt(n)), n // 3))
+            
+            if density_cv > 0.5:
+                # High density variation: more clusters
+                n_clusters = min(base_clusters * 2, n // 2)
+            else:
+                # Uniform density: fewer clusters
+                n_clusters = max(2, base_clusters // 2)
+            
+            # Perform hierarchical clustering
+            condensed_dist = squareform(dist, checks=False)
+            Z = linkage(condensed_dist, method='average')
+            clusters = fcluster(Z, n_clusters, criterion='maxclust') - 1
+            
+            # Compute cluster bonus with intra-cluster density weighting
+            cluster_bonus = np.ones_like(dist)
+            cluster_densities = np.zeros(n_clusters)
+            
+            for c in range(n_clusters):
+                cluster_nodes = np.where(clusters == c)[0]
+                if len(cluster_nodes) > 0:
+                    cluster_densities[c] = np.mean(local_density[cluster_nodes])
+            
+            if cluster_densities.max() > 0:
+                cluster_densities = cluster_densities / cluster_densities.max()
+            
+            for i in range(n):
+                for j in range(i+1, n):
+                    if clusters[i] == clusters[j]:
+                        # Bonus increases with cluster density
+                        density_factor = cluster_densities[clusters[i]]
+                        bonus = 1.0 + 0.4 * density_factor  # 0-40% bonus
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = bonus
+        except:
+            cluster_bonus = np.ones_like(dist)
+    else:
+        cluster_bonus = np.ones_like(dist)
+    
+    # 5. Solution feedback: Tour edge bonus
+    tour_bonus = np.where(tour_mask, 1.3, 1.0)  # 30% bonus for edges in nearest-neighbor tour
+    
+    # 6. Combine all factors
+    scores = inv_dist * mst_bonus * regret_matrix * cluster_bonus * tour_bonus
+    
+    # 7. Progressive edge sparsification with three stages
+    # Stage 1: Keep MST edges
+    mask = mst_mask.copy()
+    
+    # Stage 2: Add promising edges based on local scores
+    # Adaptive k based on graph sparsity
+    if len(valid_dists) > 0:
+        density_factor = dist_median / (np.max(valid_dists) + 1e-10)
+        k_base = max(3, int(np.sqrt(n) * (1.0 + density_factor)))
+    else:
+        k_base = max(3, int(np.sqrt(n)))
+    
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Determine k for this node based on its connectivity pattern
+        mst_degree = np.sum(mask[i])
+        k = min(k_base, max(k_base // 2, mst_degree + 2))
+        
+        # Select top k edges
+        if np.any(row_scores > -np.inf):
+            top_indices = np.argsort(row_scores)[-k:]
+            for j in top_indices:
+                if i != j and dist[i, j] < np.inf:
+                    mask[i, j] = True
+    
+    # Ensure symmetry
+    mask = mask | mask.T
+    
+    # Stage 3: Ensure connectivity and add critical edges
+    conn_mask = mask.astype(int)
+    n_components, labels = connected_components(conn_mask, directed=False)
+    
+    if n_components > 1:
+        # Connect components using highest scoring edges
+        comp_nodes = [np.where(labels == c)[0] for c in range(n_components)]
+        
+        for comp_i in range(n_components):
+            for comp_j in range(comp_i + 1, n_components):
+                best_score = -np.inf
+                best_i = best_j = -1
+                
+                # Sample edges between components
+                nodes_i = comp_nodes[comp_i]
+                nodes_j = comp_nodes[comp_j]
+                
+                # Check a limited number of potential connections
+                for i in nodes_i[:min(10, len(nodes_i))]:
+                    for j in nodes_j[:min(10, len(nodes_j))]:
+                        if scores[i, j] > best_score:
+                            best_score = scores[i, j]
+                            best_i, best_j = i, j
+                
+                if best_i >= 0 and best_j >= 0:
+                    mask[best_i, best_j] = mask[best_j, best_i] = True
+    
+    # Apply mask
+    scores = scores * mask
+    
+    # 8. Final normalization preserving meaningful differences
+    np.fill_diagonal(scores, 0)
+    
+    # Use robust scaling based on interquartile range
+    valid_scores = scores[scores > 0]
+    if len(valid_scores) > 5:
+        q75 = np.percentile(valid_scores, 75)
+        q25 = np.percentile(valid_scores, 25)
+        
+        if q75 > q25:
+            scaled = (scores - q25) / (q75 - q25 + 1e-10)
+            # Soft clipping to [0, 1.2] to preserve outlier information
+            scores = np.tanh(scaled) * 1.2
+        else:
+            max_val = valid_scores.max()
+            if max_val > 0:
+                scores = scores / max_val
+    elif len(valid_scores) > 0:
+        max_val = valid_scores.max()
+        if max_val > 0:
+            scores = scores / max_val
+    
+    return scores
+```

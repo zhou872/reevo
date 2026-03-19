@@ -1,0 +1,324 @@
+```json
+{
+    "algorithm_features": ["Multi-step Path Dynamic Programming", "Global Regret with Alternative Routing", "Adaptive Component Weighting", "Density-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with exact k-step dynamic programming and adaptive weighting.
+    
+    Key innovations over previous versions:
+    1. Exact k-step path calculations using dynamic programming (up to 3 edges)
+    2. Global regret with alternative routing analysis
+    3. Adaptive component weighting based on problem characteristics
+    4. Density-aware sparsification with connectivity guarantees
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between n nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Base cases
+    if n <= 2:
+        if n == 0:
+            return np.zeros_like(distance_matrix)
+        elif n == 1:
+            return np.array([[0]])
+        else:
+            # For 2 nodes, the only valid edge gets maximum score
+            heur = np.ones((2, 2))
+            np.fill_diagonal(heur, 0)
+            return heur
+    
+    # 1. Base inverse distance heuristic with smoothing
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = np.where(distance_matrix > 0, 1 / (distance_matrix + 1e-12), 0)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. MST backbone extraction
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 3. Exact k-step path calculations using dynamic programming
+    # For efficiency, we'll use min-plus algebra (tropical semiring) for exact calculations
+    d1 = distance_matrix.copy()
+    np.fill_diagonal(d1, np.inf)
+    
+    # 2-step shortest paths (exact via min-plus matrix multiplication)
+    d2 = np.full_like(d1, np.inf)
+    for k in range(n):
+        # d2[i,j] = min_k (d1[i,k] + d1[k,j]) with i≠k≠j
+        col = d1[:, k:k+1]  # n×1
+        row = d1[k:k+1, :]  # 1×n
+        sum_matrix = col + row  # n×n
+        
+        # Ensure we don't use the same node twice
+        sum_matrix[k, :] = np.inf
+        sum_matrix[:, k] = np.inf
+        np.fill_diagonal(sum_matrix, np.inf)
+        
+        d2 = np.minimum(d2, sum_matrix)
+    
+    # 3-step shortest paths (exact via double min-plus multiplication)
+    d3 = np.full_like(d1, np.inf)
+    if n >= 4:
+        # For each intermediate node l
+        for l in range(n):
+            # Compute 2-step paths through l: d[i,k] + d[k,l]
+            temp_2step = np.full_like(d1, np.inf)
+            for k in range(n):
+                if k == l:
+                    continue
+                col = d1[:, k:k+1]
+                row = d1[k:k+1, l:l+1]
+                sum_matrix = col + row
+                sum_matrix[k, :] = np.inf
+                sum_matrix[:, 0] = np.where(np.arange(n) == l, np.inf, sum_matrix[:, 0])
+                temp_2step = np.minimum(temp_2step, sum_matrix)
+            
+            # Add final edge d[l,j]
+            for j in range(n):
+                if j == l:
+                    continue
+                path_lengths = temp_2step[:, 0] + d1[l, j]
+                path_lengths[l] = np.inf
+                path_lengths[j] = np.inf
+                d3[:, j] = np.minimum(d3[:, j], path_lengths)
+    
+    # 4. Multi-step spatial lookahead with distance scaling
+    median_dist = np.median(d1[d1 < np.inf])
+    scale = 2 * median_dist
+    
+    spatial_lookahead = np.zeros_like(distance_matrix)
+    decay_factors = [1.0, 0.7, 0.4]  # Exponential decay for longer paths
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            contributions = []
+            
+            # 1-step contribution
+            if d1[i, j] < np.inf:
+                contributions.append(decay_factors[0] * np.exp(-d1[i, j] / scale))
+            
+            # 2-step contribution
+            if d2[i, j] < np.inf:
+                contributions.append(decay_factors[1] * np.exp(-d2[i, j] / scale))
+            
+            # 3-step contribution
+            if d3[i, j] < np.inf:
+                contributions.append(decay_factors[2] * np.exp(-d3[i, j] / scale))
+            
+            if contributions:
+                spatial_lookahead[i, j] = spatial_lookahead[j, i] = np.sum(contributions)
+    
+    # Normalize spatial lookahead
+    if spatial_lookahead.max() > 0:
+        spatial_lookahead = spatial_lookahead / spatial_lookahead.max()
+    
+    # 5. Global regret analysis with alternative routing
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if d1[i, j] < np.inf:
+                # Find best alternative path (2-step or 3-step)
+                alternatives = []
+                if d2[i, j] < np.inf:
+                    alternatives.append(d2[i, j])
+                if d3[i, j] < np.inf:
+                    alternatives.append(d3[i, j])
+                
+                if alternatives:
+                    best_alt = min(alternatives)
+                    # Regret: how much worse is the direct edge compared to best alternative
+                    regret = (d1[i, j] - best_alt) / (d1[i, j] + 1e-12)
+                    # Transform to boost factor: high regret means edge is critical
+                    regret_matrix[i, j] = regret_matrix[j, i] = max(0, min(1.0, 0.5 + 0.5 * regret))
+                else:
+                    # No alternative found - edge is essential
+                    regret_matrix[i, j] = regret_matrix[j, i] = 1.0
+    
+    # 6. Local density analysis
+    density_scores = np.zeros(n)
+    k_neighbors = min(5, n - 1)
+    
+    for i in range(n):
+        # Get distances to k nearest neighbors
+        distances = d1[i].copy()
+        distances[i] = np.inf
+        if np.sum(np.isfinite(distances)) >= k_neighbors:
+            k_smallest = np.partition(distances, k_neighbors)[:k_neighbors + 1]
+            k_smallest = k_smallest[np.isfinite(k_smallest)]
+            if len(k_smallest) > 0:
+                density_scores[i] = 1.0 / np.mean(k_smallest)
+    
+    if density_scores.max() > 0:
+        density_scores = density_scores / density_scores.max()
+    
+    # 7. Adaptive component weighting based on problem characteristics
+    # Analyze problem structure to determine optimal weights
+    if n <= 15:
+        # Small problems: emphasize exact calculations
+        w_base = 0.4
+        w_spatial = 0.3
+        w_regret = 0.2
+        w_density = 0.1
+    elif n <= 50:
+        # Medium problems: balanced approach
+        w_base = 0.35
+        w_spatial = 0.35
+        w_regret = 0.2
+        w_density = 0.1
+    else:
+        # Large problems: emphasize spatial lookahead and regret
+        w_base = 0.3
+        w_spatial = 0.4
+        w_regret = 0.2
+        w_density = 0.1
+    
+    # 8. Combine all factors
+    heuristic_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] <= 0:
+                continue
+            
+            # Base component
+            base_component = inv_dist[i, j] * w_base
+            
+            # Spatial component
+            spatial_component = spatial_lookahead[i, j] * w_spatial
+            
+            # Regret component
+            regret_component = regret_matrix[i, j] * w_regret
+            
+            # Density component
+            density_component = (1.0 + 0.2 * (density_scores[i] + density_scores[j])) * w_density
+            
+            # MST bonus
+            mst_bonus = 1.5 if mst_mask[i, j] else 1.0
+            
+            # Combine with normalization
+            total = (base_component + spatial_component + regret_component) * density_component * mst_bonus
+            
+            heuristic_matrix[i, j] = heuristic_matrix[j, i] = total
+    
+    # 9. Density-aware adaptive sparsification
+    # Determine connections per node based on local density
+    min_edges = max(2, min(4, n // 5))
+    max_edges = min(15, n - 1)
+    
+    mask = np.zeros_like(heuristic_matrix, dtype=bool)
+    
+    for i in range(n):
+        row_scores = heuristic_matrix[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Adaptive edge count based on density
+        target_edges = min_edges + int(density_scores[i] * (max_edges - min_edges))
+        target_edges = min(max(target_edges, min_edges), n - 1)
+        
+        # Keep top edges
+        if target_edges > 0:
+            # Find threshold for top target_edges
+            if target_edges < n - 1:
+                threshold = np.partition(row_scores, -target_edges)[-target_edges]
+            else:
+                threshold = -np.inf
+            
+            mask[i, row_scores >= threshold] = True
+    
+    # Ensure symmetry and MST inclusion
+    mask = mask | mask.T
+    mask = mask | mst_mask
+    
+    # Apply mask
+    heuristic_matrix = np.where(mask, heuristic_matrix, 0)
+    
+    # 10. Connectivity preservation
+    # Ensure all nodes have at least min_edges connections
+    for i in range(n):
+        if np.sum(mask[i]) < min_edges:
+            # Add best missing edges
+            row_scores = heuristic_matrix[i].copy()
+            row_scores[mask[i]] = -np.inf
+            row_scores[i] = -np.inf
+            
+            needed = min_edges - np.sum(mask[i])
+            if needed > 0:
+                top_indices = np.argsort(row_scores)[-needed:]
+                for idx in top_indices:
+                    if row_scores[idx] > 0:
+                        mask[i, idx] = mask[idx, i] = True
+                        heuristic_matrix[i, idx] = heuristic_matrix[idx, i] = row_scores[idx]
+    
+    # 11. Final refinement
+    # Boost weak but potentially important edges
+    if np.any(heuristic_matrix > 0):
+        median_score = np.median(heuristic_matrix[heuristic_matrix > 0])
+        std_score = np.std(heuristic_matrix[heuristic_matrix > 0])
+        
+        # Identify edges that are below median but in MST or have high regret
+        for i in range(n):
+            for j in range(i+1, n):
+                if heuristic_matrix[i, j] > 0 and heuristic_matrix[i, j] < median_score:
+                    if mst_mask[i, j] or regret_matrix[i, j] > 0.8:
+                        # Boost important but underrated edges
+                        heuristic_matrix[i, j] = heuristic_matrix[j, i] = max(
+                            heuristic_matrix[i, j], median_score * 0.8
+                        )
+    
+    # 12. Final normalization
+    max_val = heuristic_matrix.max()
+    if max_val > 0:
+        heuristic_matrix = heuristic_matrix / max_val
+    
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    return heuristic_matrix
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test with random points
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero elements:", np.count_nonzero(heuristics))
+    print("Max value:", np.max(heuristics))
+    print("Min non-zero value:", heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 0)
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print("Matrix is symmetric:", is_symmetric)
+    
+    # Check MST edges are included
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_included = np.all(heuristics[mst_mask] > 0)
+    print("All MST edges have non-zero heuristics:", mst_included)
+    
+    # Check connectivity
+    min_connections = min(np.sum(heuristics > 0, axis=1))
+    print(f"Minimum connections per node: {min_connections}")
+```

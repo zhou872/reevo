@@ -1,0 +1,138 @@
+```json
+{
+    "algorithm_features": ["Christofides MST+Match Scoring", "Local Search Edge Bonus", "Sparsity-Adaptive Sparsification", "Neighbor Rank Normalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.optimize import linear_sum_assignment
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge selection integrating Christofides algorithm components
+    and local search awareness.
+    
+    Features:
+    1. Christofides MST+Match Scoring: Combines MST edges with minimum weight matching
+       on odd-degree nodes from Christofides algorithm
+    2. Local Search Edge Bonus: Bonus for edges that participate in 2-opt optimal local moves
+    3. Sparsity-Adaptive Sparsification: Dynamic edge retention based on node degree targets
+    4. Neighbor Rank Normalization: Normalizes contributions by relative neighbor ranking
+    
+    Returns: Matrix of same shape as input with edge promise scores
+    """
+    n = distance_matrix.shape[0]
+    
+    # 1. Base inverse distance with softmin normalization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    # Softmin: emphasize near distances more strongly
+    inv_dist = np.exp(-distance_matrix / (np.median(distance_matrix[distance_matrix > 0]) + 1e-10))
+    
+    # 2. Minimum Spanning Tree (Christofides component 1)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = np.zeros((n, n))
+    mst_bonus[mst > 0] = 1.0
+    mst_bonus = mst_bonus + mst_bonus.T  # Make symmetric
+    
+    # 3. Minimum Weight Perfect Matching on odd-degree nodes (Christofides component 2)
+    matching_bonus = np.zeros((n, n))
+    if n >= 4:  # Only compute for non-trivial cases
+        # Identify odd-degree nodes in MST (approximate by high MST connection count)
+        mst_degree = np.sum(mst_bonus > 0, axis=1)
+        odd_nodes = np.where(mst_degree % 2 == 1)[0]
+        if len(odd_nodes) % 2 == 0 and len(odd_nodes) > 0:
+            # Create submatrix for odd nodes
+            submatrix = distance_matrix[np.ix_(odd_nodes, odd_nodes)]
+            # Hungarian algorithm for minimum weight perfect matching
+            row_ind, col_ind = linear_sum_assignment(submatrix)
+            for i, j in zip(row_ind, col_ind):
+                if i < j:  # Avoid double counting
+                    node_i, node_j = odd_nodes[i], odd_nodes[j]
+                    matching_bonus[node_i, node_j] = 1.0
+                    matching_bonus[node_j, node_i] = 1.0
+    
+    # 4. Local search awareness: 2-opt optimal edge pairs
+    local_bonus = np.zeros((n, n))
+    for i in range(n):
+        # Find two nearest neighbors for potential 2-opt consideration
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        nearest = np.argpartition(distances_i, 3)[:3]  # Top 3 nearest
+        
+        for j in nearest[:2]:
+            if i < j:
+                # Check if edge (i,j) could be part of an improving 2-opt move
+                for k in range(n):
+                    if k != i and k != j:
+                        # Find l as nearest neighbor to k (excluding i,j,k)
+                        distances_k = distance_matrix[k].copy()
+                        distances_k[[i, j, k]] = np.inf
+                        if len(distances_k) > 0:
+                            l = np.argmin(distances_k)
+                            # 2-opt condition: d(i,j) + d(k,l) > d(i,k) + d(j,l)
+                            if (distance_matrix[i, j] + distance_matrix[k, l] > 
+                                distance_matrix[i, k] + distance_matrix[j, l] + 1e-10):
+                                local_bonus[i, k] += 0.3
+                                local_bonus[k, i] += 0.3
+                                local_bonus[j, l] += 0.3
+                                local_bonus[l, j] += 0.3
+    
+    # 5. Neighbor rank normalization
+    rank_matrix = np.zeros((n, n))
+    for i in range(n):
+        sorted_indices = np.argsort(distance_matrix[i])
+        ranks = np.zeros(n)
+        # Assign normalized ranks (1 for closest, decreasing)
+        for rank, idx in enumerate(sorted_indices[1:6]):  # Top 5 neighbors
+            ranks[idx] = (5 - rank) / 5.0
+        rank_matrix[i] = ranks
+    
+    # 6. Combine components with learned weights
+    heuristics_matrix = np.zeros((n, n))
+    
+    # Base from inverse distance
+    heuristics_matrix = inv_dist.copy()
+    
+    # Apply Christofides components
+    heuristics_matrix *= (1.0 + 0.8 * mst_bonus)  # Strong MST bonus
+    heuristics_matrix *= (1.0 + 0.6 * matching_bonus)  # Matching bonus
+    
+    # Apply local search bonus
+    heuristics_matrix *= (1.0 + 0.4 * np.clip(local_bonus, 0, 1))
+    
+    # Apply neighbor rank normalization
+    symmetric_rank = (rank_matrix + rank_matrix.T) / 2
+    heuristics_matrix *= (0.7 + 0.3 * symmetric_rank)
+    
+    # 7. Adaptive sparsification with degree targets
+    target_degrees = np.clip(np.floor(2 + np.log2(n)), 3, 10).astype(int)
+    
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Keep top target_degrees connections
+        if np.sum(row > 0) > target_degrees:
+            threshold = np.partition(row, -target_degrees)[-target_degrees]
+            row[row < threshold] = 0
+        
+        heuristics_matrix[i] = row
+    
+    # Ensure symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # 8. Final normalization
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix /= max_val
+    
+    # Add small epsilon to distinguish zero from non-zero
+    heuristics_matrix[heuristics_matrix > 0] += 1e-8
+    
+    return heuristics_matrix
+```

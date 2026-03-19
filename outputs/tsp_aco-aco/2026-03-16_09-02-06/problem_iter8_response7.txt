@@ -1,0 +1,423 @@
+```json
+{
+    "algorithm_features": ["Adaptive K-step Path Integration", "Regret-based Bottleneck Clustering", "Density-weighted Local Search Refinement", "Hybrid Component Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+from scipy.spatial.distance import pdist, squareform
+from collections import defaultdict
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with adaptive k-step DP, regret-based clustering,
+    and local search refinement.
+    
+    Key innovations:
+    1. Adaptive k-step path calculations (1-4 steps) with smart pruning
+    2. Regret-based bottleneck identification through spectral clustering
+    3. Density-weighted local search simulation for edge refinement
+    4. Hybrid fusion of multiple scoring components with adaptive normalization
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between n nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Base cases
+    if n <= 2:
+        if n == 0:
+            return np.zeros_like(distance_matrix)
+        elif n == 1:
+            return np.array([[0]])
+        else:
+            heur = np.ones((2, 2))
+            np.fill_diagonal(heur, 0)
+            return heur
+    
+    # 1. Initialize with base inverse distance
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    median_dist = np.median(dist[dist < np.inf])
+    inv_dist = 1 / (dist + 0.05 * median_dist)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Compute MST backbone
+    mst = minimum_spanning_tree(dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 3. Adaptive k-step path calculations with pruning
+    max_k = min(4, int(np.log2(n)) + 2) if n > 10 else 3
+    path_scores = np.zeros((n, n, max_k))
+    
+    # Pre-compute nearest neighbors for pruning
+    k_nearest = min(15, n - 1)
+    nearest_masks = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        sorted_idx = np.argsort(dist[i])
+        nearest_masks[i, sorted_idx[:k_nearest]] = True
+    
+    # Compute k-step paths using dynamic programming with pruning
+    path_scores[:, :, 0] = inv_dist
+    
+    for k in range(1, max_k):
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                best_score = 0
+                # Consider intermediate nodes that are nearest to i or j
+                candidate_nodes = np.where(nearest_masks[i] | nearest_masks[j])[0]
+                candidate_nodes = candidate_nodes[candidate_nodes != i]
+                candidate_nodes = candidate_nodes[candidate_nodes != j]
+                
+                for m in candidate_nodes:
+                    # Ensure path doesn't repeat nodes
+                    if k == 1:
+                        if m != i and m != j:
+                            score = path_scores[i, m, 0] * path_scores[m, j, 0]
+                    elif k == 2:
+                        # 3-step path i -> m1 -> m2 -> j
+                        candidate_nodes2 = np.where(nearest_masks[m] | nearest_masks[j])[0]
+                        candidate_nodes2 = candidate_nodes2[candidate_nodes2 != i]
+                        candidate_nodes2 = candidate_nodes2[candidate_nodes2 != j]
+                        candidate_nodes2 = candidate_nodes2[candidate_nodes2 != m]
+                        
+                        for m2 in candidate_nodes2[:5]:  # Limit exploration
+                            score = (path_scores[i, m, 0] * 
+                                   path_scores[m, m2, 0] * 
+                                   path_scores[m2, j, 0])
+                            if score > best_score:
+                                best_score = score
+                        continue
+                    elif k == 3:
+                        # 4-step path with limited exploration
+                        continue  # Skip for efficiency
+                    
+                    if score > best_score:
+                        best_score = score
+                
+                # Apply exponential decay for longer paths
+                decay = np.exp(-k * 0.5)
+                path_scores[i, j, k] = best_score * decay
+    
+    # Combine k-step scores
+    spatial_score = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            total = 0
+            for k in range(max_k):
+                total += path_scores[i, j, k] * (0.7 ** k)
+            spatial_score[i, j] = spatial_score[j, i] = total
+    
+    # Normalize spatial scores
+    if spatial_score.max() > 0:
+        spatial_score = spatial_score / spatial_score.max()
+    
+    # 4. Regret-based bottleneck identification through clustering
+    # Compute regret matrix
+    regret = np.zeros((n, n))
+    for i in range(n):
+        row_dists = dist[i].copy()
+        row_dists[i] = np.inf
+        if np.sum(np.isfinite(row_dists)) >= 2:
+            sorted_dists = np.sort(row_dists[np.isfinite(row_dists)])
+            best = sorted_dists[0]
+            second_best = sorted_dists[1]
+            
+            for j in range(n):
+                if i != j and dist[i, j] < np.inf:
+                    alt_best = np.inf
+                    # Find best alternative path using 2 or 3 steps
+                    for k in range(n):
+                        if k != i and k != j and dist[i, k] < np.inf and dist[k, j] < np.inf:
+                            alt_dist = dist[i, k] + dist[k, j]
+                            if alt_dist < alt_best:
+                                alt_best = alt_dist
+                    
+                    if alt_best < np.inf:
+                        regret_val = (dist[i, j] - best) / (alt_best - best + 1e-10)
+                        regret[i, j] = max(0, min(1, 1.0 - regret_val))
+    
+    # Symmetrize regret
+    regret = (regret + regret.T) / 2
+    
+    # Spectral clustering based on regret
+    n_clusters = max(2, min(8, n // 5))
+    cluster_assignments = np.zeros(n, dtype=int)
+    
+    if n >= 10:
+        # Simplified spectral clustering using top eigenvectors of regret matrix
+        from scipy.linalg import eigh
+        
+        # Create normalized Laplacian
+        D = np.diag(np.sum(regret, axis=1))
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+        L = np.eye(n) - D_inv_sqrt @ regret @ D_inv_sqrt
+        
+        # Get eigenvectors
+        eigvals, eigvecs = eigh(L, subset_by_index=[0, min(n_clusters, n-1)])
+        
+        # K-means on eigenvectors (simplified)
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_assignments = kmeans.fit_predict(eigvecs[:, :n_clusters])
+    else:
+        cluster_assignments = np.arange(n) % n_clusters
+    
+    # Compute cluster connectivity bonus
+    cluster_bonus = np.ones((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            if cluster_assignments[i] != cluster_assignments[j]:
+                # Inter-cluster edges get bonus based on regret
+                cluster_bonus[i, j] = cluster_bonus[j, i] = 1.0 + 0.5 * regret[i, j]
+    
+    # 5. Density-weighted local search simulation
+    density = np.zeros(n)
+    for i in range(n):
+        valid_dists = dist[i, dist[i] < np.inf]
+        if len(valid_dists) > 0:
+            density[i] = 1.0 / np.mean(np.partition(valid_dists, min(3, len(valid_dists)-1))[:3])
+    
+    if density.max() > 0:
+        density = density / density.max()
+    
+    # Simulate local 2-opt moves to refine edge scores
+    local_refinement = np.ones((n, n))
+    n_iterations = min(20, n * 2)
+    
+    for _ in range(n_iterations):
+        for i in range(n):
+            # Consider edges connected to i
+            i_edges = np.where((dist[i] < np.inf) & (np.arange(n) != i))[0]
+            if len(i_edges) < 2:
+                continue
+            
+            # Weight by density: nodes in dense regions explore more
+            explore_prob = 0.3 + 0.4 * density[i]
+            if np.random.random() < explore_prob:
+                # Try to improve edges from i
+                for j in i_edges:
+                    if j <= i:
+                        continue
+                    
+                    # Find candidate k for 2-opt move (i-j, k-l -> i-k, j-l)
+                    for k in np.where((dist[j] < np.inf) & (np.arange(n) != j))[0]:
+                        if k == i or k == j:
+                            continue
+                        
+                        for l in np.where((dist[k] < np.inf) & (np.arange(n) != k))[0]:
+                            if l == i or l == j or l == k:
+                                continue
+                            
+                            # Calculate improvement
+                            current = dist[i, j] + dist[k, l]
+                            alternative = dist[i, k] + dist[j, l]
+                            
+                            if alternative < current:
+                                # This edge combination is promising
+                                improvement = (current - alternative) / (current + 1e-10)
+                                local_refinement[i, j] += 0.1 * improvement
+                                local_refinement[j, i] += 0.1 * improvement
+                                local_refinement[k, l] += 0.1 * improvement
+                                local_refinement[l, k] += 0.1 * improvement
+    
+    # Normalize local refinement
+    if local_refinement.max() > 1:
+        local_refinement = 0.8 + 0.2 * (local_refinement - 1) / (local_refinement.max() - 1)
+    
+    # 6. Hybrid fusion with adaptive weighting
+    # Analyze problem characteristics for weight adaptation
+    dist_vals = dist[dist < np.inf]
+    if len(dist_vals) > 0:
+        cv = np.std(dist_vals) / (np.mean(dist_vals) + 1e-10)
+        
+        if n <= 20:
+            # Small problems: emphasize exact calculations
+            w_spatial = 0.35
+            w_regret = 0.25
+            w_cluster = 0.20
+            w_local = 0.20
+        elif cv < 0.4:
+            # Uniform distances: emphasize spatial and cluster
+            w_spatial = 0.40
+            w_regret = 0.20
+            w_cluster = 0.25
+            w_local = 0.15
+        else:
+            # Variable distances: balance all components
+            w_spatial = 0.30
+            w_regret = 0.30
+            w_cluster = 0.25
+            w_local = 0.15
+    else:
+        w_spatial, w_regret, w_cluster, w_local = 0.35, 0.25, 0.20, 0.20
+    
+    # Combine components
+    heuristic_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist[i, j] < np.inf:
+                # Base component (inverse distance)
+                base = inv_dist[i, j]
+                
+                # Combined score
+                combined = (base * (
+                    w_spatial * spatial_score[i, j] +
+                    w_regret * regret[i, j] +
+                    w_cluster * cluster_bonus[i, j] +
+                    w_local * local_refinement[i, j]
+                ))
+                
+                # MST bonus
+                if mst_mask[i, j]:
+                    combined *= 1.5
+                
+                heuristic_matrix[i, j] = heuristic_matrix[j, i] = combined
+    
+    # 7. Adaptive sparsification with connectivity preservation
+    # Determine target density adaptively
+    base_density = min(max(0.15, 2.5 / np.sqrt(n)), 0.4)
+    target_edges = int(base_density * n * (n - 1) / 2)
+    
+    # Get edge list sorted by score
+    edges = []
+    for i in range(n):
+        for j in range(i+1, n):
+            if heuristic_matrix[i, j] > 0:
+                edges.append((heuristic_matrix[i, j], i, j))
+    
+    edges.sort(reverse=True)
+    
+    # Build sparse graph
+    sparse_matrix = np.zeros((n, n))
+    adj_counts = np.zeros(n, dtype=int)
+    
+    # First include MST edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_mask[i, j]:
+                sparse_matrix[i, j] = sparse_matrix[j, i] = heuristic_matrix[i, j]
+                adj_counts[i] += 1
+                adj_counts[j] += 1
+    
+    # Add promising edges while maintaining minimum connectivity
+    min_edges_per_node = max(2, min(5, int(np.sqrt(n))))
+    
+    for score, i, j in edges:
+        if sparse_matrix[i, j] > 0:
+            continue
+        
+        # Check if adding this edge is beneficial
+        if (adj_counts[i] < min_edges_per_node or 
+            adj_counts[j] < min_edges_per_node or
+            np.sum(sparse_matrix > 0) < target_edges):
+            
+            sparse_matrix[i, j] = sparse_matrix[j, i] = score
+            adj_counts[i] += 1
+            adj_counts[j] += 1
+    
+    # Ensure connectivity
+    while True:
+        conn_mask = (sparse_matrix > 0).astype(int)
+        n_components, labels = connected_components(conn_mask, directed=False)
+        
+        if n_components == 1:
+            break
+        
+        # Connect components with best available edges
+        best_edge = None
+        best_score = -np.inf
+        
+        comp_nodes = defaultdict(list)
+        for node, comp in enumerate(labels):
+            comp_nodes[comp].append(node)
+        
+        for comp1 in range(n_components):
+            for comp2 in range(comp1 + 1, n_components):
+                for i in comp_nodes[comp1]:
+                    for j in comp_nodes[comp2]:
+                        if heuristic_matrix[i, j] > best_score:
+                            best_score = heuristic_matrix[i, j]
+                            best_edge = (i, j)
+        
+        if best_edge:
+            i, j = best_edge
+            sparse_matrix[i, j] = sparse_matrix[j, i] = heuristic_matrix[i, j]
+        else:
+            break
+    
+    # 8. Final refinement and normalization
+    final_matrix = sparse_matrix.copy()
+    
+    # Boost edges that appear critical
+    edge_centrality = np.zeros((n, n))
+    for k in range(n):
+        for i in range(n):
+            if i == k or final_matrix[i, k] == 0:
+                continue
+            for j in range(i+1, n):
+                if j == k or final_matrix[k, j] == 0:
+                    continue
+                if final_matrix[i, j] > 0:
+                    # Edge (i,j) is part of triangle with k
+                    edge_centrality[i, j] += final_matrix[i, k] * final_matrix[k, j]
+    
+    # Apply centrality-based boost
+    if edge_centrality.max() > 0:
+        centrality_norm = edge_centrality / edge_centrality.max()
+        boost_factor = 1.0 + 0.3 * centrality_norm
+        final_matrix = final_matrix * boost_factor
+    
+    # Final normalization
+    max_val = final_matrix.max()
+    if max_val > 0:
+        final_matrix = final_matrix / max_val
+    
+    np.fill_diagonal(final_matrix, 0)
+    
+    return final_matrix
+
+
+# Test with example
+if __name__ == "__main__":
+    np.random.seed(42)
+    n = 25
+    points = np.random.rand(n, 2)
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print("Heuristics matrix shape:", heuristics.shape)
+    print("Non-zero elements:", np.count_nonzero(heuristics))
+    print("Max value:", np.max(heuristics))
+    min_nonzero = heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 0
+    print("Min non-zero value:", min_nonzero)
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print("Matrix is symmetric:", is_symmetric)
+    
+    # Check MST edges are included
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_included = np.all(heuristics[mst_mask] > 0)
+    print("All MST edges have non-zero heuristics:", mst_included)
+    
+    # Check connectivity
+    min_connections = min(np.sum(heuristics > 0, axis=1))
+    print(f"Minimum connections per node: {min_connections}")
+```

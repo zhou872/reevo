@@ -1,0 +1,402 @@
+```json
+{
+    "algorithm_features": ["Multi-step Discounted Regret", "Graph Convolutional Feature Propagation", "Modularity-based Community Sparsification", "Adaptive Ensemble Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with graph convolutional features, multi-step regret,
+    community detection, and adaptive ensemble learning.
+    
+    Key Innovations:
+    1. Multi-step discounted regret with path-based alternative evaluation
+    2. Graph convolutional feature propagation without neural network overhead
+    3. Modularity-based community detection for intelligent sparsification
+    4. Adaptive ensemble weighting with iterative refinement
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. BASIC COMPONENTS ====================
+    
+    # Inverse distance with power law adjustment
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix ** 1.1)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST for connectivity guarantee
+    mst = minimum_spanning_tree(csr_matrix(distance_matrix)).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. MULTI-STEP DISCOUNTED REGRET ====================
+    
+    def compute_multi_step_regret() -> np.ndarray:
+        """Compute regret using discounted multi-step alternative paths"""
+        regret_scores = np.zeros((n, n))
+        if n <= 3:
+            return regret_scores
+        
+        # Parameters for regret computation
+        max_steps = min(4, n - 1)  # Up to 4-step alternatives
+        discount_factor = 0.7  # Discount for longer paths
+        neighbor_limit = min(8, n - 1)  # Neighbors to consider per step
+        
+        # Precompute nearest neighbor lists for each node
+        nn_lists = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nn_indices = np.argsort(dists)[:neighbor_limit]
+            nn_lists.append(nn_indices)
+        
+        # Dynamic programming for multi-step regret
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                best_discounted_regret = np.inf
+                
+                # Consider alternative paths of length 2 to max_steps
+                for steps in range(2, max_steps + 1):
+                    # Recursive function to explore alternative paths
+                    def explore_path(current: int, path: List[int], depth: int, current_cost: float) -> float:
+                        if depth == steps:
+                            # Complete path to j
+                            if current == j:
+                                return current_cost
+                            return np.inf
+                        
+                        best_path_cost = np.inf
+                        # Consider promising next nodes
+                        candidates = nn_lists[current]
+                        for next_node in candidates:
+                            if next_node in path or next_node == i:
+                                continue
+                            
+                            new_path = path + [next_node]
+                            new_cost = current_cost + distance_matrix[current, next_node]
+                            
+                            # Prune if already worse than best alternative
+                            if new_cost * (discount_factor ** (depth-1)) >= best_discounted_regret:
+                                continue
+                                
+                            path_cost = explore_path(next_node, new_path, depth + 1, new_cost)
+                            best_path_cost = min(best_path_cost, path_cost)
+                        
+                        return best_path_cost
+                    
+                    # Find best alternative path of this length
+                    alt_cost = explore_path(i, [], 1, 0)
+                    
+                    if alt_cost < np.inf:
+                        regret = max(alt_cost - direct_cost, 0)
+                        discounted_regret = regret * (discount_factor ** (steps - 1))
+                        best_discounted_regret = min(best_discounted_regret, discounted_regret)
+                
+                # Convert regret to score (higher regret -> higher score)
+                if best_discounted_regret < np.inf:
+                    # Sigmoid transformation for normalized score
+                    scale = np.median(distance_matrix[i]) * 0.5
+                    regret_scores[i, j] = 1.0 / (1.0 + np.exp(-best_discounted_regret / (scale + 1e-8)))
+        
+        # Symmetrize
+        regret_scores = (regret_scores + regret_scores.T) / 2
+        np.fill_diagonal(regret_scores, 0)
+        
+        # Normalize
+        max_val = np.max(regret_scores)
+        if max_val > 0:
+            regret_scores = regret_scores / max_val
+        
+        return regret_scores
+    
+    regret_scores = compute_multi_step_regret()
+    
+    # ==================== 3. GRAPH CONVOLUTIONAL FEATURE PROPAGATION ====================
+    
+    def compute_graph_features() -> np.ndarray:
+        """Compute edge features using graph convolutional propagation"""
+        # Initialize node features (distance-based)
+        k_features = min(5, n - 1)
+        node_features = np.zeros((n, k_features))
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Use distances to k nearest neighbors as features
+            nn_dists = np.partition(dists, k_features)[:k_features]
+            node_features[i] = nn_dists
+        
+        # Normalize features
+        node_features = node_features / (np.max(node_features) + 1e-8)
+        
+        # Graph convolutional propagation (2 iterations)
+        for iteration in range(2):
+            new_features = np.zeros_like(node_features)
+            for i in range(n):
+                # Aggregate neighbor features (weighted by inverse distance)
+                neighbor_mask = distance_matrix[i] < np.percentile(distance_matrix[i], 50)
+                neighbor_mask[i] = False
+                
+                if np.any(neighbor_mask):
+                    weights = 1.0 / (distance_matrix[i, neighbor_mask] + 1e-8)
+                    weights = weights / np.sum(weights)
+                    
+                    neighbor_feats = node_features[neighbor_mask]
+                    aggregated = np.average(neighbor_feats, axis=0, weights=weights)
+                    
+                    # Combine with self features
+                    alpha = 0.7  # Self-weight
+                    new_features[i] = alpha * node_features[i] + (1 - alpha) * aggregated
+                else:
+                    new_features[i] = node_features[i]
+            
+            node_features = new_features
+        
+        # Compute edge scores from node features
+        feature_scores = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Cosine similarity of node features
+                dot_product = np.dot(node_features[i], node_features[j])
+                norm_i = np.linalg.norm(node_features[i])
+                norm_j = np.linalg.norm(node_features[j])
+                
+                if norm_i > 0 and norm_j > 0:
+                    similarity = dot_product / (norm_i * norm_j)
+                    # Adjust by distance
+                    dist_factor = np.exp(-distance_matrix[i, j] / np.median(distance_matrix))
+                    feature_scores[i, j] = (similarity + 1) * 0.5 * dist_factor
+        
+        # Symmetrize and normalize
+        feature_scores = (feature_scores + feature_scores.T) / 2
+        np.fill_diagonal(feature_scores, 0)
+        
+        max_val = np.max(feature_scores)
+        if max_val > 0:
+            feature_scores = feature_scores / max_val
+        
+        return feature_scores
+    
+    graph_features = compute_graph_features()
+    
+    # ==================== 4. COMMUNITY DETECTION FOR SPARSIFICATION ====================
+    
+    def detect_communities() -> np.ndarray:
+        """Detect communities using modularity optimization"""
+        # Fast greedy community detection approximation
+        communities = np.zeros(n, dtype=int)
+        
+        if n <= 10:
+            # Small graph: all nodes in one community
+            return np.zeros(n, dtype=int)
+        
+        # Initialize each node as its own community
+        communities = np.arange(n)
+        
+        # Create similarity matrix (inverse distance)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            similarity = 1.0 / (distance_matrix + np.eye(n))
+        similarity[np.isinf(similarity)] = 0
+        
+        # Compute modularity matrix
+        total_similarity = np.sum(similarity)
+        if total_similarity == 0:
+            return communities
+        
+        degree = np.sum(similarity, axis=1)
+        modularity_matrix = similarity - np.outer(degree, degree) / total_similarity
+        
+        # Greedy community merging
+        improvement = True
+        while improvement:
+            improvement = False
+            best_merge = (-1, -1, -np.inf)
+            
+            # Consider merging communities
+            unique_comms = np.unique(communities)
+            for i in range(len(unique_comms)):
+                for j in range(i + 1, len(unique_comms)):
+                    comm_i = unique_comms[i]
+                    comm_j = unique_comms[j]
+                    
+                    # Nodes in each community
+                    nodes_i = np.where(communities == comm_i)[0]
+                    nodes_j = np.where(communities == comm_j)[0]
+                    
+                    # Compute modularity change if merged
+                    mod_change = 0
+                    for node_i in nodes_i:
+                        for node_j in nodes_j:
+                            mod_change += modularity_matrix[node_i, node_j]
+                    
+                    if mod_change > best_merge[2]:
+                        best_merge = (comm_i, comm_j, mod_change)
+            
+            # Merge if modularity improves
+            if best_merge[2] > 0:
+                comm_i, comm_j, _ = best_merge
+                communities[communities == comm_j] = comm_i
+                improvement = True
+        
+        # Renumber communities sequentially
+        unique_comms = np.unique(communities)
+        renumbered = np.zeros(n, dtype=int)
+        for idx, comm in enumerate(unique_comms):
+            renumbered[communities == comm] = idx
+        
+        return renumbered
+    
+    community_labels = detect_communities()
+    
+    # ==================== 5. ENSEMBLE WEIGHT OPTIMIZATION ====================
+    
+    def optimize_weights() -> Tuple[float, float, float]:
+        """Optimize component weights using iterative refinement"""
+        # Initialize with adaptive weights based on problem size
+        if n <= 15:
+            base_weights = [0.4, 0.3, 0.3]  # regret, inv_dist, graph
+        elif n <= 50:
+            base_weights = [0.35, 0.3, 0.35]
+        else:
+            base_weights = [0.3, 0.25, 0.45]
+        
+        # Refine weights based on component consistency
+        components = [regret_scores, inv_dist, graph_features]
+        variances = []
+        
+        for comp in components:
+            # Measure component stability via random edge sampling
+            sample_size = min(100, n * (n - 1) // 2)
+            edge_indices = np.random.choice(n * n, size=sample_size, replace=False)
+            edge_values = comp.flat[edge_indices]
+            variances.append(np.var(edge_values) + 1e-8)
+        
+        # Adjust weights: favor components with lower variance (more stable)
+        inv_variances = 1.0 / np.array(variances)
+        stability_weights = inv_variances / np.sum(inv_variances)
+        
+        # Combine base weights with stability weights
+        final_weights = 0.7 * np.array(base_weights) + 0.3 * stability_weights
+        final_weights = final_weights / np.sum(final_weights)
+        
+        return tuple(final_weights)
+    
+    w_regret, w_inv, w_graph = optimize_weights()
+    
+    # ==================== 6. COMPOSITE SCORING ====================
+    
+    # Weighted combination of components
+    composite = (
+        w_regret * regret_scores +
+        w_inv * inv_dist +
+        w_graph * graph_features
+    )
+    
+    # Boost MST edges
+    composite[mst_edges] *= 1.2
+    
+    # ==================== 7. COMMUNITY-AWARE SPARSIFICATION ====================
+    
+    def community_sparsify(scores: np.ndarray) -> np.ndarray:
+        """Sparsify graph while preserving community structure"""
+        sparse_scores = np.zeros_like(scores)
+        
+        # Always include MST edges
+        sparse_scores[mst_edges] = scores[mst_edges]
+        
+        # Determine number of communities
+        n_communities = len(np.unique(community_labels))
+        
+        # Adaptive edge limits based on community structure
+        if n_communities == 1:
+            # Single community: degree limit based on n
+            max_degree = min(8, max(4, int(np.log2(n) + 2)))
+        else:
+            # Multiple communities: different limits for intra/inter-community
+            intra_max_degree = min(6, max(3, int(np.log2(n) + 1)))
+            inter_max_degree = min(4, max(2, int(np.log2(n))))
+        
+        # Track current degrees
+        current_degree = np.sum(sparse_scores > 0, axis=1)
+        
+        # Separate intra-community and inter-community edges
+        intra_edges = []
+        inter_edges = []
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    if community_labels[i] == community_labels[j]:
+                        intra_edges.append((scores[i, j], i, j))
+                    else:
+                        inter_edges.append((scores[i, j], i, j))
+        
+        # Sort edges
+        intra_edges.sort(reverse=True, key=lambda x: x[0])
+        inter_edges.sort(reverse=True, key=lambda x: x[0])
+        
+        # Add intra-community edges
+        for score, i, j in intra_edges:
+            if n_communities == 1:
+                degree_limit = max_degree
+            else:
+                degree_limit = intra_max_degree
+            
+            if current_degree[i] < degree_limit and current_degree[j] < degree_limit:
+                sparse_scores[i, j] = score
+                sparse_scores[j, i] = score
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        # Add inter-community edges (bridges between communities)
+        for score, i, j in inter_edges:
+            if n_communities == 1:
+                continue  # No inter-community edges in single community
+            
+            if current_degree[i] < inter_max_degree and current_degree[j] < inter_max_degree:
+                sparse_scores[i, j] = score
+                sparse_scores[j, i] = score
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparse_scores
+    
+    sparsified = community_sparsify(composite)
+    
+    # ==================== 8. FINAL REFINEMENT ====================
+    
+    # Apply distance-based attenuation (weaken very long edges)
+    median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+    if median_dist > 0:
+        attenuation = np.exp(-distance_matrix / (2.0 * median_dist))
+        sparsified *= attenuation
+    
+    # Normalize to [0, 1]
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    # Zero diagonal
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

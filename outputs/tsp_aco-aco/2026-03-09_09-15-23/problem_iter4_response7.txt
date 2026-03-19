@@ -1,0 +1,287 @@
+```json
+{
+    "algorithm_features": ["Adaptive Density-Based Neighborhood", "Dynamic Two-Hop Regret Penalty", "Sampled Three-Step Lookahead", "Spectral-Inspired Clustering"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge prioritization with dynamic parameter tuning and 
+    spectral-inspired clustering for robust edge promise evaluation.
+    
+    Features:
+    1. Density-adaptive neighborhood selection with percentile thresholds
+    2. Dynamic two-hop regret penalty considering path alternatives
+    3. Sampled three-step lookahead with adaptive exploration
+    4. Spectral-inspired clustering using distance distribution statistics
+    5. Instance-adaptive parameter tuning based on graph characteristics
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) / (distance_matrix + np.eye(n))
+    
+    # ---- 0. DYNAMIC PARAMETER TUNING ----
+    # Compute graph characteristics for adaptive parameter selection
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    mean_dist = np.mean(upper_tri)
+    std_dist = np.std(upper_tri)
+    density_coeff = mean_dist / (std_dist + 1e-10)
+    
+    # Adaptive parameters based on graph size and density
+    base_k = max(2, min(n // 4, int(np.sqrt(n) * (1 + np.tanh(density_coeff - 1)))))
+    lookahead_samples = min(8, max(3, n // 6))
+    cluster_percentile = 30 + 20 * np.tanh(1 - density_coeff)  # 30-50%
+    
+    # ---- 1. ADAPTIVE DENSITY-BASED NEIGHBORHOOD ----
+    adjacency_mask = np.zeros_like(distance_matrix, dtype=bool)
+    inv_dist = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Dynamic k per node based on local density
+        local_dists = distance_matrix[i].copy()
+        local_dists[i] = np.inf
+        
+        # Percentile-based threshold for neighborhood
+        threshold = np.percentile(local_dists[local_dists < np.inf], 
+                                 min(80, 40 + 20 * density_coeff))
+        
+        # Select neighbors within threshold, ensuring at least base_k neighbors
+        candidate_mask = local_dists <= threshold
+        if candidate_mask.sum() < base_k:
+            # Fall back to nearest base_k neighbors
+            nearest_indices = np.argsort(local_dists)[:base_k]
+            candidate_mask = np.zeros(n, dtype=bool)
+            candidate_mask[nearest_indices] = True
+        
+        adjacency_mask[i] = candidate_mask
+        candidate_dists = local_dists[candidate_mask]
+        
+        if len(candidate_dists) > 0:
+            # Weight by distance rank with exponential decay
+            sorted_indices = np.argsort(candidate_dists)
+            rank_weights = np.exp(-0.5 * np.arange(len(sorted_indices)))
+            rank_weights = rank_weights / rank_weights.sum()
+            
+            for rank, global_idx in enumerate(np.where(candidate_mask)[0][sorted_indices]):
+                if distance_matrix[i, global_idx] > 0:
+                    inv_dist[i, global_idx] = (rank_weights[rank] / 
+                                              distance_matrix[i, global_idx])
+    
+    # Symmetrize adjacency and inv_dist
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    inv_dist = (inv_dist + inv_dist.T) / 2
+    
+    # Degree normalization with smoothing
+    node_degrees = adjacency_mask.sum(axis=1, keepdims=True)
+    degree_norm = 1.0 / (np.sqrt(node_degrees * node_degrees.T) + 1e-10)
+    inv_dist = inv_dist * degree_norm
+    
+    # ---- 2. DYNAMIC TWO-HOP REGRET PENALTY ----
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        neighbor_mask = adjacency_mask[i].copy()
+        neighbor_mask[i] = False
+        if not neighbor_mask.any():
+            continue
+            
+        neighbor_indices = np.where(neighbor_mask)[0]
+        neighbor_dists = distance_matrix[i, neighbor_indices]
+        
+        if len(neighbor_indices) >= 2:
+            # For each neighbor j, find best alternative path i->k->j
+            for idx_j, j in enumerate(neighbor_indices):
+                alt_costs = []
+                
+                # Consider alternative intermediate nodes
+                for k in neighbor_indices:
+                    if k == j:
+                        continue
+                    if adjacency_mask[k, j]:
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        alt_costs.append(alt_cost)
+                
+                if alt_costs:
+                    best_alt = np.min(alt_costs)
+                    direct_cost = distance_matrix[i, j]
+                    
+                    # Regret: how much worse is direct edge compared to best alternative
+                    if direct_cost > 0 and best_alt > 0:
+                        regret_ratio = (direct_cost - best_alt) / direct_cost
+                        # Apply penalty only if alternative is better (negative regret_ratio)
+                        penalty = max(0, -regret_ratio)
+                        regret_matrix[i, j] = -penalty * (1.0 / direct_cost)
+    
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # ---- 3. SAMPLED THREE-STEP LOOKAHEAD ----
+    lookahead_scores = np.ones_like(distance_matrix)
+    
+    # Adaptive sample count based on graph density
+    sample_count = min(lookahead_samples, max(2, n // 10))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not adjacency_mask[i, j]:
+                continue
+            
+            direct_dist = distance_matrix[i, j]
+            sampled_scores = []
+            
+            # Sample random intermediate nodes
+            candidates = np.random.choice([x for x in range(n) if x not in [i, j]], 
+                                         min(sample_count, n-2), replace=False)
+            
+            for k in candidates:
+                # Two-step path
+                if adjacency_mask[i, k] and adjacency_mask[k, j]:
+                    two_step = distance_matrix[i, k] + distance_matrix[k, j]
+                    sampled_scores.append(two_step / (direct_dist + 1e-10))
+                
+                # Three-step paths (i->k->l->j)
+                if sample_count >= 3:
+                    l_candidates = np.random.choice(
+                        [x for x in range(n) if x not in [i, j, k]],
+                        min(2, n-3), replace=False
+                    )
+                    for l in l_candidates:
+                        if (adjacency_mask[i, k] and adjacency_mask[k, l] and 
+                            adjacency_mask[l, j]):
+                            three_step = (distance_matrix[i, k] + 
+                                         distance_matrix[k, l] + 
+                                         distance_matrix[l, j])
+                            sampled_scores.append(three_step / (direct_dist + 1e-10))
+            
+            if sampled_scores:
+                # Score based on how direct edge compares to alternatives
+                avg_ratio = np.mean(sampled_scores)
+                # Convert to multiplicative factor: <1 if direct is better, >1 if worse
+                lookahead_scores[i, j] = lookahead_scores[j, i] = 1.5 - 0.5 * np.tanh(avg_ratio - 1)
+    
+    # ---- 4. SPECTRAL-INSPIRED CLUSTERING ----
+    # Compute normalized distance matrix for spectral-like analysis
+    dist_std = np.std(distance_matrix[np.triu_indices(n, k=1)])
+    normalized_dist = distance_matrix / (dist_std + 1e-10)
+    
+    # Compute node affinity based on distance distribution
+    node_affinity = np.zeros(n)
+    for i in range(n):
+        neighbor_dists = normalized_dist[i, adjacency_mask[i]]
+        if len(neighbor_dists) > 0:
+            # Affinity is inverse of median distance to neighbors
+            node_affinity[i] = 1.0 / (np.median(neighbor_dists) + 1e-10)
+    
+    # Normalize affinities
+    if node_affinity.max() > 0:
+        node_affinity = node_affinity / node_affinity.max()
+    
+    # Compute cluster bonus based on affinity similarity and distance
+    cluster_bonus = np.zeros_like(distance_matrix)
+    cluster_threshold = np.percentile(upper_tri, cluster_percentile)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                affinity_sim = 1.0 - abs(node_affinity[i] - node_affinity[j])
+                dist_ratio = distance_matrix[i, j] / (cluster_threshold + 1e-10)
+                
+                if dist_ratio < 1.0:
+                    # Within cluster: bonus proportional to affinity similarity
+                    bonus = 0.4 * affinity_sim * (1.0 - dist_ratio)
+                else:
+                    # Between clusters: penalty unless connecting low-affinity nodes
+                    penalty = 0.3 * dist_ratio
+                    # Reduce penalty if both nodes have low affinity (isolated)
+                    if node_affinity[i] < 0.3 and node_affinity[j] < 0.3:
+                        penalty *= 0.5
+                    bonus = -penalty
+                
+                cluster_bonus[i, j] = cluster_bonus[j, i] = bonus
+    
+    # ---- 5. ADAPTIVE COMBINATION ----
+    heuristics = np.zeros_like(distance_matrix)
+    
+    # Weight adaptation based on graph characteristics
+    regret_weight = 0.7 + 0.3 * np.tanh(2 - density_coeff)  # Higher for sparse graphs
+    lookahead_weight = 0.6 + 0.4 * np.tanh(density_coeff - 1)  # Higher for dense graphs
+    cluster_weight = 0.5
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Base score from normalized inverse distance
+                base_score = inv_dist[i, j]
+                
+                # Apply dynamic regret penalty
+                regret_factor = 1.0 + regret_weight * regret_matrix[i, j]
+                base_score *= np.clip(regret_factor, 0.5, 2.0)
+                
+                # Apply lookahead adjustment
+                lookahead_factor = 1.0 + lookahead_weight * (lookahead_scores[i, j] - 1)
+                base_score *= np.clip(lookahead_factor, 0.8, 1.2)
+                
+                # Apply cluster bonus/penalty
+                cluster_factor = 1.0 + cluster_weight * cluster_bonus[i, j]
+                base_score *= np.clip(cluster_factor, 0.7, 1.3)
+                
+                heuristics[i, j] = heuristics[j, i] = base_score
+    
+    # ---- 6. CONNECTIVITY GUARANTEE WITH ADAPTIVE MST ----
+    # Prim's algorithm for MST with distance scaling
+    scaled_dist = distance_matrix.copy()
+    np.fill_diagonal(scaled_dist, np.inf)
+    
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    closest = np.zeros(n, dtype=int)
+    
+    visited[0] = True
+    min_edge = scaled_dist[0].copy()
+    closest[:] = 0
+    
+    for _ in range(n - 1):
+        # Find minimum edge from visited to unvisited
+        unvisited = np.where(~visited)[0]
+        if len(unvisited) == 0:
+            break
+            
+        u = unvisited[np.argmin(min_edge[unvisited])]
+        v = closest[u]
+        mst_mask[u, v] = mst_mask[v, u] = True
+        visited[u] = True
+        
+        # Update distances
+        for w in unvisited:
+            if w != u and scaled_dist[u, w] < min_edge[w]:
+                min_edge[w] = scaled_dist[u, w]
+                closest[w] = u
+    
+    # Boost MST edges adaptively based on their current score
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_mask[i, j]:
+                current_score = heuristics[i, j] if heuristics[i, j] > 0 else 0
+                mst_boost = 0.3 * (1.0 - np.tanh(current_score))
+                heuristics[i, j] = heuristics[j, i] = max(heuristics[i, j], 
+                                                         current_score + mst_boost)
+    
+    # ---- 7. FINAL PROCESSING ----
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize non-zero values to [0, 1] range
+    non_zero = heuristics[heuristics > 0]
+    if len(non_zero) > 0:
+        min_val, max_val = non_zero.min(), non_zero.max()
+        if max_val > min_val:
+            heuristics[heuristics > 0] = (heuristics[heuristics > 0] - min_val) / (max_val - min_val)
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    return heuristics
+```

@@ -1,0 +1,184 @@
+```json
+{
+    "algorithm_features": ["Adaptive Candidate Sparsification", "Regret-Based Penalization", "Neighbor Density Bonus", "Spatial Connectivity Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with adaptive candidate sparsification,
+    improved regret modeling, and efficient density-based scoring.
+    
+    Features:
+    1. Adaptive Candidate Sparsification: O(√n) edges per node with symmetry
+    2. Regret-Based Penalization: Opportunity cost normalized by local distances
+    3. Neighbor Density Bonus: Geometric mean of endpoint densities
+    4. Spatial Connectivity Preservation: Minimum 2 edges per node for feasibility
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Prepare safe distance matrix (no self-loops, no division by zero)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. ADAPTIVE CANDIDATE SPARSIFICATION
+    k = max(3, int(np.sqrt(n)))  # Top k edges per node as suggested
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get indices of k closest neighbors (excluding self)
+        neighbors = np.argpartition(safe_dist[i], k)[:k+1]  # k+1 because self is at inf
+        neighbors = neighbors[neighbors != i][:k]  # Remove self if present and keep exactly k
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetric candidate list
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # 2. REGRET-BASED PENALIZATION
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances to other nodes
+        dists = safe_dist[i].copy()
+        
+        # Find two smallest distances (best and second-best)
+        # Using argpartition for efficiency
+        if n >= 3:
+            # Get indices of two smallest distances
+            smallest_idx = np.argpartition(dists, 2)[:2]
+            smallest_dists = dists[smallest_idx]
+            best_dist = np.min(smallest_dists)
+            
+            # Second best is the larger of the two smallest
+            second_best = np.max(smallest_dists)
+            
+            # Average distance for normalization
+            avg_dist = np.mean(dists[dists < np.inf])
+            
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    edge_dist = dists[j]
+                    # Regret: opportunity cost normalized by average distance
+                    regret = (edge_dist - second_best) / (avg_dist + eps)
+                    regret_matrix[i, j] = np.exp(-regret)  # Exponential decay
+        else:
+            # For very small n, no regret penalty
+            for j in range(n):
+                if i != j:
+                    regret_matrix[i, j] = 1.0
+    
+    # 3. NEIGHBOR DENSITY BONUS
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute node density as inverse of median distance to k-nearest neighbors
+    node_density = np.zeros(n)
+    k_density = min(5, n-1)
+    
+    for i in range(n):
+        if n > 1:
+            # Get k+1 smallest distances (including inf for self)
+            k_nearest_dists = np.partition(safe_dist[i], k_density)[:k_density+1]
+            # Filter out inf and get median of actual distances
+            valid_dists = k_nearest_dists[k_nearest_dists < np.inf]
+            if len(valid_dists) > 0:
+                median_dist = np.median(valid_dists)
+                node_density[i] = 1.0 / (median_dist + eps)
+            else:
+                node_density[i] = 0.0
+        else:
+            node_density[i] = 1.0
+    
+    # Normalize densities
+    if np.max(node_density) > 0:
+        node_density = node_density / np.max(node_density)
+    
+    # Apply density bonus to candidate edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Geometric mean of endpoint densities
+                geo_mean = np.sqrt(node_density[i] * node_density[j])
+                density_bonus[i, j] = geo_mean * 0.3  # Scale factor
+    
+    # Make symmetric
+    density_bonus = density_bonus + density_bonus.T
+    
+    # 4. BASE INVERSE DISTANCE SCORE
+    inv_dist = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                inv_dist[i, j] = 1.0 / (safe_dist[i, j] + eps)
+    
+    # Normalize inverse distances
+    max_inv = np.max(inv_dist)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # 5. COMBINE FACTORS
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base score: inverse distance with regret adjustment
+    base_score = inv_dist * regret_matrix
+    
+    # Add density bonus
+    heuristics_matrix = base_score * (1.0 + density_bonus)
+    
+    # 6. SPATIAL CONNECTIVITY PRESERVATION
+    # Ensure each node has at least 2 connections for feasibility
+    for i in range(n):
+        row = heuristics_matrix[i]
+        non_zero = np.nonzero(row)[0]
+        
+        if len(non_zero) < 2:
+            # Find two closest nodes by distance
+            dist_row = safe_dist[i].copy()
+            # Exclude already selected and self
+            mask = np.ones_like(dist_row, dtype=bool)
+            mask[i] = False
+            mask[non_zero] = False
+            
+            if np.sum(mask) > 0:
+                # Get two closest from remaining
+                available = np.where(mask)[0]
+                if len(available) >= 2:
+                    closest = available[np.argsort(dist_row[available])[:2]]
+                else:
+                    # If not enough available, take the single closest
+                    closest = available[np.argsort(dist_row[available])[:1]]
+                    # And complement with second closest overall
+                    all_closest = np.argsort(dist_row)[1:3]  # Skip self
+                    closest = np.unique(np.concatenate([closest, all_closest]))[:2]
+                
+                # Set moderate scores for these forced connections
+                for j in closest:
+                    if i != j:
+                        heuristics_matrix[i, j] = np.max(row) * 0.8 if np.max(row) > 0 else 0.5
+                        heuristics_matrix[j, i] = heuristics_matrix[i, j]
+    
+    # 7. FINAL PROCESSING
+    # Zero out non-candidate edges (except those forced for connectivity)
+    for i in range(n):
+        for j in range(n):
+            if i != j and not candidate_mask[i, j] and heuristics_matrix[i, j] == 0:
+                # Only zero out if it wasn't set in connectivity preservation
+                pass  # Already zero
+    
+    # Ensure symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

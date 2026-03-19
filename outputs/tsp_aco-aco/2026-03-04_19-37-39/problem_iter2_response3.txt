@@ -1,0 +1,189 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree", "Adaptive Edge Pruning", "Multi-Strategy Combination", "Christofides-inspired"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics incorporating Christofides-inspired strategies,
+    adaptive sparsification, and robust edge evaluation.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Matrix of edge promise indicators (same shape as input)
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Compute Minimum Spanning Tree (MST) - core of Christofides algorithm
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # 2. Inverse distance (fundamental heuristic)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distances per node
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    inv_dist_norm = inv_dist / row_sums
+    
+    # 3. Adaptive nearest neighbor component
+    k = max(2, min(8, n // 3))  # More adaptive k
+    nn_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get distances excluding self
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Find k nearest neighbors
+        nn_indices = np.argsort(distances)[:k]
+        if len(nn_indices) > 0:
+            # Assign weights based on rank (higher for closer neighbors)
+            max_dist = distances[nn_indices[-1]]
+            for rank, j in enumerate(nn_indices):
+                # Exponential decay based on rank
+                weight = np.exp(-rank / 2.0)
+                if max_dist > 0:
+                    # Also consider relative distance
+                    rel_dist = 1.0 - (distances[j] / max_dist)
+                    weight *= (0.7 + 0.3 * rel_dist)
+                nn_weights[i, j] = weight
+    
+    # Make symmetric
+    nn_weights = (nn_weights + nn_weights.T) / 2
+    
+    # 4. Edge value based on local optimality
+    edge_value = np.zeros_like(distance_matrix)
+    
+    # Precompute row and column statistics
+    row_means = np.zeros(n)
+    col_means = np.zeros(n)
+    for i in range(n):
+        row_means[i] = np.mean(distance_matrix[i, np.arange(n) != i])
+        col_means[i] = np.mean(distance_matrix[np.arange(n) != i, i])
+    
+    # Compute edge values efficiently
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Local comparison with alternative connections
+            local_avg_i = (row_means[i] + col_means[i]) / 2
+            local_avg_j = (row_means[j] + col_means[j]) / 2
+            
+            # Edge is promising if significantly better than local alternatives
+            if distance_matrix[i, j] < 0.6 * (local_avg_i + local_avg_j) / 2:
+                edge_value[i, j] = 1.0
+            elif distance_matrix[i, j] < 0.8 * (local_avg_i + local_avg_j) / 2:
+                edge_value[i, j] = 0.7
+            elif distance_matrix[i, j] < 1.0 * (local_avg_i + local_avg_j) / 2:
+                edge_value[i, j] = 0.3
+            else:
+                edge_value[i, j] = 0.1
+    
+    # Make symmetric
+    edge_value = edge_value + edge_value.T
+    np.fill_diagonal(edge_value, 0)
+    
+    # 5. Christofides-inspired component: Odd-degree node emphasis
+    # In Christofides, we find minimum weight perfect matching on odd-degree vertices
+    # Here we approximate by emphasizing edges connecting to "central" nodes
+    
+    # Node centrality: nodes with many moderately short connections are more central
+    centrality = np.zeros(n)
+    threshold = np.percentile(distance_matrix[distance_matrix > 0], 25)
+    
+    for i in range(n):
+        # Count moderately short connections
+        short_connections = np.sum(distance_matrix[i] < threshold) - 1  # exclude self
+        centrality[i] = short_connections
+    
+    # Normalize centrality
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # Edge centrality: product of endpoint centralities
+    edge_centrality = np.outer(centrality, centrality)
+    np.fill_diagonal(edge_centrality, 0)
+    
+    # 6. Combine factors with adaptive weights based on problem size
+    if n < 20:
+        # Small problems: emphasize all factors equally
+        weights = [0.3, 0.25, 0.25, 0.2]  # inv_dist, nn, edge_value, centrality
+    elif n < 100:
+        # Medium problems: emphasize nearest neighbors and edge value
+        weights = [0.25, 0.35, 0.25, 0.15]
+    else:
+        # Large problems: emphasize inverse distance and sparsification
+        weights = [0.4, 0.3, 0.2, 0.1]
+    
+    combined = (
+        weights[0] * inv_dist_norm +
+        weights[1] * nn_weights +
+        weights[2] * edge_value +
+        weights[3] * edge_centrality
+    )
+    
+    # 7. Strong boost for MST edges (Christofides core idea)
+    combined[mst_mask] *= 2.5  # Stronger boost than before
+    
+    # 8. Adaptive sparsification with problem-size awareness
+    # Determine number of edges to keep per node
+    if n < 50:
+        keep_per_node = max(4, min(10, n // 2))
+    else:
+        keep_per_node = max(3, min(8, n // 3))
+    
+    # Create sparsity mask
+    sparsity_mask = np.zeros_like(combined, dtype=bool)
+    
+    for i in range(n):
+        # Get indices of top edges from node i (excluding self)
+        node_heuristics = combined[i].copy()
+        node_heuristics[i] = -np.inf
+        
+        # Keep top edges, but always include MST edges
+        top_indices = np.argsort(node_heuristics)[-keep_per_node:]
+        sparsity_mask[i, top_indices] = True
+        
+        # Ensure MST edges are included
+        mst_neighbors = np.where(mst_mask[i])[0]
+        sparsity_mask[i, mst_neighbors] = True
+    
+    # Make symmetric and ensure MST completeness
+    sparsity_mask = sparsity_mask | sparsity_mask.T | mst_mask
+    
+    # Apply sparsification
+    heuristics_matrix = combined * sparsity_mask
+    
+    # 9. Final adjustments and normalization
+    # Ensure diagonal is zero
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Apply logarithmic scaling to emphasize relative differences
+    min_val = np.min(heuristics_matrix[heuristics_matrix > 0])
+    if min_val > 0:
+        # Add small epsilon to avoid log(0)
+        heuristics_matrix[heuristics_matrix > 0] = np.log1p(
+            heuristics_matrix[heuristics_matrix > 0] / min_val
+        )
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

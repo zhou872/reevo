@@ -1,0 +1,183 @@
+```json
+{
+    "algorithm_features": ["Dynamic Density-Aware Penalization", "Two-step Lookahead with Next-Neighbor Averaging", "Cluster-aware Global Elite Selection", "Adaptive Sparsification with MST Guarantee"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges with dynamic percentile adjustment,
+    lookahead costs via nearest-neighbor averages, and cluster-aware global selection.
+    
+    Key improvements over v1:
+    1. Dynamic percentile adjustment based on graph density
+    2. Two-step lookahead scoring using average nearest-neighbor distances
+    3. Cluster-aware global elite selection that preserves edges between dense clusters
+    4. Efficient implementation with careful memory usage
+    """
+    n = distance_matrix.shape[0]
+    if n == 0:
+        return np.array([])
+    
+    # 1. Base inverse distance with safe handling
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    inv_dist = 1 / (dist + 1e-10)
+    
+    # 2. Dynamic percentile adjustment based on graph density
+    # For sparse graphs (low average degree), be more inclusive
+    # For dense graphs (high average degree), be more selective
+    avg_degree_estimate = np.sum(dist < np.percentile(dist[dist < np.inf], 10)) / n
+    density_factor = min(1.0, max(0.1, avg_degree_estimate / 5.0))
+    top_percentile = 0.3 * density_factor  # Adjust between 3% and 30%
+    
+    # 3. MST bonus with graded weighting
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    
+    # Compute MST edge weights relative to average distance
+    mst_weights = mst.toarray().copy()
+    avg_dist = np.mean(dist[dist < np.inf])
+    mst_bonus = np.ones_like(dist)
+    mst_weight_mask = mst_weights > 0
+    # Edges significantly shorter than average get higher bonus
+    if np.any(mst_weight_mask):
+        weight_ratio = avg_dist / (mst_weights[mst_weight_mask] + 1e-10)
+        bonus_values = 1.0 + np.clip(weight_ratio / 3.0, 0.0, 1.0)
+        mst_bonus[mst_weight_mask] = bonus_values
+    
+    # 4. Two-step lookahead scoring
+    # For edge (i,j), consider average distance from j to its k nearest neighbors (excluding i)
+    lookahead_scores = np.zeros_like(dist)
+    k_lookahead = min(5, n - 2)  # Number of neighbors to consider
+    
+    if k_lookahead > 0:
+        # Pre-sort distances for each node
+        sorted_indices = np.argsort(dist, axis=1)
+        sorted_distances = np.take_along_axis(dist, sorted_indices, axis=1)
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                # Get k nearest neighbors of j, excluding i
+                neighbor_idx = 1  # Start from 1 to skip self (j)
+                neighbors_found = 0
+                neighbor_dist_sum = 0.0
+                
+                while neighbors_found < k_lookahead and neighbor_idx < n:
+                    neighbor = sorted_indices[j, neighbor_idx]
+                    if neighbor != i:  # Exclude the source node
+                        neighbor_dist_sum += sorted_distances[j, neighbor_idx]
+                        neighbors_found += 1
+                    neighbor_idx += 1
+                
+                if neighbors_found > 0:
+                    avg_next_dist = neighbor_dist_sum / neighbors_found
+                    # Penalize edges that lead to nodes with high average distance to their neighbors
+                    lookahead_scores[i, j] = 1.0 / (1.0 + avg_next_dist / avg_dist)
+                else:
+                    lookahead_scores[i, j] = 0.5  # Neutral value
+    
+    # 5. Mutual top-percentile penalization with dynamic threshold
+    penalty = np.ones_like(inv_dist)
+    
+    # For each node, identify edges in top percentile
+    top_mask = np.zeros_like(inv_dist, dtype=bool)
+    for i in range(n):
+        row = inv_dist[i].copy()
+        row[i] = -np.inf  # Exclude self
+        k = max(1, int(top_percentile * (n - 1)))
+        if k > 0:
+            # Use argpartition for efficiency
+            threshold_idx = np.argpartition(row, -k)[-k]
+            threshold = row[threshold_idx]
+            top_mask[i] = row >= threshold
+    
+    # Penalize edges that are NOT in top percentile for BOTH endpoints
+    mutual_poor = (~top_mask) & (~top_mask.T)
+    penalty[mutual_poor] = 0.1
+    
+    # 6. Combined scoring with lookahead
+    base_scores = inv_dist * mst_bonus * penalty
+    scores = base_scores * (0.7 + 0.3 * lookahead_scores)  # Weighted combination
+    
+    # 7. Hybrid sparsification
+    # 7a. Adaptive degree sparsification
+    k_degree = max(2, int(np.sqrt(n)))
+    degree_mask = np.zeros_like(scores, dtype=bool)
+    
+    for i in range(n):
+        row = scores[i].copy()
+        row[i] = -np.inf
+        if k_degree < len(row):
+            top_k_idx = np.argpartition(row, -k_degree)[-k_degree:]
+            degree_mask[i, top_k_idx] = True
+    
+    # Symmetrize degree mask
+    degree_mask = degree_mask | degree_mask.T
+    
+    # 7b. Cluster-aware global elite preservation
+    # Instead of simple percentile, use cluster-aware selection
+    upper_tri = np.triu_indices(n, k=1)
+    if len(upper_tri[0]) > 0:
+        # Identify edges that connect different clusters
+        cluster_edges = np.zeros_like(scores, dtype=bool)
+        
+        # Simple clustering: nodes with average distance below threshold are in same cluster
+        avg_row_dist = np.mean(dist, axis=1)
+        cluster_threshold = np.percentile(avg_row_dist, 50)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                # If nodes have similar average distances, they might be in same cluster
+                avg_i = avg_row_dist[i]
+                avg_j = avg_row_dist[j]
+                if abs(avg_i - avg_j) > cluster_threshold:
+                    cluster_edges[i, j] = True
+                    cluster_edges[j, i] = True
+        
+        # Take top edges within clusters AND top edges between clusters
+        cluster_edge_scores = scores[cluster_edges]
+        non_cluster_edge_scores = scores[~cluster_edges & ~np.eye(n, dtype=bool)]
+        
+        if len(cluster_edge_scores) > 0 and len(non_cluster_edge_scores) > 0:
+            # Preserve top edges from both categories
+            cluster_threshold = np.percentile(cluster_edge_scores, 85)  # Top 15% within clusters
+            non_cluster_threshold = np.percentile(non_cluster_edge_scores, 92)  # Top 8% between clusters
+            
+            cluster_mask = (cluster_edges & (scores >= cluster_threshold))
+            non_cluster_mask = (~cluster_edges & (scores >= non_cluster_threshold) & ~np.eye(n, dtype=bool))
+            global_mask = cluster_mask | non_cluster_mask
+        else:
+            # Fallback to simple percentile
+            elite_scores = scores[upper_tri]
+            elite_threshold = np.percentile(elite_scores, 90)
+            global_mask = scores >= elite_threshold
+    else:
+        global_mask = np.zeros_like(scores, dtype=bool)
+    
+    # 7c. Final mask: degree OR global OR MST
+    final_mask = degree_mask | global_mask | mst_mask
+    
+    # Apply sparsification
+    scores = scores * final_mask
+    
+    # 8. Normalize with safe handling
+    max_score = scores.max()
+    min_score = scores[scores > 0].min() if np.any(scores > 0) else 0
+    
+    if max_score > min_score:
+        # Map to [0, 1] range preserving zeros
+        non_zero_mask = scores > 0
+        scores[non_zero_mask] = (scores[non_zero_mask] - min_score) / (max_score - min_score)
+    
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

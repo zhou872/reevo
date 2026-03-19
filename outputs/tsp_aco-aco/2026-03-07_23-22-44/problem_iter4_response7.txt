@@ -1,0 +1,300 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret with Global Context", "Spectral Clustering Density Bonus", "Dynamic Factor Weighting via Problem Diagnostics", "Edge Diversity Promotion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection incorporating:
+    1. Multi-step regret with global context: Extended lookahead considering global edge distribution
+    2. Spectral clustering density bonus: Formal graph clustering for density estimation
+    3. Dynamic factor weighting: Adaptive combination based on problem characteristics
+    4. Edge diversity promotion: Encourages sampling from different graph regions
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape indicating edge promise (higher = more promising)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    epsilon = 1e-12
+    
+    # ===== 1. MULTI-STEP REGRET WITH GLOBAL CONTEXT =====
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    # Global distance statistics for context
+    upper_tri = distance_matrix[np.triu_indices(n, 1)]
+    global_median = np.median(upper_tri)
+    global_std = np.std(upper_tri)
+    
+    for i in range(n):
+        # Get distances from node i
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Multi-step regret: consider 1-step and 2-step alternatives
+            remaining = [k for k in range(n) if k not in (i, j)]
+            
+            if len(remaining) >= 2:
+                # 1-step alternatives: direct edges from i (excluding j)
+                one_step_alts = [dists_i[k] for k in remaining]
+                one_step_best = np.mean(np.partition(one_step_alts, min(3, len(one_step_alts)-1))[:3])
+                
+                # 2-step alternatives: paths i→k→m (approximated)
+                two_step_alts = []
+                for k in remaining:
+                    # Best edge from k to any other node (excluding i, j, k)
+                    other_from_k = [distance_matrix[k, m] for m in remaining if m != k]
+                    if other_from_k:
+                        best_from_k = min(other_from_k)
+                        two_step_alts.append(dists_i[k] + best_from_k)
+                
+                if two_step_alts:
+                    two_step_best = np.mean(np.partition(two_step_alts, min(2, len(two_step_alts)-1))[:2])
+                    
+                    # Combine with global context
+                    edge_value = distance_matrix[i, j]
+                    global_percentile = np.sum(upper_tri <= edge_value) / len(upper_tri)
+                    
+                    # Regret calculation with global normalization
+                    regret_one_step = max(0, one_step_best - edge_value) / (global_median + epsilon)
+                    regret_two_step = max(0, two_step_best/2 - edge_value) / (global_median + epsilon) if two_step_alts else 0
+                    
+                    combined_regret = 0.6 * regret_one_step + 0.4 * regret_two_step
+                    
+                    # Sigmoid activation with global context adjustment
+                    regret_matrix[i, j] = 1.0 / (1.0 + np.exp(-5 * combined_regret * (1 + global_percentile)))
+    
+    # ===== 2. SPECTRAL CLUSTERING DENSITY BONUS =====
+    density_matrix = np.ones_like(distance_matrix)
+    
+    if n > 3:
+        try:
+            # Perform hierarchical clustering on distance matrix
+            condensed_dist = squareform(distance_matrix)
+            Z = linkage(condensed_dist, method='average')
+            
+            # Determine optimal number of clusters (between 2 and min(5, n//3))
+            max_clusters = min(5, max(2, n // 3))
+            clusters = fcluster(Z, max_clusters, criterion='maxclust')
+            
+            # Calculate intra-cluster and inter-cluster bonuses
+            for i in range(n):
+                for j in range(i+1, n):
+                    if clusters[i] == clusters[j]:
+                        # Intra-cluster: bonus based on local density
+                        cluster_mask = (clusters == clusters[i])
+                        cluster_distances = distance_matrix[i, cluster_mask]
+                        local_density = 1.0 / (np.mean(cluster_distances) + epsilon)
+                        
+                        # Normalize by global density
+                        global_density = 1.0 / (global_median + epsilon)
+                        density_ratio = local_density / (global_density + epsilon)
+                        
+                        bonus = 1.0 + 0.3 * np.tanh(density_ratio - 1.0)
+                        density_matrix[i, j] = density_matrix[j, i] = bonus
+                    else:
+                        # Inter-cluster: connection bonus based on cluster separation
+                        cluster_i_mask = (clusters == clusters[i])
+                        cluster_j_mask = (clusters == clusters[j])
+                        
+                        avg_intra_i = np.mean(distance_matrix[i, cluster_i_mask])
+                        avg_intra_j = np.mean(distance_matrix[j, cluster_j_mask])
+                        inter_dist = distance_matrix[i, j]
+                        
+                        # Bonus for connecting well-separated clusters
+                        separation = (avg_intra_i + avg_intra_j) / (2 * inter_dist + epsilon)
+                        connection_bonus = 1.0 + 0.2 * np.tanh(separation - 1.0)
+                        density_matrix[i, j] = density_matrix[j, i] = connection_bonus
+        except:
+            # Fallback to simple distance-based clustering
+            for i in range(n):
+                # Simple nearest-neighbor clustering
+                k_neighbors = min(5, n-1)
+                neighbor_dists = np.partition(distance_matrix[i], k_neighbors)[:k_neighbors+1]
+                threshold = np.mean(neighbor_dists) * 1.5
+                
+                in_cluster = distance_matrix[i] < threshold
+                in_cluster[i] = False
+                
+                if np.any(in_cluster):
+                    cluster_dists = distance_matrix[i, in_cluster]
+                    cluster_density = 1.0 / (np.mean(cluster_dists) + epsilon)
+                    bonus = 1.0 + 0.2 * np.tanh(cluster_density / (global_median + epsilon))
+                    density_matrix[i, in_cluster] = bonus
+    
+    # ===== 3. BASE INVERSE DISTANCE WITH ADAPTIVE SCALING =====
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize by global scale
+    inv_dist = inv_dist / (np.max(inv_dist) + epsilon)
+    
+    # ===== 4. TWO-STEP LOOKAHEAD SPATIAL SCORING =====
+    lookahead_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Consider future path options after taking edge (i,j)
+            remaining = [k for k in range(n) if k not in (i, j)]
+            
+            if remaining:
+                # Options from j to remaining nodes
+                next_options = distance_matrix[j, remaining]
+                
+                # Options from remaining nodes back to i (for tour completion)
+                return_options = distance_matrix[remaining, i]
+                
+                # Weighted combination favoring shorter next steps
+                lookahead_score = 0.7 * np.mean(next_options) + 0.3 * np.mean(return_options)
+                lookahead_matrix[i, j] = 1.0 / (lookahead_score + epsilon)
+    
+    # Normalize lookahead scores
+    max_lookahead = np.max(lookahead_matrix)
+    if max_lookahead > 0:
+        lookahead_matrix = lookahead_matrix / max_lookahead
+    
+    # ===== 5. DYNAMIC FACTOR WEIGHTING VIA PROBLEM DIAGNOSTICS =====
+    # Analyze problem characteristics
+    distance_variance = np.var(upper_tri) / (global_median**2 + epsilon)
+    problem_regularity = 1.0 / (1.0 + distance_variance)
+    
+    # Adjust weights based on problem characteristics
+    if problem_regularity > 0.7:
+        # Regular problems: emphasize lookahead and regret
+        regret_weight = 0.4
+        lookahead_weight = 0.3
+        density_weight = 0.2
+        inv_dist_weight = 0.1
+    else:
+        # Irregular problems: emphasize density and base distance
+        regret_weight = 0.2
+        lookahead_weight = 0.2
+        density_weight = 0.4
+        inv_dist_weight = 0.2
+    
+    # Combine factors
+    combined_scores = (
+        inv_dist_weight * inv_dist +
+        regret_weight * regret_matrix +
+        lookahead_weight * lookahead_matrix
+    ) * density_matrix
+    
+    # ===== 6. MINIMUM SPANNING TREE REINFORCEMENT =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # Boost MST edges significantly
+    mst_boost = np.where(mst_edges, 1.5, 1.0)
+    enhanced_scores = combined_scores * mst_boost
+    
+    # ===== 7. EDGE DIVERSITY PROMOTION =====
+    # Encourage sampling from different graph regions
+    if n > 4:
+        # Compute edge similarity based on shared nodes
+        diversity_matrix = np.ones_like(enhanced_scores)
+        
+        for i in range(n):
+            row_scores = enhanced_scores[i].copy()
+            row_scores[i] = -np.inf
+            
+            if np.sum(row_scores > 0) >= 3:
+                # Normalize row scores
+                row_max = np.max(row_scores)
+                if row_max > 0:
+                    normalized_scores = row_scores / row_max
+                    
+                    # Promote diverse edges: reduce scores of similar alternatives
+                    sorted_idx = np.argsort(-normalized_scores)[:min(5, n-1)]
+                    
+                    for k, idx1 in enumerate(sorted_idx):
+                        for idx2 in sorted_idx[k+1:]:
+                            # Similarity penalty based on distance correlation
+                            edge_sim = abs(distance_matrix[i, idx1] - distance_matrix[i, idx2]) / global_median
+                            penalty = 1.0 - 0.1 * np.exp(-edge_sim)
+                            diversity_matrix[i, idx1] *= penalty
+                            diversity_matrix[i, idx2] *= penalty
+        
+        enhanced_scores = enhanced_scores * diversity_matrix
+    
+    # ===== 8. ADAPTIVE SPARSIFICATION WITH DIVERSITY PRESERVATION =====
+    sparsified = np.zeros_like(enhanced_scores)
+    
+    # Determine adaptive keep count
+    base_keep = max(3, min(8, n // 4))
+    
+    for i in range(n):
+        row_scores = enhanced_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Calculate adaptive threshold
+        positive_scores = row_scores[row_scores > 0]
+        if len(positive_scores) > 0:
+            score_mean = np.mean(positive_scores)
+            score_std = np.std(positive_scores)
+            
+            if score_std > 0:
+                threshold = score_mean + 0.3 * score_std
+                keep_mask = row_scores >= max(threshold, np.max(positive_scores) * 0.3)
+            else:
+                keep_mask = row_scores >= score_mean
+        else:
+            keep_mask = np.zeros_like(row_scores, dtype=bool)
+        
+        # Ensure minimum and maximum edges kept
+        n_keep = np.sum(keep_mask)
+        if n_keep < base_keep:
+            # Add top edges to reach base_keep
+            n_add = base_keep - n_keep
+            additional = np.argsort(-row_scores)[:n_add]
+            keep_mask[additional] = True
+        elif n_keep > 3 * base_keep:
+            # Reduce to top 3*base_keep edges
+            top_indices = np.argsort(-row_scores)[:3 * base_keep]
+            new_mask = np.zeros_like(row_scores, dtype=bool)
+            new_mask[top_indices] = True
+            keep_mask = new_mask
+        
+        keep_mask[i] = False
+        sparsified[i][keep_mask] = enhanced_scores[i][keep_mask]
+    
+    # Symmetrize
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # ===== 9. FINAL NORMALIZATION =====
+    max_score = np.max(sparsified)
+    if max_score > 0:
+        final_scores = sparsified / max_score
+    else:
+        final_scores = sparsified
+    
+    # Ensure symmetry and zero diagonal
+    final_scores = (final_scores + final_scores.T) / 2
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

@@ -1,0 +1,360 @@
+```json
+{
+    "algorithm_features": ["Multi-step Regret Estimation", "Dynamic Factor Weighting", "Local Cluster Density Propagation", "Adaptive Graph Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from sklearn.neighbors import KDTree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with dynamic weighting,
+    multi-step lookahead, and adaptive sparsification.
+    
+    Args:
+        distance_matrix: Symmetric distance matrix of shape (n, n)
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        return 1 / (distance_matrix + np.eye(n))  # Avoid division by zero
+    
+    # Preprocess: set diagonal to infinity for computational convenience
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Multi-step regret estimation with adaptive depth
+    regret_scores = _compute_multi_step_regret(dist)
+    
+    # 2. Enhanced density propagation with cluster awareness
+    density_bonuses = _compute_cluster_aware_density(dist)
+    
+    # 3. Base inverse distance with logarithmic scaling
+    inv_dist = np.zeros_like(dist)
+    mask = dist < np.inf
+    inv_dist[mask] = 1.0 / (dist[mask] + 1e-10)
+    # Log scaling to reduce extreme values
+    inv_dist = np.log1p(inv_dist)
+    if np.max(inv_dist) > 0:
+        inv_dist = inv_dist / np.max(inv_dist)
+    
+    # 4. Dynamic weighting based on problem characteristics
+    weights = _compute_dynamic_weights(dist, regret_scores, density_bonuses)
+    
+    # 5. Combine factors with dynamic weights
+    combined = (weights[0] * inv_dist + 
+                weights[1] * regret_scores + 
+                weights[2] * density_bonuses)
+    
+    # 6. Adaptive sparsification with learned thresholds
+    sparsified = _learned_sparsification(combined, dist)
+    
+    return sparsified
+
+
+def _compute_multi_step_regret(dist: np.ndarray) -> np.ndarray:
+    """Compute multi-step regret scores with adaptive lookahead depth."""
+    n = dist.shape[0]
+    regret = np.zeros((n, n))
+    
+    if n < 10:
+        # For small problems, compute exact 3-step regret
+        regret = _three_step_regret_exact(dist)
+    else:
+        # For larger problems, use approximate regret with adaptive sampling
+        regret = _adaptive_regret_approximation(dist)
+    
+    # Normalize
+    if np.max(regret) > 0:
+        regret = regret / np.max(regret)
+    
+    return regret
+
+
+def _three_step_regret_exact(dist: np.ndarray) -> np.ndarray:
+    """Exact computation of 3-step regret for small instances."""
+    n = dist.shape[0]
+    regret = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            direct_cost = dist[i, j]
+            
+            # Compute cost of continuing from j (2nd and 3rd steps)
+            # Best path: j -> k -> l
+            best_continuation = np.inf
+            for k in range(n):
+                if k in (i, j):
+                    continue
+                # Find best l from k (excluding i, j, k)
+                mask_l = np.ones(n, dtype=bool)
+                mask_l[[i, j, k]] = False
+                if np.any(mask_l):
+                    continuation_cost = dist[j, k] + dist[k, mask_l].min()
+                    best_continuation = min(best_continuation, continuation_cost)
+            
+            # Compute best alternative 3-step path through different first edge
+            best_alternative = np.inf
+            for k in range(n):
+                if k in (i, j):
+                    continue
+                # Path: i -> k -> m -> n
+                for m in range(n):
+                    if m in (i, j, k):
+                        continue
+                    mask_n = np.ones(n, dtype=bool)
+                    mask_n[[i, j, k, m]] = False
+                    if np.any(mask_n):
+                        alt_cost = dist[i, k] + dist[k, m] + dist[m, mask_n].min()
+                        best_alternative = min(best_alternative, alt_cost)
+            
+            if best_continuation < np.inf and best_alternative < np.inf:
+                regret[i, j] = max(best_alternative - (direct_cost + best_continuation), 0)
+    
+    return regret
+
+
+def _adaptive_regret_approximation(dist: np.ndarray) -> np.ndarray:
+    """Approximate regret computation for larger instances using sampling."""
+    n = dist.shape[0]
+    regret = np.zeros((n, n))
+    
+    # Determine sampling size based on problem size
+    sample_size = min(15, n // 2)
+    
+    # Precompute nearest neighbors for each node
+    k_neighbors = min(10, n - 1)
+    nearest = np.argsort(dist, axis=1)[:, 1:k_neighbors+1]
+    
+    for i in range(n):
+        for j_idx in range(min(k_neighbors, n-1)):
+            j = nearest[i, j_idx]
+            
+            # Sample alternative first edges
+            alt_candidates = np.random.choice(
+                [x for x in range(n) if x not in (i, j)], 
+                size=min(sample_size, n-2), 
+                replace=False
+            )
+            
+            # Compute continuation cost from j
+            cont_candidates = np.random.choice(
+                [x for x in range(n) if x not in (i, j)], 
+                size=min(sample_size, n-2), 
+                replace=False
+            )
+            
+            best_continuation = np.inf
+            for k in cont_candidates:
+                third_candidates = np.random.choice(
+                    [x for x in range(n) if x not in (i, j, k)], 
+                    size=min(sample_size//2, max(1, n-3)), 
+                    replace=False
+                )
+                if len(third_candidates) > 0:
+                    cont_cost = dist[j, k] + dist[k, third_candidates].min()
+                    best_continuation = min(best_continuation, cont_cost)
+            
+            # Compute best alternative
+            best_alternative = np.inf
+            for k in alt_candidates:
+                for _ in range(min(3, sample_size)):
+                    m = np.random.choice([x for x in range(n) if x not in (i, j, k)])
+                    fourth_candidates = np.random.choice(
+                        [x for x in range(n) if x not in (i, j, k, m)], 
+                        size=min(sample_size//3, max(1, n-4)), 
+                        replace=False
+                    )
+                    if len(fourth_candidates) > 0:
+                        alt_cost = dist[i, k] + dist[k, m] + dist[m, fourth_candidates].min()
+                        best_alternative = min(best_alternative, alt_cost)
+            
+            if best_continuation < np.inf and best_alternative < np.inf:
+                regret[i, j] = max(best_alternative - (dist[i, j] + best_continuation), 0)
+    
+    # Make symmetric
+    regret = np.maximum(regret, regret.T)
+    
+    return regret
+
+
+def _compute_cluster_aware_density(dist: np.ndarray) -> np.ndarray:
+    """Compute density bonuses with cluster propagation."""
+    n = dist.shape[0]
+    density = np.zeros((n, n))
+    
+    if n < 5:
+        return density
+    
+    # Adaptive neighborhood size
+    k = min(max(3, n // 10), 15)
+    
+    # Compute local densities
+    local_densities = np.zeros(n)
+    for i in range(n):
+        # Find k nearest neighbors
+        distances = dist[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        avg_dist = np.mean(distances[nn_indices])
+        local_densities[i] = 1.0 / (avg_dist + 1e-10)
+    
+    # Create adjacency matrix for k-nearest neighbor graph
+    adjacency = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        distances = dist[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        adjacency[i, nn_indices] = True
+    
+    # Make adjacency symmetric (undirected)
+    adjacency = adjacency | adjacency.T
+    
+    # Propagate densities through adjacency graph
+    for i in range(n):
+        # Direct neighbors get full density bonus
+        for j in range(n):
+            if i != j and adjacency[i, j]:
+                density[i, j] = np.sqrt(local_densities[i] * local_densities[j])
+        
+        # Two-hop neighbors get reduced bonus
+        for j in range(n):
+            if i == j or adjacency[i, j]:
+                continue
+            # Check if there's a common neighbor
+            common_neighbors = np.where(adjacency[i] & adjacency[j])[0]
+            if len(common_neighbors) > 0:
+                # Use best connection through common neighbor
+                best_density = 0
+                for cn in common_neighbors:
+                    path_density = np.sqrt(
+                        local_densities[i] * local_densities[cn] * local_densities[j]
+                    )
+                    best_density = max(best_density, path_density)
+                density[i, j] = best_density * 0.7  # Discount for indirect connection
+    
+    # Normalize
+    if np.max(density) > 0:
+        density = density / np.max(density)
+    
+    return density
+
+
+def _compute_dynamic_weights(dist: np.ndarray, 
+                           regret: np.ndarray, 
+                           density: np.ndarray) -> Tuple[float, float, float]:
+    """Compute dynamic weights based on problem characteristics."""
+    n = dist.shape[0]
+    
+    # Analyze problem structure
+    std_dist = np.std(dist[dist < np.inf])
+    avg_regret = np.mean(regret[regret > 0]) if np.any(regret > 0) else 0
+    avg_density = np.mean(density[density > 0]) if np.any(density > 0) else 0
+    
+    # Base weights
+    w_inv = 0.3
+    w_regret = 0.4
+    w_density = 0.3
+    
+    # Adjust based on characteristics
+    if n > 50:  # Large instance
+        # Emphasize density for large instances
+        w_density = min(0.5, w_density * 1.3)
+        w_inv = max(0.2, w_inv * 0.8)
+    
+    if std_dist > np.mean(dist[dist < np.inf]) * 0.5:  # High variance
+        # Emphasize regret for non-uniform instances
+        w_regret = min(0.6, w_regret * 1.2)
+    
+    if avg_density > 0.5:  # Clearly clustered
+        w_density = min(0.6, w_density * 1.4)
+    
+    # Normalize to sum to 1
+    total = w_inv + w_regret + w_density
+    w_inv /= total
+    w_regret /= total
+    w_density /= total
+    
+    return w_inv, w_regret, w_density
+
+
+def _learned_sparsification(scores: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """Adaptive sparsification with learned edge retention."""
+    n = scores.shape[0]
+    sparsified = np.zeros((n, n))
+    
+    # Determine number of edges to keep per node
+    if n <= 10:
+        edges_per_node = n - 1
+    elif n <= 50:
+        edges_per_node = max(3, n // 5)
+    else:
+        edges_per_node = max(5, n // 10)
+    
+    # Keep top edges based on scores
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Sort and keep top edges
+        if edges_per_node < n - 1:
+            threshold_idx = np.argsort(row_scores)[-edges_per_node]
+            threshold = row_scores[threshold_idx]
+            keep_mask = row_scores >= threshold
+        else:
+            keep_mask = np.ones(n, dtype=bool)
+            keep_mask[i] = False
+        
+        # Apply distance-based pruning for very long edges
+        dist_threshold = np.percentile(dist[i, dist[i] < np.inf], 75)
+        dist_mask = dist[i] <= dist_threshold
+        dist_mask[i] = False
+        
+        # Combined mask: keep if either score-based or distance-based
+        final_mask = keep_mask | dist_mask
+        
+        sparsified[i, final_mask] = scores[i, final_mask]
+    
+    # Ensure symmetry (optional, TSP is symmetric)
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Apply soft threshold to very low values
+    threshold = np.percentile(sparsified[sparsified > 0], 20) if np.any(sparsified > 0) else 0
+    sparsified[sparsified < threshold] = 0
+    
+    return sparsified
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with different problem sizes
+    for n in [8, 20, 50]:
+        print(f"\nTesting with n = {n}")
+        
+        # Generate random symmetric distance matrix
+        test_matrix = np.random.rand(n, n) * 10
+        test_matrix = (test_matrix + test_matrix.T) / 2
+        np.fill_diagonal(test_matrix, 0)
+        
+        # Compute heuristics
+        result = heuristics_v2(test_matrix)
+        
+        print(f"Shape: {result.shape}")
+        print(f"Non-zero entries: {np.count_nonzero(result)} / {n*n}")
+        print(f"Max value: {np.max(result):.4f}")
+        print(f"Mean non-zero: {np.mean(result[result > 0]):.4f}")
+        
+        # Verify symmetry
+        symmetric_diff = np.max(np.abs(result - result.T))
+        print(f"Max asymmetry: {symmetric_diff:.6f}")
+```

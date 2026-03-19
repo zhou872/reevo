@@ -1,0 +1,369 @@
+```json
+{
+    "algorithm_features": ["Multi-step Lookahead Detour Assessment", "Adaptive Cluster Weighting", "Distance Spectrum Analysis", "Geometric Mean Integration"]
+}
+```
+
+```python
+import numpy as np
+import math
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges incorporating multi-step lookahead
+    and adaptive cluster-based weighting.
+    
+    Key innovations:
+    1. Three-step lookahead spatial assessment for detour impact
+    2. Dynamic cluster analysis with adaptive intra/inter-cluster weighting
+    3. Distance spectrum partitioning for nuanced edge classification
+    4. Geometric mean integration with component importance weighting
+    5. Solution pattern learning via distance distribution analysis
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix of shape (n, n)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    np.fill_diagonal(distance_matrix, np.inf)
+    
+    # ===== 1. SOLUTION DISTRIBUTION ANALYSIS =====
+    # Analyze distance patterns to infer problem characteristics
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    if len(flat_dists) == 0:
+        return np.zeros_like(distance_matrix)
+    
+    # Calculate distribution statistics
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / (dist_mean + epsilon)
+    
+    # Distance spectrum partitioning
+    q1 = np.percentile(flat_dists, 25)
+    q2 = np.percentile(flat_dists, 50)
+    q3 = np.percentile(flat_dists, 75)
+    
+    # Determine problem type and adjust parameters
+    is_regular = dist_cv < 0.35
+    is_clustered = (q3 - q1) / (q2 + epsilon) > 1.5
+    
+    # Adaptive parameters based on problem characteristics
+    if is_regular and not is_clustered:
+        lookahead_depth = 2  # Shallow lookahead for regular problems
+        cluster_weight_intra = 1.8
+        cluster_weight_inter = 0.6
+        base_exp = 0.7
+    elif is_clustered:
+        lookahead_depth = 3  # Deeper lookahead for clustered problems
+        cluster_weight_intra = 2.2
+        cluster_weight_inter = 0.4
+        base_exp = 0.6
+    else:
+        lookahead_depth = 2
+        cluster_weight_intra = 1.5
+        cluster_weight_inter = 0.8
+        base_exp = 0.8
+    
+    # ===== 2. STABLE BASE SCORING =====
+    # Log-based inverse distance with spectral weighting
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Weight by distance spectrum position
+        spectral_weight = np.ones_like(distance_matrix)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = distance_matrix[i, j]
+                if d < q1:
+                    spectral_weight[i, j] = spectral_weight[j, i] = 2.0
+                elif d < q2:
+                    spectral_weight[i, j] = spectral_weight[j, i] = 1.5
+                elif d < q3:
+                    spectral_weight[i, j] = spectral_weight[j, i] = 1.0
+                else:
+                    spectral_weight[i, j] = spectral_weight[j, i] = 0.7
+        
+        base_score = spectral_weight / (np.log1p(distance_matrix) + 1)
+    
+    base_score[np.isinf(base_score)] = 0
+    np.fill_diagonal(base_score, 0)
+    
+    # ===== 3. MULTI-STEP LOOKAHEAD DETOUR ASSESSMENT =====
+    lookahead_score = np.ones_like(distance_matrix)
+    
+    if n >= 4 and lookahead_depth >= 2:
+        # Precompute node statistics for efficiency
+        node_stats = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            if len(dists[dists < np.inf]) >= 3:
+                k = min(5, len(dists[dists < np.inf]) - 1)
+                nearest = np.partition(dists, k)[:k+1]
+                nearest = nearest[nearest < np.inf]
+                node_stats.append({
+                    'mean': np.mean(nearest),
+                    'median': np.median(nearest),
+                    'min': np.min(nearest)
+                })
+            else:
+                node_stats.append({'mean': np.mean(dists[dists < np.inf]), 
+                                 'median': np.median(dists[dists < np.inf]),
+                                 'min': np.min(dists[dists < np.inf])})
+        
+        # Compute lookahead scores
+        for i in range(n):
+            for j in range(i+1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # Two-step lookahead: i -> k -> j
+                two_step_costs = []
+                for k in range(n):
+                    if k != i and k != j and distance_matrix[i, k] < np.inf and distance_matrix[k, j] < np.inf:
+                        detour_cost = distance_matrix[i, k] + distance_matrix[k, j] - direct_cost
+                        if detour_cost > 0:
+                            two_step_costs.append(detour_cost)
+                
+                if two_step_costs:
+                    avg_detour = np.mean(two_step_costs)
+                    # Edge is more promising if detour cost is high relative to direct cost
+                    if avg_detour > 0:
+                        lookahead_ratio = direct_cost / (avg_detour + epsilon)
+                        lookahead_score[i, j] = lookahead_score[j, i] = np.exp(-lookahead_ratio)
+                
+                # Three-step lookahead for clustered problems
+                if lookahead_depth >= 3 and is_clustered:
+                    three_step_costs = []
+                    for k1 in range(n):
+                        for k2 in range(n):
+                            if (k1 != i and k1 != j and k2 != i and k2 != j and k1 != k2 and
+                                distance_matrix[i, k1] < np.inf and distance_matrix[k1, k2] < np.inf and
+                                distance_matrix[k2, j] < np.inf):
+                                detour_cost = (distance_matrix[i, k1] + distance_matrix[k1, k2] + 
+                                             distance_matrix[k2, j] - direct_cost)
+                                if detour_cost > 0:
+                                    three_step_costs.append(detour_cost)
+                    
+                    if three_step_costs:
+                        avg_detour_3 = np.mean(three_step_costs)
+                        if avg_detour_3 > 0:
+                            lookahead_ratio_3 = direct_cost / (avg_detour_3 + epsilon)
+                            # Blend two-step and three-step lookahead
+                            lookahead_score[i, j] = lookahead_score[j, i] = (
+                                0.6 * lookahead_score[i, j] + 0.4 * np.exp(-lookahead_ratio_3)
+                            )
+    
+    # ===== 4. ADAPTIVE CLUSTER ANALYSIS =====
+    cluster_score = np.ones_like(distance_matrix)
+    
+    if n >= 4:
+        # Dynamic cluster detection
+        cluster_threshold = q2  # Use median as threshold
+        
+        # Identify potential clusters
+        node_clusters = np.zeros(n, dtype=int)
+        cluster_id = 1
+        
+        for i in range(n):
+            if node_clusters[i] == 0:
+                # Start new cluster
+                cluster_members = [i]
+                
+                # Find nearby nodes
+                for j in range(n):
+                    if i != j and distance_matrix[i, j] < cluster_threshold:
+                        cluster_members.append(j)
+                
+                # Assign cluster ID
+                for node in cluster_members:
+                    node_clusters[node] = cluster_id
+                cluster_id += 1
+        
+        # Apply cluster-based weighting
+        for i in range(n):
+            for j in range(i+1, n):
+                if node_clusters[i] == node_clusters[j]:
+                    # Intra-cluster edge
+                    cluster_score[i, j] = cluster_score[j, i] = cluster_weight_intra
+                else:
+                    # Inter-cluster edge
+                    cluster_score[i, j] = cluster_score[j, i] = cluster_weight_inter
+    
+    # ===== 5. ENHANCED REGRET MODELING =====
+    regret_score = np.ones_like(distance_matrix)
+    
+    # Local regret (node-specific)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if np.any(dists < np.inf):
+            min_dist = np.min(dists[dists > 0])
+            if min_dist > 0:
+                regret_ratio = distance_matrix[i] / (min_dist + epsilon)
+                # Exponential decay with adaptive steepness
+                regret_score[i] = np.exp(-regret_ratio * (0.8 if is_regular else 1.2))
+    
+    # Global regret (cross-node)
+    if n > 3:
+        global_regret = np.ones_like(distance_matrix)
+        for i in range(n):
+            for j in range(i+1, n):
+                # Compute alternative paths through nearest neighbors
+                alt_costs = []
+                
+                # Alternative through i's nearest
+                i_dists = distance_matrix[i].copy()
+                i_dists[i] = i_dists[j] = np.inf
+                if np.any(i_dists < np.inf):
+                    i_nearest = np.min(i_dists)
+                    alt_costs.append(i_nearest + distance_matrix[j, np.argmin(i_dists)])
+                
+                # Alternative through j's nearest
+                j_dists = distance_matrix[j].copy()
+                j_dists[j] = j_dists[i] = np.inf
+                if np.any(j_dists < np.inf):
+                    j_nearest = np.min(j_dists)
+                    alt_costs.append(j_nearest + distance_matrix[i, np.argmin(j_dists)])
+                
+                if alt_costs:
+                    best_alt = np.min(alt_costs)
+                    if best_alt > 0:
+                        regret = distance_matrix[i, j] / best_alt
+                        global_regret[i, j] = global_regret[j, i] = np.exp(-regret)
+        
+        regret_score = (regret_score * global_regret) ** 0.5  # Geometric mean
+    
+    # ===== 6. MST CONNECTIVITY WITH PATH REINFORCEMENT =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    mst_bonus = np.ones_like(distance_matrix)
+    if n > 2:
+        # Calculate MST edge importance
+        mst_degrees = np.sum(mst_mask, axis=1)
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    # Boost edges that are critical in MST
+                    centrality = (mst_degrees[i] + mst_degrees[j]) / (2 * (n - 1))
+                    mst_bonus[i, j] = mst_bonus[j, i] = 1.5 + centrality
+    
+    # ===== 7. GEOMETRIC MEAN INTEGRATION WITH ADAPTIVE WEIGHTS =====
+    # Normalize components
+    components = {
+        'base': base_score,
+        'lookahead': lookahead_score,
+        'cluster': cluster_score,
+        'regret': regret_score,
+        'mst': mst_bonus
+    }
+    
+    # Adaptive weights based on problem characteristics
+    if is_clustered:
+        weights = {'base': 0.15, 'lookahead': 0.25, 'cluster': 0.30, 
+                  'regret': 0.20, 'mst': 0.10}
+    elif is_regular:
+        weights = {'base': 0.20, 'lookahead': 0.20, 'cluster': 0.15, 
+                  'regret': 0.25, 'mst': 0.20}
+    else:
+        weights = {'base': 0.18, 'lookahead': 0.22, 'cluster': 0.20, 
+                  'regret': 0.25, 'mst': 0.15}
+    
+    # Ensure weights sum to 1
+    weight_sum = sum(weights.values())
+    for key in weights:
+        weights[key] /= weight_sum
+    
+    # Geometric mean integration
+    combined_scores = np.ones_like(distance_matrix)
+    for comp_name, comp_matrix in components.items():
+        # Normalize component
+        comp_max = np.max(comp_matrix)
+        if comp_max > 0:
+            comp_norm = comp_matrix / comp_max
+        else:
+            comp_norm = comp_matrix
+        
+        # Apply weight as exponent in geometric mean
+        combined_scores *= comp_norm ** weights[comp_name]
+    
+    # Apply MST reinforcement
+    combined_scores[mst_mask] *= mst_bonus[mst_mask]
+    
+    # ===== 8. ADAPTIVE SPARSIFICATION =====
+    sparsified = np.zeros_like(combined_scores)
+    
+    for i in range(n):
+        row_scores = combined_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Always preserve MST edges
+        mst_edges = mst_mask[i]
+        
+        # Determine number of edges to keep
+        if n <= 10:
+            k = min(5, n - 1)
+        else:
+            # Adaptive k based on node centrality and problem type
+            centrality = np.mean(1.0 / (distance_matrix[i] + epsilon))
+            k_base = max(3, int(np.log2(n) * 1.5))
+            k = min(n - 1, k_base + int(centrality * 3))
+        
+        mst_count = np.sum(mst_edges)
+        if mst_count > 0:
+            keep_mask = mst_edges.copy()
+            non_mst_needed = max(0, k - mst_count)
+            
+            if non_mst_needed > 0:
+                non_mst_scores = row_scores.copy()
+                non_mst_scores[mst_edges] = -np.inf
+                
+                if np.sum(non_mst_scores > -np.inf) >= non_mst_needed:
+                    # Use percentile threshold
+                    valid_scores = non_mst_scores[non_mst_scores > -np.inf]
+                    threshold = np.partition(valid_scores, -non_mst_needed)[-non_mst_needed]
+                    top_non_mst = non_mst_scores >= threshold
+                    keep_mask = keep_mask | top_non_mst
+                else:
+                    keep_mask = keep_mask | (non_mst_scores > -np.inf)
+        else:
+            if np.any(row_scores > -np.inf):
+                k_actual = min(k, np.sum(row_scores > -np.inf))
+                valid_scores = row_scores[row_scores > -np.inf]
+                threshold = np.partition(valid_scores, -k_actual)[-k_actual]
+                keep_mask = row_scores >= threshold
+            else:
+                keep_mask = np.zeros_like(row_scores, dtype=bool)
+        
+        keep_mask[i] = False
+        sparsified[i][keep_mask] = combined_scores[i][keep_mask]
+    
+    # ===== 9. FINAL PROCESSING =====
+    # Symmetrize
+    symmetric_scores = np.maximum(sparsified, sparsified.T)
+    
+    # Ensure MST edges have minimum viable score
+    min_nonzero = np.min(symmetric_scores[symmetric_scores > 0]) if np.any(symmetric_scores > 0) else 1
+    symmetric_scores[mst_mask] = np.maximum(symmetric_scores[mst_mask], min_nonzero * 0.3)
+    
+    # Final normalization with gentle exponent
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+        # Apply adaptive exponent
+        symmetric_scores = np.power(symmetric_scores, base_exp)
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    np.fill_diagonal(distance_matrix, 0)
+    
+    return symmetric_scores
+```

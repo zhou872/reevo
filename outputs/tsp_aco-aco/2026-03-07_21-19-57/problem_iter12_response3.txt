@@ -1,0 +1,294 @@
+```json
+{
+    "algorithm_features": ["Multi-Step Lookahead Regret Analysis", "Convex Hull Structural Priority", "Adaptive Component Weighting", "Global Cluster Boundary Detection"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import ConvexHull
+import itertools
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with:
+    1. Multi-step lookahead regret analysis evaluating chain reactions of edge selection
+    2. Global topological features including convex hull edges and betweenness centrality
+    3. Self-adaptive component weighting based on instance characteristics
+    4. Cluster boundary detection for inter-region connectivity
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions (0 = discouraged edge)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # 1. INSTANCE CHARACTERIZATION FOR ADAPTIVE WEIGHTING
+    # Compute statistical properties to guide component weighting
+    triu_distances = distance_matrix[np.triu_indices(n, 1)]
+    mean_dist = np.mean(triu_distances)
+    std_dist = np.std(triu_distances)
+    cv = std_dist / (mean_dist + 1e-8)
+    
+    # Spatial clustering indicator: median nearest neighbor ratio
+    nn_ratios = []
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        sorted_dists = np.sort(dists)[:3]  # 3 nearest neighbors
+        if len(sorted_dists) >= 2:
+            nn_ratios.append(sorted_dists[1] / (sorted_dists[0] + 1e-8))
+    clustering_factor = np.median(nn_ratios) if nn_ratios else 1.0
+    
+    # 2. MULTI-STEP LOOKAHEAD REGRET ANALYSIS (3-step chain)
+    # Evaluates the ripple effect of selecting an edge on subsequent choices
+    lookahead_regret = np.ones((n, n))
+    
+    # Adaptive lookahead depth based on instance size and variation
+    lookahead_depth = min(3, max(1, int(np.log2(n)) - 1))
+    
+    for i in range(n):
+        distances_i = distance_matrix[i, :].copy()
+        distances_i[i] = np.inf
+        
+        # Get sorted alternatives for node i
+        sorted_indices_i = np.argsort(distances_i)
+        sorted_distances_i = distances_i[sorted_indices_i]
+        
+        for rank_i, j in enumerate(sorted_indices_i):
+            if i >= j:  # Process each edge once (upper triangle)
+                continue
+                
+            current_dist = distance_matrix[i, j]
+            
+            # Step 1: Immediate alternatives at i and j
+            # Best alternative at i (excluding j)
+            if rank_i == 0:
+                alt_i = sorted_distances_i[1] if len(sorted_distances_i) > 1 else current_dist
+            else:
+                alt_i = sorted_distances_i[0]
+            
+            # Best alternative at j (excluding i)
+            distances_j = distance_matrix[j, :].copy()
+            distances_j[j] = np.inf
+            distances_j[i] = np.inf  # Exclude current edge
+            if np.any(distances_j < np.inf):
+                alt_j = np.min(distances_j[distances_j < np.inf])
+            else:
+                alt_j = current_dist
+            
+            immediate_regret = ((alt_i - current_dist) + (alt_j - current_dist)) / (2 * current_dist + 1e-8)
+            
+            # Step 2: Second-order effects (if depth >= 2)
+            second_order_regret = 0
+            if lookahead_depth >= 2:
+                # Consider the best alternative's alternatives
+                for node in [i, j]:
+                    # Find best alternative to this node (excluding the other endpoint)
+                    dists_node = distance_matrix[node, :].copy()
+                    dists_node[node] = np.inf
+                    dists_node[i if node == j else j] = np.inf
+                    if np.any(dists_node < np.inf):
+                        best_alt = np.min(dists_node[dists_node < np.inf])
+                        alt_node = np.argmin(dists_node)
+                        
+                        # Now find best alternative to that alternative
+                        dists_alt = distance_matrix[alt_node, :].copy()
+                        dists_alt[alt_node] = np.inf
+                        dists_alt[node] = np.inf  # Exclude the edge we're considering
+                        if np.any(dists_alt < np.inf):
+                            alt_of_alt = np.min(dists_alt[dists_alt < np.inf])
+                            chain_regret = (alt_of_alt - best_alt) / (current_dist + 1e-8)
+                            second_order_regret += 0.3 * chain_regret
+            
+            # Step 3: Third-order effects (if depth >= 3)
+            third_order_regret = 0
+            if lookahead_depth >= 3 and n > 10:
+                # Simplified global impact: how selection affects remaining graph connectivity
+                # Approximate by considering average distance increase in remaining graph
+                remaining_nodes = [k for k in range(n) if k not in [i, j]]
+                if len(remaining_nodes) > 2:
+                    # Crude approximation of tour completion cost
+                    avg_remaining_dist = np.mean([
+                        distance_matrix[i, k] + distance_matrix[j, k] 
+                        for k in remaining_nodes[:min(5, len(remaining_nodes))]
+                    ])
+                    global_impact = avg_remaining_dist / (current_dist + 1e-8)
+                    third_order_regret = 0.1 * np.tanh(global_impact - 1.0)
+            
+            # Combine multi-step regret components
+            total_regret = immediate_regret + second_order_regret + third_order_regret
+            lookahead_regret[i, j] = lookahead_regret[j, i] = 1.0 + 0.6 * np.tanh(total_regret)
+    
+    # 3. GLOBAL TOPOLOGICAL FEATURES
+    
+    # 3a. Convex Hull Approximation (for nodes that can form hull)
+    hull_priority = np.ones((n, n))
+    if n >= 3:
+        try:
+            # Use multidimensional scaling to approximate 2D positions
+            # Simple approximation: use node centrality as proxy for hull membership
+            centrality = 1.0 / (np.mean(distance_matrix, axis=1) + 1e-8)
+            centrality_norm = centrality / np.max(centrality)
+            
+            # Nodes with extreme centrality values are likely on convex hull
+            hull_threshold = np.percentile(centrality_norm, 85)
+            hull_candidates = np.where(centrality_norm >= hull_threshold)[0]
+            
+            if len(hull_candidates) >= 3:
+                # Boost edges between hull candidates
+                for i in range(n):
+                    for j in range(i+1, n):
+                        if (i in hull_candidates and j in hull_candidates):
+                            # Strong boost for potential hull edges
+                            hull_priority[i, j] = hull_priority[j, i] = 1.8
+                        elif (i in hull_candidates) != (j in hull_candidates):
+                            # Moderate boost for connections between hull and interior
+                            hull_priority[i, j] = hull_priority[j, i] = 1.3
+        except:
+            pass  # Fall back to uniform priority if hull detection fails
+    
+    # 3b. Betweenness Centrality Approximation
+    centrality_matrix = np.ones((n, n))
+    # Approximate centrality using inverse of average distance
+    node_centrality = 1.0 / (np.mean(distance_matrix, axis=1) + 1e-8)
+    node_centrality = node_centrality / np.max(node_centrality)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            # Boost edges connecting high-centrality nodes
+            centrality_score = 0.5 * (node_centrality[i] + node_centrality[j])
+            centrality_matrix[i, j] = centrality_matrix[j, i] = 0.8 + 0.4 * centrality_score
+    
+    # 4. CLUSTER BOUNDARY DETECTION
+    boundary_matrix = np.ones((n, n))
+    
+    # Detect potential cluster boundaries using distance gaps
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        sorted_dists = np.sort(dists)
+        
+        # Find significant gaps in distance distribution
+        if len(sorted_dists) >= 4:
+            gaps = sorted_dists[1:] - sorted_dists[:-1]
+            gap_ratios = gaps / (sorted_dists[:-1] + 1e-8)
+            
+            # Identify significant gap threshold
+            if np.max(gap_ratios) > 0.5:  # Significant gap exists
+                max_gap_idx = np.argmax(gap_ratios)
+                boundary_threshold = sorted_dists[max_gap_idx]
+                
+                for j in range(n):
+                    if i != j:
+                        dist_ij = distance_matrix[i, j]
+                        if dist_ij <= boundary_threshold:
+                            # Within cluster - moderate bonus
+                            boundary_matrix[i, j] *= 1.2
+                        else:
+                            # Cross-cluster connection - higher bonus for bridges
+                            boundary_matrix[i, j] *= 1.5
+    
+    # 5. ADAPTIVE COMPONENT WEIGHTING
+    # Determine component weights based on instance characteristics
+    
+    # Weight adjustment factors based on instance properties
+    if cv > 0.5:  # High variance - emphasize regret and centrality
+        w_regret = 0.35
+        w_centrality = 0.25
+        w_hull = 0.15
+        w_boundary = 0.15
+        w_base = 0.10
+    elif clustering_factor > 1.5:  # Clustered instance - emphasize boundaries
+        w_regret = 0.25
+        w_centrality = 0.20
+        w_hull = 0.15
+        w_boundary = 0.25
+        w_base = 0.15
+    else:  # Uniform or random instance
+        w_regret = 0.30
+        w_centrality = 0.20
+        w_hull = 0.20
+        w_boundary = 0.15
+        w_base = 0.15
+    
+    # Base component: inverse distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 0.2 * mean_dist)
+        inv_dist[np.diag_indices(n)] = 0
+    inv_dist_norm = inv_dist / (np.max(inv_dist) + 1e-8)
+    
+    # MST component (fixed boost)
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_boost = np.where(mst_mask, 1.4, 1.0)
+    
+    # 6. MULTIPLICATIVE COMBINATION WITH ADAPTIVE WEIGHTS
+    heuristic = (inv_dist_norm ** w_base) * \
+                (lookahead_regret ** w_regret) * \
+                (centrality_matrix ** w_centrality) * \
+                (hull_priority ** w_hull) * \
+                (boundary_matrix ** w_boundary) * \
+                mst_boost
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # 7. INTELLIGENT SPARSIFICATION WITH GLOBAL AWARENESS
+    
+    # Phase 1: Essential backbone (MST + high-regret edges)
+    essential_mask = mst_mask.copy()
+    
+    # Add high-regret edges (top 30% by regret score)
+    regret_scores = lookahead_regret.copy()
+    np.fill_diagonal(regret_scores, -np.inf)
+    regret_threshold = np.percentile(regret_scores[regret_scores > -np.inf], 70)
+    high_regret = regret_scores > regret_threshold
+    essential_mask = essential_mask | high_regret
+    
+    # Phase 2: Global connectivity preservation
+    # Ensure each node has at least 3 connections in essential mask
+    for i in range(n):
+        connections = np.sum(essential_mask[i, :]) - 1  # Exclude self
+        if connections < 3:
+            # Add nearest neighbors not already connected
+            dists = distance_matrix[i, :].copy()
+            dists[i] = np.inf
+            dists[essential_mask[i, :]] = np.inf  # Mask already connected
+            nearest = np.argsort(dists)[:3-connections]
+            essential_mask[i, nearest] = True
+            essential_mask[nearest, i] = True
+    
+    # Phase 3: Strategic edge addition based on global structure
+    # Add edges that connect different regions (high boundary scores)
+    boundary_scores = boundary_matrix.copy()
+    np.fill_diagonal(boundary_scores, -np.inf)
+    boundary_threshold = np.percentile(boundary_scores[boundary_scores > -np.inf], 80)
+    high_boundary = boundary_scores > boundary_threshold
+    
+    # Also preserve potential convex hull edges
+    hull_edges = hull_priority > 1.5
+    
+    final_mask = essential_mask | high_boundary | hull_edges
+    
+    # Apply final sparsification mask
+    heuristic = heuristic * final_mask
+    
+    # Final normalization to [0, 1] range
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    np.fill_diagonal(heuristic, 0)
+    return heuristic
+```

@@ -1,0 +1,273 @@
+```json
+{
+    "algorithm_features": ["Adaptive Graph Sparsity Weighting", "Three-hop Regret Penalty with Instance Adaptation", "Structural Connectivity Bonus", "Topological Feature Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization heuristic with adaptive instance-specific
+    weighting, regret-based learning simulation, and topological feature fusion.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Instance-Specific Adaptive Parameterization ====================
+    # Compute graph sparsity metrics for adaptive behavior
+    instance_density = np.mean([np.mean(np.sort(row)[1:4]) for row in distance_matrix])
+    instance_variance = np.var(distance_matrix)
+    instance_sparsity = instance_density / (np.mean(distance_matrix) + 1e-10)
+    
+    # Adaptive k for neighborhood selection based on instance characteristics
+    base_k = max(3, int(np.log2(n)))
+    if instance_sparsity < 0.3:  # Dense graph
+        k = min(base_k + 2, n - 1)
+    elif instance_sparsity > 1.5:  # Sparse graph
+        k = max(3, base_k - 1)
+    else:
+        k = base_k
+    
+    # Adaptive lookahead depth based on instance size and variance
+    lookahead_depth = min(max(3, int(np.sqrt(n))), 6)
+    if instance_variance > np.mean(distance_matrix) ** 2:
+        lookahead_depth = min(lookahead_depth, 4)  # Reduce for high-variance instances
+    
+    # ==================== 2. Adaptive Symmetric Sparsification ====================
+    mask = np.zeros((n, n), dtype=bool)
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        nn_indices = sorted_indices[i, 1:k+1]
+        mask[i, nn_indices] = True
+    
+    # Ensure bidirectionality
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    # ==================== 3. Topological Feature Extraction ====================
+    # Minimum Spanning Tree structural importance
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = mst > 0
+    mst_bonus = np.ones_like(distance_matrix)
+    mst_bonus[mst_mask] = 1.3 + 0.1 * instance_sparsity
+    
+    # Local clustering coefficient (density measure)
+    cluster_coeff = np.zeros(n)
+    for i in range(n):
+        neighbors = np.where(mask[i])[0]
+        if len(neighbors) < 2:
+            cluster_coeff[i] = 0
+            continue
+        
+        triangles = 0
+        for idx, n1 in enumerate(neighbors):
+            for n2 in neighbors[idx+1:]:
+                if mask[n1, n2]:
+                    triangles += 1
+        
+        max_triangles = len(neighbors) * (len(neighbors) - 1) / 2
+        cluster_coeff[i] = triangles / max_triangles if max_triangles > 0 else 0
+    
+    # Adaptive centrality measure based on instance sparsity
+    centrality = np.zeros(n)
+    for i in range(n):
+        valid_dists = distance_matrix[i, mask[i]]
+        if len(valid_dists) > 0:
+            if instance_sparsity < 0.5:  # Dense: use harmonic mean
+                centrality[i] = len(valid_dists) / (np.sum(1.0 / (valid_dists + 1e-10)) + 1e-10)
+            else:  # Sparse: use arithmetic mean
+                centrality[i] = len(valid_dists) / (np.mean(valid_dists) + 1e-10)
+    
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # ==================== 4. Regret-Based Inverse Distance Scoring ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Precompute instance-level regret baseline
+    all_dists = distance_matrix[distance_matrix > 0]
+    regret_baseline = np.percentile(all_dists, 25) if len(all_dists) > 0 else np.mean(distance_matrix)
+    
+    for i in range(n):
+        valid_mask = mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Regret-aware ranking: penalize edges much worse than baseline
+            regret_weights = np.ones_like(valid_dists)
+            regret_mask = valid_dists > 1.5 * regret_baseline
+            regret_weights[regret_mask] = np.exp(-(valid_dists[regret_mask] / regret_baseline - 1.5))
+            
+            # Combined with traditional rank-based weighting
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            rank_weights = np.exp(-0.3 * (ranks - 1))
+            
+            weights = rank_weights * regret_weights
+            weights = weights / (np.sum(weights) + 1e-10)
+            
+            # Inverse distance with topological adaptation
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            
+            # Adjust for local density and centrality
+            local_factor = 1.0 + 0.25 * cluster_coeff[i] + 0.15 * centrality[i]
+            if instance_sparsity > 1.0:
+                local_factor *= 1.1  # Boost for sparse instances
+            
+            inv_dist[i, valid_mask] = inv_vals * weights * local_factor
+    
+    # Apply MST bonus and symmetrize
+    inv_dist = inv_dist * mst_bonus
+    inv_dist = 0.5 * (inv_dist + inv_dist.T)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ==================== 5. Extended Lookahead with Adaptive Regret ====================
+    penalty = np.ones_like(distance_matrix)
+    
+    # Precompute top neighbors for efficient lookahead
+    top_neighbors = sorted_indices[:, 1:lookahead_depth+2]
+    
+    for i in range(n):
+        valid_j = np.where(mask[i] & (i < np.arange(n)))[0]
+        if len(valid_j) == 0:
+            continue
+        
+        i_neighbors = top_neighbors[i]
+        
+        for j in valid_j:
+            j_neighbors = top_neighbors[j]
+            direct_dist = distance_matrix[i, j]
+            
+            if direct_dist < 1e-10:
+                continue
+            
+            # Multi-hop alternative analysis
+            best_alternative = np.inf
+            
+            # Two-hop alternatives
+            candidates_2hop = np.unique(np.concatenate([i_neighbors, j_neighbors]))
+            candidates_2hop = candidates_2hop[(candidates_2hop != i) & (candidates_2hop != j)]
+            
+            if len(candidates_2hop) > 0:
+                two_hop_dists = distance_matrix[i, candidates_2hop] + distance_matrix[candidates_2hop, j]
+                best_alternative = min(best_alternative, np.min(two_hop_dists))
+            
+            # Three-hop alternatives (limited for efficiency)
+            k_three = min(3, lookahead_depth)
+            for k in i_neighbors[:k_three]:
+                if k == i or k == j:
+                    continue
+                
+                k_top = top_neighbors[k]
+                valid_k = k_top[(k_top != i) & (k_top != j) & (k_top != k)]
+                
+                if len(valid_k) > 0:
+                    three_hop_dists = (distance_matrix[i, k] + 
+                                      distance_matrix[k, valid_k] + 
+                                      distance_matrix[valid_k, j])
+                    current_best = np.min(three_hop_dists) if len(three_hop_dists) > 0 else np.inf
+                    best_alternative = min(best_alternative, current_best)
+            
+            # Regret-based penalty calculation
+            if best_alternative < np.inf:
+                regret_ratio = best_alternative / direct_dist
+                
+                # Adaptive penalty thresholds based on instance characteristics
+                if instance_sparsity < 0.5:  # Dense: stricter penalties
+                    if regret_ratio < 1.3:
+                        penalty_val = 0.3
+                    elif regret_ratio < 2.0:
+                        penalty_val = 0.3 + 0.5 * ((regret_ratio - 1.3) / 0.7)
+                    else:
+                        penalty_val = 0.8 + 0.2 * np.tanh((regret_ratio - 2.0) * 0.5)
+                else:  # Sparse: more lenient penalties
+                    if regret_ratio < 1.5:
+                        penalty_val = 0.4
+                    elif regret_ratio < 2.5:
+                        penalty_val = 0.4 + 0.4 * ((regret_ratio - 1.5) / 1.0)
+                    else:
+                        penalty_val = 0.8 + 0.2 * np.tanh((regret_ratio - 2.5) * 0.3)
+                
+                # Adjust based on node centrality
+                centrality_factor = 0.6 + 0.4 * (centrality[i] + centrality[j]) / 2
+                penalty_val = penalty_val ** centrality_factor
+                
+                penalty[i, j] = penalty_val
+                penalty[j, i] = penalty_val
+    
+    # ==================== 6. Structural Connectivity Bonus ====================
+    connectivity_bonus = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        i_neighbors = set(np.where(mask[i])[0])
+        for j in range(i+1, n):
+            if mask[i, j]:
+                j_neighbors = set(np.where(mask[j])[0])
+                overlap = len(i_neighbors.intersection(j_neighbors))
+                total = len(i_neighbors.union(j_neighbors))
+                
+                if total > 0:
+                    similarity = overlap / total
+                    
+                    # Adaptive bonus based on instance sparsity
+                    if instance_sparsity < 0.7:  # Dense: reward bridging
+                        bonus = 1.0 + 0.4 * (1 - similarity)
+                    else:  # Sparse: moderate bridging
+                        bonus = 1.0 + 0.2 * (1 - similarity)
+                    
+                    connectivity_bonus[i, j] = connectivity_bonus[j, i] = bonus
+    
+    # ==================== 7. Adaptive Feature Fusion ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Instance-adaptive weighting of components
+    if instance_sparsity < 0.5:
+        # Dense graphs: emphasize penalty and connectivity
+        base_scores = inv_dist * (0.6 * penalty + 0.4 * connectivity_bonus)
+    elif instance_sparsity > 1.2:
+        # Sparse graphs: emphasize base scores
+        base_scores = inv_dist * (0.3 * penalty + 0.7 * connectivity_bonus)
+    else:
+        # Balanced approach
+        base_scores = inv_dist * (0.5 * penalty + 0.5 * connectivity_bonus)
+    
+    # Apply only to edges in mask
+    heuristics[mask] = base_scores[mask]
+    
+    # ==================== 8. Robust Normalization and Post-processing ====================
+    # Adaptive smoothing to handle edge cases
+    min_nonzero = np.min(heuristics[heuristics > 0]) if np.any(heuristics > 0) else 1e-10
+    heuristics[mask] += 0.05 * min_nonzero
+    
+    # Row normalization with stability
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    if np.any(zero_rows):
+        heuristics[zero_rows] = 1.0 / (n - 1)
+        heuristics[zero_rows, np.arange(n)[zero_rows]] = 0
+        row_sums[zero_rows] = 1
+    
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization with harmonic mean for stability
+    non_zero_pairs = (heuristics > 0) & (heuristics.T > 0)
+    harmonic_mean = 2 * heuristics * heuristics.T / (heuristics + heuristics.T + 1e-10)
+    heuristics = np.where(non_zero_pairs, harmonic_mean, 0.5 * (heuristics + heuristics.T))
+    
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

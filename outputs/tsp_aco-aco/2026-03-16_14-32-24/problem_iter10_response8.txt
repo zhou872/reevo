@@ -1,0 +1,337 @@
+```json
+{
+    "algorithm_features": ["Three-Step Chain Lookahead", "Spectral Graph Partitioning", "Adaptive Multi-Objective Weighting", "Distance Gradient Analysis"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with three-step lookahead, spectral clustering,
+    and adaptive multi-objective optimization.
+    
+    Core innovations:
+    1. Three-step chain evaluation for deeper local efficiency assessment
+    2. Spectral graph partitioning for structural analysis
+    3. Distance gradient analysis for adaptive normalization
+    4. Multi-objective weighting with instance-aware adaptation
+    
+    Returns:
+        Heuristic matrix [0,1] where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix
+    dmat = distance_matrix.copy().astype(np.float64)
+    np.fill_diagonal(dmat, np.inf)
+    eps = 1e-12
+    
+    # ========== INSTANCE CHARACTERIZATION ==========
+    flat_dist = dmat[np.isfinite(dmat)]
+    if len(flat_dist) == 0:
+        return np.zeros_like(distance_matrix)
+    
+    dist_mean = np.mean(flat_dist)
+    dist_std = np.std(flat_dist)
+    dist_q25, dist_q75 = np.percentile(flat_dist, [25, 75])
+    iqr = dist_q75 - dist_q25
+    
+    # Instance classification
+    is_uniform = dist_std / (dist_mean + eps) < 0.25
+    is_clustered = iqr / (dist_mean + eps) > 0.6
+    compactness = dist_std / (dist_mean + eps)
+    
+    # Adaptive parameters based on instance size and structure
+    if n < 100:
+        lookahead_steps = 3
+        spectral_clusters = min(8, max(3, n // 10))
+        candidate_edges = min(15, n-1)
+    elif n < 1000:
+        lookahead_steps = 3
+        spectral_clusters = min(12, max(4, n // 50))
+        candidate_edges = min(12, n-1)
+    else:
+        lookahead_steps = 2  # Reduce for computational efficiency
+        spectral_clusters = min(20, max(6, n // 100))
+        candidate_edges = min(10, n-1)
+    
+    # ========== DISTANCE GRADIENT ANALYSIS ==========
+    # Analyze local distance patterns for adaptive normalization
+    gradient_scores = np.zeros_like(dmat)
+    
+    for i in range(n):
+        if n <= 2:
+            continue
+            
+        # Get sorted distances from node i
+        sorted_dists = np.sort(dmat[i])
+        valid_dists = sorted_dists[np.isfinite(sorted_dists)]
+        
+        if len(valid_dists) < 3:
+            continue
+            
+        # Compute gradient (rate of distance increase)
+        diffs = np.diff(valid_dists[:10])
+        if len(diffs) > 0:
+            avg_gradient = np.mean(diffs) if np.sum(diffs) > 0 else 1.0
+            
+            # Score edges based on gradient-normalized distance
+            for j in range(n):
+                if i != j and not np.isinf(dmat[i, j]):
+                    # Normalize distance by local gradient
+                    rank = np.searchsorted(valid_dists, dmat[i, j])
+                    expected_dist = valid_dists[0] + avg_gradient * rank
+                    
+                    if expected_dist > 0:
+                        gradient_score = expected_dist / (dmat[i, j] + eps)
+                        gradient_scores[i, j] = np.clip(gradient_score, 0.5, 2.0)
+    
+    # Symmetrize gradient scores
+    gradient_scores = np.maximum(gradient_scores, gradient_scores.T)
+    
+    # ========== THREE-STEP CHAIN LOOKAHEAD ==========
+    chain_scores = np.zeros_like(dmat)
+    
+    # Precompute nearest neighbors for efficiency
+    k_neighbors = min(20, n-1)
+    neighbor_indices = np.argsort(dmat, axis=1)[:, 1:k_neighbors+1]
+    
+    for i in range(min(n, 300)):  # Limit computation for large instances
+        for j_idx, j in enumerate(neighbor_indices[i][:candidate_edges]):
+            if i == j or np.isinf(dmat[i, j]):
+                continue
+            
+            # Direct cost of edge (i,j)
+            direct_cost = dmat[i, j]
+            
+            # Evaluate three-step chains through (i,j)
+            best_chain_cost = np.inf
+            
+            # Consider chains of form: k -> i -> j -> l
+            # Get candidates for k (predecessor) and l (successor)
+            k_candidates = neighbor_indices[i][:min(8, len(neighbor_indices[i]))]
+            l_candidates = neighbor_indices[j][:min(8, len(neighbor_indices[j]))]
+            
+            for k in k_candidates:
+                if k == j or np.isinf(dmat[k, i]):
+                    continue
+                    
+                for l in l_candidates:
+                    if l == i or l == k or np.isinf(dmat[j, l]):
+                        continue
+                    
+                    # Calculate chain cost: k-i + i-j + j-l
+                    chain_cost = dmat[k, i] + direct_cost + dmat[j, l]
+                    
+                    # Compare with alternative two-edge path: k-l directly or through other nodes
+                    direct_kl = dmat[k, l]
+                    alt_paths = []
+                    
+                    # Alternative through other nodes
+                    for m in neighbor_indices[k][:3]:
+                        if m != i and m != j and m != l:
+                            alt_cost = dmat[k, m] + dmat[m, l]
+                            alt_paths.append(alt_cost)
+                    
+                    if len(alt_paths) > 0:
+                        best_alt = min(direct_kl, min(alt_paths))
+                    else:
+                        best_alt = direct_kl
+                    
+                    if best_alt > 0:
+                        chain_quality = best_alt / (chain_cost + eps)
+                        if chain_quality > 0:
+                            best_chain_cost = min(best_chain_cost, 1.0 / chain_quality)
+            
+            if best_chain_cost < np.inf and direct_cost > 0:
+                # Normalize by direct cost
+                chain_value = direct_cost / (best_chain_cost + eps)
+                chain_scores[i, j] = np.clip(chain_value, 0.1, 2.0)
+    
+    chain_scores = np.maximum(chain_scores, chain_scores.T)
+    
+    # ========== SPECTRAL GRAPH PARTITIONING ==========
+    structural_bonus = np.zeros_like(dmat)
+    
+    if n >= 4 and n <= 2000:  # Spectral clustering feasible range
+        try:
+            # Use normalized Laplacian for spectral embedding
+            from scipy.sparse.csgraph import laplacian
+            
+            # Create affinity matrix (Gaussian kernel on distances)
+            sigma = np.median(flat_dist) * 0.5
+            affinity = np.exp(-dmat**2 / (2 * sigma**2))
+            np.fill_diagonal(affinity, 0)
+            
+            # Compute normalized Laplacian
+            L = laplacian(affinity, normed=True)
+            
+            # Compute eigenvectors (k smallest eigenvalues)
+            from scipy.sparse.linalg import eigsh
+            k = min(spectral_clusters, n-1)
+            
+            if k >= 2:
+                eigenvalues, eigenvectors = eigsh(L, k=k, which='SM')
+                
+                # Use k-means on eigenvectors for clustering
+                from sklearn.cluster import KMeans
+                if eigenvectors.shape[0] >= k:
+                    kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+                    clusters = kmeans.fit_predict(eigenvectors)
+                    
+                    # Assign bonus for intra-cluster edges
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            if clusters[i] == clusters[j]:
+                                # Bonus proportional to cluster density
+                                cluster_size = np.sum(clusters == clusters[i])
+                                density_bonus = 0.3 / (1 + np.sqrt(cluster_size) / 5)
+                                structural_bonus[i, j] = density_bonus
+                                structural_bonus[j, i] = density_bonus
+        except:
+            # Fallback to distance-based clustering
+            if n <= 500:
+                threshold = np.percentile(flat_dist, 40)
+                cluster_id = -np.ones(n, dtype=int)
+                cluster_count = 0
+                
+                for i in range(n):
+                    if cluster_id[i] == -1:
+                        cluster_id[i] = cluster_count
+                        stack = [i]
+                        
+                        while stack:
+                            node = stack.pop()
+                            close_neighbors = np.where((dmat[node] < threshold) & 
+                                                      (cluster_id == -1))[0]
+                            for neighbor in close_neighbors:
+                                cluster_id[neighbor] = cluster_count
+                                stack.append(neighbor)
+                        
+                        cluster_count += 1
+                
+                # Bonus for intra-cluster edges
+                for i in range(n):
+                    for j in range(i+1, n):
+                        if cluster_id[i] == cluster_id[j] and cluster_id[i] != -1:
+                            structural_bonus[i, j] = 0.2
+                            structural_bonus[j, i] = 0.2
+    
+    # ========== ADAPTIVE MULTI-OBJECTIVE WEIGHTING ==========
+    # Compute base inverse distance
+    scale = np.median(flat_dist)
+    inv_dist = scale / (dmat + scale * 0.05)
+    
+    # Compute instance-aware component weights
+    if is_uniform:
+        chain_weight = 0.4
+        gradient_weight = 0.3
+        structure_weight = 0.2
+        mst_weight = 0.1
+    elif is_clustered:
+        chain_weight = 0.3
+        gradient_weight = 0.2
+        structure_weight = 0.4
+        mst_weight = 0.1
+    else:
+        chain_weight = 0.35
+        gradient_weight = 0.3
+        structure_weight = 0.25
+        mst_weight = 0.1
+    
+    # Combine components with adaptive weights
+    heuristics_matrix = inv_dist.copy()
+    
+    # Apply chain lookahead score
+    chain_factor = 1.0 + (chain_scores - 1.0) * chain_weight
+    heuristics_matrix *= chain_factor
+    
+    # Apply gradient analysis
+    gradient_factor = 1.0 + (gradient_scores - 1.0) * gradient_weight
+    heuristics_matrix *= gradient_factor
+    
+    # Apply structural bonus
+    heuristics_matrix *= (1.0 + structural_bonus * structure_weight)
+    
+    # Add MST bias
+    if n <= 2000:
+        try:
+            mst = minimum_spanning_tree(dmat).toarray()
+            mst_edges = (mst + mst.T) > 0
+            heuristics_matrix[mst_edges] *= (1.0 + mst_weight)
+        except:
+            pass
+    
+    # ========== INTELLIGENT SPARSIFICATION ==========
+    # Dynamic candidate selection
+    edges_per_node = max(3, min(candidate_edges, int(np.sqrt(n)) + 3))
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        if np.all(scores <= 0):
+            # Fallback to nearest neighbors
+            top_idx = np.argsort(dmat[i])[1:edges_per_node+1]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Adaptive threshold based on score distribution
+            non_zero = scores[scores > 0]
+            if len(non_zero) >= edges_per_node:
+                threshold = np.partition(non_zero, -edges_per_node)[-edges_per_node]
+                candidate_mask[i, scores >= threshold] = True
+            else:
+                top_idx = np.argsort(scores)[-edges_per_node:]
+                candidate_mask[i, top_idx] = True
+    
+    # Ensure symmetry and minimum connectivity
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < 2:
+            nearest = np.argsort(dmat[i])[1:3]
+            candidate_mask[i, nearest] = True
+            candidate_mask[nearest, i] = True
+    
+    # Apply mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # ========== FINAL NORMALIZATION ==========
+    # Symmetrize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # Row-wise adaptive softmax
+    for i in range(n):
+        row = heuristics_matrix[i]
+        if np.sum(row) > eps:
+            # Adaptive temperature based on row statistics
+            nonzeros = row[row > eps]
+            if len(nonzeros) > 1:
+                row_mean = np.mean(nonzeros)
+                row_std = np.std(nonzeros)
+                if row_std > 0:
+                    temperature = max(0.1, row_std / row_mean)
+                    exp_row = np.exp(row / temperature)
+                    row_sum = np.sum(exp_row)
+                    if row_sum > eps:
+                        heuristics_matrix[i] = exp_row / row_sum
+    
+    # Global normalization
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    heuristics_matrix = np.clip(heuristics_matrix, 0.0, 1.0)
+    
+    return heuristics_matrix
+```

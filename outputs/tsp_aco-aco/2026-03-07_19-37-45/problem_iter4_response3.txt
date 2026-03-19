@@ -1,0 +1,312 @@
+```json
+{
+    "algorithm_features": ["Two-hop Regret Penalty", "Adaptive Concentration Scaling", "Local Clustering Bonus", "Degree-Constrained Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import squareform, pdist
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with simplified multi-hop lookahead and 
+    adaptive parameter optimization.
+    
+    Key improvements:
+    1. Two-hop regret computation for better alternative path consideration
+    2. Adaptive parameter tuning based on problem size and structure
+    3. Optimized multi-factor combination with size-aware weights
+    4. Efficient sparsification with connectivity preservation
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # ====================
+    # Adaptive Parameter Tuning
+    # ====================
+    
+    # Analyze problem characteristics for adaptive parameters
+    flat_distances = distance_matrix[np.triu_indices(n, k=1)]
+    distance_mean = np.mean(flat_distances) if len(flat_distances) > 0 else 1.0
+    distance_std = np.std(flat_distances) if len(flat_distances) > 0 else 0.0
+    
+    # Concentration metric: low std/mean = more uniform distances
+    concentration = distance_std / (distance_mean + 1e-12)
+    
+    # Size-aware parameters
+    if n < 20:
+        k_regret = 4
+        k_density = 6
+        k_nn = max(3, n // 3)
+        power_min, power_max = 1.2, 2.0
+        lookahead_factor = 0.7  # Weight for 2-hop lookahead
+    elif n < 100:
+        k_regret = 5
+        k_density = 8
+        k_nn = max(3, n // 8)
+        power_min, power_max = 1.3, 2.2
+        lookahead_factor = 0.6
+    else:
+        k_regret = min(6, n // 20)
+        k_density = min(10, n // 15)
+        k_nn = max(3, n // 12)
+        power_min, power_max = 1.5, 2.5
+        lookahead_factor = 0.5
+    
+    # ====================
+    # 1. Base Inverse Distance with Adaptive Scaling
+    # ====================
+    
+    # Dynamic power based on concentration
+    power = power_min + (power_max - power_min) * np.exp(-concentration)
+    inv_dist = 1 / (distance_matrix + 1e-12)
+    inv_dist_pow = inv_dist ** power
+    
+    # ====================
+    # 2. Enhanced Regret-based Penalty with 2-Hop Lookahead
+    # ====================
+    
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    # For efficiency, precompute nearest neighbors for each node
+    nn_indices = np.zeros((n, k_regret + 2), dtype=int)
+    nn_distances = np.zeros((n, k_regret + 2))
+    
+    for i in range(n):
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        
+        # Get k_regret+2 nearest neighbors
+        k_temp = min(k_regret + 2, n - 1)
+        indices = np.argpartition(distances_i, k_temp)[:k_temp]
+        sorted_idx = indices[np.argsort(distances_i[indices])]
+        
+        nn_indices[i, :len(sorted_idx)] = sorted_idx
+        nn_distances[i, :len(sorted_idx)] = distances_i[sorted_idx]
+    
+    # Compute 1-hop and 2-hop regret
+    for i in range(n):
+        # Get valid neighbors (excluding self)
+        valid_nn = nn_indices[i][nn_indices[i] != i]
+        if len(valid_nn) == 0:
+            continue
+        
+        # 1-hop regret calculation
+        if len(valid_nn) > k_regret:
+            kth_best_1hop = nn_distances[i, k_regret]
+        else:
+            kth_best_1hop = nn_distances[i, -1] if len(valid_nn) > 0 else np.inf
+        
+        # For each edge from i, compute combined 1-hop and 2-hop regret
+        for j_idx, j in enumerate(valid_nn):
+            if i == j:
+                continue
+            
+            dist_ij = distance_matrix[i, j]
+            
+            # 1-hop regret
+            if dist_ij <= nn_distances[i, min(k_regret, len(valid_nn)-1)]:
+                # Edge is in top-k, use (k+1)th as alternative
+                regret_1hop = max(0, dist_ij - kth_best_1hop)
+            else:
+                # Edge is not in top-k, use kth as alternative
+                regret_1hop = max(0, dist_ij - nn_distances[i, min(k_regret-1, len(valid_nn)-1)])
+            
+            # 2-hop regret: look for best alternative 2-hop path i->k->j
+            best_2hop = np.inf
+            
+            # Consider intermediate nodes from both i and j's neighborhoods
+            candidates_i = valid_nn[:min(k_regret+1, len(valid_nn))]
+            candidates_j = nn_indices[j][:min(k_regret+1, n-1)]
+            candidates_j = candidates_j[candidates_j != i]
+            
+            # Combine and deduplicate
+            all_candidates = np.unique(np.concatenate([candidates_i, candidates_j]))
+            
+            for k in all_candidates:
+                if k == i or k == j:
+                    continue
+                
+                # Check if both edges i->k and k->j exist (non-zero in distance matrix)
+                path_length = distance_matrix[i, k] + distance_matrix[k, j]
+                best_2hop = min(best_2hop, path_length)
+            
+            # Compute 2-hop regret
+            regret_2hop = max(0, dist_ij - best_2hop / 2) if best_2hop < np.inf else 0
+            
+            # Combined regret (weighted average)
+            regret_combined = (1 - lookahead_factor) * regret_1hop + lookahead_factor * regret_2hop
+            
+            # Normalize and apply penalty
+            if dist_ij > 0:
+                regret_norm = regret_combined / (dist_ij + 1e-12)
+                # Sigmoid penalty: higher regret -> lower score
+                regret_matrix[i, j] *= 1 / (1 + np.exp(5 * regret_norm))
+    
+    # Symmetrize regret matrix
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # ====================
+    # 3. Local Cluster Density with Adaptive Neighborhood
+    # ====================
+    
+    density_factor = np.ones_like(distance_matrix)
+    k_density = min(k_density, n - 1)
+    
+    if k_density > 0:
+        # Precompute local densities for each node
+        local_densities = np.zeros(n)
+        
+        for i in range(n):
+            distances_i = distance_matrix[i].copy()
+            distances_i[i] = np.inf
+            
+            # Get k_density nearest neighbors
+            nn_idx = np.argpartition(distances_i, k_density)[:k_density]
+            nn_dists = distances_i[nn_idx]
+            
+            if len(nn_dists) > 0:
+                # Density = inverse of average distance to neighbors
+                local_densities[i] = 1 / (np.mean(nn_dists) + 1e-12)
+            else:
+                local_densities[i] = 0
+        
+        # Normalize densities
+        if np.max(local_densities) > 0:
+            local_densities = local_densities / np.max(local_densities)
+        
+        # Apply density factor to edges
+        for i in range(n):
+            for j in range(i+1, n):
+                # Boost edges between nodes in dense regions
+                density_score = (local_densities[i] + local_densities[j]) / 2
+                # Non-linear boosting for high-density regions
+                boost = 1.0 + 0.3 * density_score ** 2
+                density_factor[i, j] = boost
+                density_factor[j, i] = boost
+    
+    # ====================
+    # 4. Degree-Aware Normalization
+    # ====================
+    
+    node_avg_dist = np.mean(distance_matrix, axis=1)
+    node_weights = node_avg_dist.max() / (node_avg_dist + 1e-12)
+    degree_matrix = np.outer(node_weights, node_weights)
+    
+    # ====================
+    # 5. Combine All Factors
+    # ====================
+    
+    heuristics_matrix = inv_dist_pow * regret_matrix * density_factor * degree_matrix
+    
+    # ====================
+    # 6. Adaptive Sparsification with Connectivity Guarantee
+    # ====================
+    
+    # a) Adaptive nearest neighbor mask
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        
+        if k_nn < n - 1:
+            nn_idx = np.argpartition(distances_i, k_nn)[:k_nn]
+        else:
+            nn_idx = np.arange(n)
+            nn_idx = nn_idx[nn_idx != i]
+        
+        nn_mask[i, nn_idx] = True
+    
+    # Symmetrize
+    nn_mask = nn_mask | nn_mask.T
+    
+    # b) Distance threshold based on adaptive quantile
+    if len(flat_distances) > 0:
+        # More aggressive sparsification for larger problems
+        if n > 50:
+            quantile = 0.6
+        elif n > 20:
+            quantile = 0.65
+        else:
+            quantile = 0.7
+            
+        threshold = np.quantile(flat_distances, quantile)
+        dist_mask = distance_matrix <= threshold
+        np.fill_diagonal(dist_mask, False)
+    else:
+        dist_mask = np.ones_like(distance_matrix, dtype=bool)
+        np.fill_diagonal(dist_mask, False)
+    
+    # c) Combined mask
+    combined_mask = nn_mask & dist_mask
+    heuristics_matrix = heuristics_matrix * combined_mask
+    
+    # d) Ensure minimum connectivity (at least 2 edges per node)
+    min_degree = min(2, n - 1)
+    for i in range(n):
+        non_zero = np.where(heuristics_matrix[i] > 0)[0]
+        if len(non_zero) < min_degree:
+            # Use combined score before masking to find best additional edges
+            combined_score = inv_dist_pow[i] * regret_matrix[i] * density_factor[i] * degree_matrix[i]
+            combined_score[i] = 0
+            
+            # Select top edges not already included
+            sorted_indices = np.argsort(combined_score)[::-1]
+            added = 0
+            for j in sorted_indices:
+                if j != i and heuristics_matrix[i, j] == 0:
+                    heuristics_matrix[i, j] = combined_score[j]
+                    heuristics_matrix[j, i] = combined_score[j]
+                    added += 1
+                    if added >= min_degree - len(non_zero):
+                        break
+    
+    # ====================
+    # 7. Final Processing
+    # ====================
+    
+    # Symmetrize
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    
+    # Normalize to [0, 1]
+    max_val = heuristics_matrix.max()
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # Zero diagonal
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+
+
+# Example usage and validation
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_cities = 15
+    coords = np.random.rand(n_cities, 2) * 100
+    
+    # Create distance matrix
+    distances = squareform(pdist(coords, 'euclidean'))
+    
+    # Compute heuristics
+    h_matrix = heuristics_v2(distances)
+    
+    print("Problem size:", n_cities)
+    print("Distance matrix shape:", distances.shape)
+    print("Heuristics matrix shape:", h_matrix.shape)
+    print(f"\nSparsity (zero entries): {(h_matrix == 0).sum() / h_matrix.size:.1%}")
+    print(f"Non-zero entries: {(h_matrix != 0).sum()}")
+    print(f"Average degree per node: {np.sum(h_matrix > 0) / n_cities:.1f}")
+    print(f"\nTop 5 edges by heuristic value:")
+    
+    # Find top edges
+    triu_indices = np.triu_indices_from(h_matrix, k=1)
+    top_indices = np.argsort(h_matrix[triu_indices])[-5:][::-1]
+    
+    for idx in top_indices:
+        i, j = triu_indices[0][idx], triu_indices[1][idx]
+        print(f"  Edge ({i}, {j}): distance={distances[i, j]:.2f}, heuristic={h_matrix[i, j]:.4f}")
+```

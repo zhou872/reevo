@@ -1,0 +1,215 @@
+```json
+{
+    "algorithm_features": ["Lightweight Spectral Clustering Penalty", "Dynamic Regret Order Adaptation", "Harmonic Centrality Edge Balancing", "Fused Multiplicative-Additive Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.linalg import eigsh
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection with adaptive spectral features
+    and dynamic regret scaling based on graph density.
+    
+    Key improvements over v1:
+    1. Lightweight spectral clustering for cluster-aware penalties
+    2. Dynamic regret order adaptation based on graph density
+    3. Optimized combination of multiplicative and additive factors
+    4. Efficient vectorized operations throughout
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, indicating edge promise.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    
+    # 1. Base inverse distance heuristic
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Dynamic regret order based on graph density
+    regret_penalty = np.ones_like(distance_matrix)
+    
+    # Analyze graph density for dynamic order selection
+    dist_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(dist_flat)
+    dist_std = np.std(dist_flat)
+    cv = dist_std / (dist_mean + epsilon)  # Coefficient of variation
+    
+    # Determine optimal regret order based on density characteristics
+    if cv < 0.3:  # Uniform distances
+        regret_order = 2
+    elif cv < 0.7:  # Moderate variation
+        regret_order = min(3, n - 1)
+    else:  # High variation
+        regret_order = min(4, n - 1)
+    
+    # Vectorized regret computation with adaptive order
+    dist_with_inf = distance_matrix.copy()
+    np.fill_diagonal(dist_with_inf, np.inf)
+    
+    # Find k-nearest neighbors for each node
+    k = min(regret_order + 2, n - 1)
+    sorted_indices = np.argsort(dist_with_inf, axis=1)[:, :k]
+    sorted_values = np.take_along_axis(dist_with_inf, sorted_indices, axis=1)
+    
+    # Compute adaptive regret metrics
+    best_dists = sorted_values[:, 0]
+    reference_dists = np.zeros_like(best_dists)
+    
+    for i in range(n):
+        if regret_order < sorted_values.shape[1]:
+            reference_dists[i] = sorted_values[i, regret_order]
+        else:
+            reference_dists[i] = sorted_values[i, -1]
+    
+    # Spread regularization prevents division by zero
+    spread = np.maximum(epsilon, reference_dists - best_dists)
+    
+    # Vectorized regret penalty computation
+    regret_i = dist_with_inf - best_dists[:, np.newaxis]
+    penalty_i = 1.0 / (1.0 + regret_i / spread[:, np.newaxis])
+    
+    regret_j = dist_with_inf - best_dists[np.newaxis, :]
+    penalty_j = 1.0 / (1.0 + regret_j / spread[np.newaxis, :])
+    
+    # Symmetric geometric mean
+    regret_penalty = np.sqrt(penalty_i * penalty_j)
+    np.fill_diagonal(regret_penalty, 0)
+    
+    # 3. Harmonic centrality-based edge balancing
+    harmonic_centrality = np.sum(1 / (distance_matrix + epsilon), axis=1) - 1/epsilon
+    centrality_norm = (harmonic_centrality - np.min(harmonic_centrality)) / \
+                     (np.max(harmonic_centrality) - np.min(harmonic_centrality) + epsilon)
+    
+    # Penalize edges between high-centrality nodes to avoid hub concentration
+    centrality_penalty = 1.0 - 0.3 * np.sqrt(np.outer(centrality_norm, centrality_norm))
+    np.fill_diagonal(centrality_penalty, 0)
+    
+    # 4. Lightweight spectral clustering penalty
+    spectral_penalty = np.ones_like(distance_matrix)
+    
+    if n >= 5 and n <= 2000:  # Spectral analysis for medium-sized graphs
+        try:
+            # Construct similarity matrix with adaptive bandwidth
+            sigma = np.median(dist_flat)
+            similarity = np.exp(-distance_matrix ** 2 / (2 * sigma ** 2))
+            np.fill_diagonal(similarity, 0)
+            
+            # Compute normalized Laplacian
+            D = np.diag(np.sum(similarity, axis=1))
+            D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + epsilon))
+            L = np.eye(n) - D_inv_sqrt @ similarity @ D_inv_sqrt
+            
+            # Compute first k eigenvectors (k=min(4, n-1))
+            k_spectral = min(4, n - 1)
+            if n <= 300:
+                eigvals, eigvecs = eigh(L)
+                embedding = eigvecs[:, 1:k_spectral+1]  # Skip first eigenvector
+            else:
+                embedding, _ = eigsh(L, k=k_spectral+1, which='SM')
+                embedding = embedding[:, 1:]  # Skip first eigenvector
+            
+            # Compute embedding distances
+            embedding_norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+            normalized_embedding = embedding / (embedding_norms + epsilon)
+            
+            # Spectral similarity as cosine similarity in embedding space
+            spectral_similarity = normalized_embedding @ normalized_embedding.T
+            spectral_similarity = np.clip(spectral_similarity, -1, 1)
+            
+            # Convert to penalty: penalize edges between nodes in different spectral clusters
+            spectral_penalty = 0.7 + 0.3 * spectral_similarity
+            
+            np.fill_diagonal(spectral_penalty, 0)
+        except:
+            # Fallback to simpler penalty if spectral computation fails
+            spectral_penalty = 1.0 - 0.2 * centrality_penalty
+    
+    # 5. Structural bonuses: MST and mutual nearest neighbors
+    mst_boost = np.zeros_like(distance_matrix)
+    if n > 1:
+        mst_sparse = minimum_spanning_tree(distance_matrix)
+        mst_dense = mst_sparse.toarray()
+        mst_boost = (mst_dense > 0).astype(float) * 1.5
+        mst_boost = np.maximum(mst_boost, mst_boost.T)
+    
+    mnn_boost = np.zeros_like(distance_matrix)
+    k_mnn = max(3, min(10, int(np.sqrt(n))))
+    
+    if n > k_mnn:
+        nn_indices = np.argpartition(distance_matrix, k_mnn+1, axis=1)[:, 1:k_mnn+1]
+        nn_adj = np.zeros_like(distance_matrix, dtype=bool)
+        for i in range(n):
+            nn_adj[i, nn_indices[i]] = True
+        
+        mutual_nn = nn_adj & nn_adj.T
+        mnn_boost[mutual_nn] = 1.3
+    
+    # 6. Factor fusion with adaptive weighting
+    # Base multiplicative combination
+    base_score = inv_dist * regret_penalty * centrality_penalty * spectral_penalty
+    
+    # Additive structural bonuses with adaptive scaling
+    structural_boost = mst_boost + mnn_boost
+    
+    # Adaptive scaling based on graph size and density
+    if n < 50:
+        structural_weight = 0.6
+    elif cv < 0.4:
+        structural_weight = 0.4
+    else:
+        structural_weight = 0.5
+    
+    heuristics = base_score * (1.0 + structural_weight * structural_boost)
+    
+    # 7. Adaptive per-node sparsification
+    adaptive_k = min(12, max(4, n // 5))
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        
+        if adaptive_k < n - 1:
+            threshold_idx = n - adaptive_k - 1
+            threshold = np.partition(row, threshold_idx)[threshold_idx]
+            
+            # Zero out below threshold, keep at least 2 connections
+            below_threshold = row < threshold
+            if np.sum(~below_threshold) < 2:
+                top2_threshold = np.partition(row, n - 3)[n - 3]
+                below_threshold = row < top2_threshold
+            
+            row[below_threshold] = 0
+            heuristics[i] = row
+    
+    # 8. Symmetrize and finalize
+    heuristics = np.sqrt(heuristics * heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Remove very weak edges (bottom 20%)
+    non_zero = heuristics[heuristics > 0]
+    if len(non_zero) > 10:
+        threshold = np.percentile(non_zero, 20)
+        heuristics[heuristics < threshold] = 0
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > epsilon:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+```

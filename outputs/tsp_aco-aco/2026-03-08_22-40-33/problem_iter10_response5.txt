@@ -1,0 +1,375 @@
+```json
+{
+    "algorithm_features": ["Clustering-aware Regret Decay", "Local Density Adaptive Pruning", "Two-hop Regret with Rank Penalty", "Connectivity Preservation (MST & Mutual K-NN)"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from sklearn.cluster import KMeans
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic function for TSP edge prioritization with clustering-aware
+    regret modeling and density-based adaptive pruning.
+    
+    Key improvements from v1:
+    1. Clustering pattern analysis for adaptive regret decay
+    2. Local density metrics for smarter edge pruning
+    3. Optimized trade-off between exploration depth and runtime
+    4. Incremental learning of instance characteristics
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. INSTANCE ANALYSIS WITH CLUSTERING PATTERN DETECTION ===
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    
+    if len(distances) > 0:
+        # Basic instance statistics
+        median_dist = np.median(distances)
+        mean_dist = np.mean(distances)
+        sparsity_ratio = median_dist / (mean_dist + 1e-12)
+        
+        # Detect clustering patterns using K-means (only for moderate sizes)
+        clustering_factor = 0.5  # default for uniform distribution
+        if n >= 10 and n <= 500:
+            try:
+                # Use 2D embeddings if available, else use distance matrix
+                # For simplicity, we'll use spectral embedding approximation
+                from scipy.sparse.csgraph import laplacian
+                from scipy.linalg import eigh
+                
+                # Create similarity matrix (inverse distance)
+                eps = np.percentile(distances, 10) * 0.01
+                similarity = 1.0 / (distance_matrix + eps * np.eye(n))
+                np.fill_diagonal(similarity, 0)
+                
+                # Normalized Laplacian for spectral clustering
+                L = laplacian(similarity, normed=True)
+                k_clusters = min(5, n // 4) if n > 20 else 2
+                
+                # Compute first k_clusters eigenvectors
+                eigvals, eigvecs = eigh(L, subset_by_index=[1, k_clusters])
+                
+                # K-means on eigenvectors
+                kmeans = KMeans(n_clusters=k_clusters, n_init=10, random_state=42)
+                labels = kmeans.fit_predict(eigvecs)
+                
+                # Compute intra-cluster vs inter-cluster distances
+                intra_distances = []
+                inter_distances = []
+                
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        if labels[i] == labels[j]:
+                            intra_distances.append(distance_matrix[i, j])
+                        else:
+                            inter_distances.append(distance_matrix[i, j])
+                
+                if intra_distances and inter_distances:
+                    avg_intra = np.mean(intra_distances)
+                    avg_inter = np.mean(inter_distances)
+                    clustering_factor = min(1.0, avg_intra / (avg_inter + 1e-12))
+                
+            except Exception:
+                # Fallback to simpler clustering detection
+                # Compute local density variation
+                k_density = min(5, n - 1)
+                knn_dists = np.sort(distance_matrix, axis=1)[:, 1:k_density+1]
+                local_density = np.mean(knn_dists, axis=1)
+                density_cv = np.std(local_density) / (np.mean(local_density) + 1e-12)
+                clustering_factor = min(1.0, density_cv * 2)
+        
+        # Dynamic K selection based on clustering factor
+        min_k = max(2, n // 10)
+        max_k = min(15, n // 2)
+        
+        # More neighbors for clustered instances, fewer for uniform
+        base_k = min_k + int((max_k - min_k) * (1 - clustering_factor))
+        k = max(min_k, min(max_k, base_k, n - 1))
+        
+        # Regret decay parameter based on clustering pattern
+        # Stronger decay for clustered instances (more aggressive regret)
+        regret_decay = 0.3 + 0.5 * clustering_factor
+        
+    else:
+        k = min(8, n - 1)
+        clustering_factor = 0.5
+        regret_decay = 0.5
+    
+    # === 2. BASE INVERSE DISTANCE WITH ADAPTIVE SMOOTHING ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        eps = np.percentile(distances, 10) * 0.01 if len(distances) > 0 else 1e-12
+        # Adjust smoothing based on clustering
+        eps *= (1 + 0.5 * clustering_factor)
+        inv_dist = 1.0 / (distance_matrix + eps * np.eye(n))
+    
+    np.fill_diagonal(inv_dist, 0)
+    max_inv = np.max(inv_dist[~np.eye(n, dtype=bool)], initial=0)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # === 3. K-NEAREST NEIGHBORS WITH LOCAL DENSITY CALCULATION ===
+    knn_indices = np.argsort(distance_matrix, axis=1)[:, 1:k+1]
+    knn_distances = np.take_along_axis(distance_matrix, knn_indices, axis=1)
+    
+    # Compute local density for each node
+    local_density = np.mean(knn_distances, axis=1)
+    density_normalized = local_density / (np.max(local_density) + 1e-12)
+    
+    knn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        knn_mask[i, knn_indices[i]] = True
+    
+    mutual_knn = knn_mask & knn_mask.T
+    
+    # === 4. HYBRID REGRET SCORING WITH CLUSTERING-AWARE ADJUSTMENT ===
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    positions = np.argsort(sorted_indices, axis=1)
+    
+    regret_score = np.ones((n, n))
+    
+    # Precompute neighbor sets for efficient two-hop lookahead
+    neighbor_sets = [set(knn_indices[i]) for i in range(n)]
+    
+    for i in range(n):
+        i_neighbors = knn_indices[i]
+        i_neighbor_dists = knn_distances[i]
+        
+        for j in range(i + 1, n):
+            direct_dist = distance_matrix[i, j]
+            if direct_dist <= 0:
+                continue
+            
+            # === RANK-BASED PENALTY WITH DENSITY AWARENESS ===
+            rank_i_j = positions[i, j]
+            rank_j_i = positions[j, i]
+            
+            norm_rank_i = rank_i_j / (n - 1)
+            norm_rank_j = rank_j_i / (n - 1)
+            avg_norm_rank = (norm_rank_i + norm_rank_j) / 2
+            
+            # Adjust rank penalty based on local densities
+            density_factor = (density_normalized[i] + density_normalized[j]) / 2
+            rank_decay = 2.5 + 1.5 * density_factor  # More aggressive for dense areas
+            rank_penalty = np.exp(-rank_decay * avg_norm_rank)
+            
+            # === TWO-HOP REGRET WITH EFFICIENT EXPLORATION ===
+            best_alternative = np.inf
+            
+            # Check common neighbors in intersection of KNN sets
+            common_neighbors = neighbor_sets[i].intersection(neighbor_sets[j])
+            
+            for m in common_neighbors:
+                if m != i and m != j:
+                    alt_dist = distance_matrix[i, m] + distance_matrix[m, j]
+                    best_alternative = min(best_alternative, alt_dist)
+            
+            # Limited exploration of other two-hop paths
+            if best_alternative == np.inf and len(i_neighbors) > 0:
+                # Try a few best neighbors of i connecting to j's neighborhood
+                explore_limit = min(3, len(i_neighbors))
+                for a in i_neighbors[:explore_limit]:
+                    if a == j:
+                        continue
+                    
+                    # Check if a connects well to j's neighbors
+                    a_neighbors = neighbor_sets[a]
+                    common_with_j = a_neighbors.intersection(neighbor_sets[j])
+                    
+                    for m in common_with_j:
+                        if m != i and m != j and m != a:
+                            alt_dist = distance_matrix[i, a] + distance_matrix[a, m] + distance_matrix[m, j]
+                            best_alternative = min(best_alternative, alt_dist)
+            
+            # === CLUSTERING-AWARE REGRET CALCULATION ===
+            if best_alternative < np.inf:
+                regret_ratio = best_alternative / direct_dist
+                
+                # Adjust regret calculation based on clustering
+                if clustering_factor > 0.7:  # Strong clustering
+                    # More aggressive penalty for poor edges in clusters
+                    if regret_ratio > 1.2:
+                        exp_regret = 1.0 + 0.8 * (regret_ratio - 1.2)
+                    else:
+                        exp_regret = np.exp(-regret_decay * (1.2 - regret_ratio))
+                else:  # Uniform or weak clustering
+                    if regret_ratio > 1.0:
+                        exp_regret = 1.0 + np.exp(regret_decay * (regret_ratio - 1.0)) - 1.0
+                    else:
+                        exp_regret = np.exp(-regret_decay * (1.0 - regret_ratio))
+                
+                # Adaptive weighting based on instance characteristics
+                if regret_ratio > 1.5:
+                    hybrid_weight = 0.7 - 0.2 * clustering_factor
+                else:
+                    hybrid_weight = 0.4 + 0.2 * clustering_factor
+                
+                regret_val = (hybrid_weight * exp_regret + 
+                             (1 - hybrid_weight) * rank_penalty)
+            else:
+                # No alternative found - rely on rank penalty
+                regret_val = rank_penalty * (1.1 + 0.1 * clustering_factor)
+            
+            regret_score[i, j] = regret_score[j, i] = max(0.1, min(2.0, regret_val))
+    
+    # === 5. MUTUAL PROXIMITY WITH DENSITY-AWARE WEIGHTING ===
+    proximity_weight = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            pos_i_j = positions[i, j]
+            pos_j_i = positions[j, i]
+            
+            if pos_i_j < k and pos_j_i < k:
+                # Mutual high ranking
+                avg_pos = (pos_i_j + pos_j_i) / 2
+                # Adjust weight based on local densities
+                density_bonus = 0.5 * (1 - density_normalized[i] * density_normalized[j])
+                weight = 1.0 + (k - avg_pos) / k + density_bonus
+            elif pos_i_j < k or pos_j_i < k:
+                # One-way high ranking
+                min_pos = min(pos_i_j, pos_j_i)
+                weight = 1.0 + 0.5 * (k - min_pos) / k
+            else:
+                weight = 1.0
+            
+            proximity_weight[i, j] = proximity_weight[j, i] = weight
+    
+    # === 6. CONNECTIVITY-AWARE SPARSIFICATION ===
+    # Compute MST for connectivity preservation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Intermediate heuristic matrix
+    heuristics_intermediate = inv_dist * regret_score * proximity_weight
+    
+    # Boost important structural edges
+    boost_mutual = 1.6 + 0.2 * clustering_factor  # Stronger boost for clustered instances
+    boost_mst = 1.4 + 0.1 * clustering_factor
+    
+    heuristics_intermediate[mutual_knn] *= boost_mutual
+    heuristics_intermediate[mst_mask] *= boost_mst
+    
+    # Ensure symmetry
+    heuristics_intermediate = (heuristics_intermediate + heuristics_intermediate.T) / 2
+    np.fill_diagonal(heuristics_intermediate, 0)
+    
+    # === 7. DENSITY-AWARE ADAPTIVE PRUNING ===
+    target_edges_base = max(k, int(0.3 * (n - 1)))
+    
+    heuristics_final = heuristics_intermediate.copy()
+    
+    for i in range(n):
+        row_values = heuristics_intermediate[i].copy()
+        row_values[i] = -np.inf
+        
+        # Compute node-specific pruning parameters
+        node_density = density_normalized[i]
+        
+        # Adjust target edges based on local density
+        if node_density < 0.3:  # Sparse area
+            target_edges = int(target_edges_base * 1.2)
+        elif node_density > 0.7:  # Dense area
+            target_edges = int(target_edges_base * 0.8)
+        else:
+            target_edges = target_edges_base
+        
+        # Preserve important structural edges
+        preserve_mask = mst_mask[i] | mutual_knn[i]
+        
+        if np.sum(row_values > 0) > target_edges:
+            # Separate preserved and non-preserved edges
+            non_preserved = row_values.copy()
+            non_preserved[preserve_mask] = -np.inf
+            
+            if np.sum(non_preserved > -np.inf) > 0:
+                # Calculate how many non-preserved edges we can keep
+                preserved_count = np.sum(preserve_mask)
+                additional_edges = max(0, target_edges - preserved_count)
+                
+                if additional_edges > 0:
+                    threshold = np.partition(non_preserved, -additional_edges)[-additional_edges]
+                    mask = (row_values < threshold) & (~preserve_mask)
+                    heuristics_final[i, mask] = 0
+                else:
+                    # Only keep preserved edges
+                    mask = (row_values > -np.inf) & (~preserve_mask)
+                    heuristics_final[i, mask] = 0
+    
+    # Ensure symmetry after pruning
+    symmetric_heuristics = np.maximum(heuristics_final, heuristics_final.T)
+    
+    # Preserve edges that are strong in at least one direction
+    strong_mask = (heuristics_final > 0) | (heuristics_final.T > 0)
+    heuristics = np.where(strong_mask, symmetric_heuristics, 0)
+    
+    # === 8. FINAL NORMALIZATION AND VALIDATION ===
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = np.max(heuristics[non_zero_mask])
+        if max_val > 0:
+            heuristics = heuristics / max_val
+    
+    np.fill_diagonal(heuristics, 0)
+    
+    # Final symmetry check
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    return heuristics
+
+
+# Test function
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with different instance types
+    test_cases = [
+        ("cluster", 30, lambda: np.random.randn(30, 2) * 5 + np.array([30, 30])),
+        ("uniform", 30, lambda: np.random.rand(30, 2) * 100),
+        ("mixed", 30, lambda: np.concatenate([
+            np.random.randn(10, 2) * 5 + [20, 20],
+            np.random.rand(10, 2) * 60 + [40, 40],
+            np.random.rand(10, 2) * 100
+        ]))
+    ]
+    
+    for instance_type, n, coord_generator in test_cases:
+        coords = coord_generator()
+        dist_matrix = squareform(pdist(coords))
+        heuristics = heuristics_v2(dist_matrix.copy())
+        
+        print(f"\n=== {instance_type.upper()} Instance (n={n}) ===")
+        print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+        
+        edges_per_node = np.sum(heuristics > 0, axis=1)
+        print(f"Edges per node: min={edges_per_node.min()}, "
+              f"max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+        
+        is_symmetric = np.allclose(heuristics, heuristics.T)
+        print(f"Matrix symmetric: {is_symmetric}")
+        
+        # Sample scores
+        print("Sample edge scores (i, j, distance, heuristic):")
+        for i, j in [(0, 1), (0, 10), (5, 15), (10, 25)]:
+            if i < n and j < n:
+                print(f"({i:2d}, {j:2d}): dist={dist_matrix[i, j]:6.2f}, "
+                      f"score={heuristics[i, j]:.4f}")
+```

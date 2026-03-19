@@ -1,0 +1,187 @@
+```json
+{
+    "algorithm_features": ["Adaptive Symmetric Neighbor Mask", "Rank-Weighted Inverse Distance with Density Augmentation", "Efficient Two-Hop Alternative Penalty", "Row-wise Softmax Normalization"]
+}
+```
+
+```python
+import numpy as np
+from typing import Optional
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  alpha: float = 0.7, 
+                  beta: float = 0.3,
+                  temperature: float = 1.0) -> np.ndarray:
+    """
+    Optimized heuristic function for TSP edge selection with adaptive sparsification,
+    density-augmented inverse distance, and efficient two-hop analysis.
+    
+    Features:
+    1. Adaptive symmetric neighbor mask based on logarithmic scaling
+    2. Rank-weighted inverse distance with local density augmentation
+    3. Vectorized two-hop alternative penalty
+    4. Row-wise softmax normalization for probability distribution
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        alpha: Weight for inverse distance component (0.0-1.0)
+        beta: Weight for two-hop penalty component (0.0-1.0, automatically adjusted)
+        temperature: Softmax temperature for final normalization
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Ensure alpha + beta = 1.0
+    beta = 1.0 - alpha if alpha + beta != 1.0 else beta
+    
+    # ==================== 1. ADAPTIVE SYMMETRIC NEIGHBOR MASK ====================
+    # Logarithmic neighbor selection ensures O(n log n) edges
+    k = max(3, int(np.log2(n)))
+    
+    # Create mask using argpartition for O(n) selection
+    mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        # Temporarily set diagonal to infinity for exclusion
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Get k smallest distances using argpartition (O(n))
+        nn_indices = np.argpartition(distances, k)[:k]
+        mask[i, nn_indices] = True
+    
+    # Ensure symmetry: if i is in j's neighbors, include edge
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    # ==================== 2. DENSITY-AUGMENTED INVERSE DISTANCE ====================
+    # Compute local density from k-nearest neighbors
+    local_density = np.zeros(n, dtype=float)
+    inv_dist_base = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        # Get neighbor distances through mask
+        neighbor_mask = mask[i]
+        if not np.any(neighbor_mask):
+            continue
+            
+        neighbor_dists = distance_matrix[i, neighbor_mask]
+        
+        # Compute local density as mean inverse distance to neighbors
+        if len(neighbor_dists) > 0:
+            local_density[i] = np.mean(1.0 / (neighbor_dists + 1e-10))
+        
+        # Rank neighbors by distance
+        ranks = np.argsort(np.argsort(neighbor_dists)) + 1
+        
+        # Exponential rank weighting: closer neighbors get higher weight
+        rank_weights = np.exp(-0.5 * (ranks - 1))
+        rank_weights = rank_weights / np.sum(rank_weights)
+        
+        # Base inverse distance with rank weighting
+        inv_vals = 1.0 / (neighbor_dists + 1e-10)
+        inv_vals = inv_vals * rank_weights
+        
+        # Apply density augmentation
+        density_factor = 1.0 + 0.5 * (local_density[i] / np.mean(local_density) if np.mean(local_density) > 0 else 1.0)
+        inv_dist_base[i, neighbor_mask] = inv_vals * density_factor
+    
+    # Symmetrize and ensure non-negative
+    inv_dist_base = np.maximum(inv_dist_base, inv_dist_base.T)
+    np.fill_diagonal(inv_dist_base, 0)
+    
+    # ==================== 3. EFFICIENT TWO-HOP ALTERNATIVE PENALTY ====================
+    # Precompute sorted neighbor indices for two-hop analysis
+    penalty = np.ones_like(distance_matrix, dtype=float)
+    
+    # Limit candidate search to O(sqrt(n)) neighbors for efficiency
+    candidate_limit = max(3, int(np.sqrt(n)))
+    
+    # Get candidate neighbors for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    candidate_sets = {}
+    
+    for i in range(n):
+        # Exclude self and take top candidates
+        candidates = sorted_indices[i, 1:candidate_limit+1]
+        candidates = candidates[candidates != i]
+        candidate_sets[i] = candidates
+    
+    # Compute penalty only for edges in mask
+    edges_i, edges_j = np.where(mask & (np.triu(np.ones((n, n), dtype=bool), k=1)))
+    
+    for idx in range(len(edges_i)):
+        i, j = edges_i[idx], edges_j[idx]
+        
+        # Get candidate intermediate nodes
+        i_candidates = candidate_sets[i]
+        j_candidates = candidate_sets[j]
+        
+        # Combine and filter candidates
+        candidates = np.unique(np.concatenate([i_candidates, j_candidates]))
+        candidates = candidates[(candidates != i) & (candidates != j)]
+        
+        if len(candidates) > 0:
+            # Compute two-hop distances through candidates
+            two_hop_dists = distance_matrix[i, candidates] + distance_matrix[candidates, j]
+            min_two_hop = np.min(two_hop_dists)
+            direct_dist = distance_matrix[i, j]
+            
+            if direct_dist > 1e-10:
+                # Compute penalty based on alternative quality
+                ratio = min_two_hop / direct_dist
+                
+                # Sigmoid penalty function: edges with good alternatives get penalized
+                # ratio < 1.0 means alternative is better → strong penalty
+                # ratio > 1.0 means direct edge is better → weak penalty
+                penalty_val = 1.0 / (1.0 + np.exp(-5.0 * (ratio - 1.0)))
+                penalty[i, j] = penalty_val
+                penalty[j, i] = penalty_val
+    
+    # ==================== 4. COMBINE COMPONENTS ====================
+    # Initialize heuristic matrix with zeros
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply components only to edges in mask
+    valid_mask = mask.copy()
+    
+    # Weighted combination: alpha * inv_dist + beta * penalty
+    # Note: penalty is inverted (1-penalty) because higher penalty means less promising
+    combined_scores = np.zeros_like(distance_matrix, dtype=float)
+    combined_scores[valid_mask] = (
+        alpha * inv_dist_base[valid_mask] + 
+        beta * (1.0 - penalty[valid_mask])
+    )
+    
+    # Ensure non-negative scores
+    combined_scores = np.maximum(combined_scores, 0)
+    
+    # ==================== 5. ROW-WISE SOFTMAX NORMALIZATION ====================
+    # Apply softmax to each row to create probability distribution
+    for i in range(n):
+        row = combined_scores[i]
+        if np.sum(row) > 0:
+            # Apply temperature scaling
+            exp_row = np.exp(row / temperature)
+            row_sum = np.sum(exp_row)
+            if row_sum > 0:
+                heuristics[i] = exp_row / row_sum
+    
+    # Final symmetrization and diagonal zeroing
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure connectivity: add small epsilon to all edges in mask
+    heuristics[valid_mask] += 1e-10
+    
+    # Renormalize rows after adding epsilon
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    heuristics = heuristics / np.where(row_sums > 0, row_sums, 1.0)
+    
+    return heuristics
+```

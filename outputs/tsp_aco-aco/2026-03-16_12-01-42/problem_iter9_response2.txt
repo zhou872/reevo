@@ -1,0 +1,251 @@
+```json
+{
+    "algorithm_features": ["Dynamic Regret Order Adaptation", "Normalized Spatial Harmonic Scoring", "Multiplicative Factor Fusion", "Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization with adaptive regret order selection,
+    normalized harmonic scoring, multiplicative fusion, and intelligent sparsification.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix with non-negative entries
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Dynamic Regret Order Adaptation ===
+    # Compute coefficient of variation to determine regret order
+    off_diag_mask = ~np.eye(n, dtype=bool)
+    global_distances = distance_matrix[off_diag_mask]
+    if len(global_distances) > 0:
+        global_mean = np.mean(global_distances)
+        global_std = np.std(global_distances)
+        cv = global_std / (global_mean + epsilon)
+    else:
+        cv = 0.5  # default for trivial cases
+    
+    # Adaptive regret order based on coefficient of variation
+    if cv < 0.3:  # uniform distances
+        k_regret = 2
+    elif cv < 0.7:  # moderate variation
+        k_regret = 3
+    else:  # high variation
+        k_regret = 4
+    
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= k_regret:
+            # Find k_regret best distances
+            indices = np.argpartition(dists, k_regret)[:k_regret]
+            best_dists = dists[indices]
+            
+            # Sort the k_regret best distances
+            sorted_idx = np.argsort(best_dists)
+            sorted_indices = indices[sorted_idx]
+            sorted_dists = best_dists[sorted_idx]
+            
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                d_ij = distance_matrix[i, j]
+                if j in sorted_indices[:k_regret-1]:
+                    # Edge is in top k-1 edges, compute regret to k-th best
+                    kth_best = sorted_dists[-1]
+                    if d_ij > 0:
+                        regret = (kth_best - d_ij) / (d_ij + epsilon)
+                        regret_matrix[i, j] = 1.0 + np.tanh(regret)
+                else:
+                    # Edge is not in top k-1, compute negative regret
+                    best_excluding_ij = sorted_dists[0] if j != sorted_indices[0] else sorted_dists[1]
+                    if d_ij > 0:
+                        regret = (best_excluding_ij - d_ij) / (d_ij + epsilon)
+                        regret_matrix[i, j] = 1.0 - 0.5 * np.tanh(-regret)
+    
+    # === 3. Normalized Spatial Harmonic Scoring ===
+    harmonic_scores = np.ones_like(distance_matrix)
+    
+    # Adaptive neighborhood size
+    k_harmonic = max(3, min(15, int(np.sqrt(n) * 1.5)))
+    
+    node_harmonic_means = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= k_harmonic:
+            # Get k_harmonic nearest neighbors
+            nearest_idx = np.argpartition(dists, k_harmonic)[:k_harmonic]
+            nearest_dists = dists[nearest_idx]
+            
+            # Compute harmonic mean for node i
+            if np.any(nearest_dists > 0):
+                node_harmonic_means[i] = k_harmonic / np.sum(1 / (nearest_dists + epsilon))
+    
+    # Compute edge harmonic scores
+    for i in range(n):
+        if node_harmonic_means[i] > 0:
+            for j in range(i+1, n):  # Only compute upper triangle
+                if node_harmonic_means[j] > 0:
+                    d_ij = distance_matrix[i, j]
+                    # Harmonic combination of node harmonic means and edge distance
+                    harmonic_score = 3 / (1/(node_harmonic_means[i] + epsilon) + 
+                                          1/(node_harmonic_means[j] + epsilon) + 
+                                          1/(d_ij + epsilon))
+                    
+                    # Normalize to range [0.5, 1.5]
+                    # Use global statistics for normalization
+                    if global_mean > 0:
+                        normalized_score = 0.5 + (harmonic_score / global_mean)
+                        normalized_score = np.clip(normalized_score, 0.5, 1.5)
+                        
+                        harmonic_scores[i, j] = normalized_score
+                        harmonic_scores[j, i] = normalized_score
+    
+    # === 4. Path Efficiency with Vectorized Computation ===
+    path_efficiency = np.ones_like(distance_matrix)
+    
+    if n > 3:
+        k_path = max(2, min(6, n // 4))
+        
+        # Precompute nearest neighbors for all nodes
+        neighbor_indices = np.zeros((n, k_path), dtype=int)
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            if len(dists) >= k_path:
+                neighbor_indices[i] = np.argpartition(dists, k_path)[:k_path]
+        
+        # Vectorized path efficiency computation
+        for i in range(n):
+            for j in range(i+1, n):
+                # Two-step paths through i's neighbors
+                neighbors_i = neighbor_indices[i]
+                two_step_costs = distance_matrix[i, neighbors_i][:, None] + distance_matrix[neighbors_i, j]
+                best_two_step = np.min(two_step_costs) if len(two_step_costs) > 0 else np.inf
+                
+                # Three-step paths through i's and j's neighbors
+                neighbors_j = neighbor_indices[j]
+                best_three_step = np.inf
+                for k in neighbors_i:
+                    if k != j:
+                        for l in neighbors_j:
+                            if l != i and l != k:
+                                three_step = (distance_matrix[i, k] + 
+                                             distance_matrix[k, l] + 
+                                             distance_matrix[l, j])
+                                best_three_step = min(best_three_step, three_step)
+                
+                best_alt = min(best_two_step, best_three_step)
+                
+                if best_alt < np.inf:
+                    efficiency_ratio = distance_matrix[i, j] / (best_alt + epsilon)
+                    # Boost edges that are significantly better than alternatives
+                    path_efficiency[i, j] = 1.0 + 0.6 * np.exp(-max(0, efficiency_ratio - 1.0))
+                    path_efficiency[j, i] = path_efficiency[i, j]
+    
+    # === 5. Multiplicative Factor Fusion ===
+    # Dynamic weights based on problem size and characteristics
+    if n <= 10:
+        weights = {'inv': 1.2, 'regret': 1.1, 'harmonic': 0.9, 'path': 0.8}
+    elif n <= 50:
+        weights = {'inv': 1.0, 'regret': 1.0, 'harmonic': 1.0, 'path': 0.9}
+    else:
+        weights = {'inv': 0.9, 'regret': 0.9, 'harmonic': 1.1, 'path': 1.0}
+    
+    # Multiplicative combination with exponentiation
+    heuristics = (
+        inv_dist ** weights['inv'] *
+        regret_matrix ** weights['regret'] *
+        harmonic_scores ** weights['harmonic'] *
+        path_efficiency ** weights['path']
+    )
+    
+    # === 6. MST Reinforcement ===
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_present = (mst_dense > 0) | (mst_dense.T > 0)
+            
+            # Stronger boost for MST edges
+            heuristics[mst_present] *= 1.8
+        except:
+            pass  # Fallback if MST computation fails
+    
+    # === 7. Adaptive Sparsification with Degree Control ===
+    for i in range(n):
+        row = heuristics[i].copy()
+        
+        # Determine keep threshold
+        non_zero = row[row > 0]
+        if len(non_zero) > 3:
+            # Adaptive percentile based on problem size and density
+            keep_pct = max(20, min(60, 40 - n/20))
+            threshold = np.percentile(non_zero, keep_pct)
+            
+            # Always keep MST edges
+            mst_mask = np.zeros(n, dtype=bool)
+            if n > 2:
+                try:
+                    mst_i = minimum_spanning_tree(distance_matrix).toarray()[i] > 0
+                    mst_mask = mst_i
+                except:
+                    pass
+            
+            # Keep edges above threshold or MST edges
+            mask = (row >= threshold) | mst_mask
+            
+            # Ensure minimum degree of 2 and maximum degree of min(8, n-1)
+            if np.sum(mask) < 2:
+                top_idx = np.argsort(row)[-2:]
+                mask[top_idx] = True
+            elif np.sum(mask) > min(8, n-1):
+                # Keep only top-k edges
+                top_k = min(8, n-1)
+                top_idx = np.argsort(row)[-top_k:]
+                mask = np.zeros(n, dtype=bool)
+                mask[top_idx] = True
+                mask = mask | mst_mask  # Preserve MST edges
+            
+            row[~mask] = 0
+            heuristics[i] = row
+    
+    # === 8. Symmetrization and Final Scaling ===
+    # Ensure symmetry by taking maximum (more aggressive than mean)
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    np.fill_diagonal(heuristics, 0)
+    heuristics = np.maximum(heuristics, 0)
+    
+    # Final normalization to [0, 1] range with logarithmic compression
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+        # Apply soft compression to enhance differentiation
+        heuristics = np.power(heuristics, 0.8)
+    
+    return heuristics
+```

@@ -1,0 +1,312 @@
+```json
+{
+    "algorithm_features": ["Regret-weighted Edge Prioritization", "Ensemble Heuristic Blending", "Instance-adaptive Weighting", "Minimum Spanning Tree Backbone"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.sparse.csgraph import minimum_spanning_tree
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with regret-based prioritization,
+    ensemble blending of multiple heuristics, and instance-adaptive weighting.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes.
+        
+    Returns:
+        Priority matrix of same shape, where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) / (distance_matrix + 1e-12)
+    
+    # 1. Base inverse distance (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    inv_dist[np.eye(n, dtype=bool)] = 0
+    
+    # 2. Compute multiple heuristic components
+    components = {}
+    
+    # 2.1 Minimum Spanning Tree edges
+    components['mst'] = _compute_mst_mask(distance_matrix)
+    
+    # 2.2 Adaptive k-nearest neighbors
+    components['knn'] = _compute_knn_bonus(distance_matrix, base_k=max(2, n//10))
+    
+    # 2.3 Cluster density
+    components['density'] = _compute_density_bonus(distance_matrix)
+    
+    # 2.4 Regret-based prioritization (NEW)
+    components['regret'] = _compute_regret_bonus(distance_matrix)
+    
+    # 3. Instance-adaptive weight adjustment
+    instance_features = _extract_instance_features(distance_matrix)
+    weights = _compute_adaptive_weights(instance_features, n)
+    
+    # 4. Ensemble combination with adaptive weights
+    weighted_sum = np.zeros_like(inv_dist)
+    for i, (key, component) in enumerate(components.items()):
+        weighted_sum += weights[i] * component
+    
+    # Combine with inverse distance using sigmoid-like blending
+    blend_factor = np.tanh(weighted_sum)  # Maps to [0, 1]
+    priorities = inv_dist * (1.0 + 2.0 * blend_factor)
+    
+    # 5. Progressive sparsification with connectivity guarantee
+    priorities = _progressive_sparsify(priorities, n)
+    
+    # Ensure symmetry and zero diagonal
+    priorities = (priorities + priorities.T) / 2
+    priorities[np.eye(n, dtype=bool)] = 0
+    
+    # Final normalization
+    max_val = np.max(priorities)
+    if max_val > 0:
+        priorities = priorities / max_val
+    
+    return priorities
+
+def _compute_mst_mask(dist_matrix: np.ndarray) -> np.ndarray:
+    """Return binary mask of edges in Minimum Spanning Tree."""
+    n = dist_matrix.shape[0]
+    mask = np.zeros_like(dist_matrix, dtype=float)
+    
+    if n <= 1:
+        return mask
+    
+    # Use Prim's algorithm for efficiency
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        # Find unvisited node with minimum edge to tree
+        u = -1
+        min_val = np.inf
+        for v in range(n):
+            if not visited[v] and min_edge[v] < min_val:
+                min_val = min_edge[v]
+                u = v
+        
+        if u == -1:
+            break
+        
+        visited[u] = True
+        if parent[u] != -1:
+            mask[u, parent[u]] = 1
+            mask[parent[u], u] = 1
+        
+        # Update distances to tree
+        for v in range(n):
+            if not visited[v] and dist_matrix[u, v] < min_edge[v]:
+                min_edge[v] = dist_matrix[u, v]
+                parent[v] = u
+    
+    return mask
+
+def _compute_knn_bonus(dist_matrix: np.ndarray, base_k: int) -> np.ndarray:
+    """Bonus based on adaptive k-nearest neighbors with distance weighting."""
+    n = dist_matrix.shape[0]
+    bonus = np.zeros_like(dist_matrix)
+    
+    k = min(base_k, max(2, n // 5))
+    
+    for i in range(n):
+        # Get k+1 neighbors (including self)
+        indices = np.argsort(dist_matrix[i])[:k+1]
+        indices = indices[indices != i][:k]  # Remove self
+        
+        # Exponential decay by rank
+        for rank, j in enumerate(indices):
+            weight = np.exp(-rank / k)  # Exponential decay
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = weight / dist_matrix[i, j]
+    
+    # Symmetrize and normalize
+    bonus = (bonus + bonus.T) / 2
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+def _compute_density_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """Reward edges within dense clusters using local neighborhood analysis."""
+    n = dist_matrix.shape[0]
+    if n <= 3:
+        return np.zeros_like(dist_matrix)
+    
+    # Estimate local density using k-nearest neighbors mean
+    densities = np.zeros(n)
+    k = min(5, n-1)
+    
+    for i in range(n):
+        distances = np.partition(dist_matrix[i], k+1)[:k+1]
+        distances = distances[distances > 0][:k]  # Remove self and zeros
+        if len(distances) > 0:
+            densities[i] = 1.0 / (np.mean(distances) + 1e-12)
+    
+    # Normalize densities
+    if densities.max() > 0:
+        densities = densities / densities.max()
+    
+    # Bonus is harmonic mean of endpoint densities weighted by inverse distance
+    bonus = np.zeros_like(dist_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_matrix[i, j] > 0:
+                # Harmonic mean emphasizes balanced densities
+                if densities[i] > 0 and densities[j] > 0:
+                    hm = 2 * densities[i] * densities[j] / (densities[i] + densities[j] + 1e-12)
+                else:
+                    hm = 0
+                bonus[i, j] = hm / dist_matrix[i, j]
+    
+    bonus = bonus + bonus.T
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+def _compute_regret_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """Prioritize edges with high regret (few good alternatives)."""
+    n = dist_matrix.shape[0]
+    if n <= 3:
+        return np.zeros_like(dist_matrix)
+    
+    # Compute regret for each node: (second_best - best) / best
+    regrets = np.zeros(n)
+    for i in range(n):
+        row = dist_matrix[i].copy()
+        row[i] = np.inf
+        sorted_dists = np.partition(row, 2)[:2]
+        if sorted_dists[0] > 0 and sorted_dists[1] < np.inf:
+            regrets[i] = (sorted_dists[1] - sorted_dists[0]) / sorted_dists[0]
+    
+    # Edge regret is product of endpoint regrets
+    regret_matrix = np.zeros_like(dist_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_matrix[i, j] > 0:
+                # Multiplicative combination for stronger emphasis
+                regret_matrix[i, j] = (regrets[i] + 1e-6) * (regrets[j] + 1e-6)
+    
+    regret_matrix = regret_matrix + regret_matrix.T
+    
+    # Weight by inverse distance to prefer short high-regret edges
+    with np.errstate(divide='ignore', invalid='ignore'):
+        weighted_regret = regret_matrix / (dist_matrix + 1e-12)
+    weighted_regret[np.isinf(weighted_regret)] = 0
+    
+    if weighted_regret.max() > 0:
+        weighted_regret = weighted_regret / weighted_regret.max()
+    
+    return weighted_regret
+
+def _extract_instance_features(dist_matrix: np.ndarray) -> np.ndarray:
+    """Extract features describing the TSP instance."""
+    n = dist_matrix.shape[0]
+    
+    features = []
+    
+    # 1. Normalized graph size
+    features.append(min(1.0, n / 100.0))
+    
+    # 2. Distance distribution skewness
+    flat_dists = dist_matrix[np.triu_indices(n, k=1)]
+    if len(flat_dists) > 0:
+        features.append(np.std(flat_dists) / (np.mean(flat_dists) + 1e-12))
+    else:
+        features.append(0.0)
+    
+    # 3. Clustering tendency (ratio of nearest neighbor distances)
+    nn_ratios = []
+    for i in range(n):
+        row = dist_matrix[i].copy()
+        row[i] = np.inf
+        sorted_dists = np.partition(row, 2)[:2]
+        if sorted_dists[0] > 0 and sorted_dists[1] < np.inf:
+            nn_ratios.append(sorted_dists[1] / sorted_dists[0])
+    features.append(np.mean(nn_ratios) if nn_ratios else 1.0)
+    
+    # 4. MST sparsity (ratio of MST edges to total possible)
+    mst_edges = n - 1 if n > 1 else 0
+    total_possible = n * (n - 1) // 2
+    features.append(mst_edges / total_possible if total_possible > 0 else 0.0)
+    
+    return np.array(features)
+
+def _compute_adaptive_weights(features: np.ndarray, n: int) -> np.ndarray:
+    """Compute dynamic weights for heuristic components based on instance features."""
+    # Base weights
+    base_weights = np.array([3.0, 1.5, 0.8, 2.0])  # MST, KNN, Density, Regret
+    
+    # Adjust based on instance features
+    adjustments = np.zeros(4)
+    
+    # 1. Scale MST weight with log(n)
+    adjustments[0] = 2.0 * np.log1p(n) / max(1, n)
+    
+    # 2. Adjust KNN weight based on clustering tendency
+    if len(features) > 2:
+        adjustments[1] = 0.5 * (features[2] - 1.0)  # Positive when clusters are tight
+    
+    # 3. Adjust density weight based on distance variability
+    if len(features) > 1:
+        adjustments[2] = 0.3 * features[1]  # Higher for varied distances
+    
+    # 4. Boost regret for larger, more structured instances
+    if len(features) > 0:
+        adjustments[3] = 0.8 * features[0]  # Scale with normalized size
+    
+    final_weights = base_weights + adjustments
+    
+    # Ensure non-negative weights
+    final_weights = np.maximum(final_weights, 0.1)
+    
+    # Normalize to preserve relative importance
+    final_weights = final_weights / np.sum(final_weights)
+    
+    return final_weights
+
+def _progressive_sparsify(priorities: np.ndarray, n: int) -> np.ndarray:
+    """Progressively sparsify matrix while maintaining connectivity."""
+    result = priorities.copy()
+    
+    # Adaptive threshold based on graph size
+    if n <= 10:
+        keep_ratio = 0.5
+    elif n <= 50:
+        keep_ratio = 0.3
+    else:
+        keep_ratio = 0.1
+    
+    # Apply percentile threshold
+    if np.any(result > 0):
+        threshold = np.percentile(result[result > 0], 100 * (1 - keep_ratio))
+        result[result < threshold] = 0
+    
+    # Ensure minimum degree of 2 for each node
+    for i in range(n):
+        non_zero = np.where(result[i] > 0)[0]
+        if len(non_zero) < 2:
+            # Add top edges from original priorities
+            row = priorities[i].copy()
+            row[i] = -np.inf
+            top_indices = np.argsort(row)[-2:]
+            for idx in top_indices:
+                if idx != i:
+                    result[i, idx] = priorities[i, idx]
+                    result[idx, i] = priorities[idx, i]
+    
+    return result
+```

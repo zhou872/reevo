@@ -1,0 +1,517 @@
+```json
+{
+    "algorithm_features": ["Adaptive Landmark Sampling", "Vectorized Local Statistics", "Meta-Heuristic Edge Scoring", "Dynamic Weight Ensemble"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+import warnings
+from sklearn.manifold import MDS
+from scipy.spatial import KDTree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic for TSP edge selection with meta-heuristic optimization,
+    adaptive landmark sampling, and online parameter tuning.
+    
+    Returns a matrix of edge promises with the same shape as distance_matrix,
+    where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+        return result
+    
+    # Online parameter adaptation based on instance analysis
+    instance_stats = _analyze_instance_online(distance_matrix, n)
+    
+    # 1. Base heuristic with adaptive decay
+    reciprocal_weights = _compute_adaptive_reciprocal(distance_matrix, n, instance_stats)
+    
+    # 2. Landmark-based spatial embedding with online learning
+    spatial_promising = _landmark_based_embedding(distance_matrix, n, instance_stats)
+    
+    # 3. MST-enhanced promises with meta-heuristic refinement
+    mst_promising = _mst_meta_enhancement(distance_matrix, n, instance_stats)
+    
+    # 4. Meta-heuristic triangle quality assessment
+    triangle_quality = _meta_triangle_assessment(distance_matrix, n, instance_stats)
+    
+    # 5. Vectorized local statistics with adaptive kernels
+    local_factors = _adaptive_local_kernels(distance_matrix, n, instance_stats)
+    
+    # 6. Dynamic ensemble with online weight optimization
+    combined = _dynamic_ensemble_optimization(
+        reciprocal_weights, spatial_promising, mst_promising,
+        triangle_quality, local_factors, distance_matrix, n, instance_stats
+    )
+    
+    # 7. Meta-heuristic edge sampling with exploitation-exploration balance
+    sampled = _meta_heuristic_sampling(combined, distance_matrix, n, instance_stats)
+    
+    # 8. Final refinement with symmetry preservation
+    final = _meta_refinement(sampled, distance_matrix, n, instance_stats)
+    
+    return final
+
+
+def _analyze_instance_online(dist_mat: np.ndarray, n: int) -> dict:
+    """Online instance analysis with adaptive feature extraction."""
+    stats = {}
+    
+    # Extract triu distances
+    triu_indices = np.triu_indices(n, k=1)
+    distances = dist_mat[triu_indices]
+    
+    # Basic statistics
+    stats['mean'] = np.mean(distances)
+    stats['std'] = np.std(distances)
+    stats['cv'] = stats['std'] / (stats['mean'] + 1e-12)
+    stats['skew'] = np.mean((distances - stats['mean'])**3) / (stats['std']**3 + 1e-12)
+    
+    # Local connectivity analysis
+    k_local = min(5, n - 1)
+    neighbor_distances = []
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        nearest = np.partition(dists, k_local)[:k_local]
+        neighbor_distances.extend(nearest)
+    
+    stats['local_mean'] = np.mean(neighbor_distances)
+    stats['local_cv'] = np.std(neighbor_distances) / (stats['local_mean'] + 1e-12)
+    
+    # Graph type classification
+    if n > 500:
+        stats['type'] = 'large'
+    elif stats['cv'] > 0.8:
+        stats['type'] = 'irregular'
+    elif stats['local_cv'] < 0.3:
+        stats['type'] = 'uniform'
+    else:
+        stats['type'] = 'clustered'
+    
+    # Online parameter initialization
+    stats['alpha'] = 1.0
+    stats['beta'] = 1.5 if stats['type'] == 'clustered' else 1.2
+    stats['gamma'] = 0.3 if stats['type'] == 'irregular' else 0.2
+    
+    return stats
+
+
+def _compute_adaptive_reciprocal(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Adaptive reciprocal weighting with instance-aware scaling."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Adaptive scaling based on instance characteristics
+        if stats['type'] == 'irregular':
+            scale = np.percentile(dist_mat[dist_mat > 0], 25)
+        else:
+            scale = stats['local_mean']
+        
+        # Exponential decay with adaptive parameter
+        reciprocal = np.exp(-dist_mat / (scale + 1e-12))
+        np.fill_diagonal(reciprocal, 0)
+    
+    return reciprocal
+
+
+def _landmark_based_embedding(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Landmark-based spatial embedding with farthest point sampling."""
+    promising = np.zeros_like(dist_mat)
+    
+    # Determine embedding method based on instance size
+    if n <= 300:
+        # Exact MDS for small instances
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=min(5, n-1),
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=1,
+                max_iter=50
+            )
+            coords = mds.fit_transform(dist_mat)
+            tree = KDTree(coords)
+    else:
+        # Landmark-based approximation
+        n_landmarks = min(100, max(20, n // 10))
+        landmarks = _farthest_point_sampling_v2(dist_mat, n_landmarks)
+        
+        # Use distances to landmarks as embedding
+        coords = dist_mat[:, landmarks]
+        
+        # Build approximate KDTree on landmarks
+        if n_landmarks > 10:
+            tree = KDTree(coords[:, :min(10, n_landmarks)])
+        else:
+            tree = None
+    
+    # Adaptive neighbor selection
+    if stats['type'] == 'clustered':
+        k_neighbors = max(5, int(np.log2(n)) * 2)
+    elif stats['type'] == 'uniform':
+        k_neighbors = max(3, int(np.log2(n)))
+    else:
+        k_neighbors = max(4, int(np.log2(n) * 1.5))
+    
+    k_neighbors = min(k_neighbors, n - 1)
+    
+    # Assign promising values
+    for i in range(n):
+        if tree is not None:
+            # Use spatial neighbors
+            distances, indices = tree.query(coords[i].reshape(1, -1), k=k_neighbors + 1)
+            neighbors = indices[0][1:] if distances[0][0] == 0 else indices[0][:k_neighbors]
+        else:
+            # Fallback to distance-based neighbors
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            neighbors = np.argsort(dists)[:k_neighbors]
+        
+        # Assign weights with rank-based decay
+        for rank, j in enumerate(neighbors):
+            weight = np.exp(-stats['gamma'] * rank)
+            promising[i, j] = weight
+    
+    # Ensure symmetry
+    promising = (promising + promising.T) / 2
+    
+    return promising
+
+
+def _farthest_point_sampling_v2(dist_mat: np.ndarray, k: int) -> np.ndarray:
+    """Improved farthest point sampling with distance balancing."""
+    n = dist_mat.shape[0]
+    selected = np.zeros(k, dtype=int)
+    
+    # Start with point having maximum average distance to others
+    avg_dists = np.mean(dist_mat, axis=1)
+    selected[0] = np.argmax(avg_dists)
+    
+    # Greedy selection of farthest points
+    for i in range(1, k):
+        min_dists = np.min(dist_mat[:, selected[:i]], axis=1)
+        selected[i] = np.argmax(min_dists)
+    
+    return selected
+
+
+def _mst_meta_enhancement(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """MST-based promises with meta-heuristic enhancement."""
+    # Compute MST
+    mst = minimum_spanning_tree(dist_mat)
+    mst_edges = (mst.toarray() > 0)
+    
+    promising = np.zeros_like(dist_mat)
+    
+    # Strong weight for MST edges
+    promising[mst_edges] = 2.0
+    
+    # Enhanced neighborhood based on instance type
+    if stats['type'] == 'irregular':
+        k_near = 6
+        decay = 0.4
+    elif stats['type'] == 'clustered':
+        k_near = 8
+        decay = 0.3
+    else:
+        k_near = 4
+        decay = 0.5
+    
+    # Add promising near-MST edges
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        
+        # Consider k_near closest non-MST edges
+        non_mst_mask = promising[i] == 0
+        if np.any(non_mst_mask):
+            candidate_dists = dists.copy()
+            candidate_dists[~non_mst_mask] = np.inf
+            nearest = np.argsort(candidate_dists)[:k_near]
+            
+            for rank, j in enumerate(nearest):
+                if promising[i, j] == 0:
+                    weight = 1.5 * np.exp(-decay * rank)
+                    promising[i, j] = weight
+    
+    # Symmetrize
+    promising = np.maximum(promising, promising.T)
+    
+    return promising
+
+
+def _meta_triangle_assessment(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Meta-heuristic triangle quality assessment."""
+    quality = np.ones_like(dist_mat)
+    
+    if n < 3:
+        return quality
+    
+    # Adaptive sampling strategy
+    if n > 800:
+        # Sampling-based approach for large graphs
+        sample_size = min(300, n)
+        sampled_nodes = np.random.choice(n, sample_size, replace=False)
+        
+        for i in sampled_nodes:
+            # Sample neighbors for node i
+            k_i = min(25, n-1)
+            i_neighbors = np.argsort(dist_mat[i])[1:k_i+1]
+            
+            for j in i_neighbors:
+                if j <= i:
+                    continue
+                
+                # Sample common neighbors
+                sample_k = min(15, n-2)
+                k_samples = np.random.choice([x for x in range(n) if x != i and x != j], 
+                                            sample_k, replace=False)
+                
+                triangle_qualities = []
+                for k in k_samples:
+                    # Triangle quality metric
+                    a, b, c = dist_mat[i, j], dist_mat[i, k], dist_mat[j, k]
+                    quality_score = (a + b + c) / (3 * min(a, b, c) + 1e-12)
+                    triangle_qualities.append(np.exp(-quality_score))
+                
+                if triangle_qualities:
+                    avg_quality = np.mean(triangle_qualities)
+                    boost = 1.0 + stats['beta'] * avg_quality
+                    quality[i, j] = quality[j, i] = min(boost, 2.0)
+    else:
+        # Exact computation for moderate sizes
+        binary_mask = (dist_mat < np.inf).astype(float)
+        common_counts = binary_mask @ binary_mask.T
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                count = common_counts[i, j]
+                if count > 0:
+                    # Quality-weighted boost
+                    base_boost = 1.0 + 0.15 * min(count, 8)
+                    
+                    # Sample a few triangles for quality assessment
+                    sample_k = min(5, int(count))
+                    if sample_k > 0:
+                        # Find some common neighbors
+                        common = np.where((dist_mat[i] < np.inf) & (dist_mat[j] < np.inf))[0]
+                        common = common[(common != i) & (common != j)]
+                        
+                        if len(common) > 0:
+                            sample_indices = np.random.choice(common, 
+                                                            min(sample_k, len(common)), 
+                                                            replace=False)
+                            
+                            qualities = []
+                            for k in sample_indices:
+                                a, b, c = dist_mat[i, j], dist_mat[i, k], dist_mat[j, k]
+                                quality_score = (a + b + c) / (3 * min(a, b, c) + 1e-12)
+                                qualities.append(np.exp(-quality_score))
+                            
+                            if qualities:
+                                quality_adjustment = np.mean(qualities)
+                                boost = base_boost * (1.0 + 0.2 * quality_adjustment)
+                                quality[i, j] = quality[j, i] = min(boost, 2.5)
+    
+    return quality
+
+
+def _adaptive_local_kernels(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Vectorized local statistics with adaptive kernel functions."""
+    # Adaptive neighborhood size
+    m = min(12, max(4, n // 15))
+    
+    # Precompute local statistics using vectorized operations
+    dist_copy = dist_mat.copy()
+    np.fill_diagonal(dist_copy, np.inf)
+    
+    # Find m nearest distances for each node
+    sorted_indices = np.argsort(dist_copy, axis=1)[:, :m]
+    row_indices = np.arange(n)[:, np.newaxis]
+    
+    nearest_dists = dist_copy[row_indices, sorted_indices]
+    
+    local_means = np.mean(nearest_dists, axis=1)
+    local_stds = np.std(nearest_dists, axis=1) + 1e-12
+    
+    # Compute kernel matrix using vectorized operations
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Mean difference kernel
+    mean_diff = np.abs(local_means[i_idx] - local_means[j_idx])
+    std_sum = local_stds[i_idx] + local_stds[j_idx]
+    mean_kernel = np.exp(-mean_diff / std_sum)
+    
+    # Distance adaptive kernel
+    dist_vals = dist_mat[i_idx, j_idx]
+    mean_vals = (local_means[i_idx] + local_means[j_idx]) / 2
+    dist_kernel = np.exp(-dist_vals / (mean_vals + 1e-12))
+    
+    # Combine kernels adaptively
+    if stats['type'] == 'irregular':
+        kernel_weights = 0.7 * mean_kernel + 0.3 * dist_kernel
+    else:
+        kernel_weights = 0.5 * mean_kernel + 0.5 * dist_kernel
+    
+    # Create symmetric matrix
+    local_factors = np.ones_like(dist_mat)
+    local_factors[i_idx, j_idx] = kernel_weights
+    local_factors[j_idx, i_idx] = kernel_weights
+    np.fill_diagonal(local_factors, 0)
+    
+    return local_factors
+
+
+def _dynamic_ensemble_optimization(base, spatial, mst, triangle, local, 
+                                 dist_mat, n, stats):
+    """Dynamic ensemble combination with online weight optimization."""
+    
+    # Adaptive weights based on instance analysis
+    if stats['type'] == 'large':
+        weights = {'base': 1.0, 'spatial': 1.1, 'mst': 1.9, 'triangle': 1.3, 'local': 1.0}
+    elif stats['type'] == 'irregular':
+        weights = {'base': 1.1, 'spatial': 0.9, 'mst': 1.7, 'triangle': 1.6, 'local': 1.2}
+    elif stats['type'] == 'clustered':
+        weights = {'base': 1.0, 'spatial': 1.3, 'mst': 1.6, 'triangle': 1.4, 'local': 1.3}
+    else:  # uniform
+        weights = {'base': 1.0, 'spatial': 1.0, 'mst': 1.8, 'triangle': 1.2, 'local': 1.1}
+    
+    # Apply weights with non-linear transformations
+    weighted_spatial = np.where(spatial > 0, 
+                               base * (1 + (weights['spatial'] - 1) * spatial),
+                               base * 0.8)
+    
+    weighted_mst = np.where(mst > 1.5,
+                           weighted_spatial * weights['mst'],
+                           np.where(mst > 0,
+                                   weighted_spatial * (1 + 0.3 * mst),
+                                   weighted_spatial))
+    
+    weighted_triangle = weighted_mst * (1 + (weights['triangle'] - 1) * (triangle - 1))
+    
+    weighted_local = weighted_triangle * (1 + (weights['local'] - 1) * local)
+    
+    # Final base weight application
+    combined = weighted_local * weights['base']
+    
+    # Distance-based refinement
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dist_factor = 1 + 0.15 * np.log(1 + 1 / (base + 1e-12))
+        dist_factor = np.nan_to_num(dist_factor, nan=1.0, posinf=1.0)
+    
+    combined *= dist_factor
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+
+def _meta_heuristic_sampling(heuristics_mat: np.ndarray, dist_mat: np.ndarray, 
+                           n: int, stats: dict) -> np.ndarray:
+    """Meta-heuristic edge sampling with exploitation-exploration balance."""
+    if n <= 10:
+        return heuristics_mat
+    
+    sampled = np.zeros_like(heuristics_mat)
+    
+    # Adaptive sampling parameters
+    if stats['type'] == 'large':
+        base_samples = max(3, int(np.log2(n)))
+        exploration_rate = 0.2
+    else:
+        base_samples = max(4, int(np.log2(n)) + 1)
+        exploration_rate = 0.3
+    
+    max_samples = min(n // 4, 25)
+    num_samples = min(base_samples, max_samples)
+    
+    # Preserve MST edges
+    mst = minimum_spanning_tree(dist_mat)
+    mst_edges = (mst.toarray() > 0)
+    
+    for i in range(n):
+        row = heuristics_mat[i].copy()
+        row[i] = 0
+        
+        if np.sum(row) > 0:
+            # Convert to probabilities with exploration component
+            probs = row / np.sum(row)
+            
+            # Add exploration component
+            uniform = np.ones(n) / (n - 1)
+            probs = (1 - exploration_rate) * probs + exploration_rate * uniform
+            probs[i] = 0
+            
+            # Normalize
+            probs_sum = np.sum(probs)
+            if probs_sum > 0:
+                probs = probs / probs_sum
+            else:
+                probs = uniform
+                probs[i] = 0
+            
+            # Sample edges
+            try:
+                sampled_indices = np.random.choice(n, size=num_samples, 
+                                                  replace=False, p=probs)
+            except ValueError:
+                # Fallback to deterministic selection
+                sampled_indices = np.argsort(row)[-num_samples:]
+            
+            # Assign values
+            sampled[i, sampled_indices] = heuristics_mat[i, sampled_indices]
+    
+    # Ensure symmetry and preserve MST
+    sampled = np.maximum(sampled, sampled.T)
+    sampled[mst_edges] = np.maximum(sampled[mst_edges], heuristics_mat[mst_edges])
+    
+    return sampled
+
+
+def _meta_refinement(heuristics_mat: np.ndarray, dist_mat: np.ndarray, 
+                   n: int, stats: dict) -> np.ndarray:
+    """Final meta-heuristic refinement."""
+    result = heuristics_mat.copy()
+    
+    # Zero diagonal
+    np.fill_diagonal(result, 0)
+    
+    # Symmetry enforcement
+    result = (result + result.T) / 2
+    
+    # Edge quality propagation
+    if n > 3 and stats['type'] != 'large':
+        # Small graph refinement through 2-hop propagation
+        for _ in range(2):
+            for i in range(n):
+                for j in range(i+1, n):
+                    if result[i, j] > 0:
+                        # Consider common neighbors
+                        common = np.where((result[i] > 0) & (result[j] > 0))[0]
+                        common = common[(common != i) & (common != j)]
+                        
+                        if len(common) > 0:
+                            # Boost based on common neighbor quality
+                            neighbor_quality = np.mean(result[i, common] * result[common, j])
+                            result[i, j] = result[j, i] = max(result[i, j], 
+                                                            result[i, j] * (1 + 0.1 * neighbor_quality))
+    
+    # Final normalization
+    max_val = np.max(result)
+    if max_val > 0:
+        result = result / max_val
+    
+    # Add small epsilon to non-zero edges
+    result[result > 0] += 1e-8
+    
+    return result
+```

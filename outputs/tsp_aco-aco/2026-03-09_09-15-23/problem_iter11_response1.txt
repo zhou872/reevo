@@ -1,0 +1,171 @@
+```json
+{
+    "algorithm_features": ["Logarithmic Symmetric Sparsification", "Context-Sensitive Two-Hop Penalty", "Reciprocal Distance Weighting", "Neighbor Count Normalization"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with improved sparsification
+    and context-sensitive two-hop analysis for more accurate edge promise indicators.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Logarithmic Symmetric Sparsification ====================
+    # Use logarithmic scaling for sparsification
+    k = max(3, int(np.log2(n)))
+    
+    # Create directed adjacency mask using argpartition
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Get k nearest neighbors for each node
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        adjacency_mask[i, nn_indices] = True
+    
+    # Ensure bidirectionality for symmetry
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Reciprocal Distance Weighting ====================
+    # Compute weighted distance scores with neighbor normalization
+    distance_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Count neighbors for normalization
+            neighbor_count = np.sum(valid_mask)
+            
+            # Get distances to valid neighbors
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Compute reciprocal distances with smoothing
+            # Weight by inverse distance rank among neighbors
+            dist_ranks = np.argsort(valid_dists)  # Closest has rank 0
+            
+            # Create rank-based weights (linear decay)
+            rank_weights = (len(valid_dists) - dist_ranks) / len(valid_dists)
+            
+            # Apply weights to reciprocal distances
+            reciprocal_vals = 1.0 / (valid_dists + 1e-8)
+            weighted_vals = reciprocal_vals * rank_weights
+            
+            # Normalize by neighbor count
+            distance_scores[i, valid_mask] = weighted_vals / neighbor_count
+    
+    # Symmetrize distance scores
+    distance_scores = np.maximum(distance_scores, distance_scores.T)
+    
+    # ==================== 3. Context-Sensitive Two-Hop Penalty ====================
+    # Compute adaptive two-hop penalties based on instance density
+    two_hop_penalty = np.ones_like(distance_matrix)
+    
+    # Estimate instance density using adjacency connectivity
+    density = np.sum(adjacency_mask) / (n * (n - 1)) if n > 1 else 1.0
+    
+    # Compute scale factor based on density
+    scale_factor = 1.0 + 2.0 * density  # Higher density -> more penalty scaling
+    base_penalty = 0.5  # Base penalty factor
+    
+    # Precompute sorted neighbors for efficiency
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Get all neighbors of i from adjacency mask
+        i_neighbors = np.where(adjacency_mask[i])[0]
+        
+        for j in i_neighbors:
+            if i >= j:
+                continue
+                
+            # Find common neighbors between i and j (candidates for two-hop paths)
+            j_neighbors = np.where(adjacency_mask[j])[0]
+            common_neighbors = np.intersect1d(i_neighbors, j_neighbors)
+            
+            # Also consider top neighbors from sorted list
+            check_limit = max(3, int(np.sqrt(n)))
+            top_i_neighbors = sorted_indices[i, 1:check_limit+1]
+            top_j_neighbors = sorted_indices[j, 1:check_limit+1]
+            
+            # Combine all candidate intermediate nodes
+            candidate_nodes = np.unique(np.concatenate([
+                common_neighbors,
+                top_i_neighbors,
+                top_j_neighbors
+            ]))
+            
+            # Remove i and j from candidates
+            candidate_nodes = candidate_nodes[(candidate_nodes != i) & (candidate_nodes != j)]
+            
+            if len(candidate_nodes) > 0:
+                # Vectorized computation of two-hop distances
+                two_hop_dists = distance_matrix[i, candidate_nodes] + distance_matrix[candidate_nodes, j]
+                
+                if len(two_hop_dists) > 0:
+                    min_two_hop = np.min(two_hop_dists)
+                    direct_dist = distance_matrix[i, j]
+                    
+                    if direct_dist > 1e-8:
+                        ratio = min_two_hop / direct_dist
+                        
+                        # Apply context-sensitive penalty scaling
+                        if ratio < 1.5:  # Good two-hop alternative exists
+                            # Scale penalty based on density and ratio
+                            penalty_factor = base_penalty + (1 - base_penalty) * (ratio / 1.5)
+                            penalty = penalty_factor ** scale_factor
+                        else:
+                            # Less penalty for poor two-hop alternatives
+                            penalty = 1.0 / (1.0 + np.log(ratio) * density)
+                        
+                        two_hop_penalty[i, j] = two_hop_penalty[j, i] = penalty
+    
+    # ==================== 4. Combine Components ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply sparsity mask and combine components
+    valid_edges = np.where(adjacency_mask)
+    for i, j in zip(*valid_edges):
+        if i < j:  # Process each edge once
+            # Base score from reciprocal distance
+            base_score = distance_scores[i, j]
+            
+            # Apply two-hop penalty
+            final_score = base_score * two_hop_penalty[i, j]
+            
+            heuristics[i, j] = heuristics[j, i] = final_score
+    
+    # ==================== 5. Normalization and Final Processing ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small constant to avoid zeros and improve stability
+    heuristics[heuristics > 0] += 1e-8
+    
+    # Row-normalize to create probability-like distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Symmetrize final matrix
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

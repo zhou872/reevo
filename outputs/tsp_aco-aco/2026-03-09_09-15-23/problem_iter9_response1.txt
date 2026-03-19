@@ -1,0 +1,169 @@
+```json
+{
+    "algorithm_features": ["Rank-Weighted Exponential Decay", "Density-Augmented Inverse Distance", "Vectorized Two-Hop Alternative Penalty", "Adaptive Symmetric Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection that combines multiple
+    sophisticated scoring factors with efficient vectorized computations.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ADAPTIVE SYMMETRIC SPARSIFICATION ====================
+    # Dynamic neighborhood size with symmetry enforcement
+    k = max(3, int(np.sqrt(n)))  # More connections than v1 for better density estimation
+    
+    # Find k-nearest neighbors for each node
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        nn_indices = sorted_indices[i, 1:k+1]
+        adjacency_mask[i, nn_indices] = True
+    
+    # Enforce symmetry: edge exists if either direction considers it
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. DENSITY-AUGMENTED RANK-WEIGHTED INVERSE DISTANCE ====================
+    # Compute density scores for each node based on mean inverse neighbor distances
+    inv_dist_matrix = 1.0 / (distance_matrix + 1e-10)
+    np.fill_diagonal(inv_dist_matrix, 0)
+    
+    # Node density: mean inverse distance to neighbors
+    density_scores = np.zeros(n, dtype=float)
+    for i in range(n):
+        neighbor_mask = adjacency_mask[i]
+        if np.any(neighbor_mask):
+            density_scores[i] = np.mean(inv_dist_matrix[i, neighbor_mask])
+    
+    # Exponential rank-weighted inverse distance
+    base_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        # Get distances to neighbors
+        neighbor_mask = adjacency_mask[i]
+        neighbor_indices = np.where(neighbor_mask)[0]
+        
+        if len(neighbor_indices) == 0:
+            continue
+            
+        neighbor_dists = distance_matrix[i, neighbor_indices]
+        
+        # Rank neighbors by distance (closest = rank 1)
+        ranks = np.argsort(np.argsort(neighbor_dists)) + 1
+        
+        # Exponential decay weights: e^(-λ*(rank-1))
+        lambda_decay = 0.5  # Decay parameter
+        rank_weights = np.exp(-lambda_decay * (ranks - 1))
+        rank_weights = rank_weights / np.sum(rank_weights)  # Normalize
+        
+        # Inverse distance with rank weighting
+        inv_dists = 1.0 / (neighbor_dists + 1e-10)
+        weighted_inv_dists = inv_dists * rank_weights
+        
+        # Apply density augmentation
+        neighbor_densities = density_scores[neighbor_indices]
+        # Use geometric mean of node densities
+        density_factors = np.sqrt(density_scores[i] * neighbor_densities)
+        
+        base_scores[i, neighbor_indices] = weighted_inv_dists * density_factors
+    
+    # Symmetrize base scores (take maximum)
+    base_scores = np.maximum(base_scores, base_scores.T)
+    
+    # ==================== 3. VECTORIZED TWO-HOP ALTERNATIVE PENALTY ====================
+    two_hop_penalty = np.ones_like(distance_matrix, dtype=float)
+    
+    # Vectorized computation of two-hop alternatives using sorted neighbor lists
+    check_limit = min(10, int(np.sqrt(n)))  # Check top neighbors for alternatives
+    
+    # Precompute top neighbor indices for each node
+    top_neighbors = sorted_indices[:, 1:check_limit+1]
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if not adjacency_mask[i, j]:
+                continue
+                
+            # Get top neighbors for both endpoints
+            i_neighbors = top_neighbors[i]
+            j_neighbors = top_neighbors[j]
+            
+            # Find common candidates (excluding i and j)
+            candidate_mask = ~((i_neighbors == i) | (i_neighbors == j) | 
+                              (j_neighbors == i) | (j_neighbors == j))
+            
+            if not np.any(candidate_mask):
+                continue
+                
+            # Vectorized two-hop distance computation
+            candidates = np.union1d(i_neighbors[candidate_mask[:len(i_neighbors)]], 
+                                   j_neighbors[candidate_mask[:len(j_neighbors)]])
+            
+            if len(candidates) > 0:
+                # Compute all two-hop distances through candidates
+                two_hop_dists = distance_matrix[i, candidates] + distance_matrix[candidates, j]
+                
+                if len(two_hop_dists) > 0:
+                    min_two_hop = np.min(two_hop_dists)
+                    direct_dist = distance_matrix[i, j]
+                    
+                    if direct_dist > 1e-10:
+                        ratio = min_two_hop / direct_dist
+                        # Penalty increases as two-hop becomes competitive
+                        penalty = 0.2 + 0.8 * np.clip(ratio, 0.5, 2.0) / 2.0
+                        two_hop_penalty[i, j] = two_hop_penalty[j, i] = penalty
+    
+    # ==================== 4. COMBINE COMPONENTS ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply scores only to edges in adjacency mask
+    mask_indices = np.where(adjacency_mask)
+    i_indices, j_indices = mask_indices
+    
+    # Combine base scores with two-hop penalty
+    edge_scores = base_scores[mask_indices] * two_hop_penalty[mask_indices]
+    
+    # Apply edge scores
+    heuristics[i_indices, j_indices] = edge_scores
+    
+    # Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # ==================== 5. FINAL PROCESSING ====================
+    # Zero out diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small constant to avoid division by zero
+    heuristics[adjacency_mask] += 1e-8
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

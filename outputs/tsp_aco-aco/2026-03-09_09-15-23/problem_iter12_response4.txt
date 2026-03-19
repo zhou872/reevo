@@ -1,0 +1,279 @@
+```json
+{
+    "algorithm_features": ["Adaptive Lookahead Depth", "Regret-based k-opt Sampling", "Spectral Embedding Utility", "Dynamic Sparsity Adjustment"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization heuristic with adaptive lookahead,
+    regret-based k-opt analysis, and spectral embedding for cycle detection.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Dynamic Sparse Graph Construction ====================
+    # Adaptive sparsity based on graph density and size
+    base_k = max(3, int(np.log2(n)))
+    
+    # Estimate graph density from nearest neighbor distances
+    density_indicators = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nn_dists = np.partition(dists, min(base_k, n-1))[:min(base_k, n-1)]
+        density_indicators[i] = np.mean(nn_dists)
+    
+    # Dynamic k values based on local density
+    density_norm = (density_indicators - np.min(density_indicators)) / \
+                   (np.max(density_indicators) - np.min(density_indicators) + 1e-10)
+    k_values = np.clip(base_k * (0.5 + density_norm), 3, min(15, n-1)).astype(int)
+    
+    # Build sparse symmetric mask
+    mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nn_indices = np.argpartition(dists, k_values[i])[:k_values[i]]
+        mask[i, nn_indices] = True
+    
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    # ==================== 2. Global Topological Features ====================
+    # MST bonus (essential edges get higher weight)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = mst > 0
+    mst_bonus = np.ones_like(distance_matrix)
+    mst_bonus[mst_mask] = 1.5
+    
+    # Local clustering coefficient
+    cluster_coeff = np.zeros(n)
+    for i in range(n):
+        neighbors = np.where(mask[i])[0]
+        if len(neighbors) < 2:
+            cluster_coeff[i] = 0
+            continue
+        
+        triangles = 0
+        for idx, n1 in enumerate(neighbors):
+            for n2 in neighbors[idx+1:]:
+                if mask[n1, n2]:
+                    triangles += 1
+        
+        max_triangles = len(neighbors) * (len(neighbors) - 1) / 2
+        cluster_coeff[i] = triangles / max_triangles if max_triangles > 0 else 0
+    
+    # ==================== 3. Spectral Embedding for Cycle Awareness ====================
+    # Fast spectral embedding using power iteration for Fiedler vector
+    def spectral_embedding(adj_matrix, dim=2, iterations=20):
+        """Compute spectral embedding for nodes using power iteration"""
+        n = len(adj_matrix)
+        # Laplacian matrix
+        degree = np.sum(adj_matrix, axis=1)
+        laplacian = np.diag(degree) - adj_matrix
+        
+        # Initialize random vectors
+        embeddings = np.random.randn(n, dim)
+        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        
+        # Power iteration for dominant eigenvectors
+        for _ in range(iterations):
+            embeddings = laplacian @ embeddings
+            # Orthogonalize
+            for d in range(dim):
+                for prev_d in range(d):
+                    proj = np.sum(embeddings[:, d] * embeddings[:, prev_d])
+                    embeddings[:, d] -= proj * embeddings[:, prev_d]
+                norm = np.linalg.norm(embeddings[:, d])
+                if norm > 1e-10:
+                    embeddings[:, d] /= norm
+        
+        return embeddings
+    
+    # Create adjacency from sparse mask (weighted by inverse distance)
+    adj_matrix = np.zeros_like(distance_matrix)
+    adj_matrix[mask] = 1.0 / (distance_matrix[mask] + 1e-10)
+    
+    # Compute spectral embedding
+    spectral_emb = spectral_embedding(adj_matrix, dim=2, iterations=15)
+    
+    # Spectral utility: reward edges that connect nodes with similar embeddings
+    # (likely in same cluster) but also consider angular alignment for cycles
+    spectral_similarity = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if mask[i, j]:
+                # Cosine similarity of embeddings
+                cos_sim = np.dot(spectral_emb[i], spectral_emb[j]) / \
+                         (np.linalg.norm(spectral_emb[i]) * np.linalg.norm(spectral_emb[j]) + 1e-10)
+                
+                # Angular alignment score (higher for edges that fit in cycles)
+                vec_diff = spectral_emb[i] - spectral_emb[j]
+                alignment = 1.0 / (1.0 + np.linalg.norm(vec_diff))
+                
+                spectral_similarity[i, j] = spectral_similarity[j, i] = 0.5 + 0.5 * (cos_sim + alignment) / 2
+    
+    # ==================== 4. Adaptive Lookahead Regret Analysis ====================
+    # Dynamic lookahead depth based on graph sparsity
+    avg_degree = np.sum(mask) / n
+    base_lookahead = max(2, int(np.log2(n)))
+    lookahead_depth = min(base_lookahead + int(avg_degree / 3), 8)
+    
+    # Precompute sorted neighbors for efficiency
+    sorted_neighbors = np.argsort(distance_matrix, axis=1)
+    
+    # Regret-based scoring: evaluate k-opt move alternatives
+    regret_scores = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        # Get candidate edges from sparse mask
+        candidate_edges = np.where(mask[i] & (i < np.arange(n)))[0]
+        
+        for j in candidate_edges:
+            direct_cost = distance_matrix[i, j]
+            
+            # ========== 2-opt Regret Analysis ==========
+            best_2opt = np.inf
+            # Check limited number of alternative 2-opt edges
+            check_2opt = min(lookahead_depth, n-2)
+            i_candidates = sorted_neighbors[i, 1:check_2opt+1]
+            j_candidates = sorted_neighbors[j, 1:check_2opt+1]
+            
+            for k in i_candidates:
+                if k == j or k == i:
+                    continue
+                for l in j_candidates:
+                    if l == i or l == j or l == k:
+                        continue
+                    # 2-opt alternative: (i,k) + (j,l) + (k,l)
+                    alt_cost = (distance_matrix[i, k] + 
+                               distance_matrix[j, l] + 
+                               distance_matrix[k, l])
+                    best_2opt = min(best_2opt, alt_cost)
+            
+            # ========== 3-opt Regret Analysis (simplified) ==========
+            best_3opt = np.inf
+            if lookahead_depth >= 3:
+                # Sample limited 3-opt configurations
+                for k in i_candidates[:min(3, len(i_candidates))]:
+                    if k == j or k == i:
+                        continue
+                    # Get k's neighbors
+                    k_candidates = sorted_neighbors[k, 1:min(3, n-3)]
+                    for l in k_candidates:
+                        if l == i or l == j or l == k:
+                            continue
+                        # 3-opt alternative configuration
+                        alt_cost = (distance_matrix[i, k] + 
+                                   distance_matrix[k, l] + 
+                                   distance_matrix[l, j])
+                        best_3opt = min(best_3opt, alt_cost)
+            
+            # Compute regret: difference between best alternative and direct edge
+            best_alternative = min(best_2opt, best_3opt)
+            if best_alternative < np.inf and direct_cost > 1e-10:
+                regret_ratio = best_alternative / direct_cost
+                
+                # Sigmoid-based penalty: edges with poor alternatives get higher scores
+                if regret_ratio < 1.2:
+                    # Excellent direct edge (alternatives much worse)
+                    penalty = 0.9 + 0.1 * (1.2 - regret_ratio) / 1.2
+                elif regret_ratio < 2.0:
+                    # Competitive alternatives exist
+                    penalty = 0.5 + 0.4 * (2.0 - regret_ratio) / 0.8
+                else:
+                    # Poor direct edge (good alternatives available)
+                    penalty = 0.3 + 0.2 * min(1.0, 3.0 / regret_ratio)
+                
+                # Adjust by local clustering (edges in dense regions tolerate more alternatives)
+                local_density = 0.5 * (cluster_coeff[i] + cluster_coeff[j])
+                penalty = penalty ** (1.0 + local_density)
+                
+                regret_scores[i, j] = regret_scores[j, i] = penalty
+            else:
+                # No good alternative found
+                regret_scores[i, j] = regret_scores[j, i] = 1.2
+    
+    # ==================== 5. Edge Quality Assessment ====================
+    # Base inverse distance with rank weighting
+    base_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            valid_indices = np.where(valid_mask)[0]
+            
+            # Rank-based exponential weighting
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = np.exp(-0.3 * (ranks - 1))
+            weights = weights / np.sum(weights)
+            
+            # Inverse distance with MST bonus
+            inv_dists = 1.0 / (valid_dists + 1e-10)
+            base_scores[i, valid_indices] = inv_dists * weights
+    
+    # Apply all enhancement factors
+    enhanced_scores = base_scores * mst_bonus * spectral_similarity * regret_scores
+    
+    # Connectivity bonus: reward edges that connect different spectral clusters
+    connectivity_bonus = np.ones_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if mask[i, j]:
+                # Angle between node embeddings indicates cluster alignment
+                vec_i = spectral_emb[i]
+                vec_j = spectral_emb[j]
+                angle = np.arccos(np.clip(np.dot(vec_i, vec_j) / 
+                                          (np.linalg.norm(vec_i) * np.linalg.norm(vec_j) + 1e-10), -1, 1))
+                
+                # Moderate bonus for edges with medium angles (bridging clusters)
+                if angle > np.pi/4 and angle < 3*np.pi/4:
+                    connectivity_bonus[i, j] = connectivity_bonus[j, i] = 1.2
+                else:
+                    connectivity_bonus[i, j] = connectivity_bonus[j, i] = 1.0
+    
+    enhanced_scores = enhanced_scores * connectivity_bonus
+    
+    # ==================== 6. Final Aggregation & Normalization ====================
+    # Apply sparse mask
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    heuristics[mask] = enhanced_scores[mask]
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row normalization with stability
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    non_zero_rows = row_sums.flatten() > 0
+    
+    if np.any(non_zero_rows):
+        heuristics[non_zero_rows] = heuristics[non_zero_rows] / row_sums[non_zero_rows]
+    
+    # Add minimal noise to break ties
+    heuristics[mask] += 1e-12
+    
+    # Symmetrize
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure proper normalization
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    return heuristics
+```

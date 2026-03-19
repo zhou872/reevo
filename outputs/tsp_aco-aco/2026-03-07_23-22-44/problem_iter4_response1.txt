@@ -1,0 +1,395 @@
+```json
+{
+    "algorithm_features": ["Regret-weighted Edge Prioritization", "Two-Step Spatial Lookahead", "MST-Matching Fusion", "Density-Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+import heapq
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection with regret-based prioritization
+    and spatial lookahead for improved long-term decision making.
+    
+    Key Innovations:
+    1. Regret-weighted prioritization: Emphasizes edges with fewer good alternatives
+    2. Two-step spatial lookahead: Anticipates future path costs using local neighborhood analysis
+    3. MST-matching fusion: Combines proven TSP approximation components
+    4. Density-adaptive sparsification with regret-awareness
+    
+    Returns a heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Initialize heuristic matrix
+    heuristics_mat = np.zeros_like(distance_matrix, dtype=float)
+    
+    # 1. Minimum Spanning Tree edge weights
+    mst_weights = compute_mst_weights(distance_matrix)
+    heuristics_mat += mst_weights * 2.0  # Strong emphasis on MST edges
+    
+    # 2. Christofides-like matching heuristic
+    matching_bonus = compute_matching_heuristic(distance_matrix, mst_weights)
+    heuristics_mat += matching_bonus * 1.5
+    
+    # 3. Regret-weighted prioritization
+    regret_scores = compute_regret_scores(distance_matrix, mst_weights)
+    heuristics_mat += regret_scores * 2.0  # High weight for regret-based guidance
+    
+    # 4. Two-step spatial lookahead
+    lookahead_scores = compute_spatial_lookahead(distance_matrix)
+    heuristics_mat += lookahead_scores * 1.2
+    
+    # 5. Density-adaptive nearest neighbors with regret consideration
+    density_k = compute_density_adaptive_k(distance_matrix)
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    np.divide(1.0, distance_matrix, out=inv_dist, where=distance_matrix != 0)
+    np.fill_diagonal(inv_dist, 0)
+    
+    for i in range(n):
+        k = min(density_k[i], n-1)
+        if k > 0:
+            # Get nearest neighbors
+            dist_from_i = distance_matrix[i].copy()
+            dist_from_i[i] = np.inf
+            nearest_indices = np.argpartition(dist_from_i, k)[:k]
+            
+            # Apply regret-aware weighting
+            for rank, j in enumerate(nearest_indices, 1):
+                if j != i:
+                    # Base inverse distance weight
+                    base_weight = inv_dist[i, j]
+                    
+                    # Rank-based decay (worse alternatives get lower weight)
+                    rank_decay = 1.0 / (1.0 + 0.3 * rank)
+                    
+                    # Combine with edge importance
+                    edge_importance = (
+                        mst_weights[i, j] * 0.4 +
+                        regret_scores[i, j] * 0.3 +
+                        lookahead_scores[i, j] * 0.3
+                    )
+                    
+                    heuristics_mat[i, j] += base_weight * rank_decay * (1.0 + edge_importance)
+    
+    # 6. Symmetrize for undirected TSP
+    heuristics_mat = (heuristics_mat + heuristics_mat.T) / 2.0
+    
+    # 7. Regret-aware sparsification
+    if n > 2:
+        # Keep edges that are either in MST or have high regret scores
+        mst_threshold = 0.5
+        regret_threshold = np.percentile(regret_scores[regret_scores > 0], 50) if np.any(regret_scores > 0) else 0
+        
+        mask = (mst_weights > mst_threshold) | (regret_scores > regret_threshold)
+        
+        # Also keep top-k edges per node based on combined score
+        k_edges = max(3, min(5, n // 4))
+        for i in range(n):
+            row_scores = heuristics_mat[i].copy()
+            row_scores[i] = -np.inf  # Exclude self
+            top_indices = np.argpartition(row_scores, -k_edges)[-k_edges:]
+            mask[i, top_indices] = True
+            mask[top_indices, i] = True
+        
+        # Apply mask
+        heuristics_mat = heuristics_mat * mask
+    
+    # 8. Final normalization
+    max_val = heuristics_mat.max()
+    if max_val > 0:
+        heuristics_mat = heuristics_mat / max_val
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(heuristics_mat, 0)
+    
+    return heuristics_mat
+
+
+def compute_mst_weights(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute Minimum Spanning Tree edge weights using Prim's algorithm."""
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    mst_weights = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Prim's algorithm for MST
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    # Start from node 0
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        # Find minimum edge from visited to unvisited nodes
+        u = -1
+        min_val = np.inf
+        for i in range(n):
+            if not visited[i] and min_edge[i] < min_val:
+                min_val = min_edge[i]
+                u = i
+        
+        if u == -1:
+            break
+            
+        visited[u] = True
+        
+        # Add edge to MST if not root
+        if parent[u] != -1:
+            mst_weights[u, parent[u]] = 1.0
+            mst_weights[parent[u], u] = 1.0
+        
+        # Update min_edge for adjacent nodes
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    return mst_weights
+
+
+def compute_matching_heuristic(distance_matrix: np.ndarray, mst_weights: np.ndarray) -> np.ndarray:
+    """Compute Christofides-like matching heuristic for odd-degree nodes."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return np.zeros_like(distance_matrix)
+    
+    matching_bonus = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Identify nodes with odd degree in MST approximation
+    mst_degrees = np.sum(mst_weights > 0, axis=1)
+    odd_nodes = np.where(mst_degrees % 2 == 1)[0]
+    
+    if len(odd_nodes) < 2:
+        return matching_bonus
+    
+    # Greedy matching with regret consideration
+    unmatched = set(odd_nodes.tolist())
+    
+    while len(unmatched) >= 2:
+        # Find best pair using regret-aware scoring
+        best_pair = None
+        best_score = -np.inf
+        
+        for u in unmatched:
+            # Calculate regret for node u (difference between best and second best edges)
+            u_dists = [(distance_matrix[u, v], v) for v in unmatched if v != u]
+            if len(u_dists) < 2:
+                continue
+                
+            u_dists.sort()
+            regret_u = u_dists[1][0] - u_dists[0][0] if len(u_dists) >= 2 else 0
+            
+            for v in unmatched:
+                if u >= v:  # Avoid duplicate checks
+                    continue
+                    
+                # Calculate regret for node v
+                v_dists = [(distance_matrix[v, w], w) for w in unmatched if w != v]
+                if len(v_dists) < 2:
+                    continue
+                    
+                v_dists.sort()
+                regret_v = v_dists[1][0] - v_dists[0][0] if len(v_dists) >= 2 else 0
+                
+                # Score combines distance and regret
+                dist_score = 1.0 / (distance_matrix[u, v] + 1e-10)
+                regret_score = (regret_u + regret_v) / (distance_matrix[u, v] + 1e-10)
+                
+                total_score = dist_score * (1.0 + 0.5 * regret_score)
+                
+                if total_score > best_score:
+                    best_score = total_score
+                    best_pair = (u, v)
+        
+        if best_pair:
+            u, v = best_pair
+            bonus = 1.0 / (distance_matrix[u, v] + 1e-10)
+            matching_bonus[u, v] = bonus
+            matching_bonus[v, u] = bonus
+            
+            unmatched.remove(u)
+            unmatched.remove(v)
+        else:
+            break
+    
+    return matching_bonus
+
+
+def compute_regret_scores(distance_matrix: np.ndarray, mst_weights: np.ndarray) -> np.ndarray:
+    """
+    Compute regret-based scores for edges.
+    Higher scores for edges that are critical (few good alternatives).
+    """
+    n = distance_matrix.shape[0]
+    regret_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    if n < 3:
+        return regret_scores
+    
+    for i in range(n):
+        # Get distances to other nodes, excluding self
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Sort distances and get k nearest neighbors
+        k = min(5, n-1)
+        nearest_indices = np.argpartition(distances, k)[:k]
+        nearest_dists = distances[nearest_indices]
+        
+        if len(nearest_dists) < 2:
+            continue
+        
+        # Sort the nearest distances
+        sorted_idx = np.argsort(nearest_dists)
+        nearest_indices = nearest_indices[sorted_idx]
+        nearest_dists = nearest_dists[sorted_idx]
+        
+        # Calculate regret for each position
+        for rank, (j, dist_ij) in enumerate(zip(nearest_indices, nearest_dists), 1):
+            if rank == 1:
+                # Best edge: high regret if next best is much worse
+                if len(nearest_dists) > 1:
+                    regret = (nearest_dists[1] - dist_ij) / (dist_ij + 1e-10)
+                    regret_scores[i, j] = min(1.0, regret * 2.0)  # Cap at 1.0
+            else:
+                # Non-best edges: regret decreases with rank
+                regret = (dist_ij - nearest_dists[0]) / (nearest_dists[0] + 1e-10)
+                decay = 1.0 / (1.0 + 0.5 * rank)  # Rank-based decay
+                regret_scores[i, j] = min(0.5, regret * decay)
+    
+    # Average regret from both directions
+    regret_scores = (regret_scores + regret_scores.T) / 2.0
+    
+    # Boost regret for MST edges (they are critical for connectivity)
+    regret_scores[mst_weights > 0.5] *= 1.5
+    
+    return regret_scores
+
+
+def compute_spatial_lookahead(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute spatial lookahead scores that anticipate future path costs.
+    Uses two-step neighborhood analysis to evaluate edge desirability.
+    """
+    n = distance_matrix.shape[0]
+    lookahead_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    if n < 3:
+        return lookahead_scores
+    
+    # Step 1: Compute local centrality for each node
+    local_centrality = np.zeros(n)
+    for i in range(n):
+        # Average distance to k nearest neighbors as centrality measure
+        k = min(5, n-1)
+        dists = np.partition(distance_matrix[i], k)[:k+1]
+        valid_dists = dists[dists > 0]
+        if len(valid_dists) > 0:
+            local_centrality[i] = 1.0 / (np.mean(valid_dists) + 1e-10)
+    
+    # Normalize centrality
+    if np.max(local_centrality) > 0:
+        local_centrality = local_centrality / np.max(local_centrality)
+    
+    # Step 2: Two-step lookahead for each edge
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+            
+            # Get neighbors of i and j (excluding each other)
+            k_neighbors = min(3, n-2)
+            
+            # Neighbors of i (excluding j)
+            dists_i = distance_matrix[i].copy()
+            dists_i[j] = np.inf
+            dists_i[i] = np.inf
+            neighbors_i = np.argpartition(dists_i, k_neighbors)[:k_neighbors]
+            
+            # Neighbors of j (excluding i)
+            dists_j = distance_matrix[j].copy()
+            dists_j[i] = np.inf
+            dists_j[j] = np.inf
+            neighbors_j = np.argpartition(dists_j, k_neighbors)[:k_neighbors]
+            
+            # Calculate two-step connectivity score
+            two_step_score = 0.0
+            
+            # Check connections from i's neighbors to j's neighbors
+            for ni in neighbors_i:
+                for nj in neighbors_j:
+                    if ni != nj:
+                        # Path: i -> ni -> nj -> j
+                        path_length = (
+                            distance_matrix[i, ni] +
+                            distance_matrix[ni, nj] +
+                            distance_matrix[nj, j]
+                        )
+                        if path_length > 0:
+                            # Lower alternative path length means edge (i,j) is less critical
+                            alt_ratio = path_length / distance_matrix[i, j]
+                            two_step_score += 1.0 / alt_ratio
+            
+            # Normalize two-step score
+            if two_step_score > 0:
+                two_step_score = min(1.0, two_step_score / (k_neighbors * k_neighbors))
+            
+            # Combine with centrality
+            centrality_score = (local_centrality[i] + local_centrality[j]) / 2.0
+            
+            # Final lookahead score
+            lookahead_scores[i, j] = (0.6 * two_step_score + 0.4 * centrality_score)
+            lookahead_scores[j, i] = lookahead_scores[i, j]
+    
+    return lookahead_scores
+
+
+def compute_density_adaptive_k(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute adaptive k for each node based on local density with regret consideration."""
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.array([max(1, n-1)] * n, dtype=int)
+    
+    k_values = np.zeros(n, dtype=int)
+    
+    for i in range(n):
+        # Compute median distance to other nodes
+        other_dists = distance_matrix[i, distance_matrix[i] > 0]
+        if len(other_dists) > 0:
+            median_dist = np.median(other_dists)
+            
+            # Count nodes within adaptive radius based on distance distribution
+            radius = 1.5 * median_dist
+            close_count = np.sum(distance_matrix[i] <= radius) - 1  # -1 for self
+            
+            # Base k with density adjustment
+            base_k = max(2, min(5, n // 8))
+            
+            # Adjust k based on local density and regret potential
+            if close_count > 0:
+                # In dense regions, consider more alternatives (lower regret)
+                density_factor = min(close_count, n // 4)
+                # In sparse regions, fewer alternatives (higher regret for best edges)
+                sparsity_penalty = max(0, (n // 10) - close_count) // 3
+                
+                k_values[i] = base_k + density_factor // 2 - sparsity_penalty
+            else:
+                k_values[i] = base_k
+            
+            # Ensure bounds
+            k_values[i] = max(2, min(k_values[i], n-1, 10))
+        else:
+            k_values[i] = max(2, n-1)
+    
+    return k_values
+```

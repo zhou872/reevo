@@ -1,0 +1,164 @@
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic for TSP that adapts parameters to instance size and 
+    implements effective per-node sparsification.
+    
+    The heuristic combines:
+    1. Inverse distance as baseline
+    2. Local connectivity via k-nearest neighbors
+    3. Node centrality measures
+    4. Adaptive sparsification per node
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle edge cases
+    if n <= 2:
+        heuristics_matrix = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics_matrix, 0)
+        return heuristics_matrix
+    
+    # Make a copy and handle diagonal
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # ==================== ADAPTIVE PARAMETERS ====================
+    # Dynamically adjust parameters based on problem size
+    k_nearest = max(3, min(10, int(np.log2(n)) + 2))  # Number of nearest neighbors
+    edges_to_keep = max(3, min(15, int(np.sqrt(n)) + 2))  # Edges to keep per node
+    cluster_count = max(2, min(5, n // 10))  # Number of clusters for betweenness
+    
+    # ==================== BASE HEURISTICS ====================
+    
+    # 1. Inverse distance (closer nodes are more promising)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / dist
+        inv_dist[np.isinf(inv_dist)] = 0
+    
+    # Normalize inverse distance per row
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    inv_dist_norm = np.zeros_like(inv_dist)
+    mask = row_sums > 0
+    inv_dist_norm[mask[:, 0]] = inv_dist[mask[:, 0]] / row_sums[mask]
+    
+    # 2. K-nearest neighbors connectivity
+    nearest_mask = np.zeros_like(dist, dtype=bool)
+    for i in range(n):
+        # Get indices of k nearest neighbors
+        nearest_indices = np.argsort(dist[i])[:k_nearest + 1]  # +1 because self is excluded
+        nearest_indices = nearest_indices[nearest_indices != i][:k_nearest]
+        nearest_mask[i, nearest_indices] = True
+    
+    # Symmetrize the nearest neighbor mask
+    nearest_mask_sym = nearest_mask | nearest_mask.T
+    
+    # 3. Node centrality: nodes with many close neighbors are more central
+    node_centrality = np.zeros(n)
+    for i in range(n):
+        # Average distance to k nearest neighbors
+        nearest_dists = np.sort(dist[i])[1:k_nearest + 1]  # Skip self
+        if len(nearest_dists) > 0:
+            node_centrality[i] = 1 / (1 + np.mean(nearest_dists))
+    
+    # Normalize centrality
+    if node_centrality.max() > 0:
+        node_centrality = node_centrality / node_centrality.max()
+    
+    # Centrality-based score: connect central nodes to less central ones
+    centrality_score = np.zeros_like(dist)
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Prefer edges that balance centrality
+            score = 1 - abs(node_centrality[i] - node_centrality[j])
+            centrality_score[i, j] = centrality_score[j, i] = score
+    
+    # 4. Simple between-cluster approximation (for larger instances)
+    between_cluster = np.zeros_like(dist)
+    if n > 10 and cluster_count > 1:
+        # Use farthest-first traversal to identify cluster centers
+        centers = [np.random.randint(0, n)]  # Start with random center
+        for _ in range(1, cluster_count):
+            # Find point farthest from all current centers
+            dist_to_centers = np.min(dist[np.ix_(centers, range(n))], axis=0)
+            new_center = np.argmax(dist_to_centers)
+            centers.append(new_center)
+        
+        # Assign each node to nearest center
+        assignments = np.argmin(dist[np.ix_(centers, range(n))], axis=0)
+        
+        # Score edges between different clusters higher
+        for i in range(n):
+            for j in range(i + 1, n):
+                if assignments[i] != assignments[j]:
+                    # Scale score by distance to encourage connecting nearby clusters
+                    scale = 1 / (1 + dist[i, j] / np.median(dist))
+                    between_cluster[i, j] = between_cluster[j, i] = scale
+    
+    # ==================== COMBINE FACTORS ====================
+    
+    # Weighted combination of all factors
+    heuristics_matrix = np.zeros_like(dist, dtype=float)
+    
+    # Base inverse distance contributes everywhere
+    heuristics_matrix += 0.4 * inv_dist_norm
+    
+    # Boost edges that are in nearest neighbor graph
+    heuristics_matrix += 0.3 * nearest_mask_sym.astype(float) * inv_dist_norm
+    
+    # Add centrality balancing
+    heuristics_matrix += 0.2 * centrality_score
+    
+    # Add between-cluster connections for larger instances
+    if n > 10:
+        heuristics_matrix += 0.1 * between_cluster
+    
+    # ==================== ADAPTIVE SPARSIFICATION ====================
+    
+    # Per-node sparsification: keep top edges for each node
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    for i in range(n):
+        # Get heuristic values for this node
+        row_heuristics = heuristics_matrix[i].copy()
+        row_heuristics[i] = -np.inf  # Exclude self
+        
+        # Find top edges to keep
+        if edges_to_keep < n - 1:
+            # Get indices of top edges
+            threshold_idx = np.argsort(row_heuristics)[-edges_to_keep:]
+            # Keep only top edges
+            sparsified[i, threshold_idx] = row_heuristics[threshold_idx]
+        else:
+            # Keep all edges (for very small instances)
+            sparsified[i, :] = row_heuristics
+            sparsified[i, i] = 0
+    
+    # Symmetrize: keep edge if promising in either direction
+    final_heuristics = np.maximum(sparsified, sparsified.T)
+    
+    # ==================== POST-PROCESSING ====================
+    
+    # Normalize to [0, 1] range
+    max_val = final_heuristics.max()
+    if max_val > 0:
+        final_heuristics = final_heuristics / max_val
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(final_heuristics, 0)
+    
+    return final_heuristics
+```

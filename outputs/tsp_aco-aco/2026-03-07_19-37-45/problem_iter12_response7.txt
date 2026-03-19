@@ -1,0 +1,612 @@
+```json
+{
+    "algorithm_features": ["Probabilistic Regret Model", "Cluster-Aware Candidate Selection", "Variance-Adaptive Multi-Hop Scoring", "Dynamic Edge Prioritization"]
+}
+```
+
+```python
+import numpy as np
+from typing import Dict, Tuple
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with probabilistic regret modeling and cluster-aware candidate selection.
+    
+    Key improvements over v1:
+    1. Probabilistic regret model using beta distribution for alternative path evaluation
+    2. Cluster-aware candidate selection using density-based clustering
+    3. Dynamic edge prioritization based on partial tour simulation
+    4. Adaptive multi-hop path sampling with variance-aware scoring
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Enhanced instance analysis with cluster detection
+    stats, cluster_labels = _analyze_instance_v3(distance_matrix)
+    
+    # Step 2: Cluster-aware candidate selection
+    candidate_mask = _build_cluster_aware_mask_v3(distance_matrix, stats, cluster_labels)
+    
+    # Step 3: Probabilistic multi-hop regret scoring
+    regret_scores = _compute_probabilistic_regret_v3(distance_matrix, stats, candidate_mask, cluster_labels)
+    
+    # Step 4: Dynamic edge prioritization via partial tour simulation
+    priority_scores = _compute_dynamic_priorities_v3(distance_matrix, stats, candidate_mask, cluster_labels)
+    
+    # Step 5: Base inverse distance scores
+    inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-8)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Step 6: Adaptive combination with variance-aware weighting
+    H = np.zeros((n, n))
+    weights = _compute_adaptive_weights_v3(stats, cluster_labels)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if candidate_mask[i, j]:
+                # Combine all factors with learned weights
+                combined = (
+                    inv_dist[i, j] ** weights['w_inv'] *
+                    regret_scores[i, j] ** weights['w_regret'] *
+                    priority_scores[i, j] ** weights['w_priority']
+                )
+                H[i, j] = H[j, i] = combined
+    
+    # Step 7: Post-processing with cluster-aware normalization
+    H = _post_process_v3(H, distance_matrix, stats, candidate_mask, cluster_labels)
+    
+    return H
+
+def _analyze_instance_v3(distance_matrix: np.ndarray) -> Tuple[Dict, np.ndarray]:
+    """Enhanced instance analysis with density-based clustering detection."""
+    n = distance_matrix.shape[0]
+    
+    # Remove diagonal for statistics
+    dist_no_diag = distance_matrix[~np.eye(n, dtype=bool)].reshape(n, n-1)
+    
+    # Basic statistics
+    stats = {
+        'n': n,
+        'mean_dist': np.mean(dist_no_diag),
+        'std_dist': np.std(dist_no_diag),
+        'cv_dist': np.std(dist_no_diag) / (np.mean(dist_no_diag) + 1e-8),
+        'regularity': _compute_regularity_v2(distance_matrix),
+        'density_ratio': _compute_density_ratio_v2(distance_matrix)
+    }
+    
+    # Detect clusters using adaptive threshold DBSCAN-like approach
+    cluster_labels = _detect_clusters_v3(distance_matrix, stats)
+    stats['n_clusters'] = len(np.unique(cluster_labels))
+    stats['cluster_balance'] = _compute_cluster_balance(cluster_labels)
+    
+    return stats, cluster_labels
+
+def _compute_regularity_v2(distance_matrix: np.ndarray) -> float:
+    """Enhanced regularity measure with quartile analysis."""
+    n = distance_matrix.shape[0]
+    
+    cv_per_node = []
+    iqr_per_node = []
+    
+    for i in range(n):
+        dists = distance_matrix[i]
+        dists = dists[dists != 0]  # Remove self-distance
+        
+        if len(dists) > 1:
+            # Coefficient of variation
+            cv = np.std(dists) / (np.mean(dists) + 1e-8)
+            cv_per_node.append(cv)
+            
+            # Interquartile range normalized by median
+            q75, q25 = np.percentile(dists, [75, 25])
+            iqr = (q75 - q25) / (np.median(dists) + 1e-8)
+            iqr_per_node.append(iqr)
+    
+    if len(cv_per_node) == 0:
+        return 1.0
+    
+    avg_cv = np.mean(cv_per_node)
+    avg_iqr = np.mean(iqr_per_node) if iqr_per_node else 0.5
+    
+    # Combined regularity measure
+    regularity = 1.0 / (1.0 + 0.7 * avg_cv + 0.3 * avg_iqr)
+    return np.clip(regularity, 0.1, 1.0)
+
+def _compute_density_ratio_v2(distance_matrix: np.ndarray) -> float:
+    """Enhanced density ratio with multiple neighborhood scales."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return 0.5
+    
+    # Multi-scale density analysis
+    scales = [1, 2, 3]  # Number of nearest neighbors to consider
+    ratios = []
+    
+    for k in scales:
+        if k >= n - 1:
+            continue
+            
+        local_dists = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Get k nearest neighbors
+            k_nearest = np.partition(dists, k)[:k]
+            local_dists.extend(k_nearest)
+        
+        if local_dists:
+            local_avg = np.mean(local_dists)
+            global_avg = np.mean(distance_matrix[~np.eye(n, dtype=bool)])
+            ratio = local_avg / (global_avg + 1e-8)
+            ratios.append(ratio)
+    
+    if not ratios:
+        return 0.5
+    
+    # Weighted average (more weight to smaller scales)
+    weights = [0.5, 0.3, 0.2][:len(ratios)]
+    weighted_ratio = np.average(ratios, weights=weights)
+    
+    return np.clip(weighted_ratio, 0.3, 2.0)
+
+def _detect_clusters_v3(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+    """Density-based cluster detection using adaptive thresholding."""
+    n = stats['n']
+    
+    if n < 10:
+        # No clustering for small instances
+        return np.zeros(n, dtype=int)
+    
+    # Adaptive threshold based on distance statistics
+    mean_dist = stats['mean_dist']
+    std_dist = stats['std_dist']
+    
+    # Use median of nearest neighbor distances as threshold
+    nn_dists = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nn_dists.append(np.min(dists))
+    
+    threshold = np.median(nn_dists) * 1.5
+    
+    # Simple DBSCAN-like clustering
+    cluster_id = 0
+    visited = np.zeros(n, dtype=bool)
+    cluster_labels = -np.ones(n, dtype=int)
+    
+    for i in range(n):
+        if not visited[i]:
+            # Find all points within threshold
+            neighbors = np.where(distance_matrix[i] < threshold)[0]
+            if len(neighbors) >= max(2, n // 10):  # Core point condition
+                # Expand cluster
+                stack = list(neighbors)
+                while stack:
+                    point = stack.pop()
+                    if not visited[point]:
+                        visited[point] = True
+                        cluster_labels[point] = cluster_id
+                        
+                        # Find neighbors of this point
+                        point_neighbors = np.where(distance_matrix[point] < threshold)[0]
+                        if len(point_neighbors) >= max(2, n // 10):
+                            for nb in point_neighbors:
+                                if not visited[nb] and cluster_labels[nb] == -1:
+                                    stack.append(nb)
+                
+                cluster_id += 1
+    
+    # Assign noise points to nearest cluster
+    noise_points = np.where(cluster_labels == -1)[0]
+    for point in noise_points:
+        if len(noise_points) < n:  # There are some clusters
+            # Find nearest non-noise point
+            dists = distance_matrix[point].copy()
+            dists[cluster_labels == -1] = np.inf
+            nearest = np.argmin(dists)
+            cluster_labels[point] = cluster_labels[nearest]
+        else:
+            cluster_labels[point] = 0
+    
+    return cluster_labels
+
+def _compute_cluster_balance(cluster_labels: np.ndarray) -> float:
+    """Measure how balanced the clusters are."""
+    unique, counts = np.unique(cluster_labels, return_counts=True)
+    if len(unique) <= 1:
+        return 1.0
+    
+    # Balance: 1.0 if all clusters same size, 0.0 if highly imbalanced
+    max_count = np.max(counts)
+    min_count = np.min(counts)
+    balance = min_count / (max_count + 1e-8)
+    return np.clip(balance, 0.1, 1.0)
+
+def _build_cluster_aware_mask_v3(distance_matrix: np.ndarray, stats: Dict, 
+                                cluster_labels: np.ndarray) -> np.ndarray:
+    """Build candidate mask with cluster-aware edge selection."""
+    n = stats['n']
+    n_clusters = stats['n_clusters']
+    
+    # Base number of candidates
+    base_k = min(12, max(4, int(np.log2(n) * 2.5)))
+    
+    # Adjust based on clustering
+    if n_clusters > 1:
+        # More intra-cluster edges for clustered instances
+        intra_k = int(base_k * 1.3)
+        inter_k = max(2, base_k // 3)
+    else:
+        intra_k = base_k
+        inter_k = base_k // 2
+    
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        cluster_i = cluster_labels[i]
+        
+        # Get distances
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Separate intra-cluster and inter-cluster distances
+        intra_mask = (cluster_labels == cluster_i)
+        inter_mask = (cluster_labels != cluster_i)
+        
+        # Select intra-cluster candidates
+        if np.sum(intra_mask) > 1:
+            intra_dists = dists.copy()
+            intra_dists[~intra_mask] = np.inf
+            intra_indices = np.argsort(intra_dists)[:intra_k]
+            candidate_mask[i, intra_indices] = True
+        
+        # Select inter-cluster candidates
+        if np.sum(inter_mask) > 0 and inter_k > 0:
+            inter_dists = dists.copy()
+            inter_dists[~inter_mask] = np.inf
+            inter_indices = np.argsort(inter_dists)[:inter_k]
+            candidate_mask[i, inter_indices] = True
+    
+    # Make symmetric and zero diagonal
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    
+    return candidate_mask
+
+def _compute_probabilistic_regret_v3(distance_matrix: np.ndarray, stats: Dict,
+                                    candidate_mask: np.ndarray, 
+                                    cluster_labels: np.ndarray) -> np.ndarray:
+    """
+    Probabilistic regret scoring using beta distribution for alternative path evaluation.
+    """
+    n = stats['n']
+    regret_scores = np.ones((n, n))
+    
+    # Adaptive parameters
+    max_hops = min(3, max(2, int(4 - 2 * stats['regularity'])))
+    n_samples = min(50, max(10, n * 2))
+    
+    # Precompute sorted neighbors for each node
+    sorted_neighbors = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        sorted_neighbors.append(np.argsort(dists))
+    
+    for i in range(n):
+        i_candidates = np.where(candidate_mask[i])[0]
+        for j in i_candidates:
+            if j <= i:
+                continue
+                
+            direct_cost = distance_matrix[i, j]
+            
+            # Sample alternative paths using probabilistic model
+            alternative_costs = []
+            
+            # 2-hop alternatives
+            for k in i_candidates:
+                if k == j or not candidate_mask[k, j]:
+                    continue
+                alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                alternative_costs.append(alt_cost)
+            
+            # Sample multi-hop alternatives
+            if max_hops >= 3 and len(alternative_costs) < n_samples // 2:
+                for _ in range(n_samples - len(alternative_costs)):
+                    # Random walk of length 2-3
+                    path_length = np.random.randint(2, max_hops + 1)
+                    current = i
+                    total_cost = 0
+                    valid_path = True
+                    
+                    for step in range(path_length):
+                        # Choose next node from candidates
+                        candidates = np.where(candidate_mask[current])[0]
+                        if len(candidates) == 0 or (step == path_length - 1 and j not in candidates):
+                            valid_path = False
+                            break
+                        
+                        if step == path_length - 1:
+                            next_node = j
+                        else:
+                            # Prefer nodes that lead toward destination
+                            available = [c for c in candidates if c != current and c != j]
+                            if available:
+                                # Weight by inverse distance to j
+                                weights = 1 / (distance_matrix[available, j] + 1e-8)
+                                weights = weights / np.sum(weights)
+                                next_node = np.random.choice(available, p=weights)
+                            else:
+                                valid_path = False
+                                break
+                        
+                        total_cost += distance_matrix[current, next_node]
+                        current = next_node
+                    
+                    if valid_path and current == j:
+                        alternative_costs.append(total_cost)
+            
+            if alternative_costs:
+                # Fit probabilistic model (simplified beta distribution)
+                min_alt = np.min(alternative_costs)
+                mean_alt = np.mean(alternative_costs)
+                std_alt = np.std(alternative_costs) + 1e-8
+                
+                # Probability that direct edge is better than alternative
+                # Using sigmoid of z-score difference
+                z_score = (mean_alt - direct_cost) / std_alt
+                probability = 1 / (1 + np.exp(-z_score))
+                
+                # Adjust based on cluster relationship
+                if cluster_labels[i] == cluster_labels[j]:
+                    # Intra-cluster: higher confidence
+                    probability = probability ** 0.8
+                else:
+                    # Inter-cluster: more conservative
+                    probability = probability ** 1.2
+                
+                # Convert probability to score (0.5 to 2.0 range)
+                score = 0.5 + 1.5 * probability
+                regret_scores[i, j] = regret_scores[j, i] = score
+    
+    # Symmetrize and ensure non-negative
+    regret_scores = (regret_scores + regret_scores.T) / 2
+    regret_scores = np.maximum(regret_scores, 0.1)
+    np.fill_diagonal(regret_scores, 0)
+    
+    return regret_scores
+
+def _compute_dynamic_priorities_v3(distance_matrix: np.ndarray, stats: Dict,
+                                  candidate_mask: np.ndarray,
+                                  cluster_labels: np.ndarray) -> np.ndarray:
+    """
+    Compute dynamic edge priorities through partial tour simulation.
+    """
+    n = stats['n']
+    priority_scores = np.ones((n, n))
+    
+    if n < 8:
+        return priority_scores
+    
+    # Number of partial tours to simulate
+    n_tours = min(20, n * 2)
+    tour_length = min(10, n // 2)
+    
+    # Precompute for efficiency
+    sorted_neighbors = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        sorted_neighbors.append(np.argsort(dists))
+    
+    edge_counts = np.zeros((n, n))
+    
+    for _ in range(n_tours):
+        # Start from random node
+        start = np.random.randint(n)
+        visited = np.zeros(n, dtype=bool)
+        current = start
+        visited[current] = True
+        
+        # Build partial tour
+        tour = [current]
+        for step in range(tour_length - 1):
+            # Find unvisited candidates
+            candidates = np.where(candidate_mask[current] & ~visited)[0]
+            if len(candidates) == 0:
+                # Fall back to nearest unvisited
+                dists = distance_matrix[current].copy()
+                dists[visited] = np.inf
+                if np.all(dists == np.inf):
+                    break
+                candidates = [np.argmin(dists)]
+            
+            # Choose next node with probability based on inverse distance
+            if len(candidates) > 0:
+                weights = 1 / (distance_matrix[current, candidates] + 1e-8)
+                weights = weights / np.sum(weights)
+                next_node = np.random.choice(candidates, p=weights)
+                
+                # Count this edge
+                edge_counts[current, next_node] += 1
+                edge_counts[next_node, current] += 1
+                
+                current = next_node
+                visited[current] = True
+                tour.append(current)
+    
+    # Convert counts to priority scores
+    if np.max(edge_counts) > 0:
+        # Normalize and apply nonlinear scaling
+        normalized = edge_counts / np.max(edge_counts)
+        
+        # Boost edges that appear frequently (sigmoid emphasis)
+        priority_scores = 1 / (1 + np.exp(-6 * (normalized - 0.3)))
+        
+        # Adjust for cluster relationships
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_labels[i] != cluster_labels[j]:
+                    # Boost inter-cluster edges that appear in tours
+                    priority_scores[i, j] = priority_scores[j, i] = min(
+                        1.0, priority_scores[i, j] * 1.5
+                    )
+    
+    np.fill_diagonal(priority_scores, 0)
+    return priority_scores
+
+def _compute_adaptive_weights_v3(stats: Dict, cluster_labels: np.ndarray) -> Dict:
+    """Compute adaptive weights based on instance characteristics and clustering."""
+    n = stats['n']
+    cv = stats['cv_dist']
+    regularity = stats['regularity']
+    density_ratio = stats['density_ratio']
+    n_clusters = stats['n_clusters']
+    
+    # Base weights
+    weights = {
+        'w_inv': 1.0,
+        'w_regret': 0.6 * (1.0 - regularity),
+        'w_priority': 0.4 * regularity,
+    }
+    
+    # Adjust for clustering
+    if n_clusters > 1:
+        # More weight to regret and priority for clustered instances
+        weights['w_regret'] *= 1.3
+        weights['w_priority'] *= 1.2
+    
+    # Adjust for density pattern
+    if density_ratio < 0.8:  # Clustered
+        weights['w_inv'] *= 0.8
+        weights['w_priority'] *= 1.2
+    elif density_ratio > 1.2:  # Uniform
+        weights['w_inv'] *= 1.2
+        weights['w_regret'] *= 0.8
+    
+    # Normalize to maintain scale
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] = weights[key] / total * 3.0
+    
+    return weights
+
+def _post_process_v3(H: np.ndarray, distance_matrix: np.ndarray,
+                    stats: Dict, candidate_mask: np.ndarray,
+                    cluster_labels: np.ndarray) -> np.ndarray:
+    """Enhanced post-processing with cluster-aware normalization."""
+    n = stats['n']
+    n_clusters = stats['n_clusters']
+    
+    # Ensure minimum connectivity
+    if n_clusters > 1:
+        min_edges_per_cluster = 3
+    else:
+        min_edges_per_cluster = 2
+    
+    min_edges = min(min_edges_per_cluster, n - 1)
+    
+    for i in range(n):
+        non_zero = np.nonzero(H[i] > 0)[0]
+        if len(non_zero) < min_edges:
+            # Add missing edges prioritizing within cluster first
+            cluster_i = cluster_labels[i]
+            same_cluster = np.where(cluster_labels == cluster_i)[0]
+            same_cluster = [x for x in same_cluster if x != i]
+            
+            # Try to add intra-cluster edges first
+            added = 0
+            for j in same_cluster:
+                if H[i, j] == 0 and j != i:
+                    base_score = 1 / (distance_matrix[i, j] + 1e-8)
+                    H[i, j] = H[j, i] = base_score
+                    added += 1
+                    if added >= min_edges - len(non_zero):
+                        break
+            
+            # If still needed, add inter-cluster edges
+            if added < min_edges - len(non_zero):
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                sorted_idx = np.argsort(dists)
+                for j in sorted_idx:
+                    if H[i, j] == 0 and j != i:
+                        base_score = 1 / (distance_matrix[i, j] + 1e-8)
+                        H[i, j] = H[j, i] = base_score
+                        added += 1
+                        if added >= min_edges - len(non_zero):
+                            break
+    
+    # Apply candidate mask
+    H = H * candidate_mask
+    
+    # Symmetrize and zero diagonal
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    # Cluster-aware normalization
+    if n_clusters > 1:
+        # Normalize within each cluster separately, then globally
+        for cluster_id in np.unique(cluster_labels):
+            cluster_indices = np.where(cluster_labels == cluster_id)[0]
+            if len(cluster_indices) > 1:
+                cluster_block = H[np.ix_(cluster_indices, cluster_indices)]
+                max_val = np.max(cluster_block)
+                if max_val > 0:
+                    cluster_block = cluster_block / max_val
+                    H[np.ix_(cluster_indices, cluster_indices)] = cluster_block
+    
+    # Final global normalization
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    return H
+
+# Example usage and testing
+if __name__ == "__main__":
+    np.random.seed(42)
+    warnings.filterwarnings('ignore')
+    
+    # Test with various problem sizes
+    for n in [10, 25, 50, 100]:
+        print(f"\nTesting with n = {n}")
+        
+        # Generate random distance matrix
+        points = np.random.rand(n, 2) * 100
+        from scipy.spatial.distance import pdist, squareform
+        dist_matrix = squareform(pdist(points, 'euclidean'))
+        
+        # Compute heuristics
+        H = heuristics_v2(dist_matrix)
+        
+        # Statistics
+        print(f"Shape: {H.shape}")
+        print(f"Non-zero entries: {np.count_nonzero(H)}")
+        print(f"Sparsity: {(H == 0).sum() / H.size:.1%}")
+        print(f"Mean non-zero: {np.mean(H[H > 0]):.4f}")
+        
+        # Verify symmetry
+        symmetric_diff = np.max(np.abs(H - H.T))
+        print(f"Max asymmetry: {symmetric_diff:.6f}")
+        
+        # Show top edges for small instances
+        if n <= 25:
+            triu_idx = np.triu_indices_from(H, k=1)
+            top_k = min(5, len(triu_idx[0]))
+            if top_k > 0:
+                values = H[triu_idx]
+                top_indices = np.argsort(values)[-top_k:][::-1]
+                
+                print("\nTop edges:")
+                for idx in top_indices:
+                    i, j = triu_idx[0][idx], triu_idx[1][idx]
+                    print(f"  ({i:2d}, {j:2d}): dist={dist_matrix[i,j]:6.2f}, score={H[i,j]:.4f}")
+```

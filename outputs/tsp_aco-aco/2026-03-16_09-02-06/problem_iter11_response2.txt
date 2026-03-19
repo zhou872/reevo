@@ -1,0 +1,184 @@
+```json
+{
+    "algorithm_features": ["Average-based Two-step Lookahead", "Dynamic Regret Thresholding", "Spatial Connectivity Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with simplified two-step lookahead and dynamic regret.
+    
+    Core improvements over v1:
+    1. Simplified average-based two-step lookahead scoring
+    2. Dynamic regret thresholding based on coefficient of variation
+    3. Spatial connectivity scoring for neighborhood preservation
+    4. More aggressive sparsification for computational efficiency
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between n nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Working copy with diagonal set to infinity
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # ========== 1. STATISTICS AND ADAPTIVE PARAMETERS ==========
+    flat_dists = dist[np.triu_indices(n, k=1)]
+    global_avg = np.mean(flat_dists)
+    cv = np.std(flat_dists) / (global_avg + 1e-12)
+    
+    # Dynamic parameters based on problem characteristics
+    k_neighbors = min(5, n - 2)  # Number of neighbors for lookahead
+    regret_threshold_factor = 0.3 + 0.4 * np.tanh(cv)  # Higher CV → higher threshold
+    spatial_weight = min(0.25, 2.0 / np.sqrt(n))  # Smaller for larger problems
+    
+    # ========== 2. BASE INVERSE DISTANCE ==========
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = np.where(dist < np.inf, 1 / (dist + 1e-12), 0)
+    
+    # ========== 3. AVERAGE-BASED TWO-STEP LOOKAHEAD ==========
+    lookahead_scores = np.ones_like(dist)
+    
+    # Precompute nearest neighbors for each node
+    neighbor_indices = np.zeros((n, k_neighbors), dtype=int)
+    neighbor_avgs = np.zeros(n)
+    
+    for i in range(n):
+        # Get distances and sort (excluding self)
+        dist_i = dist[i].copy()
+        sorted_idx = np.argsort(dist_i)
+        # Get k nearest neighbors (skip the first which is self/inf)
+        valid_neighbors = sorted_idx[1:k_neighbors+1]
+        neighbor_indices[i] = valid_neighbors
+        if len(valid_neighbors) > 0:
+            neighbor_avgs[i] = np.mean(dist_i[valid_neighbors])
+        else:
+            neighbor_avgs[i] = global_avg
+    
+    # Compute lookahead scores for each edge
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dist[i, j] < np.inf:
+                # Lookahead: average distance from j to its k nearest (excluding i)
+                j_neighbors = neighbor_indices[j]
+                # Filter out i if present
+                mask = j_neighbors != i
+                if np.any(mask):
+                    avg_next = np.mean(dist[j, j_neighbors[mask][:k_neighbors]])
+                else:
+                    avg_next = neighbor_avgs[j]
+                
+                # Normalize by global average
+                avg_ratio = avg_next / (global_avg + 1e-12)
+                lookahead_scores[i, j] = lookahead_scores[j, i] = 1.0 / (1.0 + avg_ratio)
+    
+    # ========== 4. DYNAMIC REGRET THRESHOLDING ==========
+    regret_scores = np.ones_like(dist)
+    
+    for i in range(n):
+        # Get distances from node i
+        dist_i = dist[i].copy()
+        
+        # Find two smallest distances for regret calculation
+        smallest_two = np.partition(dist_i, 1)[:2]  # 2 smallest elements
+        best = np.min(smallest_two)
+        second_best = np.max(smallest_two)
+        
+        # Dynamic threshold based on spread and cv
+        if second_best - best > 1e-12:
+            base_threshold = (second_best - best) * 0.5
+            dynamic_threshold = base_threshold * (1 + cv * regret_threshold_factor)
+        else:
+            dynamic_threshold = global_avg * 0.1  # Fallback
+            
+        for j in range(n):
+            if i != j and dist_i[j] < np.inf:
+                regret = dist_i[j] - best
+                # Apply penalty only if regret exceeds threshold
+                if regret > dynamic_threshold:
+                    # Normalized penalty based on how much above threshold
+                    penalty_ratio = (regret - dynamic_threshold) / (dynamic_threshold + 1e-12)
+                    regret_scores[i, j] = np.exp(-penalty_ratio)
+    
+    # Make symmetric (geometric mean)
+    regret_symmetric = np.sqrt(regret_scores * regret_scores.T)
+    
+    # ========== 5. SPATIAL CONNECTIVITY SCORING ==========
+    spatial_scores = np.ones_like(dist)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dist[i, j] < np.inf:
+                # Quality of best alternative connections for both nodes
+                dist_i = dist[i].copy()
+                dist_i[j] = np.inf
+                dist_j = dist[j].copy()
+                dist_j[i] = np.inf
+                
+                if np.any(dist_i < np.inf) and np.any(dist_j < np.inf):
+                    best_alt_i = np.min(dist_i)
+                    best_alt_j = np.min(dist_j)
+                    
+                    # Combined quality score
+                    alt_quality = (best_alt_i + best_alt_j) / (2 * (global_avg + 1e-12))
+                    spatial_scores[i, j] = spatial_scores[j, i] = 1.0 - spatial_weight * alt_quality
+    
+    # ========== 6. COMBINE SCORES AND MST REINFORCEMENT ==========
+    base_scores = inv_dist * regret_symmetric * lookahead_scores * spatial_scores
+    
+    # MST reinforcement
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    base_scores[mst_mask] *= 1.5  # Fixed bonus for MST edges
+    
+    # ========== 7. AGGRESSIVE SPARSIFICATION ==========
+    sparsity_mask = np.zeros_like(base_scores, dtype=bool)
+    
+    # Determine number of edges to keep per node
+    target_edges_per_node = min(8, n // 2)
+    
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Keep top target_edges_per_node edges
+        if target_edges_per_node > 0:
+            threshold_idx = -target_edges_per_node
+            threshold = np.partition(row_scores, threshold_idx)[threshold_idx]
+            sparsity_mask[i, row_scores >= threshold] = True
+    
+    # Ensure symmetry and preserve MST
+    sparsity_mask = (sparsity_mask | sparsity_mask.T) | mst_mask
+    
+    # Apply sparsification
+    final_scores = base_scores * sparsity_mask
+    
+    # ========== 8. FINAL NORMALIZATION ==========
+    np.fill_diagonal(final_scores, 0)
+    
+    # Row-wise normalization
+    row_max = final_scores.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    final_scores = final_scores / row_max
+    
+    # Global normalization
+    max_val = final_scores.max()
+    if max_val > 0:
+        final_scores = final_scores / max_val
+    
+    return final_scores
+```

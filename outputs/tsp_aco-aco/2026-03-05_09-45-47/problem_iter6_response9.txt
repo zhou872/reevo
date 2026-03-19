@@ -1,0 +1,493 @@
+```json
+{
+    "algorithm_features": ["MST-Guided Sparsification", "Spectral Clustering", "Probabilistic Triangle Analysis", "Adaptive Ensemble"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.cluster import SpectralClustering
+import networkx as nx
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with:
+    1. Memory-efficient spectral clustering with landmark approximation
+    2. MST-guided sparsification with connectivity guarantees
+    3. Probabilistic triangle quality analysis
+    4. Adaptive ensemble of heuristic factors
+    
+    Args:
+        distance_matrix: Square symmetric distance matrix (n x n)
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases directly
+    if n <= 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(heuristic, 0)
+        max_val = np.max(heuristic)
+        if max_val > 0:
+            heuristic /= max_val
+        return heuristic
+    
+    # 1. Compute Minimum Spanning Tree (essential connectivity)
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # 2. Adaptive clustering based on problem size
+    cluster_labels, intra_cluster_mask = _adaptive_clustering(distance_matrix, n, mst_mask)
+    
+    # 3. Base reciprocal heuristic with distance normalization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(base_heuristic, 0)
+    if np.max(base_heuristic) > 0:
+        base_heuristic /= np.max(base_heuristic)
+    
+    # 4. Probabilistic triangle analysis
+    triangle_boost = _probabilistic_triangle_analysis(distance_matrix, base_heuristic, n)
+    
+    # 5. Local neighborhood consistency
+    local_factor = _compute_local_consistency(distance_matrix, n)
+    
+    # 6. Adaptive ensemble combination
+    heuristic_matrix = _adaptive_ensemble(
+        base_heuristic, mst_mask, intra_cluster_mask, 
+        triangle_boost, local_factor, distance_matrix, n
+    )
+    
+    # 7. MST-guided sparsification (ensures connectivity)
+    heuristic_matrix = _mst_guided_sparsification(
+        heuristic_matrix, mst_mask, distance_matrix, n
+    )
+    
+    # 8. Final normalization and symmetry enforcement
+    np.fill_diagonal(heuristic_matrix, 0)
+    max_val = np.max(heuristic_matrix)
+    if max_val > 0:
+        heuristic_matrix /= max_val
+    
+    return heuristic_matrix
+
+
+def _adaptive_clustering(
+    distance_matrix: np.ndarray, 
+    n: int, 
+    mst_mask: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Adaptive clustering that scales efficiently with problem size.
+    For small instances: spectral clustering
+    For large instances: landmark-based approximate clustering
+    """
+    # Adaptive number of clusters
+    n_clusters = max(2, min(int(np.sqrt(n)), 15))
+    
+    if n <= 2000:
+        # Spectral clustering for moderate-sized problems
+        try:
+            # Convert distances to similarities
+            max_dist = np.max(distance_matrix)
+            if max_dist > 0:
+                similarities = 1 - distance_matrix / max_dist
+            else:
+                similarities = np.ones_like(distance_matrix)
+            
+            # Use fast spectral clustering with precomputed affinity
+            spectral = SpectralClustering(
+                n_clusters=n_clusters,
+                affinity='precomputed',
+                random_state=42,
+                n_init=2,
+                assign_labels='discretize'
+            )
+            labels = spectral.fit_predict(np.maximum(0, similarities))
+        except Exception:
+            # Fallback to MST-based clustering
+            labels = _mst_based_clustering(mst_mask, n_clusters, n)
+    else:
+        # Landmark-based clustering for large problems
+        labels = _landmark_based_clustering(distance_matrix, n_clusters, n)
+    
+    # Create intra-cluster mask
+    intra_cluster_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        intra_cluster_mask[i] = (labels == labels[i])
+    np.fill_diagonal(intra_cluster_mask, False)
+    
+    return labels, intra_cluster_mask
+
+
+def _mst_based_clustering(mst_mask: np.ndarray, n_clusters: int, n: int) -> np.ndarray:
+    """
+    Cluster nodes based on MST connectivity by removing long edges.
+    """
+    # Build graph from MST
+    G = nx.Graph()
+    edges = np.argwhere(mst_mask)
+    for i, j in edges:
+        if i < j:
+            G.add_edge(i, j, weight=1)  # All MST edges have equal weight
+    
+    # Sort edges by some metric (here we use node degree product as proxy)
+    edge_scores = []
+    for i, j in edges:
+        if i < j:
+            score = G.degree(i) * G.degree(j)
+            edge_scores.append((i, j, score))
+    
+    # Sort edges by score (higher score = more central)
+    edge_scores.sort(key=lambda x: x[2], reverse=True)
+    
+    # Remove top (n_clusters-1) edges to create clusters
+    edges_to_remove = edge_scores[:n_clusters-1]
+    for i, j, _ in edges_to_remove:
+        if G.has_edge(i, j):
+            G.remove_edge(i, j)
+    
+    # Assign cluster labels based on connected components
+    labels = np.zeros(n, dtype=int)
+    for idx, component in enumerate(nx.connected_components(G)):
+        for node in component:
+            labels[node] = idx
+    
+    return labels
+
+
+def _landmark_based_clustering(distance_matrix: np.ndarray, n_clusters: int, n: int) -> np.ndarray:
+    """
+    Fast clustering using landmark nodes for large instances.
+    """
+    # Select landmarks (sampled based on MST degree)
+    landmarks = min(100, n // 10)
+    
+    # Use MST to identify important nodes as landmarks
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    node_importance = mst_array.sum(axis=0) + mst_array.sum(axis=1)
+    
+    # Select landmarks: top important nodes + random sampling
+    n_important = landmarks // 2
+    important_indices = np.argsort(-node_importance)[:n_important]
+    random_indices = np.random.choice(n, landmarks - n_important, replace=False)
+    landmark_indices = np.unique(np.concatenate([important_indices, random_indices]))
+    
+    # Create feature vectors: distances to landmarks
+    landmark_features = distance_matrix[:, landmark_indices]
+    
+    # Normalize features
+    feature_means = landmark_features.mean(axis=0, keepdims=True)
+    feature_stds = landmark_features.std(axis=0, keepdims=True) + 1e-12
+    normalized_features = (landmark_features - feature_means) / feature_stds
+    
+    # Simple k-means clustering (fast implementation)
+    from sklearn.cluster import MiniBatchKMeans
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters, 
+        random_state=42, 
+        batch_size=min(1000, n),
+        n_init=2
+    )
+    labels = kmeans.fit_predict(normalized_features)
+    
+    return labels
+
+
+def _probabilistic_triangle_analysis(
+    distance_matrix: np.ndarray, 
+    base_heuristic: np.ndarray, 
+    n: int
+) -> np.ndarray:
+    """
+    Efficient triangle quality analysis using probabilistic sampling.
+    """
+    triangle_boost = np.ones((n, n))
+    
+    # Determine sampling parameters based on problem size
+    if n <= 100:
+        sample_rate = 1.0  # Check all promising edges
+        neighbors_per_node = min(20, n-1)
+    elif n <= 1000:
+        sample_rate = 0.7
+        neighbors_per_node = min(15, n-1)
+    else:
+        sample_rate = 0.4
+        neighbors_per_node = min(10, n-1)
+    
+    # Precompute neighbor lists for each node
+    neighbor_lists = []
+    for i in range(n):
+        # Get nearest neighbors based on base heuristic
+        scores = base_heuristic[i].copy()
+        scores[i] = -np.inf
+        top_indices = np.argsort(-scores)[:neighbors_per_node]
+        neighbor_lists.append(set(top_indices))
+    
+    # Identify promising edges to analyze
+    triu_indices = np.triu_indices(n, k=1)
+    promising_edges = []
+    
+    for i, j in zip(*triu_indices):
+        if base_heuristic[i, j] > np.percentile(base_heuristic[triu_indices], 60):
+            promising_edges.append((i, j))
+    
+    # Sample edges for triangle analysis
+    n_to_sample = int(len(promising_edges) * sample_rate)
+    if n_to_sample < len(promising_edges):
+        sampled_indices = np.random.choice(len(promising_edges), n_to_sample, replace=False)
+        edges_to_analyze = [promising_edges[idx] for idx in sampled_indices]
+    else:
+        edges_to_analyze = promising_edges
+    
+    # Analyze triangle quality for sampled edges
+    for i, j in edges_to_analyze:
+        # Find common neighbors
+        common_neighbors = neighbor_lists[i].intersection(neighbor_lists[j])
+        
+        if not common_neighbors:
+            continue
+        
+        # Sample a few common neighbors
+        max_check = min(3, len(common_neighbors))
+        sampled_neighbors = np.random.choice(list(common_neighbors), max_check, replace=False)
+        
+        best_quality = 0
+        for k in sampled_neighbors:
+            # Triangle inequality quality measure
+            a, b, c = distance_matrix[i, j], distance_matrix[i, k], distance_matrix[j, k]
+            
+            # Quality: how close is the triangle to being equilateral?
+            # Lower variance in edge lengths indicates better triangle
+            edges = np.array([a, b, c])
+            mean_edge = edges.mean()
+            if mean_edge > 0:
+                # Coefficient of variation (inverse is quality)
+                cv = edges.std() / mean_edge
+                quality = 1.0 / (1.0 + cv)
+                best_quality = max(best_quality, quality)
+        
+        # Apply boost based on triangle quality
+        if best_quality > 0:
+            boost = 1.0 + 0.6 * best_quality
+            triangle_boost[i, j] = triangle_boost[j, i] = boost
+    
+    return triangle_boost
+
+
+def _compute_local_consistency(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Compute local consistency factor based on neighborhood statistics.
+    """
+    local_factor = np.ones((n, n))
+    
+    # For each node, compute local statistics
+    k = min(max(5, int(np.log2(n))), n-1)
+    
+    for i in range(n):
+        # Get distances to k nearest neighbors
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest_indices = np.argsort(dists)[:k]
+        nearest_dists = dists[nearest_indices]
+        
+        mean_i = nearest_dists.mean()
+        std_i = nearest_dists.std() + 1e-12
+        
+        for j in range(i+1, n):
+            # Get j's statistics
+            dists_j = distance_matrix[j].copy()
+            dists_j[j] = np.inf
+            nearest_j = np.argsort(dists_j)[:k]
+            mean_j = dists_j[nearest_j].mean()
+            
+            # Consistency factor: nodes with similar local densities
+            mean_ratio = min(mean_i, mean_j) / max(mean_i, mean_j)
+            
+            # Distance consistency: how typical is this distance?
+            expected_distance = (mean_i + mean_j) / 2
+            actual_distance = distance_matrix[i, j]
+            dist_ratio = min(actual_distance, expected_distance) / max(actual_distance, expected_distance)
+            
+            # Combine factors
+            consistency = 0.7 * mean_ratio + 0.3 * dist_ratio
+            local_factor[i, j] = local_factor[j, i] = 1.0 + 0.3 * consistency
+    
+    return local_factor
+
+
+def _adaptive_ensemble(
+    base_heuristic: np.ndarray,
+    mst_mask: np.ndarray,
+    intra_cluster_mask: np.ndarray,
+    triangle_boost: np.ndarray,
+    local_factor: np.ndarray,
+    distance_matrix: np.ndarray,
+    n: int
+) -> np.ndarray:
+    """
+    Combine heuristic factors with adaptive weights based on problem characteristics.
+    """
+    heuristic_matrix = np.zeros((n, n))
+    
+    # Analyze problem characteristics for adaptive weighting
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv_dist = std_dist / (mean_dist + 1e-12)
+    
+    # Adaptive weights based on problem structure
+    if cv_dist < 0.3:  # Regular, grid-like problems
+        weights = {
+            'base': 0.4,
+            'mst': 0.3,
+            'cluster': 0.15,
+            'triangle': 0.1,
+            'local': 0.05
+        }
+    elif cv_dist < 0.7:  # Moderately irregular
+        weights = {
+            'base': 0.35,
+            'mst': 0.25,
+            'cluster': 0.2,
+            'triangle': 0.15,
+            'local': 0.05
+        }
+    else:  # Highly irregular problems
+        weights = {
+            'base': 0.3,
+            'mst': 0.2,
+            'cluster': 0.25,
+            'triangle': 0.2,
+            'local': 0.05
+        }
+    
+    # Adjust weights based on problem size
+    size_factor = min(1.0, n / 500)
+    weights['mst'] *= (1.0 + 0.2 * size_factor)
+    weights['cluster'] *= (1.0 + 0.1 * size_factor)
+    
+    # Normalize weights
+    total_weight = sum(weights.values())
+    for key in weights:
+        weights[key] /= total_weight
+    
+    # Combine factors
+    for i in range(n):
+        for j in range(i+1, n):
+            score = 0.0
+            
+            # Base reciprocal score
+            score += weights['base'] * base_heuristic[i, j]
+            
+            # MST factor (strong boost for MST edges)
+            if mst_mask[i, j]:
+                score += weights['mst'] * 2.0
+            
+            # Cluster factor
+            if intra_cluster_mask[i, j]:
+                score += weights['cluster'] * 1.5
+            
+            # Triangle boost (multiplicative)
+            score *= triangle_boost[i, j] ** weights['triangle']
+            
+            # Local consistency factor (multiplicative)
+            score *= local_factor[i, j] ** weights['local']
+            
+            # Mutual nearness bonus
+            k = min(max(3, int(np.log2(n))), n-1)
+            i_top = set(np.argsort(-base_heuristic[i])[:k])
+            j_top = set(np.argsort(-base_heuristic[j])[:k])
+            
+            if j in i_top and i in j_top:
+                score *= 1.2
+            
+            heuristic_matrix[i, j] = heuristic_matrix[j, i] = score
+    
+    return heuristic_matrix
+
+
+def _mst_guided_sparsification(
+    heuristic_matrix: np.ndarray,
+    mst_mask: np.ndarray,
+    distance_matrix: np.ndarray,
+    n: int
+) -> np.ndarray:
+    """
+    Sparsify heuristic matrix while preserving MST edges and connectivity.
+    """
+    sparsified = np.zeros_like(heuristic_matrix)
+    
+    # Adaptive target degree per node
+    if n <= 50:
+        target_degree = max(3, n // 4)
+    elif n <= 200:
+        target_degree = max(5, int(np.log2(n) * 2))
+    else:
+        target_degree = max(8, int(np.log2(n) * 1.5))
+    
+    target_degree = min(target_degree, n-1)
+    
+    for i in range(n):
+        # Start with MST neighbors (must keep)
+        mst_neighbors = np.where(mst_mask[i])[0]
+        
+        # Calculate available slots for additional edges
+        current_degree = len(mst_neighbors)
+        additional_slots = max(0, target_degree - current_degree)
+        
+        if additional_slots > 0:
+            # Get candidate non-MST edges
+            non_mst_mask = ~mst_mask[i]
+            non_mst_mask[i] = False  # Exclude self
+            
+            if np.any(non_mst_mask):
+                # Get scores for non-MST edges
+                candidate_scores = heuristic_matrix[i, non_mst_mask]
+                candidate_indices = np.where(non_mst_mask)[0]
+                
+                if len(candidate_scores) > additional_slots:
+                    # Select top additional_slots edges
+                    threshold = np.partition(candidate_scores, -additional_slots)[-additional_slots]
+                    selected = candidate_indices[candidate_scores >= threshold]
+                else:
+                    # Take all candidates with positive scores
+                    selected = candidate_indices[candidate_scores > 0]
+            else:
+                selected = []
+        else:
+            selected = []
+        
+        # Combine MST and selected edges
+        keep_indices = np.concatenate([mst_neighbors, selected])
+        keep_indices = np.unique(keep_indices[keep_indices != i])
+        
+        # Apply to sparsified matrix
+        sparsified[i, keep_indices] = heuristic_matrix[i, keep_indices]
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Additional connectivity check
+    for i in range(n):
+        if np.count_nonzero(sparsified[i]) == 0:
+            # Connect to nearest neighbor not already connected
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            # Find nearest neighbor not already in sparsified
+            sorted_indices = np.argsort(distances)
+            for neighbor in sorted_indices:
+                if sparsified[i, neighbor] == 0:
+                    sparsified[i, neighbor] = sparsified[nearest, i] = 1.0
+                    break
+    
+    return sparsified
+```

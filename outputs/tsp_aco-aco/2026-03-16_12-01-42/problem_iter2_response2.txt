@@ -1,0 +1,194 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Regret", "Spectral Embedding Weighting", "Entropy-based Sparsification", "Gradient-driven Parameter Optimization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse import csr_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with multi-step lookahead,
+    spectral graph features, and adaptive parameter optimization.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Trivial cases
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # Adaptive parameters based on problem size and structure
+    k_nn = max(2, int(np.log2(n)))  # Nearest neighbors parameter
+    sparse_factor = min(0.15, max(0.05, 5/n))  # Sparsity control
+    lookahead_depth = 2  # Multi-step lookahead depth
+    
+    # 1. Inverse distance baseline (with smoothing)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Spectral graph embedding features
+    # Compute normalized Laplacian for spectral analysis
+    W = np.exp(-distance_matrix / distance_matrix.mean())
+    np.fill_diagonal(W, 0)
+    D = np.diag(W.sum(axis=1))
+    L = D - W
+    # Smallest non-zero eigenvalues capture graph connectivity
+    try:
+        eigvals = np.linalg.eigvalsh(L)
+        eigvals = eigvals[eigvals > 1e-10]
+        spectral_ratio = eigvals[1] / eigvals[-1] if len(eigvals) > 1 else 1
+    except:
+        spectral_ratio = 1
+    
+    # 3. Multi-step lookahead penalty
+    # Consider both current edge quality and implications for next steps
+    lookahead_penalty = np.ones((n, n))
+    
+    # Precompute sorted distances for efficient lookahead
+    sorted_dist_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Best distances for 1-step and 2-step lookahead
+        best_1step = sorted_dists[i, 1]  # Best from i (excluding self)
+        best_2step = np.inf
+        
+        # Find best 2-step path from i
+        for j_idx in range(1, min(4, n)):  # Check top 3 neighbors for 2-step
+            j = sorted_dist_indices[i, j_idx]
+            if j == i:
+                continue
+            # Best from j (excluding i)
+            for k_idx in range(1, min(4, n)):
+                k = sorted_dist_indices[j, k_idx]
+                if k != i and k != j:
+                    two_step_cost = distance_matrix[i, j] + distance_matrix[j, k]
+                    best_2step = min(best_2step, two_step_cost)
+        
+        if best_2step == np.inf:
+            best_2step = best_1step * 2  # Fallback
+        
+        for j in range(n):
+            if i != j:
+                # Current edge regret
+                current_regret = (distance_matrix[i, j] - best_1step) / (best_1step + 1e-10)
+                
+                # 2-step lookahead regret (approximate)
+                best_from_j = sorted_dists[j, 1] if sorted_dist_indices[j, 1] != i else sorted_dists[j, 2]
+                two_step_cost = distance_matrix[i, j] + best_from_j
+                lookahead_regret = (two_step_cost - best_2step) / (best_2step + 1e-10)
+                
+                # Combined penalty with spectral weighting
+                penalty = np.exp(-0.5 * current_regret - 0.3 * spectral_ratio * lookahead_regret)
+                lookahead_penalty[i, j] = max(0.1, min(1.0, penalty))
+    
+    # 4. Adaptive nearest neighbor connectivity with variance weighting
+    nn_connectivity = np.zeros((n, n))
+    for i in range(n):
+        # Adaptive k based on spectral ratio
+        k = max(2, int(k_nn * (1 + spectral_ratio)))
+        k = min(k, n-1)
+        
+        # Weight neighbors by relative distance rank
+        nearest = sorted_dist_indices[i, 1:k+1]
+        for rank, j in enumerate(nearest):
+            weight = (k - rank) / k  # Higher weight for closer neighbors
+            nn_connectivity[i, j] += weight
+    
+    # Make symmetric and normalize
+    nn_connectivity = (nn_connectivity + nn_connectivity.T) / 2
+    row_sums = nn_connectivity.sum(axis=1, keepdims=True)
+    nn_connectivity = np.divide(nn_connectivity, row_sums + 1e-10, 
+                                where=row_sums > 0)
+    
+    # 5. MST-based connectivity with gradient information
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = ((mst > 0) | (mst.T > 0)).astype(float)
+    
+    # Add gradient: edges that connect MST components get extra bonus
+    # Compute component connectivity via MST adjacency
+    mst_adj = mst + mst.T
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_adj[i, j] == 0:
+                # Check if adding (i,j) creates shortcuts between MST branches
+                i_neighbors = np.where(mst_adj[i] > 0)[0]
+                j_neighbors = np.where(mst_adj[j] > 0)[0]
+                if len(i_neighbors) > 0 and len(j_neighbors) > 0:
+                    # Measure potential shortcut benefit
+                    best_i_to_j = min(distance_matrix[i, k] + distance_matrix[k, j] 
+                                     for k in set(i_neighbors) | set(j_neighbors))
+                    shortcut_benefit = max(0, best_i_to_j - distance_matrix[i, j])
+                    mst_bonus[i, j] += 0.2 * shortcut_benefit / (distance_matrix.mean() + 1e-10)
+    
+    mst_bonus = (mst_bonus + mst_bonus.T) / 2
+    
+    # 6. Combine factors with learned weights
+    # Weights adapt based on problem characteristics
+    w_inv = 1.0  # Base inverse distance weight
+    w_nn = 0.5 + 0.5 * spectral_ratio  # Higher for more structured graphs
+    w_mst = 0.3 - 0.1 * spectral_ratio  # Lower for more regular graphs
+    w_lookahead = 0.8  # Fixed weight for lookahead
+    
+    combined = (w_inv * inv_dist * 
+                (1 + w_nn * nn_connectivity) * 
+                (1 + w_mst * mst_bonus) * 
+                (w_lookahead * lookahead_penalty))
+    
+    # 7. Entropy-based adaptive sparsification
+    # Keep edges with highest information content
+    sparse_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude diagonal
+        
+        # Compute entropy of the row distribution
+        row_pos = row[row > 0]
+        if len(row_pos) > 1:
+            probs = row_pos / row_pos.sum()
+            entropy = -np.sum(probs * np.log(probs + 1e-10))
+            # More uniform distributions → keep more edges
+            keep_fraction = min(0.3, max(0.1, entropy / np.log(len(row_pos))))
+        else:
+            keep_fraction = 0.2
+        
+        k_keep = max(2, int(keep_fraction * (n-1)))
+        k_keep = min(k_keep, n-1)
+        
+        top_indices = np.argpartition(row, -k_keep)[-k_keep:]
+        sparse_mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    sparse_mask = sparse_mask | sparse_mask.T
+    
+    # Apply sparsification with smoothing
+    heuristics_matrix = combined * sparse_mask
+    
+    # 8. Local normalization with Laplacian smoothing
+    for i in range(n):
+        row_sum = heuristics_matrix[i].sum()
+        if row_sum > 0:
+            # Smooth normalization to avoid extremes
+            heuristics_matrix[i] = 0.7 * (heuristics_matrix[i] / row_sum) + 0.3 * (1/(n-1))
+        else:
+            heuristics_matrix[i] = 1/(n-1)
+        heuristics_matrix[i, i] = 0
+    
+    # Final symmetrization
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    
+    return heuristics_matrix
+```

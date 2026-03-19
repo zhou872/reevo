@@ -1,0 +1,271 @@
+```json
+{
+    "algorithm_features": ["Multiplicative Structural Integration", "Regret-Weighted Distance Scaling", "Two-Step Lookahead Evaluation", "Adaptive Cluster-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization heuristic integrating regret-based metrics,
+    lookahead evaluation, and adaptive structural bonuses in multiplicative framework.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes.
+        
+    Returns:
+        Priority matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) / (distance_matrix + 1e-12)
+    
+    # 1. Base inverse distance (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    inv_dist[np.eye(n, dtype=bool)] = 0
+    
+    # 2. Minimum Spanning Tree edges get adaptive bonus
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # 3. Regret-based multiplicative factor
+    regret_factor = _compute_regret_factor(distance_matrix)
+    
+    # 4. Two-step lookahead evaluation
+    lookahead_score = _compute_lookahead_score(distance_matrix)
+    
+    # 5. Adaptive k-nearest neighbors bonus
+    knn_bonus = _compute_knn_bonus(distance_matrix, base_k=max(2, n//10))
+    
+    # 6. Cluster density reward
+    density_bonus = _compute_density_bonus(distance_matrix)
+    
+    # 7. Combine factors with multiplicative integration
+    # Base structure weight decays with graph size
+    mst_weight = 2.5 + 2.0 * np.log1p(n) / n
+    knn_weight = 1.2
+    density_weight = 0.7
+    
+    # Combine structural bonuses additively, then multiply with regret and lookahead
+    structural_bonus = 1.0 + mst_weight * mst_mask + knn_weight * knn_bonus + density_weight * density_bonus
+    
+    priorities = inv_dist * structural_bonus * regret_factor * lookahead_score
+    
+    # 8. Adaptive sparsification preserving tour feasibility
+    priorities = _adaptive_sparsify(priorities, n)
+    
+    # Ensure symmetry and zero diagonal
+    priorities = (priorities + priorities.T) / 2
+    priorities[np.eye(n, dtype=bool)] = 0
+    
+    return priorities
+
+
+def _compute_mst_mask(dist_matrix: np.ndarray) -> np.ndarray:
+    """Return binary mask of edges in Minimum Spanning Tree."""
+    n = dist_matrix.shape[0]
+    mask = np.zeros_like(dist_matrix, dtype=float)
+    
+    if n <= 1:
+        return mask
+    
+    # Prim's algorithm for MST
+    in_mst = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        u = -1
+        min_val = np.inf
+        for v in range(n):
+            if not in_mst[v] and min_edge[v] < min_val:
+                min_val = min_edge[v]
+                u = v
+        
+        if u == -1:
+            break
+        
+        in_mst[u] = True
+        if parent[u] != -1:
+            mask[u, parent[u]] = 1
+            mask[parent[u], u] = 1
+        
+        for v in range(n):
+            if not in_mst[v] and dist_matrix[u, v] < min_edge[v]:
+                min_edge[v] = dist_matrix[u, v]
+                parent[v] = u
+    
+    return mask
+
+
+def _compute_regret_factor(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute multiplicative regret factor for each edge.
+    Higher values for edges with poor alternatives.
+    """
+    n = dist_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(dist_matrix)
+    
+    # Compute regret for each node
+    node_regret = np.zeros(n)
+    for i in range(n):
+        sorted_dists = np.sort(dist_matrix[i])[1:]  # Exclude self
+        if len(sorted_dists) >= 2:
+            best, second = sorted_dists[0], sorted_dists[1]
+            # Normalized regret: difference relative to best
+            node_regret[i] = (second - best) / (best + 1e-12)
+    
+    # Normalize node regrets
+    if node_regret.max() > 0:
+        node_regret = node_regret / node_regret.max()
+    
+    # For each edge, combine regrets of endpoints
+    regret_factor = np.ones_like(dist_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_matrix[i, j] > 0:
+                # Geometric mean of endpoint regrets plus base
+                regret_val = np.sqrt(node_regret[i] * node_regret[j]) if node_regret[i] > 0 and node_regret[j] > 0 else 0
+                # Convert to multiplicative factor (1 + regret)
+                regret_factor[i, j] = 1.0 + 0.8 * regret_val
+                regret_factor[j, i] = regret_factor[i, j]
+    
+    return regret_factor
+
+
+def _compute_lookahead_score(dist_matrix: np.ndarray) -> np.ndarray:
+    """
+    Two-step lookahead evaluation: for each edge (i,j), evaluate
+    the best possible continuation to complete a 3-node path.
+    """
+    n = dist_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(dist_matrix)
+    
+    lookahead_score = np.ones_like(dist_matrix)
+    
+    for i in range(n):
+        # Get distances from node i, excluding self
+        i_dists = dist_matrix[i].copy()
+        i_dists[i] = np.inf
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Find best third node k (k != i, j) to form i->j->k
+            k_dists = dist_matrix[j].copy()
+            k_dists[i] = k_dists[j] = np.inf  # Exclude i and j
+            
+            if np.any(k_dists < np.inf):
+                best_continuation = np.min(k_dists)
+                # Normalize by the best possible 2-step path from i
+                current_path = dist_matrix[i, j] + best_continuation
+                # Find best alternative 2-step path from i (excluding j)
+                alt_dists = i_dists.copy()
+                alt_dists[j] = np.inf
+                if np.any(alt_dists < np.inf):
+                    best_alt = np.min(alt_dists)
+                    k_for_alt = np.argmin(alt_dists)
+                    k_alt_dists = dist_matrix[k_for_alt].copy()
+                    k_alt_dists[i] = k_alt_dists[k_for_alt] = np.inf
+                    if np.any(k_alt_dists < np.inf):
+                        best_alt_continuation = np.min(k_alt_dists)
+                        best_alt_path = best_alt + best_alt_continuation
+                        # Score is ratio of best alternative to current
+                        score = best_alt_path / (current_path + 1e-12)
+                        # Convert to multiplicative factor favoring better paths
+                        lookahead_score[i, j] = np.clip(1.5 - 0.5 * score, 0.5, 1.5)
+    
+    # Symmetrize
+    lookahead_score = (lookahead_score + lookahead_score.T) / 2
+    return lookahead_score
+
+
+def _compute_knn_bonus(dist_matrix: np.ndarray, base_k: int) -> np.ndarray:
+    """Bonus based on adaptive k-nearest neighbors with distance weighting."""
+    n = dist_matrix.shape[0]
+    bonus = np.zeros_like(dist_matrix)
+    
+    k = min(base_k, max(2, n // 5))
+    
+    for i in range(n):
+        indices = np.argsort(dist_matrix[i])[:k+1]
+        indices = indices[indices != i][:k]
+        
+        for rank, j in enumerate(indices):
+            weight = (k - rank) / k
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = weight / dist_matrix[i, j]
+    
+    bonus = (bonus + bonus.T) / 2
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+
+def _compute_density_bonus(dist_matrix: np.ndarray) -> np.ndarray:
+    """Reward edges within dense clusters."""
+    n = dist_matrix.shape[0]
+    if n <= 3:
+        return np.zeros_like(dist_matrix)
+    
+    densities = np.zeros(n)
+    for i in range(n):
+        distances = np.sort(dist_matrix[i])[1:4]
+        densities[i] = 1.0 / (np.median(distances) + 1e-12)
+    
+    if densities.max() > 0:
+        densities = densities / densities.max()
+    
+    bonus = np.zeros_like(dist_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if dist_matrix[i, j] > 0:
+                bonus[i, j] = np.sqrt(densities[i] * densities[j]) / dist_matrix[i, j]
+    
+    bonus = bonus + bonus.T
+    if bonus.max() > 0:
+        bonus = bonus / bonus.max()
+    
+    return bonus
+
+
+def _adaptive_sparsify(priorities: np.ndarray, n: int) -> np.ndarray:
+    """
+    Adaptive sparsification that preserves connectivity while
+    focusing on promising edges.
+    """
+    result = priorities.copy()
+    
+    if n <= 10:
+        threshold = np.percentile(result[result > 0], 40) if np.any(result > 0) else 0
+    else:
+        keep_ratio = max(0.08, 15.0 / n)
+        if np.any(result > 0):
+            threshold = np.percentile(result[result > 0], 100 * (1 - keep_ratio))
+        else:
+            threshold = 0
+    
+    result[result < threshold] = 0
+    
+    # Ensure minimum connectivity: each node connected to at least 2 others
+    for i in range(n):
+        non_zero = np.where(result[i] > 0)[0]
+        if len(non_zero) < 2:
+            top_indices = np.argsort(priorities[i])[-2:]
+            for idx in top_indices:
+                if idx != i:
+                    result[i, idx] = priorities[i, idx]
+                    result[idx, i] = priorities[idx, i]
+    
+    return result
+```

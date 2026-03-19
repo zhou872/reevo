@@ -1,0 +1,403 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Shortcut Detection", "Adaptive Ensemble Weighting", "Graph Feature Embedding", "Path Connectivity Analysis"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple, List, Dict
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  density_aware: bool = True,
+                  multi_hop_depth: int = 3,
+                  use_feature_embedding: bool = True) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with multi-hop analysis,
+    dynamic ensemble weighting, and graph feature embedding.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        density_aware: Adapt neighborhood size based on local density
+        multi_hop_depth: Maximum depth for multi-hop analysis (2-4 recommended)
+        use_feature_embedding: Use learned feature combinations for edge scoring
+    
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Adaptive Neighborhood Selection ====================
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    if density_aware:
+        base_k = max(2, int(np.sqrt(n)))
+        for i in range(n):
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            sorted_dists = np.sort(distances)
+            nearest_avg = np.mean(sorted_dists[:base_k])
+            dist_std = np.std(sorted_dists[:base_k])
+            
+            if dist_std > 1e-10:
+                cv = dist_std / nearest_avg
+                adaptive_k = min(n-1, int(base_k * (1.0 + 0.5 * cv)))
+            else:
+                adaptive_k = base_k
+            
+            nn_indices = np.argpartition(distances, adaptive_k)[:adaptive_k]
+            adjacency_mask[i, nn_indices] = True
+            
+            if len(nn_indices) > 0:
+                threshold = 1.2 * np.max(distances[nn_indices])
+                within_threshold = distances <= threshold
+                adjacency_mask[i, within_threshold] = True
+    else:
+        k = max(2, int(np.sqrt(n)))
+        for i in range(n):
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nn_indices = np.argpartition(distances, k)[:k]
+            adjacency_mask[i, nn_indices] = True
+    
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Compute Graph Features ====================
+    features = compute_graph_features(distance_matrix, adjacency_mask, n)
+    
+    # ==================== 3. Multi-Hop Analysis ====================
+    hop_ratios = multi_hop_analysis(distance_matrix, adjacency_mask, n, 
+                                   max_depth=multi_hop_depth)
+    
+    # ==================== 4. Ensemble Component Computation ====================
+    components = compute_ensemble_components(distance_matrix, adjacency_mask, 
+                                            features, n)
+    
+    # ==================== 5. Adaptive Weighting ====================
+    weights = compute_adaptive_weights(features, components, n)
+    
+    # ==================== 6. Edge Scoring with Feature Embedding ====================
+    heuristics = compute_edge_scores(distance_matrix, adjacency_mask, 
+                                    components, hop_ratios, weights, 
+                                    use_feature_embedding, n)
+    
+    # ==================== 7. Final Normalization ====================
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-wise normalization
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+
+def compute_graph_features(distance_matrix: np.ndarray, 
+                          adjacency_mask: np.ndarray, 
+                          n: int) -> Dict[str, np.ndarray]:
+    """Compute various graph features for each edge."""
+    features = {}
+    
+    # 1. Local density
+    base_k = max(2, int(np.sqrt(n)))
+    local_density = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest_dists = np.partition(distances, base_k)[:base_k]
+        local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-10)
+    
+    # Normalize
+    if local_density.max() > 0:
+        local_density = local_density / local_density.max()
+    
+    # 2. Degree centrality
+    degrees = adjacency_mask.sum(axis=1)
+    if degrees.max() > 0:
+        degree_centrality = degrees / degrees.max()
+    else:
+        degree_centrality = np.zeros(n)
+    
+    # 3. Clustering coefficient approximation
+    clustering = np.zeros(n)
+    for i in range(n):
+        neighbors = np.where(adjacency_mask[i])[0]
+        if len(neighbors) >= 2:
+            # Count triangles among neighbors
+            neighbor_mask = adjacency_mask[neighbors][:, neighbors]
+            triangles = neighbor_mask.sum() / 2
+            possible = len(neighbors) * (len(neighbors) - 1) / 2
+            clustering[i] = triangles / possible if possible > 0 else 0
+    
+    # 4. Distance to k-nearest neighbors ratio
+    dist_ratios = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        sorted_dists = np.sort(distances)[:min(3, n-1)]
+        if len(sorted_dists) >= 2 and sorted_dists[0] > 0:
+            dist_ratios[i] = sorted_dists[1] / sorted_dists[0]
+    
+    features['local_density'] = local_density
+    features['degree_centrality'] = degree_centrality
+    features['clustering'] = clustering
+    features['dist_ratios'] = dist_ratios
+    
+    return features
+
+def multi_hop_analysis(distance_matrix: np.ndarray,
+                      adjacency_mask: np.ndarray,
+                      n: int,
+                      max_depth: int = 3) -> np.ndarray:
+    """Compute multi-hop ratios for all edges up to specified depth."""
+    hop_ratios = np.zeros((n, n))
+    
+    # Precompute neighbor sets for efficiency
+    neighbor_sets = [set(np.where(adjacency_mask[i])[0]) for i in range(n)]
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not adjacency_mask[i, j]:
+                continue
+                
+            direct_dist = distance_matrix[i, j]
+            if direct_dist < 1e-10:
+                continue
+            
+            # Find best alternative path of length 2 to max_depth
+            best_alternative = np.inf
+            
+            # 2-hop paths (i -> k -> j)
+            common_neighbors = neighbor_sets[i].intersection(neighbor_sets[j])
+            for k in common_neighbors:
+                if k != i and k != j:
+                    alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alternative = min(best_alternative, alt_dist)
+            
+            # 3+ hop paths using BFS with depth limit
+            if max_depth >= 3 and best_alternative > direct_dist * 1.5:
+                # Limited BFS from i, stopping at depth 3
+                visited = {i, j}
+                for k in neighbor_sets[i]:
+                    if k == j:
+                        continue
+                    if k in visited:
+                        continue
+                    visited.add(k)
+                    
+                    # Check 3-hop paths: i -> k -> l -> j
+                    for l in neighbor_sets[k]:
+                        if l == i or l == j or l == k:
+                            continue
+                        if l in visited:
+                            continue
+                        if j in neighbor_sets[l]:
+                            alt_dist = (distance_matrix[i, k] + 
+                                       distance_matrix[k, l] + 
+                                       distance_matrix[l, j])
+                            best_alternative = min(best_alternative, alt_dist)
+                    
+                    if max_depth >= 4:
+                        # Check 4-hop paths with one additional level
+                        for l in neighbor_sets[k]:
+                            if l == i or l == j or l == k:
+                                continue
+                            if l in visited:
+                                continue
+                            visited.add(l)
+                            
+                            for m in neighbor_sets[l]:
+                                if m == i or m == j or m == k or m == l:
+                                    continue
+                                if m in visited:
+                                    continue
+                                if j in neighbor_sets[m]:
+                                    alt_dist = (distance_matrix[i, k] + 
+                                               distance_matrix[k, l] + 
+                                               distance_matrix[l, m] + 
+                                               distance_matrix[m, j])
+                                    best_alternative = min(best_alternative, alt_dist)
+            
+            if best_alternative < np.inf:
+                hop_ratios[i, j] = hop_ratios[j, i] = best_alternative / direct_dist
+            else:
+                hop_ratios[i, j] = hop_ratios[j, i] = 2.0  # Penalty for no alternative
+    
+    # Normalize to [0, 1] range (inverse: higher ratio = worse alternative)
+    max_ratio = hop_ratios.max()
+    if max_ratio > 0:
+        hop_ratios = 1.0 - (hop_ratios / max_ratio)
+    
+    return hop_ratios
+
+def compute_ensemble_components(distance_matrix: np.ndarray,
+                               adjacency_mask: np.ndarray,
+                               features: Dict[str, np.ndarray],
+                               n: int) -> Dict[str, np.ndarray]:
+    """Compute different heuristic components for ensemble combination."""
+    components = {}
+    
+    # 1. Inverse distance with ranking
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    for i in range(n):
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = row_dists[valid_mask]
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = 1.0 / ranks
+            weights /= np.sum(weights)
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            inv_dist[i, valid_mask] = inv_vals * weights
+    
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    components['inv_dist'] = inv_dist
+    
+    # 2. MST component
+    mst_mask = np.zeros((n, n), dtype=bool)
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        u = -1
+        min_val = np.inf
+        for i in range(n):
+            if not visited[i] and min_edge[i] < min_val:
+                min_val = min_edge[i]
+                u = i
+        if u == -1:
+            break
+        visited[u] = True
+        if parent[u] != -1:
+            mst_mask[u, parent[u]] = True
+            mst_mask[parent[u], u] = True
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    mst_component = np.zeros_like(distance_matrix)
+    mst_component[mst_mask] = 1.0
+    components['mst'] = mst_component
+    
+    # 3. Feature-based component
+    feature_component = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Combine multiple features
+                score = 1.0
+                score *= (features['local_density'][i] * features['local_density'][j])
+                score *= (1.0 + 0.3 * (features['clustering'][i] + features['clustering'][j]))
+                score /= (1.0 + 0.2 * features['dist_ratios'][i] * features['dist_ratios'][j])
+                feature_component[i, j] = feature_component[j, i] = score
+    
+    if feature_component.max() > 0:
+        feature_component = feature_component / feature_component.max()
+    components['features'] = feature_component
+    
+    return components
+
+def compute_adaptive_weights(features: Dict[str, np.ndarray],
+                           components: Dict[str, np.ndarray],
+                           n: int) -> Dict[str, float]:
+    """Compute adaptive weights for ensemble components based on instance characteristics."""
+    weights = {}
+    
+    # Analyze instance characteristics
+    avg_density = features['local_density'].mean()
+    avg_clustering = features['clustering'].mean()
+    avg_dist_ratio = features['dist_ratios'].mean()
+    
+    # Base weights
+    base_weights = {
+        'inv_dist': 1.0,
+        'mst': 0.8,
+        'features': 0.6
+    }
+    
+    # Adjust based on instance features
+    # More clustered instances benefit more from MST and features
+    cluster_adjust = 0.3 * avg_clustering
+    
+    # Instances with tight clusters benefit more from feature-based scoring
+    density_adjust = 0.2 * avg_density
+    
+    # Instances with uniform distances benefit more from pure distance-based
+    uniformity_adjust = -0.1 * avg_dist_ratio
+    
+    weights['inv_dist'] = base_weights['inv_dist'] + uniformity_adjust
+    weights['mst'] = base_weights['mst'] + cluster_adjust
+    weights['features'] = base_weights['features'] + density_adjust
+    
+    # Normalize to sum to 1
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] = weights[key] / total
+    
+    return weights
+
+def compute_edge_scores(distance_matrix: np.ndarray,
+                       adjacency_mask: np.ndarray,
+                       components: Dict[str, np.ndarray],
+                       hop_ratios: np.ndarray,
+                       weights: Dict[str, float],
+                       use_feature_embedding: bool,
+                       n: int) -> np.ndarray:
+    """Compute final edge scores using ensemble combination."""
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Compute MST degrees for Christofides-inspired bonus
+    mst_mask = components['mst'] > 0.5
+    mst_degrees = mst_mask.sum(axis=1)
+    odd_degree_nodes = np.where(mst_degrees % 2 == 1)[0]
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not adjacency_mask[i, j]:
+                continue
+            
+            # Ensemble combination
+            ensemble_score = 0
+            for key, weight in weights.items():
+                ensemble_score += weight * components[key][i, j]
+            
+            # Boost for critical edges (high hop ratio = good shortcut)
+            shortcut_bonus = 1.0 + 0.5 * hop_ratios[i, j]
+            
+            # Christofides-inspired bonus for odd-degree nodes
+            matching_bonus = 1.0
+            if i in odd_degree_nodes and j in odd_degree_nodes:
+                other_odd = [node for node in odd_degree_nodes if node not in (i, j)]
+                if other_odd:
+                    avg_dist_i = np.mean([distance_matrix[i, k] for k in other_odd])
+                    avg_dist_j = np.mean([distance_matrix[j, k] for k in other_odd])
+                    avg_dist_to_other = (avg_dist_i + avg_dist_j) / 2
+                    if distance_matrix[i, j] > 0:
+                        matching_quality = avg_dist_to_other / distance_matrix[i, j]
+                        matching_bonus = 1.0 + 0.3 * min(matching_quality, 2.0)
+            
+            # Feature embedding if enabled
+            if use_feature_embedding:
+                # Non-linear combination of factors
+                base_score = ensemble_score * shortcut_bonus * matching_bonus
+                
+                # Add small random component for exploration in stochastic sampling
+                exploration = 1.0 + 0.05 * np.random.random()
+                
+                heuristics[i, j] = heuristics[j, i] = base_score * exploration
+            else:
+                heuristics[i, j] = heuristics[j, i] = ensemble_score * shortcut_bonus * matching_bonus
+    
+    return heuristics
+```

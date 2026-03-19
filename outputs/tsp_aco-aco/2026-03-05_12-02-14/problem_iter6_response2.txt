@@ -1,0 +1,223 @@
+```json
+{
+    "algorithm_features": ["Adaptive Parameter Tuning", "Component Weighting", "Intelligent Sparsification", "Local Enhancement"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with adaptive parameter tuning
+    and intelligent sparsification.
+    
+    Combines reciprocal distance, centrality measures, and MST indicators
+    with instance-adaptive weights and pruning strategies.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Matrix of same shape with scores indicating edge promise.
+    """
+    n = distance_matrix.shape[0]
+    
+    # ==================== 1. INITIAL COMPUTATIONS ====================
+    
+    # Reciprocal distance (closer nodes are more promising)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    
+    np.fill_diagonal(reciprocal, 0)
+    
+    # ==================== 2. INSTANCE ANALYSIS ====================
+    
+    # Analyze instance characteristics for adaptive parameter tuning
+    instance_stats = {}
+    
+    # Extract non-diagonal distances
+    mask = ~np.eye(n, dtype=bool)
+    distances = distance_matrix[mask]
+    
+    # Basic statistics
+    instance_stats['n'] = n
+    instance_stats['distance_mean'] = np.mean(distances)
+    instance_stats['distance_std'] = np.std(distances)
+    instance_stats['distance_cv'] = instance_stats['distance_std'] / (instance_stats['distance_mean'] + 1e-10)
+    
+    # Estimate clustering tendency
+    if n > 3:
+        nearest_dists = []
+        for i in range(n):
+            row = distance_matrix[i].copy()
+            row[i] = np.inf
+            nearest_dists.append(np.min(row))
+        avg_nearest = np.mean(nearest_dists)
+        instance_stats['clustering'] = 1 - avg_nearest / instance_stats['distance_mean']
+        instance_stats['clustering'] = np.clip(instance_stats['clustering'], 0.0, 1.0)
+    else:
+        instance_stats['clustering'] = 0.5
+    
+    # ==================== 3. COMPONENT COMPUTATION ====================
+    
+    # Component 1: Enhanced centrality measure
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Compute closeness to nearest neighbors
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        
+        # Adaptive number of neighbors based on instance size
+        k = max(2, min(8, n // 4))
+        if n > k:
+            nn_indices = np.argpartition(row, k)[:k]
+            closeness = 1 / (np.mean(row[nn_indices]) + 1e-10)
+        else:
+            closeness = 1 / (np.mean(row[row < np.inf]) + 1e-10)
+        
+        # Local density measure
+        density = np.sum(reciprocal[i]) / max(1, n - 1)
+        
+        # Combined centrality
+        centrality[i] = 0.7 * closeness + 0.3 * density
+    
+    # Normalize centrality
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    centrality_matrix = np.outer(centrality, centrality)
+    centrality_matrix = centrality_matrix * reciprocal
+    
+    # Component 2: MST with local enhancement
+    if n > 2:
+        try:
+            mst = sparse.csgraph.minimum_spanning_tree(distance_matrix)
+            mst_indicator = (mst > 0).astype(float)
+            
+            # Enhance MST edges based on local structure
+            mst_degree = mst_indicator.sum(axis=1)
+            if mst_degree.max() > 0:
+                degree_norm = mst_degree / mst_degree.max()
+                for i in range(n):
+                    mst_neighbors = np.where(mst_indicator[i] > 0)[0]
+                    if len(mst_neighbors) > 0:
+                        neighbor_boost = np.mean(degree_norm[mst_neighbors])
+                        local_boost = 1 + 0.5 * (degree_norm[i] + neighbor_boost)
+                        mst_indicator[i, mst_neighbors] *= local_boost
+        except:
+            mst_indicator = np.zeros_like(distance_matrix)
+    else:
+        mst_indicator = np.zeros_like(distance_matrix)
+    
+    # ==================== 4. ADAPTIVE WEIGHTING ====================
+    
+    # Adaptive weights based on instance characteristics
+    cv = instance_stats['distance_cv']
+    clustering = instance_stats['clustering']
+    
+    # Base weights with instance adaptation
+    if n < 20:
+        w_dist = 0.6 - 0.2 * min(1.0, cv)
+        w_cent = 0.3 + 0.1 * clustering
+        w_mst = 0.1 + 0.1 * min(1.0, cv)
+    elif n < 50:
+        w_dist = 0.5 - 0.15 * min(1.0, cv)
+        w_cent = 0.35 + 0.1 * clustering
+        w_mst = 0.15 + 0.05 * min(1.0, cv)
+    else:
+        w_dist = 0.4 - 0.1 * min(1.0, cv)
+        w_cent = 0.4 + 0.1 * clustering
+        w_mst = 0.2 + 0.05 * min(1.0, cv)
+    
+    # Normalize to sum to 1
+    total = w_dist + w_cent + w_mst
+    w_dist, w_cent, w_mst = w_dist/total, w_cent/total, w_mst/total
+    
+    # Combine components
+    combined = (w_dist * reciprocal + 
+                w_cent * centrality_matrix + 
+                w_mst * mst_indicator)
+    
+    # ==================== 5. INTELLIGENT SPARSIFICATION ====================
+    
+    sparsified = np.zeros_like(combined)
+    
+    # Adaptive k (edges per node) based on instance size and characteristics
+    base_k = max(3, min(15, int(np.sqrt(n) * (1 + 0.5 * clustering))))
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        # Adaptive k with small random variation for exploration
+        k = base_k + np.random.randint(-1, 2)
+        k = max(2, min(k, n-1))
+        
+        if k < n-1:
+            # Get top k edges
+            top_k_idx = np.argpartition(row, -k)[-k:]
+        else:
+            top_k_idx = np.arange(n)
+            top_k_idx = top_k_idx[top_k_idx != i]
+        
+        # Apply smooth exponential decay based on rank
+        if len(top_k_idx) > 0:
+            # Sort in descending order
+            sorted_values = row[top_k_idx]
+            sort_order = np.argsort(sorted_values)[::-1]
+            sorted_idx = top_k_idx[sort_order]
+            
+            for rank, j in enumerate(sorted_idx):
+                # Smooth decay: exp(-rank/decay_rate)
+                # Adaptive decay rate based on distance quality
+                distance_quality = 1 / (1 + distance_matrix[i, j])
+                decay_rate = 2.0 + 1.0 * distance_quality
+                decay = np.exp(-rank / decay_rate)
+                
+                # Add small stochastic perturbation
+                noise = 1 + 0.05 * np.random.randn()
+                noise = np.clip(noise, 0.9, 1.1)
+                
+                sparsified[i, j] = combined[i, j] * decay * noise
+    
+    # ==================== 6. POST-PROCESSING ====================
+    
+    # Ensure minimum connectivity
+    min_conn = max(2, min(5, n // 10))
+    for i in range(n):
+        non_zero = np.where(sparsified[i] > 0)[0]
+        if len(non_zero) < min_conn:
+            # Add promising edges based on reciprocal distance
+            row = reciprocal[i].copy()
+            row[i] = 0
+            row[non_zero] = 0
+            
+            if np.sum(row) > 0:
+                additional = min(min_conn - len(non_zero), np.sum(row > 0))
+                if additional > 0:
+                    additional_idx = np.argsort(row)[::-1][:additional]
+                    for j in additional_idx:
+                        if row[j] > 0:
+                            sparsified[i, j] = reciprocal[i, j] * 0.3
+    
+    # Ensure symmetry (TSP is symmetric)
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Final cleanup
+    np.fill_diagonal(sparsified, 0)
+    
+    # Normalize for consistency
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

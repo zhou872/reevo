@@ -1,0 +1,218 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Weighting", "2-opt Improvement Potential", "Diameter-based Sparsification", "Multi-objective Edge Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with adaptive regret weighting, 2-opt improvement
+    potential, and diameter-based sparsification for better scalability.
+    
+    Core Improvements:
+    1. Adaptive Regret Weighting: Adjusts regret penalty based on node degree variance
+       to better account for local connectivity patterns.
+    2. 2-opt Improvement Potential: Directly embeds local search improvement
+       potential into edge scores using sampled 2-opt move analysis.
+    3. Diameter-based Sparsification: Uses graph diameter to dynamically set
+       edge retention thresholds, improving scalability while maintaining connectivity.
+    4. Multi-objective Edge Scoring: Combines distance, regret, MST, and 2-opt
+       factors with adaptive weights based on graph properties.
+    
+    Returns:
+        np.ndarray: Heuristic score matrix with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== 1. INITIALIZATION & GRAPH ANALYSIS ==========
+    dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(dist, np.inf)
+    
+    # Base inverse distance
+    inv_dist = 1 / (dist + 1e-12)
+    
+    # Graph statistics for adaptive parameter tuning
+    triu_indices = np.triu_indices(n, k=1)
+    distances_flat = dist[triu_indices]
+    mean_dist = np.mean(distances_flat)
+    std_dist = np.std(distances_flat)
+    cv_dist = std_dist / (mean_dist + 1e-12)
+    
+    # ========== 2. MST EDGE BONUS ==========
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    # Stronger bonus for MST edges in sparse regions
+    mst_edge_bonus = np.where(mst_mask, 2.0, 1.0)
+    
+    # ========== 3. ADAPTIVE REGRET WEIGHTING ==========
+    # Calculate regret with weights adapted to node degree variance
+    regret_penalty = np.ones_like(dist)
+    
+    # Precompute node statistics
+    node_stats = []
+    for i in range(n):
+        valid_dists = dist[i][dist[i] < np.inf]
+        if len(valid_dists) >= 2:
+            sorted_dists = np.sort(valid_dists)
+            best, second_best = sorted_dists[0], sorted_dists[1]
+            
+            # Calculate local statistics for adaptive weighting
+            local_mean = np.mean(valid_dists)
+            local_std = np.std(valid_dists)
+            local_cv = local_std / (local_mean + 1e-12)
+            
+            # Regret weight adapts to local variance
+            # Higher variance → stronger regret penalty (clearer best choice)
+            regret_weight = 1.0 + 2.0 * local_cv
+            
+            node_stats.append((best, second_best, regret_weight))
+        else:
+            node_stats.append((0, 0, 1.0))
+    
+    # Apply regret penalty with adaptive weights
+    for i in range(n):
+        if i >= len(node_stats):
+            continue
+            
+        best_i, second_best_i, weight_i = node_stats[i]
+        if second_best_i <= best_i:
+            continue
+            
+        for j in range(n):
+            if i != j and dist[i, j] < np.inf:
+                # Calculate normalized regret
+                regret = (dist[i, j] - best_i) / (second_best_i - best_i + 1e-12)
+                # Apply adaptive weight and convert to penalty
+                penalty = np.exp(-weight_i * regret)
+                regret_penalty[i, j] = min(regret_penalty[i, j], penalty)
+    
+    # ========== 4. 2-OPT IMPROVEMENT POTENTIAL ==========
+    # Direct embedding of local search improvement potential
+    opt_potential = np.ones_like(dist)
+    
+    if n >= 4 and n <= 500:  # Computationally feasible range
+        # Estimate 2-opt improvement for each edge
+        for i in range(n):
+            for j in range(i + 1, n):
+                if dist[i, j] >= np.inf:
+                    continue
+                
+                improvement_sum = 0
+                valid_samples = 0
+                
+                # Sample potential 2-opt moves involving edge (i,j)
+                sample_size = min(20, n - 2)
+                if sample_size > 0:
+                    # Get other nodes excluding i and j
+                    other_nodes = [k for k in range(n) if k not in (i, j)]
+                    
+                    # Random sample of pairs (k,l) for 2-opt evaluation
+                    for _ in range(sample_size):
+                        if len(other_nodes) < 2:
+                            break
+                            
+                        k_idx = np.random.randint(0, len(other_nodes))
+                        k = other_nodes[k_idx]
+                        remaining = [x for x in other_nodes if x != k]
+                        
+                        if not remaining:
+                            break
+                            
+                        l_idx = np.random.randint(0, len(remaining))
+                        l = remaining[l_idx]
+                        
+                        # Calculate 2-opt improvement
+                        current_cost = dist[i, j] + dist[k, l]
+                        swapped_cost = dist[i, k] + dist[j, l]
+                        
+                        if swapped_cost < current_cost:
+                            improvement = current_cost - swapped_cost
+                            improvement_sum += improvement
+                            valid_samples += 1
+                
+                if valid_samples > 0:
+                    avg_improvement = improvement_sum / valid_samples
+                    # Convert improvement to bonus (edges with less improvement potential are better)
+                    # Use sigmoid function to map to [0.5, 1.5] range
+                    bonus = 1.5 - 1.0 / (1.0 + np.exp(-avg_improvement / (mean_dist + 1e-12)))
+                    opt_potential[i, j] = opt_potential[j, i] = bonus
+    
+    # ========== 5. DIAMETER-BASED SPARSIFICATION ==========
+    # Use graph diameter to set dynamic edge retention thresholds
+    if n > 10:
+        # Estimate graph diameter using MST (cheaper than full APSP)
+        mst_edges = dist[mst_mask]
+        if len(mst_edges) > 0:
+            diameter_estimate = np.max(mst_edges) * 2  # Conservative estimate
+        else:
+            diameter_estimate = np.max(dist[dist < np.inf])
+        
+        # Base retention based on diameter and graph size
+        # Larger diameter → keep more edges for connectivity
+        diameter_factor = diameter_estimate / (mean_dist + 1e-12)
+        base_k = int(np.sqrt(n) * (1.0 + np.log1p(diameter_factor)))
+        k_retain = max(3, min(base_k, n // 2))
+    else:
+        k_retain = n - 1
+    
+    # Create sparsification mask
+    sparsify_mask = np.zeros_like(dist, dtype=bool)
+    
+    for i in range(n):
+        # Score edges for this node
+        node_scores = inv_dist[i] * regret_penalty[i] * opt_potential[i]
+        node_scores[i] = -np.inf  # Exclude self
+        
+        # Keep top-k edges
+        top_indices = np.argsort(node_scores)[-k_retain:]
+        sparsify_mask[i, top_indices] = True
+        
+        # Ensure connectivity to nearest neighbors
+        nearest = np.argsort(dist[i])[1:min(3, n)]
+        sparsify_mask[i, nearest] = True
+        sparsify_mask[nearest, i] = True
+    
+    # Always include MST edges for connectivity
+    sparsify_mask = sparsify_mask | mst_mask
+    
+    # ========== 6. COMBINED SCORING ==========
+    # Combine factors with adaptive weights
+    # Weights adapt to graph characteristics
+    w_distance = 1.0  # Base importance
+    w_regret = 0.8 + 0.4 * cv_dist  # Higher for irregular graphs
+    w_mst = 0.6 + 0.4 * (1.0 - cv_dist)  # Higher for regular graphs
+    w_opt = 0.5 if n <= 500 else 0.1  # Only for computationally feasible graphs
+    
+    scores = (inv_dist ** w_distance) * \
+             (regret_penalty ** w_regret) * \
+             (mst_edge_bonus ** w_mst) * \
+             (opt_potential ** w_opt)
+    
+    # Apply sparsification
+    scores = scores * sparsify_mask
+    
+    # Add small baseline for all edges to maintain connectivity
+    scores += 0.01 * scores.max()
+    
+    # ========== 7. FINAL NORMALIZATION ==========
+    # Softmax-style normalization with adaptive temperature
+    score_flat = scores[triu_indices]
+    if len(score_flat) > 0 and np.std(score_flat) > 0:
+        # Temperature adapts to score distribution
+        temperature = 1.0 + 2.0 * cv_dist
+        scores_normalized = (scores - np.mean(score_flat)) / (np.std(score_flat) + 1e-12)
+        scores = 1 / (1 + np.exp(-temperature * scores_normalized))
+    
+    # Ensure symmetry and zero diagonal
+    scores = (scores + scores.T) / 2
+    np.fill_diagonal(scores, 0.0)
+    
+    return scores
+```

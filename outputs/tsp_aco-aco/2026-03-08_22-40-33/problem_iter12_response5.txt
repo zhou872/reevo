@@ -1,0 +1,941 @@
+```json
+{
+    "algorithm_features": ["Cluster-Aware Adaptive Weighting", "Multi-Pattern Local Optimization Scoring", "Connectivity-Preserving Topological Sparsification", "Hierarchical Instance Feature Learning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.csgraph import minimum_spanning_tree
+import warnings
+from collections import defaultdict
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Next-generation TSP edge heuristic with adaptive component activation
+    and multi-pattern local optimization scoring.
+    
+    Core Innovations:
+    1. Hierarchical instance feature learning for dynamic component selection
+    2. Multi-pattern local optimization (2-opt, 3-opt, Or-opt) with predictive scoring
+    3. Topological sparsification with connectivity guarantees
+    4. Adaptive non-linear combination via learned feature thresholds
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (shape n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with scores in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    warnings.filterwarnings('ignore')
+    
+    # ===== 1. HIERARCHICAL INSTANCE FEATURE LEARNING =====
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + 1e-12)
+    
+    # Multi-scale instance analysis
+    instance_features = {
+        'cv': dist_cv,
+        'size': n,
+        'mean_dist': dist_mean,
+        'skewness': np.mean((distances - dist_mean)**3) / (dist_std**3 + 1e-12),
+        'density': n / (dist_mean + 1e-12) if dist_mean > 0 else 0,
+        'uniformity': 1.0 / (1.0 + 0.1 * np.var(distances / (dist_mean + 1e-12)))
+    }
+    
+    # ===== 2. ADAPTIVE COMPONENT ACTIVATION DECISION =====
+    component_flags = _decide_active_components(instance_features, n)
+    
+    # ===== 3. INSTANCE-AWARE SPATIAL CLUSTERING =====
+    cluster_labels, cluster_stats = _adaptive_clustering(
+        distance_matrix, instance_features
+    )
+    
+    # ===== 4. ENHANCED CHRISTOFIDES BASELINE =====
+    christofides_mask = _enhanced_christofides_components(
+        distance_matrix, cluster_labels, instance_features
+    ) if component_flags['christofides'] else np.zeros((n, n), dtype=bool)
+    
+    # ===== 5. COMPONENT COMPUTATION WITH ACTIVATION CONTROL =====
+    # Base inverse distance (always active)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        smoothing = 0.1 * dist_mean + 0.01 * np.sqrt(dist_std)
+        inv_dist = dist_mean / (distance_matrix + smoothing * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Regret penalty (conditional)
+    regret_penalty = _adaptive_regret_penalty(
+        distance_matrix, cluster_labels, cluster_stats, instance_features
+    ) if component_flags['regret'] else np.ones((n, n))
+    
+    # Mutual nearest neighbors (conditional)
+    mutual_nn_bonus = _enhanced_mutual_nn(
+        distance_matrix, cluster_labels, instance_features
+    ) if component_flags['mutual_nn'] else np.ones((n, n))
+    
+    # Path efficiency lookahead (conditional)
+    lookahead_score = _multi_tier_lookahead(
+        distance_matrix, cluster_labels, instance_features
+    ) if component_flags['lookahead'] else np.ones((n, n))
+    
+    # Multi-pattern local optimization (conditional)
+    optimization_potential = _multi_pattern_optimization_potential(
+        distance_matrix, cluster_labels, instance_features
+    ) if component_flags['optimization'] else np.ones((n, n))
+    
+    # ===== 6. ADAPTIVE COMPONENT WEIGHTING =====
+    weights = _compute_adaptive_weights(
+        component_flags, cluster_stats, instance_features
+    )
+    
+    # ===== 7. NON-LINEAR COMPONENT COMBINATION =====
+    heuristics = inv_dist.copy()
+    
+    # Apply components with learned weights using power transform
+    for component_name, weight in weights.items():
+        if weight != 1.0:
+            if component_name == 'regret':
+                heuristics *= regret_penalty ** weight
+            elif component_name == 'mutual_nn':
+                heuristics *= mutual_nn_bonus ** weight
+            elif component_name == 'lookahead':
+                heuristics *= lookahead_score ** weight
+            elif component_name == 'optimization':
+                heuristics *= optimization_potential ** weight
+    
+    # Boost Christofides edges if active
+    if component_flags['christofides']:
+        boost_factor = 1.5 + 0.5 * np.tanh(2 - 2 * instance_features['uniformity'])
+        heuristics[christofides_mask] *= boost_factor
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # ===== 8. TOPOLOGICAL SPARSIFICATION WITH CONNECTIVITY GUARANTEE =====
+    if n > 3 and component_flags['sparsify']:
+        heuristics = _topological_sparsification(
+            heuristics, distance_matrix, christofides_mask,
+            cluster_labels, cluster_stats, instance_features
+        )
+    
+    # ===== 9. FINAL NORMALIZATION AND VALIDATION =====
+    np.fill_diagonal(heuristics, 0)
+    heuristics = np.maximum(heuristics, 0)
+    
+    # Normalize to [0, 1]
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Final symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    return np.clip(heuristics, 0, 1)
+
+
+def _decide_active_components(features: dict, n: int) -> dict:
+    """
+    Decide which heuristic components to activate based on instance features.
+    """
+    flags = {
+        'christofides': True,
+        'regret': True,
+        'mutual_nn': True,
+        'lookahead': True,
+        'optimization': True,
+        'sparsify': True
+    }
+    
+    # Deactivate components for small instances
+    if n <= 10:
+        flags['sparsify'] = False
+        if n <= 6:
+            flags['lookahead'] = False
+    
+    # Deactivate based on uniformity
+    if features['uniformity'] > 0.8:
+        # Very uniform instances: simpler heuristics
+        flags['mutual_nn'] = False
+        flags['optimization'] = False
+    
+    # Deactivate based on coefficient of variation
+    if features['cv'] < 0.2:
+        # Low variance: regret less useful
+        flags['regret'] = False
+    
+    # Deactivate based on size
+    if n > 100:
+        # Large instances: disable expensive components
+        flags['optimization'] = False
+        flags['lookahead'] = False
+    
+    return flags
+
+
+def _adaptive_clustering(distance_matrix: np.ndarray, features: dict) -> tuple:
+    """
+    Adaptive clustering based on instance characteristics.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 15 or features['uniformity'] > 0.85:
+        # Small or very uniform: single cluster
+        return np.zeros(n, dtype=int), {'n_clusters': 1, 'sizes': [n]}
+    
+    # Determine number of clusters adaptively
+    if features['cv'] < 0.3:
+        n_clusters = max(2, min(5, n // 15))
+    elif features['cv'] > 0.7:
+        n_clusters = max(3, min(8, n // 10))
+    else:
+        n_clusters = max(2, min(6, n // 12))
+    
+    # Simple distance-based clustering
+    cluster_labels = -np.ones(n, dtype=int)
+    cluster_centers = []
+    
+    # Choose initial centers as far apart as possible
+    if n_clusters > 0:
+        # Start with two farthest points
+        max_dist = 0
+        center1, center2 = 0, 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if distance_matrix[i, j] > max_dist:
+                    max_dist = distance_matrix[i, j]
+                    center1, center2 = i, j
+        
+        cluster_centers.append(center1)
+        cluster_labels[center1] = 0
+        
+        if n_clusters > 1:
+            cluster_centers.append(center2)
+            cluster_labels[center2] = 1
+            
+            # Additional centers: farthest from existing centers
+            for k in range(2, n_clusters):
+                max_min_dist = -1
+                new_center = -1
+                for i in range(n):
+                    if cluster_labels[i] == -1:
+                        min_dist_to_centers = min(
+                            [distance_matrix[i, c] for c in cluster_centers]
+                        )
+                        if min_dist_to_centers > max_min_dist:
+                            max_min_dist = min_dist_to_centers
+                            new_center = i
+                
+                if new_center != -1:
+                    cluster_centers.append(new_center)
+                    cluster_labels[new_center] = k
+    
+    # Assign remaining points to nearest center
+    for i in range(n):
+        if cluster_labels[i] == -1:
+            distances_to_centers = [distance_matrix[i, c] for c in cluster_centers]
+            cluster_labels[i] = np.argmin(distances_to_centers)
+    
+    # Compute cluster statistics
+    unique_labels = np.unique(cluster_labels)
+    cluster_sizes = [np.sum(cluster_labels == label) for label in unique_labels]
+    
+    return cluster_labels, {
+        'n_clusters': len(unique_labels),
+        'sizes': cluster_sizes,
+        'labels': cluster_labels
+    }
+
+
+def _enhanced_christofides_components(distance_matrix: np.ndarray,
+                                      cluster_labels: np.ndarray,
+                                      features: dict) -> np.ndarray:
+    """
+    Enhanced Christofides approximation with cluster-aware matching.
+    """
+    n = distance_matrix.shape[0]
+    mask = np.zeros((n, n), dtype=bool)
+    
+    # Minimum Spanning Tree using Prim's algorithm
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        u = np.argmin(np.where(visited, np.inf, min_edge))
+        visited[u] = True
+        if parent[u] != -1:
+            mask[u, parent[u]] = mask[parent[u], u] = True
+        
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    # Find odd-degree vertices
+    mst_degrees = np.sum(mask, axis=1)
+    odd_vertices = np.where(mst_degrees % 2 == 1)[0]
+    
+    # Cluster-aware matching
+    if len(odd_vertices) >= 2:
+        # Group odd vertices by cluster
+        cluster_groups = defaultdict(list)
+        for v in odd_vertices:
+            cluster_groups[cluster_labels[v]].append(v)
+        
+        # Match within clusters first, then between clusters
+        matched = np.zeros(len(odd_vertices), dtype=bool)
+        vertex_to_index = {v: idx for idx, v in enumerate(odd_vertices)}
+        
+        # Phase 1: Match within clusters
+        for cluster, vertices in cluster_groups.items():
+            if len(vertices) >= 2:
+                cluster_vertices = np.array(vertices)
+                cluster_dists = distance_matrix[np.ix_(cluster_vertices, cluster_vertices)]
+                np.fill_diagonal(cluster_dists, np.inf)
+                
+                # Greedy matching within cluster
+                for i in range(len(cluster_vertices)):
+                    u = cluster_vertices[i]
+                    u_idx = vertex_to_index[u]
+                    if not matched[u_idx]:
+                        # Find closest unmatched vertex in same cluster
+                        min_dist = np.inf
+                        best_v = -1
+                        for j in range(len(cluster_vertices)):
+                            if i != j:
+                                v = cluster_vertices[j]
+                                v_idx = vertex_to_index[v]
+                                if not matched[v_idx] and cluster_dists[i, j] < min_dist:
+                                    min_dist = cluster_dists[i, j]
+                                    best_v = v
+                        
+                        if best_v != -1:
+                            v_idx = vertex_to_index[best_v]
+                            mask[u, best_v] = mask[best_v, u] = True
+                            matched[u_idx] = matched[v_idx] = True
+        
+        # Phase 2: Match remaining vertices between clusters
+        unmatched = odd_vertices[~matched]
+        if len(unmatched) >= 2:
+            # Simple greedy matching for remaining vertices
+            for i in range(len(unmatched)):
+                u = unmatched[i]
+                u_idx = vertex_to_index[u]
+                if not matched[u_idx]:
+                    min_dist = np.inf
+                    best_v = -1
+                    for j in range(i + 1, len(unmatched)):
+                        v = unmatched[j]
+                        v_idx = vertex_to_index[v]
+                        if not matched[v_idx]:
+                            dist = distance_matrix[u, v]
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_v = v
+                    
+                    if best_v != -1:
+                        v_idx = vertex_to_index[best_v]
+                        mask[u, best_v] = mask[best_v, u] = True
+                        matched[u_idx] = matched[v_idx] = True
+    
+    return mask
+
+
+def _adaptive_regret_penalty(distance_matrix: np.ndarray,
+                            cluster_labels: np.ndarray,
+                            cluster_stats: dict,
+                            features: dict) -> np.ndarray:
+    """
+    Adaptive regret penalty with cluster awareness and instance tuning.
+    """
+    n = distance_matrix.shape[0]
+    regret = np.ones((n, n))
+    
+    # Adaptive parameters
+    base_power = 1.2 + 0.8 * np.tanh(3 * features['cv'] - 1)
+    lookahead_k = max(3, min(10, int(np.sqrt(n))))
+    
+    for i in range(n):
+        # Get k+1 nearest neighbors for lookahead
+        k_neighbors = min(n - 1, lookahead_k + 3)
+        neighbor_indices = np.argsort(distance_matrix[i])[1:k_neighbors + 1]
+        
+        # Best direct distance
+        best_dist = distance_matrix[i, neighbor_indices[0]]
+        
+        # Cluster context
+        cluster_i = cluster_labels[i]
+        
+        for rank, j in enumerate(neighbor_indices):
+            current_dist = distance_matrix[i, j]
+            
+            if rank == 0:
+                regret[i, j] = 1.0
+                continue
+            
+            # Base regret components
+            norm_rank = rank / (len(neighbor_indices) - 1)
+            dist_ratio = current_dist / (best_dist + 1e-12)
+            
+            # Cluster-aware adjustment
+            same_cluster = (cluster_labels[j] == cluster_i)
+            
+            if same_cluster and cluster_stats['n_clusters'] > 1:
+                # Within clusters: relaxed penalty
+                power_adjust = 0.8
+            elif not same_cluster and cluster_stats['n_clusters'] > 1:
+                # Between clusters: stronger penalty
+                power_adjust = 1.2
+            else:
+                power_adjust = 1.0
+            
+            # Adjust for instance characteristics
+            if features['uniformity'] > 0.7:
+                power_adjust *= 0.9  # More uniform, less penalty
+            
+            adjusted_power = base_power * power_adjust
+            
+            # Enhanced regret calculation with lookahead consideration
+            # Check if there's a significantly better 2-hop path
+            lookahead_penalty = 1.0
+            if rank >= 2:  # Only for non-top choices
+                # Check best 2-hop through top neighbors
+                for k in neighbor_indices[:min(3, len(neighbor_indices))]:
+                    if k != j:
+                        alt_path = distance_matrix[i, k] + distance_matrix[k, j]
+                        if alt_path < current_dist * 0.9:  # 10% better
+                            lookahead_penalty *= 0.7
+                            break
+            
+            # Final penalty calculation
+            regret_term = norm_rank * np.sqrt(dist_ratio)
+            penalty = 1 / (1 + adjusted_power * regret_term) * lookahead_penalty
+            
+            # Additional decay for very poor alternatives
+            if dist_ratio > 2.0:
+                penalty *= 0.6
+            elif dist_ratio > 1.5:
+                penalty *= 0.8
+            
+            regret[i, j] = penalty
+    
+    # Symmetrize using geometric mean
+    regret = np.sqrt(regret * regret.T)
+    
+    return regret
+
+
+def _enhanced_mutual_nn(distance_matrix: np.ndarray,
+                        cluster_labels: np.ndarray,
+                        features: dict) -> np.ndarray:
+    """
+    Enhanced mutual nearest neighbors with cluster awareness.
+    """
+    n = distance_matrix.shape[0]
+    bonus = np.ones((n, n))
+    
+    # Adaptive k for NN
+    k = max(3, min(15, int(2 * np.sqrt(n) + 3 * features['cv'])))
+    k = min(k, n - 1)
+    
+    # Get k-nearest neighbors for each node
+    nearest = np.argsort(distance_matrix, axis=1)[:, 1:k + 1]
+    
+    # Create reverse index for fast lookup
+    reverse_index = [set() for _ in range(n)]
+    for i in range(n):
+        for idx, j in enumerate(nearest[i]):
+            reverse_index[j].add((i, idx))
+    
+    # Compute mutual NN bonuses
+    for i in range(n):
+        for idx_j, j in enumerate(nearest[i]):
+            if i < j:
+                # Check if mutual NN
+                mutual = False
+                rank_i = idx_j
+                
+                # Check if i is in j's neighbors
+                for (neighbor_i, rank_j) in reverse_index[j]:
+                    if neighbor_i == i:
+                        mutual = True
+                        break
+                
+                if mutual:
+                    # Enhanced bonus calculation
+                    avg_rank = (rank_i + rank_j) / (2 * (k - 1))
+                    
+                    # Cluster adjustment
+                    if cluster_labels[i] == cluster_labels[j]:
+                        cluster_bonus = 1.4 - 0.4 * avg_rank
+                    else:
+                        cluster_bonus = 1.2 - 0.3 * avg_rank
+                    
+                    # Instance feature adjustment
+                    if features['uniformity'] > 0.7:
+                        cluster_bonus *= 0.9  # Reduce bonus for uniform instances
+                    
+                    # Distance ratio adjustment
+                    dist_ratio = distance_matrix[i, j] / features['mean_dist']
+                    if dist_ratio < 0.5:
+                        cluster_bonus *= 1.2
+                    elif dist_ratio > 2.0:
+                        cluster_bonus *= 0.8
+                    
+                    bonus[i, j] = bonus[j, i] = cluster_bonus
+    
+    return bonus
+
+
+def _multi_tier_lookahead(distance_matrix: np.ndarray,
+                         cluster_labels: np.ndarray,
+                         features: dict) -> np.ndarray:
+    """
+    Multi-tier path efficiency lookahead with adaptive depth control.
+    """
+    n = distance_matrix.shape[0]
+    score = np.ones((n, n))
+    
+    if n < 4:
+        return score
+    
+    # Adaptive parameters
+    if n <= 20:
+        base_k = 6
+        max_depth = 3
+    elif n <= 50:
+        base_k = 8
+        max_depth = 2
+    else:
+        base_k = 10
+        max_depth = 1
+    
+    # Adjust based on instance features
+    if features['cv'] > 0.6:
+        base_k = min(base_k + 3, n - 1)
+    if features['uniformity'] > 0.8:
+        max_depth = min(max_depth, 2)
+    
+    # Get nearest neighbors for lookahead
+    lookahead_k = min(n - 1, base_k)
+    nearest = np.argsort(distance_matrix, axis=1)[:, 1:lookahead_k + 1]
+    
+    # Cache for efficiency
+    nearest_sets = [set(neighbors) for neighbors in nearest]
+    
+    for i in range(n):
+        i_neighbors = nearest_sets[i]
+        
+        for j in range(i + 1, n):
+            if j not in i_neighbors:
+                continue
+            
+            direct_dist = distance_matrix[i, j]
+            if direct_dist <= 0:
+                continue
+            
+            best_alternative = np.inf
+            
+            # Tier 1: Direct 2-hop paths
+            j_neighbors = nearest_sets[j]
+            common_neighbors = i_neighbors.intersection(j_neighbors)
+            
+            for k in common_neighbors:
+                if k != i and k != j:
+                    alt_path = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alternative = min(best_alternative, alt_path)
+            
+            # Tier 2: Extended paths if needed
+            if max_depth >= 2 and (best_alternative / direct_dist > 1.3):
+                # Check 3-hop paths through promising intermediaries
+                for k in list(i_neighbors)[:min(5, len(i_neighbors))]:
+                    if k == j:
+                        continue
+                    
+                    k_neighbors = nearest_sets[k]
+                    for l in list(j_neighbors)[:min(5, len(j_neighbors))]:
+                        if l == i or l == k:
+                            continue
+                        
+                        # Check connection between k and l
+                        if l in k_neighbors or k in nearest_sets[l]:
+                            alt_path = (distance_matrix[i, k] +
+                                       distance_matrix[k, l] +
+                                       distance_matrix[l, j])
+                            best_alternative = min(best_alternative, alt_path)
+            
+            # Tier 3: Limited 4-hop for very poor direct connections
+            if (max_depth >= 3 and 
+                best_alternative / direct_dist > 1.8 and 
+                len(i_neighbors) >= 3 and len(j_neighbors) >= 3):
+                
+                # Sample a few 4-hop paths
+                for k in list(i_neighbors)[:min(3, len(i_neighbors))]:
+                    if k == j:
+                        continue
+                    
+                    k_neighbors = nearest_sets[k]
+                    for l in list(k_neighbors)[:min(3, len(k_neighbors))]:
+                        if l == i or l == j:
+                            continue
+                        
+                        l_neighbors = nearest_sets[l]
+                        for m in list(j_neighbors)[:min(3, len(j_neighbors))]:
+                            if m == i or m == k or m == l:
+                                continue
+                            
+                            if m in l_neighbors:
+                                alt_path = (distance_matrix[i, k] +
+                                           distance_matrix[k, l] +
+                                           distance_matrix[l, m] +
+                                           distance_matrix[m, j])
+                                best_alternative = min(best_alternative, alt_path)
+            
+            # Calculate efficiency score
+            if best_alternative < np.inf:
+                efficiency = best_alternative / direct_dist
+                
+                # Adaptive scoring based on instance and clustering
+                same_cluster = (cluster_labels[i] == cluster_labels[j])
+                
+                if same_cluster:
+                    center, steepness = 1.2, 2.5
+                else:
+                    center, steepness = 1.4, 2.0
+                
+                # Adjust based on instance features
+                if features['uniformity'] > 0.7:
+                    center *= 1.1  # More forgiving for uniform instances
+                
+                # Sigmoid transformation
+                sigmoid = 1.0 / (1.0 + np.exp(-steepness * (efficiency - center)))
+                final_score = 0.4 + 1.2 * sigmoid
+                
+                score[i, j] = score[j, i] = np.clip(final_score, 0.2, 1.8)
+    
+    return score
+
+
+def _multi_pattern_optimization_potential(distance_matrix: np.ndarray,
+                                         cluster_labels: np.ndarray,
+                                         features: dict) -> np.ndarray:
+    """
+    Multi-pattern local optimization potential scoring.
+    """
+    n = distance_matrix.shape[0]
+    potential = np.ones((n, n))
+    
+    if n < 5:
+        return potential
+    
+    # Adaptive neighbor limit
+    neighbor_limit = min(12, max(5, int(1.5 * np.sqrt(n))))
+    
+    # Get nearest neighbors for each node
+    nearest = np.argsort(distance_matrix, axis=1)[:, 1:neighbor_limit + 1]
+    
+    for i in range(n):
+        i_neighbors = nearest[i]
+        
+        for j in range(i + 1, n):
+            if j not in i_neighbors and i not in nearest[j]:
+                continue
+            
+            current_dist = distance_matrix[i, j]
+            if current_dist <= 0:
+                continue
+            
+            j_neighbors = nearest[j]
+            best_gain = 0
+            
+            # Pattern 1: 2-opt gains
+            for k in i_neighbors:
+                if k == j:
+                    continue
+                
+                for l in j_neighbors:
+                    if l == i or l == k:
+                        continue
+                    
+                    gain = (current_dist + distance_matrix[k, l] -
+                           distance_matrix[i, k] - distance_matrix[j, l])
+                    best_gain = max(best_gain, gain)
+            
+            # Pattern 2: 3-opt gains (star pattern)
+            if neighbor_limit >= 6 and n >= 8:
+                # Sample promising 3-opt patterns
+                for k in i_neighbors[:min(4, len(i_neighbors))]:
+                    if k == j:
+                        continue
+                    
+                    for l in j_neighbors[:min(4, len(j_neighbors))]:
+                        if l == i or l == k:
+                            continue
+                        
+                        # Find connector between k and l's neighborhoods
+                        possible_connectors = set(nearest[k]).intersection(
+                            set(nearest[l])
+                        )
+                        possible_connectors.discard(i)
+                        possible_connectors.discard(j)
+                        possible_connectors.discard(k)
+                        possible_connectors.discard(l)
+                        
+                        if possible_connectors:
+                            m = list(possible_connectors)[0]
+                            gain_3opt = (current_dist + distance_matrix[k, m] +
+                                       distance_matrix[m, l] -
+                                       distance_matrix[i, k] -
+                                       distance_matrix[j, l] -
+                                       distance_matrix[k, l])
+                            best_gain = max(best_gain, gain_3opt * 0.7)
+            
+            # Pattern 3: Or-opt gains (node relocation)
+            if n >= 10 and neighbor_limit >= 8:
+                # Try relocating node i between other edges
+                for k in i_neighbors[:min(5, len(i_neighbors))]:
+                    if k == j:
+                        continue
+                    
+                    # Find potential new position for edge (i,j)
+                    for l in range(n):
+                        if l == i or l == j or l == k:
+                            continue
+                        
+                        # Check if (k,l) is a reasonable edge
+                        if (l in nearest[k][:8] or k in nearest[l][:8]):
+                            gain_or = (current_dist + distance_matrix[k, l] -
+                                      distance_matrix[i, k] - distance_matrix[j, l])
+                            best_gain = max(best_gain, gain_or * 0.6)
+            
+            # Convert gain to potential score
+            if best_gain > 0:
+                # Normalize gain by average distance
+                norm_gain = min(best_gain / (features['mean_dist'] + 1e-12), 3.0)
+                
+                # Cluster-aware scoring
+                same_cluster = (cluster_labels[i] == cluster_labels[j])
+                if same_cluster:
+                    base_potential = 1.0 + 0.4 * np.tanh(norm_gain)
+                else:
+                    base_potential = 1.0 + 0.3 * np.tanh(norm_gain)
+                
+                # Adjust for instance features
+                if features['cv'] < 0.3:
+                    base_potential *= 0.9  # Less potential in uniform instances
+                
+                potential[i, j] = potential[j, i] = np.clip(base_potential, 0.8, 1.5)
+    
+    return potential
+
+
+def _compute_adaptive_weights(component_flags: dict,
+                             cluster_stats: dict,
+                             features: dict) -> dict:
+    """
+    Compute adaptive weights for heuristic components.
+    """
+    weights = {
+        'regret': 1.0,
+        'mutual_nn': 1.0,
+        'lookahead': 1.0,
+        'optimization': 1.0
+    }
+    
+    # Base adjustments from component flags
+    for component in weights:
+        if not component_flags.get(component, True):
+            weights[component] = 0.0
+    
+    # Adjust based on clustering
+    if cluster_stats['n_clusters'] > 1:
+        # Multiple clusters: emphasize regret and mutual NN
+        weights['regret'] *= 1.2
+        weights['mutual_nn'] *= 1.1
+        weights['lookahead'] *= 0.9
+    
+    # Adjust based on instance size
+    if features['size'] > 50:
+        # Large instances: reduce weight on expensive components
+        weights['optimization'] *= 0.7
+        weights['lookahead'] *= 0.8
+    
+    # Adjust based on coefficient of variation
+    if features['cv'] > 0.6:
+        # High variance: emphasize regret
+        weights['regret'] *= 1.3
+    elif features['cv'] < 0.3:
+        # Low variance: emphasize mutual NN
+        weights['mutual_nn'] *= 1.2
+    
+    # Adjust based on uniformity
+    if features['uniformity'] > 0.8:
+        # Very uniform: reduce all weights
+        for key in weights:
+            weights[key] *= 0.8
+    
+    # Ensure non-negative weights
+    for key in weights:
+        weights[key] = max(0.0, weights[key])
+    
+    return weights
+
+
+def _topological_sparsification(heuristics: np.ndarray,
+                               distance_matrix: np.ndarray,
+                               christofides_mask: np.ndarray,
+                               cluster_labels: np.ndarray,
+                               cluster_stats: dict,
+                               features: dict) -> np.ndarray:
+    """
+    Topological sparsification with connectivity preservation.
+    """
+    n = heuristics.shape[0]
+    result = heuristics.copy()
+    
+    # Always preserve Christofides edges
+    preserve_mask = christofides_mask.copy()
+    
+    # Determine target edges per node adaptively
+    if features['size'] <= 20:
+        base_target = min(8, n - 1)
+    elif features['size'] <= 50:
+        base_target = min(10, int(1.5 * np.sqrt(n)))
+    else:
+        base_target = min(12, int(1.2 * np.sqrt(n)))
+    
+    # Adjust based on clustering
+    if cluster_stats['n_clusters'] > 1:
+        base_target = min(base_target + 2, n - 1)
+    
+    # Per-node edge selection
+    for i in range(n):
+        row = result[i].copy()
+        row[i] = -np.inf
+        
+        # Always keep preserved edges
+        keep_indices = set(np.where(preserve_mask[i])[0])
+        
+        # Get remaining edges by cluster
+        same_cluster = cluster_labels == cluster_labels[i]
+        
+        # Determine targets for within and between clusters
+        if cluster_stats['n_clusters'] == 1:
+            # Single cluster: simple top-k
+            target_same = base_target
+            target_diff = 0
+        else:
+            # Multiple clusters: balance
+            cluster_size = cluster_stats['sizes'][cluster_labels[i]]
+            size_factor = np.sqrt(min(cluster_size, 20) / 20)
+            target_same = max(2, int(base_target * 0.6 * size_factor))
+            target_diff = max(1, int(base_target * 0.4))
+        
+        # Keep within-cluster edges
+        same_idx = np.where(same_cluster & (np.arange(n) != i))[0]
+        if len(same_idx) > 0:
+            same_scores = row[same_idx]
+            keep_same = min(target_same, len(same_idx))
+            
+            if keep_same > 0:
+                top_same = np.argsort(same_scores)[-keep_same:]
+                keep_indices.update(same_idx[top_same])
+        
+        # Keep between-cluster edges
+        diff_idx = np.where(~same_cluster & (np.arange(n) != i))[0]
+        if len(diff_idx) > 0:
+            diff_scores = row[diff_idx]
+            keep_diff = min(target_diff, len(diff_idx))
+            
+            if keep_diff > 0:
+                top_diff = np.argsort(diff_scores)[-keep_diff:]
+                keep_indices.update(diff_idx[top_diff])
+        
+        # Ensure minimum connectivity
+        min_edges = max(3, min(5, int(np.sqrt(n))))
+        if len(keep_indices) < min_edges:
+            # Add highest-scoring edges not already kept
+            all_indices = np.where(row > 0)[0]
+            if len(all_indices) > 0:
+                remaining = [idx for idx in all_indices if idx not in keep_indices]
+                if remaining:
+                    remaining_scores = row[remaining]
+                    needed = min_edges - len(keep_indices)
+                    top_remaining = np.argsort(remaining_scores)[-needed:]
+                    keep_indices.update([remaining[idx] for idx in top_remaining])
+        
+        # Zero out non-kept edges
+        for j in range(n):
+            if j != i and j not in keep_indices:
+                result[i, j] = 0
+    
+    # Ensure symmetry and connectivity
+    result = np.maximum(result, result.T)
+    
+    # Final connectivity check (simplified)
+    for i in range(n):
+        if np.sum(result[i] > 0) == 0 and n > 1:
+            # Isolated node: connect to nearest
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nearest = np.argmin(distances)
+            result[i, nearest] = result[nearest, i] = 0.5
+    
+    return result
+
+
+# Example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_nodes = 30
+    
+    # Create symmetric distance matrix
+    coords = np.random.rand(n_nodes, 2) * 100
+    dist_matrix = squareform(pdist(coords))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity (zero entries): {(heuristics == 0).sum() / heuristics.size:.1%}")
+    
+    non_zero_edges = np.sum(heuristics > 0, axis=1)
+    print(f"Non-zero edges per node: min={non_zero_edges.min()}, "
+          f"max={non_zero_edges.max()}, mean={non_zero_edges.mean():.1f}")
+    
+    print(f"Matrix symmetric? {np.allclose(heuristics, heuristics.T)}")
+    print(f"Diagonal all zero? {np.allclose(np.diag(heuristics), 0)}")
+    
+    # Check connectivity
+    visited = np.zeros(n_nodes, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        current = stack.pop()
+        neighbors = np.where(heuristics[current] > 0)[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                stack.append(neighbor)
+    
+    print(f"Graph connected? {np.all(visited)}")
+    
+    print("\nSample edge scores (i, j, distance, heuristic):")
+    for i, j in [(0, 1), (0, 7), (3, 8), (5, 12), (10, 20)]:
+        if i < n_nodes and j < n_nodes:
+            print(f"({i}, {j}): dist={dist_matrix[i, j]:.2f}, "
+                  f"heuristic={heuristics[i, j]:.4f}")
+```

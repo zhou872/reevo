@@ -1,0 +1,552 @@
+```json
+{
+    "algorithm_features": ["Three-step Path Potential", "Hierarchical Community Bonuses", "Instance-Adaptive Weight Tuning", "Monte Carlo Edge Sampling"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.cluster import AgglomerativeClustering
+from typing import Dict, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with three-step lookahead, hierarchical clustering,
+    and adaptive weight optimization.
+    
+    Core improvements over v1:
+    1. Three-step path potential estimation for deeper lookahead
+    2. Multi-level hierarchical clustering for community structure
+    3. Adaptive weight learning through instance profiling
+    4. Monte Carlo sampling for edge quality estimation
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix with higher values for more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristic = np.zeros_like(distance_matrix)
+        if n == 2:
+            heuristic[0, 1] = heuristic[1, 0] = 1.0
+        return heuristic
+    
+    # ==================== 1. INSTANCE PROFILING ====================
+    profile = _extract_instance_features(distance_matrix, n)
+    
+    # ==================== 2. ADAPTIVE COMPONENT WEIGHTS ====================
+    weights = _learn_weights_from_profile(profile, n)
+    
+    # ==================== 3. CORE COMPONENT COMPUTATION ====================
+    # Base components
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    mst_mask = _compute_mst_mask(distance_matrix)
+    mst_degrees = mst_mask.sum(axis=1)
+    centrality = _compute_enhanced_centrality(distance_matrix, profile)
+    
+    # Advanced components
+    three_step_gain = _estimate_three_step_gain(distance_matrix, n)
+    hierarchical_bonus = _compute_hierarchical_bonuses(distance_matrix, n)
+    monte_carlo_score = _monte_carlo_edge_sampling(distance_matrix, n, profile)
+    regret_matrix = _compute_enhanced_regret(distance_matrix, n, profile)
+    density_factor = _compute_local_density(distance_matrix, n)
+    
+    # ==================== 4. MULTI-OBJECTIVE FUSION ====================
+    heuristic = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+            
+            # Collect all components with adaptive scaling
+            components = {
+                'inv_dist': np.power(inv_dist[i, j], 0.8),
+                'mst': 2.0 if mst_mask[i, j] else 1.0 - 0.1 * (mst_degrees[i] + mst_degrees[j]) / 2,
+                'centrality': _fuse_centrality_scores(centrality[i], centrality[j]),
+                'three_step': three_step_gain[i, j],
+                'hierarchical': hierarchical_bonus[i, j],
+                'monte_carlo': monte_carlo_score[i, j],
+                'regret': 1.0 - 0.3 * regret_matrix[i, j],
+                'density': density_factor[i, j]
+            }
+            
+            # Weighted geometric mean with learned weights
+            log_score = 0.0
+            total_weight = 0.0
+            
+            for key, value in components.items():
+                w = weights.get(key, 1.0)
+                value = max(value, 1e-10)
+                log_score += w * np.log(value)
+                total_weight += w
+            
+            score = np.exp(log_score / total_weight) if total_weight > 0 else 0
+            heuristic[i, j] = heuristic[j, i] = score
+    
+    # ==================== 5. POST-PROCESSING ====================
+    # Hierarchical sparsification
+    heuristic = _hierarchical_sparsify(heuristic, distance_matrix, mst_mask, n)
+    
+    # Final refinement
+    max_val = heuristic.max()
+    if max_val > 0:
+        heuristic /= max_val
+    
+    np.fill_diagonal(heuristic, 0)
+    return heuristic
+
+def _extract_instance_features(distance_matrix: np.ndarray, n: int) -> Dict[str, float]:
+    """Extract comprehensive instance features for adaptive tuning."""
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    
+    # Basic statistics
+    mean_dist = np.mean(upper_tri)
+    std_dist = np.std(upper_tri)
+    cv = std_dist / (mean_dist + 1e-10)
+    
+    # Nearest neighbor statistics
+    nn_ratios = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        sorted_dists = np.sort(dists)[:3]
+        if len(sorted_dists) >= 2:
+            nn_ratios.append(sorted_dists[1] / sorted_dists[0])
+    
+    # Spatial distribution
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_dists = mst.data[mst.data > 0]
+    mst_span = np.max(mst_dists) / (np.min(mst_dists) + 1e-10) if len(mst_dists) > 0 else 1.0
+    
+    return {
+        'mean': mean_dist,
+        'std': std_dist,
+        'cv': cv,
+        'nn_ratio_mean': np.mean(nn_ratios) if nn_ratios else 1.0,
+        'nn_ratio_var': np.var(nn_ratios) if nn_ratios else 0.0,
+        'mst_span': mst_span,
+        'n': n
+    }
+
+def _learn_weights_from_profile(profile: Dict[str, float], n: int) -> Dict[str, float]:
+    """Learn optimal component weights from instance characteristics."""
+    weights = {}
+    
+    # Base configuration
+    if n < 20:
+        # Small instances: emphasize lookahead
+        base = {
+            'inv_dist': 0.15, 'mst': 0.20, 'centrality': 0.10,
+            'three_step': 0.25, 'hierarchical': 0.05,
+            'monte_carlo': 0.10, 'regret': 0.10, 'density': 0.05
+        }
+    elif n < 100:
+        # Medium instances: balanced
+        base = {
+            'inv_dist': 0.16, 'mst': 0.18, 'centrality': 0.12,
+            'three_step': 0.18, 'hierarchical': 0.10,
+            'monte_carlo': 0.12, 'regret': 0.08, 'density': 0.06
+        }
+    else:
+        # Large instances: emphasize structure
+        base = {
+            'inv_dist': 0.18, 'mst': 0.15, 'centrality': 0.10,
+            'three_step': 0.14, 'hierarchical': 0.15,
+            'monte_carlo': 0.13, 'regret': 0.10, 'density': 0.05
+        }
+    
+    # Adapt based on instance characteristics
+    if profile['cv'] > 1.0:
+        base['three_step'] *= 1.2
+        base['monte_carlo'] *= 1.1
+        base['regret'] *= 0.9
+    
+    if profile['nn_ratio_var'] > 0.3:
+        base['hierarchical'] *= 1.3
+        base['centrality'] *= 0.8
+    
+    if profile['mst_span'] > 10:
+        base['mst'] *= 1.4
+        base['density'] *= 0.7
+    
+    # Normalize
+    total = sum(base.values())
+    weights = {k: v/total for k, v in base.items()}
+    
+    return weights
+
+def _compute_mst_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute Minimum Spanning Tree mask using Prim's algorithm."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    if n <= 1:
+        return mst_mask
+    
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    distances = distance_matrix[0].copy()
+    parent = np.zeros(n, dtype=int)
+    
+    for _ in range(n - 1):
+        unvisited = ~visited
+        if not np.any(unvisited):
+            break
+        
+        masked_dist = distances.copy()
+        masked_dist[visited] = np.inf
+        v = np.argmin(masked_dist)
+        
+        if v > 0:
+            mst_mask[parent[v], v] = True
+            mst_mask[v, parent[v]] = True
+        
+        visited[v] = True
+        new_distances = distance_matrix[v]
+        update_mask = new_distances < distances
+        update_mask &= ~visited
+        distances[update_mask] = new_distances[update_mask]
+        parent[update_mask] = v
+    
+    return mst_mask
+
+def _compute_enhanced_centrality(distance_matrix: np.ndarray, 
+                                 profile: Dict[str, float]) -> np.ndarray:
+    """Compute multi-scale centrality with instance adaptation."""
+    n = distance_matrix.shape[0]
+    centrality = np.zeros(n)
+    
+    # Local centrality (k-nearest)
+    k_local = max(2, n // 8)
+    for i in range(n):
+        neighbors = np.argsort(distance_matrix[i])[1:k_local+1]
+        centrality[i] = np.mean(distance_matrix[i, neighbors])
+    
+    # Global centrality (harmonic)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        harmonic = np.sum(1.0 / (distance_matrix + np.eye(n) * 1e-10), axis=1)
+    
+    # Adjust based on instance
+    if profile['cv'] > 1.0:
+        # Emphasize local centrality for variable instances
+        local_weight = 0.7
+    else:
+        local_weight = 0.5
+    
+    # Combine
+    if np.max(centrality) > 0:
+        centrality = 1.0 / (centrality + 1e-10)
+        centrality /= np.max(centrality)
+    
+    if np.max(harmonic) > 0:
+        harmonic /= np.max(harmonic)
+    
+    centrality = local_weight * centrality + (1 - local_weight) * harmonic
+    
+    # Normalize
+    c_min, c_max = centrality.min(), centrality.max()
+    if c_max - c_min > 1e-10:
+        centrality = 0.5 + (centrality - c_min) / (c_max - c_min)
+    
+    return centrality
+
+def _estimate_three_step_gain(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Estimate gain from three-step alternative paths."""
+    gain_matrix = np.ones((n, n))
+    
+    # Precompute nearest neighbors
+    nearest = np.argsort(distance_matrix, axis=1)[:, 1:5]  # Top 4 neighbors
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Find best three-step alternative
+            best_gain = 0.0
+            
+            # Try different three-step configurations
+            for alt_i in nearest[i][nearest[i] != j][:2]:
+                for alt_j in nearest[j][nearest[j] != i][:2]:
+                    if alt_i == alt_j or alt_i == j or alt_j == i:
+                        continue
+                    
+                    # Find connector between alt_i and alt_j
+                    possible_connectors = set(nearest[alt_i]) & set(nearest[alt_j])
+                    if len(possible_connectors) == 0:
+                        continue
+                    
+                    # Try best connector
+                    for conn in possible_connectors:
+                        if conn not in {i, j, alt_i, alt_j}:
+                            current = distance_matrix[i, j]
+                            alternative = (distance_matrix[i, alt_i] + 
+                                         distance_matrix[alt_i, conn] +
+                                         distance_matrix[conn, alt_j] +
+                                         distance_matrix[alt_j, j])
+                            gain = current - alternative
+                            best_gain = max(best_gain, gain)
+            
+            # Convert to multiplicative factor
+            avg_edge = np.mean([distance_matrix[i, k] for k in nearest[i][:3] if k != j])
+            gain_factor = np.exp(best_gain / (avg_edge + 1e-10))
+            gain_matrix[i, j] = gain_matrix[j, i] = min(max(gain_factor, 0.5), 2.0)
+    
+    # Normalize
+    max_gain = gain_matrix.max()
+    if max_gain > 0:
+        gain_matrix /= max_gain
+    
+    np.fill_diagonal(gain_matrix, 0)
+    return gain_matrix
+
+def _compute_hierarchical_bonuses(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute multi-level hierarchical clustering bonuses."""
+    bonus_matrix = np.ones((n, n))
+    
+    if n < 4:
+        return bonus_matrix
+    
+    try:
+        # Convert to similarities
+        max_dist = distance_matrix.max()
+        similarities = 1.0 - distance_matrix / (max_dist + 1e-10)
+        
+        # Create multiple clustering levels
+        n_levels = min(4, n // 3)
+        cluster_levels = []
+        
+        for level in range(2, 2 + n_levels):
+            clustering = AgglomerativeClustering(
+                n_clusters=min(level, n-1),
+                affinity='precomputed',
+                linkage='average',
+                metric='precomputed'
+            )
+            # Need to convert similarity to distance
+            labels = clustering.fit_predict(1.0 - similarities)
+            cluster_levels.append(labels)
+        
+        # Combine levels
+        for i in range(n):
+            for j in range(i + 1, n):
+                level_bonuses = []
+                for labels in cluster_levels:
+                    if labels[i] == labels[j]:
+                        cluster_size = np.sum(labels == labels[i])
+                        bonus = 1.0 + 1.0 / np.sqrt(cluster_size)
+                        level_bonuses.append(bonus)
+                    else:
+                        level_bonuses.append(0.8)
+                
+                # Weight later levels (finer clusters) more
+                weights = np.linspace(0.5, 1.5, len(level_bonuses))
+                weighted_sum = np.sum(w * b for w, b in zip(weights, level_bonuses))
+                bonus_matrix[i, j] = bonus_matrix[j, i] = weighted_sum / np.sum(weights)
+                
+    except Exception:
+        # Fallback to simple distance-based bonus
+        pass
+    
+    return bonus_matrix
+
+def _monte_carlo_edge_sampling(distance_matrix: np.ndarray, 
+                              n: int, 
+                              profile: Dict[str, float]) -> np.ndarray:
+    """Estimate edge quality through limited Monte Carlo sampling."""
+    score_matrix = np.ones((n, n))
+    
+    if n < 10:
+        return score_matrix
+    
+    # Determine sample size based on instance
+    n_samples = min(20, max(5, n // 5))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            samples = []
+            
+            for _ in range(n_samples):
+                # Randomly select third node
+                k = np.random.choice([x for x in range(n) if x not in (i, j)])
+                
+                # Score based on triangle quality
+                base_cost = distance_matrix[i, j]
+                alt_cost1 = distance_matrix[i, k] + distance_matrix[k, j]
+                alt_cost2 = distance_matrix[j, k] + distance_matrix[k, i]
+                
+                # Relative advantage
+                advantage = base_cost / min(alt_cost1, alt_cost2)
+                samples.append(advantage)
+            
+            avg_advantage = np.mean(samples)
+            score_matrix[i, j] = score_matrix[j, i] = avg_advantage
+    
+    # Normalize
+    max_score = score_matrix.max()
+    if max_score > 0:
+        score_matrix /= max_score
+    
+    np.fill_diagonal(score_matrix, 0)
+    return score_matrix
+
+def _compute_enhanced_regret(distance_matrix: np.ndarray, 
+                            n: int, 
+                            profile: Dict[str, float]) -> np.ndarray:
+    """Compute adaptive regret based on instance characteristics."""
+    regret = np.zeros_like(distance_matrix)
+    
+    # Adaptive k based on instance
+    if profile['cv'] > 1.0:
+        k = max(2, n // 15)  # Smaller k for variable instances
+    else:
+        k = max(3, n // 10)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        k_nearest = min(k + 1, n - 1)
+        nearest_indices = np.argsort(distances)[:k_nearest]
+        nearest_dists = distances[nearest_indices]
+        
+        if len(nearest_dists) == 0:
+            continue
+        
+        for j in range(n):
+            if i == j:
+                continue
+            
+            if j in nearest_indices[:k]:
+                alt_dist = nearest_dists[0] if j != nearest_indices[0] else nearest_dists[1]
+                regret[i, j] = (distance_matrix[i, j] - alt_dist) / (alt_dist + 1e-10)
+            else:
+                avg_topk = np.mean(nearest_dists[:k])
+                regret[i, j] = (distance_matrix[i, j] - avg_topk) / (avg_topk + 1e-10)
+    
+    # Symmetrize and normalize
+    regret = (regret + regret.T) / 2
+    regret = np.clip(regret, 0, 2)
+    
+    max_regret = regret.max()
+    if max_regret > 0:
+        regret /= max_regret
+    
+    return regret
+
+def _compute_local_density(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute local density adjustment factors."""
+    density_factors = np.ones((n, n))
+    
+    if n <= 3:
+        return density_factors
+    
+    # Estimate density using k nearest neighbors
+    k = max(2, n // 6)
+    densities = np.zeros(n)
+    
+    for i in range(n):
+        distances = np.partition(distance_matrix[i], k+1)[:k+1]
+        distances = distances[distances > 0]
+        if len(distances) > 0:
+            densities[i] = np.median(distances)
+        else:
+            densities[i] = 1.0
+    
+    # Relative density
+    density_mean = densities.mean()
+    if density_mean > 0:
+        relative_density = densities / density_mean
+    
+    # Adjust factors
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                dens_i, dens_j = relative_density[i], relative_density[j]
+                if dens_i < 0.8 and dens_j < 0.8:
+                    density_factors[i, j] = 1.3
+                elif dens_i > 1.2 and dens_j > 1.2:
+                    density_factors[i, j] = 0.9
+                elif abs(dens_i - dens_j) > 0.6:
+                    density_factors[i, j] = 1.2
+    
+    return density_factors
+
+def _fuse_centrality_scores(ci: float, cj: float) -> float:
+    """Fuse two centrality scores using weighted harmonic mean."""
+    if ci + cj > 0:
+        # Emphasize balanced centrality
+        return 2 * ci * cj / (ci + cj + 1e-10)
+    return 1.0
+
+def _hierarchical_sparsify(heuristic: np.ndarray, 
+                          distance_matrix: np.ndarray,
+                          mst_mask: np.ndarray, 
+                          n: int) -> np.ndarray:
+    """Sparsify using hierarchical structure preservation."""
+    result = heuristic.copy()
+    
+    # Always keep MST edges
+    result[mst_mask] = heuristic[mst_mask]
+    
+    # Adaptive edges per node
+    base_edges = max(3, min(12, n // 4))
+    
+    # Group nodes by distance quartiles
+    if n >= 8:
+        try:
+            # Create distance-based groups
+            flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+            q25, q50, q75 = np.percentile(flat_dists, [25, 50, 75])
+            
+            for i in range(n):
+                row = result[i].copy()
+                row[i] = -np.inf
+                
+                # Categorize connections
+                close_edges = np.where(distance_matrix[i] <= q25)[0]
+                medium_edges = np.where((distance_matrix[i] > q25) & 
+                                       (distance_matrix[i] <= q75))[0]
+                far_edges = np.where(distance_matrix[i] > q75)[0]
+                
+                # Keep proportions from each category
+                keep_from_close = min(len(close_edges), base_edges // 2)
+                keep_from_medium = min(len(medium_edges), base_edges // 3)
+                keep_from_far = min(len(far_edges), max(1, base_edges // 6))
+                
+                # Select best from each category
+                for edges, n_keep in [(close_edges, keep_from_close),
+                                     (medium_edges, keep_from_medium),
+                                     (far_edges, keep_from_far)]:
+                    if len(edges) > 0:
+                        edge_scores = row[edges]
+                        keep_idx = np.argsort(edge_scores)[-n_keep:]
+                        keep_edges = edges[keep_idx]
+                    else:
+                        keep_edges = []
+                
+                # Zero out non-kept edges
+                all_keep = set(keep_edges) | set(np.where(mst_mask[i])[0])
+                for j in range(n):
+                    if j != i and j not in all_keep:
+                        result[i, j] = result[j, i] = 0
+        
+        except Exception:
+            # Fallback to simple top-k
+            for i in range(n):
+                row = result[i].copy()
+                row[i] = -np.inf
+                sorted_idx = np.argsort(row)[::-1][:base_edges]
+                for j in range(n):
+                    if j != i and j not in sorted_idx and not mst_mask[i, j]:
+                        result[i, j] = result[j, i] = 0
+    
+    # Ensure symmetry
+    result = np.maximum(result, result.T)
+    
+    return result
+```

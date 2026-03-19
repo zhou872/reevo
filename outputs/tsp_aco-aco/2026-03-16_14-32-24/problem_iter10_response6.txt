@@ -1,0 +1,283 @@
+```json
+{
+    "algorithm_features": ["Normalized Regret Decay", "Adaptive Rank Scaling", "Strategic Edge Sparsification", "Global Distance Statistics"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge evaluation with enhanced regret modeling,
+    adaptive parameter optimization based on global statistics, and integrated
+    candidate selection.
+    
+    Key improvements over v1:
+    1. Enhanced regret modeling with global distance statistics for parameter tuning
+    2. Integrated candidate selection using regret-augmented scoring
+    3. Adaptive exponential decay parameters based on distance distribution
+    4. Improved sparsification with connectivity-aware edge retention
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. GLOBAL DISTANCE STATISTICS FOR PARAMETER TUNING
+    # ------------------------------------------------------------
+    
+    # Extract upper triangular distances (excluding diagonal)
+    triu_indices = np.triu_indices(n, k=1)
+    all_distances = distance_matrix[triu_indices]
+    
+    # Compute global statistics
+    dist_mean = np.mean(all_distances)
+    dist_std = np.std(all_distances)
+    dist_cv = dist_std / (dist_mean + eps)
+    
+    # Percentile-based statistics for robustness
+    p25, p50, p75 = np.percentile(all_distances, [25, 50, 75])
+    iqr = p75 - p25
+    
+    # ------------------------------------------------------------
+    # 2. ADAPTIVE PARAMETER SETTINGS BASED ON GLOBAL STATISTICS
+    # ------------------------------------------------------------
+    
+    # Base candidate count: logarithmic scaling with instance size
+    base_k = max(4, min(15, int(np.log2(n) * 2.5)))
+    
+    # Adapt based on distance distribution
+    if dist_cv > 0.5:  # Highly irregular distances
+        base_k = min(base_k + 3, n-1)
+    
+    # Regret sensitivity parameter: higher for more uniform distances
+    regret_sensitivity = 0.5 + 0.5 * np.exp(-dist_cv * 2)
+    
+    # Rank decay base: faster decay for more regular instances
+    rank_decay_base = 0.4 + 0.4 * np.tanh(1.5 - dist_cv * 3)
+    
+    # ------------------------------------------------------------
+    # 3. ENHANCED REGRET MODELING WITH GLOBAL CONTEXT
+    # ------------------------------------------------------------
+    
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        
+        # Find two smallest distances for this node
+        sorted_dists = np.sort(dists[dists < np.inf])
+        
+        if len(sorted_dists) >= 2:
+            best_dist = sorted_dists[0]
+            second_best = sorted_dists[1]
+            
+            # Global normalization factor
+            global_scale = max(p50, best_dist) / (best_dist + eps)
+            
+            for j in range(n):
+                if i != j and dists[j] < np.inf:
+                    # Enhanced regret calculation with global context
+                    raw_regret = (dists[j] - best_dist) / (second_best - best_dist + eps)
+                    
+                    # Apply adaptive sensitivity and global scaling
+                    adjusted_regret = raw_regret * regret_sensitivity * global_scale
+                    
+                    # Exponential penalty with adaptive decay
+                    regret_matrix[i, j] = np.exp(-adjusted_regret)
+        else:
+            # Fallback for isolated nodes
+            regret_matrix[i, :] = 1.0
+            regret_matrix[i, i] = 0.0
+    
+    # ------------------------------------------------------------
+    # 4. INTEGRATED CANDIDATE SELECTION WITH REGRET AUGMENTATION
+    # ------------------------------------------------------------
+    
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Combine distance and regret for candidate selection
+        dists = safe_dist[i].copy()
+        
+        # Compute combined scores: inverse distance weighted by regret
+        combined_scores = regret_matrix[i] / (dists + eps)
+        combined_scores[i] = 0
+        
+        # Select top candidates based on combined score
+        candidates = np.argsort(combined_scores)[-base_k:]
+        candidate_mask[i, candidates] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # ------------------------------------------------------------
+    # 5. ADAPTIVE RANK WEIGHTING WITH GLOBAL STATISTICS
+    # ------------------------------------------------------------
+    
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get sorted distances for this node
+        distances = safe_dist[i].copy()
+        sorted_idx = np.argsort(distances)
+        
+        # Determine adaptive decay rate based on local and global statistics
+        # Use first 5 distances (or available) to assess local variance
+        k_local = min(5, n-1)
+        if k_local > 1:
+            local_dists = distances[sorted_idx[1:k_local+1]]
+            local_mean = np.mean(local_dists)
+            local_std = np.std(local_dists)
+            local_cv = local_std / (local_mean + eps)
+            
+            # Blend local and global CV for decay rate
+            blended_cv = 0.7 * local_cv + 0.3 * dist_cv
+            
+            # Sigmoid mapping from CV to decay rate
+            x = 4.0 * (blended_cv - 0.5)
+            decay_rate = 0.25 + 0.6 * (1 / (1 + np.exp(-x)))
+            decay_rate = np.clip(decay_rate, 0.25, 0.85)
+        else:
+            decay_rate = rank_decay_base
+        
+        # Apply exponential decay by rank
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # ------------------------------------------------------------
+    # 6. INVERSE DISTANCE WITH ADAPTIVE SCALING
+    # ------------------------------------------------------------
+    
+    inv_dist = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row = safe_dist[i]
+        if np.max(row) > eps:
+            # Normalize by median distance for robustness
+            scale = p50 if p50 > eps else 1.0
+            inv_dist[i] = scale / (row + eps)
+    
+    # Normalize each row
+    row_max = np.max(inv_dist, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    inv_dist = inv_dist / row_max
+    
+    # ------------------------------------------------------------
+    # 7. MST STRUCTURAL BIAS (LIGHTWEIGHT)
+    # ------------------------------------------------------------
+    
+    mst_bias = np.zeros_like(distance_matrix)
+    if n <= 2000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            mst_bias = mst_mask * 0.2  # Conservative bias
+        except:
+            pass
+    
+    # ------------------------------------------------------------
+    # 8. COMBINE FACTORS WITH ADAPTIVE WEIGHTING
+    # ------------------------------------------------------------
+    
+    # Weights adapt based on instance characteristics
+    if dist_cv > 0.4:  # Irregular instances
+        w_regret, w_rank, w_inv = 0.5, 0.3, 0.2
+    elif dist_cv < 0.2:  # Regular instances
+        w_regret, w_rank, w_inv = 0.3, 0.4, 0.3
+    else:  # Moderate variation
+        w_regret, w_rank, w_inv = 0.4, 0.35, 0.25
+    
+    # Combine using weighted geometric mean
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                score = (regret_matrix[i, j] ** w_regret *
+                         rank_weights[i, j] ** w_rank *
+                         inv_dist[i, j] ** w_inv)
+                heuristics_matrix[i, j] = score
+                heuristics_matrix[j, i] = score
+    
+    # Add MST bias multiplicatively
+    heuristics_matrix *= (1.0 + mst_bias)
+    
+    # ------------------------------------------------------------
+    # 9. CONNECTIVITY-AWARE SPARSIFICATION
+    # ------------------------------------------------------------
+    
+    # Adaptive minimum connections based on instance size
+    min_connections = max(2, min(5, int(np.log2(n))))
+    
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_indices = np.where(row > 0)[0]
+        
+        if len(nonzero_indices) > 0:
+            # Determine adaptive threshold based on score distribution
+            nonzero_scores = row[nonzero_indices]
+            if len(nonzero_scores) > min_connections:
+                # Keep top scores while maintaining connectivity
+                sorted_scores = np.sort(nonzero_scores)[::-1]
+                threshold = sorted_scores[min(min_connections, len(sorted_scores)-1)]
+                row[row < threshold] = 0
+        
+        # Ensure minimum connectivity
+        current_connections = np.sum(row > 0)
+        if current_connections < min_connections:
+            # Add promising edges based on original combined scores
+            potential = np.where(~candidate_mask[i] & (np.arange(n) != i))[0]
+            if len(potential) > 0:
+                # Score potential edges using simple distance measure
+                potential_scores = 1.0 / (safe_dist[i, potential] + eps)
+                needed = min_connections - current_connections
+                top_indices = np.argsort(potential_scores)[-needed:]
+                
+                for idx in top_indices:
+                    j = potential[idx]
+                    # Set to median of existing scores or a base value
+                    existing_scores = row[row > 0]
+                    boost = np.median(existing_scores) if len(existing_scores) > 0 else 0.1
+                    heuristics_matrix[i, j] = boost
+                    heuristics_matrix[j, i] = boost
+    
+    # ------------------------------------------------------------
+    # 10. FINAL PROCESSING
+    # ------------------------------------------------------------
+    
+    # Ensure symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Row-wise softmax normalization
+    for i in range(n):
+        row = heuristics_matrix[i]
+        if np.sum(row) > 0:
+            # Temperature based on row sparsity
+            nonzero_count = np.sum(row > 0)
+            temperature = 0.5 + 0.5 * (nonzero_count / (n-1))
+            
+            exp_row = np.exp(row / (temperature + eps))
+            row_sum = np.sum(exp_row)
+            if row_sum > eps:
+                heuristics_matrix[i] = exp_row / row_sum
+    
+    # Final zeroing of diagonal
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

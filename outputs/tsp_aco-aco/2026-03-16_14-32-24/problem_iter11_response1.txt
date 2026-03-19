@@ -1,0 +1,168 @@
+```json
+{
+    "algorithm_features": ["Normalized Exponential Regret Penalty", "Geometric Rank-Weighted Scoring", "Local Density Intersection Bonus", "Adaptive Candidate Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge evaluation with refined regret modeling,
+    adaptive rank weighting, and efficient spatial analysis.
+    
+    Features:
+    1. Normalized Exponential Regret Penalty: Direct implementation from knowledge graph
+    2. Geometric Rank-Weighted Scoring: Adaptive decay based on distance distribution
+    3. Local Density Intersection Bonus: Efficient neighborhood intersection for spatial patterns
+    4. Adaptive Candidate Sparsification: Dynamic connectivity-preserving thresholding
+    """
+    n = distance_matrix.shape[0]
+    
+    # Safe distance matrix (avoid self-loops and division by zero)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # Base inverse distance (normalized by median distance)
+    inv_dist = 1.0 / safe_dist
+    median_dist = np.median(safe_dist[safe_dist < np.inf])
+    inv_dist = inv_dist * median_dist  # Scale to comparable magnitude
+    
+    # 1. Adaptive candidate list with dynamic size
+    k_candidate = max(4, int(np.sqrt(n) * 1.2))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get top k candidates by distance
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # 2. Normalized Exponential Regret Penalty (direct from knowledge graph)
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        # Get two smallest distances for this node (excluding self)
+        sorted_dists = np.sort(dists[dists < np.inf])
+        if len(sorted_dists) >= 2:
+            d_best = sorted_dists[0]
+            d_second = sorted_dists[1]
+            denominator = max(d_second - d_best, eps)
+            
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    d_ij = dists[j]
+                    # Exponential regret penalty
+                    penalty = np.exp(-(d_ij - d_best) / denominator)
+                    regret_matrix[i, j] = penalty
+    
+    # 3. Geometric Rank-Weighted Scoring with data-driven decay
+    rank_weights = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        # Get sorted indices by distance (excluding self)
+        valid_idx = np.where(safe_dist[i] < np.inf)[0]
+        sorted_idx = valid_idx[np.argsort(safe_dist[i, valid_idx])]
+        
+        # Adaptive decay rate based on nearest neighbor distance variability
+        if len(sorted_idx) >= 5:
+            # Use distances to 5 nearest neighbors for decay calculation
+            nearest_dists = safe_dist[i, sorted_idx[:5]]
+            if np.std(nearest_dists) > eps:
+                decay_rate = 0.4 + 0.3 * np.std(nearest_dists) / np.mean(nearest_dists)
+                decay_rate = np.clip(decay_rate, 0.4, 0.9)
+            else:
+                decay_rate = 0.7
+        else:
+            decay_rate = 0.7
+        
+        # Assign rank-based weights
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # 4. Local Density Intersection Bonus (efficient computation)
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Precompute k-nearest neighbors for each node
+    k_density = min(10, n-1)
+    nearest_sets = []
+    
+    for i in range(n):
+        # Get k-nearest neighbors (excluding self)
+        neighbors = np.argsort(safe_dist[i])[1:k_density+1]  # Skip self at index 0
+        nearest_sets.append(set(neighbors))
+    
+    # Compute intersection-based density bonus only for candidate edges
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Intersection of k-nearest neighborhoods
+                intersection = len(nearest_sets[i] & nearest_sets[j])
+                if intersection > 0:
+                    # Bonus proportional to intersection size, normalized by k
+                    bonus = 0.2 * (intersection / k_density)
+                    density_bonus[i, j] = bonus
+                    density_bonus[j, i] = bonus
+    
+    # 5. Minimum Spanning Tree bias (optional for moderate instances)
+    mst_bonus = np.zeros_like(distance_matrix)
+    if n <= 2000:  # Adjust threshold for computational feasibility
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            mst_bonus = mst_mask * 0.25  # Slightly reduced bonus
+        except:
+            pass  # Fall back to no MST bonus
+    
+    # 6. Combine factors with multiplicative weighting
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base score combines inverse distance and rank weights
+    base_score = inv_dist * rank_weights
+    
+    # Apply regret penalty multiplicatively
+    score_with_regret = base_score * regret_matrix
+    
+    # Apply density and MST bonuses additively to promising edges
+    heuristics_matrix = score_with_regret * (1.0 + density_bonus + mst_bonus)
+    
+    # 7. Smart sparsification with connectivity guarantee
+    # Zero out non-candidate edges
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure minimum connectivity: each node must connect to at least 2 others
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_indices = np.where(row > 0)[0]
+        
+        if len(nonzero_indices) < 2:
+            # Find top edges by base score (before bonuses)
+            top_candidates = np.argsort(base_score[i])[-max(2, k_candidate//2):]
+            for j in top_candidates:
+                if i != j:
+                    # Set to median of existing values or a small default
+                    if np.max(row) > 0:
+                        heuristics_matrix[i, j] = np.median(row[row > 0])
+                        heuristics_matrix[j, i] = heuristics_matrix[i, j]
+                    else:
+                        heuristics_matrix[i, j] = 0.1
+                        heuristics_matrix[j, i] = 0.1
+    
+    # 8. Final symmetrization and normalization
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1] range for consistent sampling
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

@@ -1,0 +1,188 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with improved rank-based weighting,
+    systematic triangle exploration, and adaptive multi-criteria fusion.
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Stable inverse distances with adaptive smoothing
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # Adaptive smoothing based on distance statistics
+    median_dist = np.median(safe_dist[safe_dist < np.inf])
+    epsilon = max(1e-8, median_dist * 1e-6)
+    base_heuristic = 1.0 / (safe_dist + epsilon)
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. MST edges with confidence-weighted bonus
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # MST edge confidence decreases with edge length relative to median
+    mst_edges = np.where(mst_mask)
+    mst_distances = safe_dist[mst_edges]
+    mst_confidence = np.exp(-mst_distances / (2 * median_dist))
+    mst_bonus_values = 2.0 + 1.5 * mst_confidence  # Bonus between 2.0-3.5
+    
+    # 3. Enhanced rank-based nearest neighbors
+    k_nearest = min(max(3, n // 4), 12)
+    nn_heuristic = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dist_i = safe_dist[i]
+        sorted_indices = np.argsort(dist_i)
+        valid_indices = sorted_indices[sorted_indices != i][:k_nearest]
+        
+        if len(valid_indices) > 0:
+            ranks = np.arange(1, len(valid_indices) + 1)
+            # Exponential rank decay with adaptive steepness
+            steepness = 1.0 / (1.0 + np.log(n))
+            weights = np.exp(-steepness * (ranks - 1))
+            
+            for idx, j in enumerate(valid_indices):
+                nn_heuristic[i, j] = weights[idx] * base_heuristic[i, j]
+    
+    nn_heuristic = np.maximum(nn_heuristic, nn_heuristic.T)
+    
+    # 4. Mutual nearest neighbor enhancement
+    mutual_nn_mask = (nn_heuristic > 0) & (nn_heuristic.T > 0)
+    mutual_bonus = 1.4
+    
+    # 5. Systematic triangle exploration
+    triangle_boost = np.ones_like(distance_matrix)
+    
+    if n >= 3:
+        # Focus on promising edges for triangle completion
+        promising_threshold = np.percentile(base_heuristic[base_heuristic > 0], 70)
+        
+        for i in range(n):
+            # Get potentially promising neighbors for this node
+            promising_mask = base_heuristic[i] > promising_threshold
+            promising_neighbors = np.where(promising_mask)[0]
+            
+            if len(promising_neighbors) >= 2:
+                # Explore triangles with top neighbors
+                top_neighbors = promising_neighbors[:min(8, len(promising_neighbors))]
+                
+                # Check all pairs of top neighbors for triangle completion
+                for p in range(len(top_neighbors)):
+                    for q in range(p + 1, len(top_neighbors)):
+                        j, k = top_neighbors[p], top_neighbors[q]
+                        
+                        # If edges (i,j) and (i,k) are promising,
+                        # boost edge (j,k) that completes the triangle
+                        if base_heuristic[j, k] > 0:
+                            boost_factor = 1.0 + 0.2 * (
+                                base_heuristic[i, j] + base_heuristic[i, k]
+                            ) / (2 * promising_threshold)
+                            triangle_boost[j, k] = max(triangle_boost[j, k], boost_factor)
+                            triangle_boost[k, j] = triangle_boost[j, k]
+    
+    # 6. Multi-criteria fusion with adaptive weights
+    heuristics = base_heuristic.copy()
+    
+    # Apply MST bonuses
+    for (i, j), bonus in zip(zip(*mst_edges), mst_bonus_values):
+        heuristics[i, j] *= bonus
+        heuristics[j, i] = heuristics[i, j]
+    
+    # Fuse NN heuristic with logarithmic mixing
+    nn_weight = 0.6 / (1.0 + np.log(1 + n / 20))  # Adaptive weight
+    heuristics += nn_weight * nn_heuristic
+    
+    # Apply mutual NN bonus
+    heuristics[mutual_nn_mask] *= mutual_bonus
+    
+    # Apply triangle completion boost
+    heuristics *= triangle_boost
+    
+    # 7. Overlap enhancement (multiple criteria satisfied)
+    strong_criteria_mask = mst_mask | (nn_heuristic > 0) | mutual_nn_mask
+    overlap_strength = np.zeros_like(heuristics)
+    
+    # Count satisfied criteria per edge
+    criteria_count = mst_mask.astype(int) + (nn_heuristic > 0).astype(int) + mutual_nn_mask.astype(int)
+    strong_overlap = criteria_count >= 2
+    
+    # Logarithmic overlap bonus
+    if np.any(strong_overlap):
+        overlap_values = heuristics[strong_overlap]
+        mean_overlap = overlap_values.mean()
+        if mean_overlap > 0:
+            overlap_boost = 1.0 + np.log1p(mean_overlap)
+            heuristics[strong_overlap] *= overlap_boost
+    
+    # 8. Adaptive sparsification with dual thresholds
+    # First, always keep MST edges
+    combined_mask = mst_mask.copy()
+    
+    # Per-node adaptive sparsification
+    for i in range(n):
+        row_values = heuristics[i]
+        non_zero_mask = row_values > 0
+        
+        if non_zero_mask.sum() > 0:
+            non_zero_values = row_values[non_zero_mask]
+            
+            # Adaptive parameters based on problem size
+            if n <= 20:
+                keep_percentile = 80
+                min_keep = 3
+            elif n <= 50:
+                keep_percentile = 75
+                min_keep = 4
+            else:
+                keep_percentile = max(65, 80 - n // 30)
+                min_keep = min(6, n // 10)
+            
+            threshold = np.percentile(non_zero_values, keep_percentile)
+            
+            # Keep edges above threshold, but at least min_keep edges
+            above_threshold = row_values >= threshold
+            if above_threshold.sum() < min_keep:
+                # Keep top min_keep edges
+                top_indices = np.argpartition(-row_values, min_keep)[:min_keep]
+                above_threshold = np.zeros(n, dtype=bool)
+                above_threshold[top_indices] = True
+            
+            combined_mask[i] = combined_mask[i] | above_threshold
+    
+    # Global sparsification to remove weak edges
+    all_values = heuristics[combined_mask]
+    if len(all_values) > 0:
+        global_threshold = np.percentile(all_values, 40)  # Keep stronger 60%
+        weak_edges = combined_mask & (heuristics < global_threshold)
+        combined_mask[weak_edges] = False
+    
+    # Ensure symmetry
+    combined_mask = combined_mask | combined_mask.T
+    
+    # Apply sparsification
+    heuristics = heuristics * combined_mask
+    np.fill_diagonal(heuristics, 0.0)
+    
+    # 9. Final refinement and normalization
+    # Symmetrize with geometric mean for better balance
+    symmetric_heuristics = np.sqrt(heuristics * heuristics.T)
+    
+    # Normalize to [0, 1] range
+    max_val = symmetric_heuristics.max()
+    if max_val > 0:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+```

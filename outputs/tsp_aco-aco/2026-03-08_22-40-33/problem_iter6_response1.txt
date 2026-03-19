@@ -1,0 +1,379 @@
+```json
+{
+    "algorithm_features": ["Adaptive Problem Structure Analysis", "Multi-hop Path Efficiency with Systematic Sampling", "Rank-Distance Regret Fusion", "Connectivity-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with dynamic parameter tuning
+    and multi-hop path analysis.
+    
+    Features:
+    1. Adaptive Problem Structure Analysis: Characterizes instance properties (sparsity, 
+       clustering, variance) to dynamically adjust heuristic parameters
+    2. Multi-hop Path Efficiency: Evaluates edges as shortcuts in 2-3 hop paths using
+       systematic nearest neighbor sampling
+    3. Rank-Distance Regret Fusion: Combines rank-based regret with distance ratio 
+       penalties, adjusting aggressiveness based on problem structure
+    4. Connectivity-Aware Sparsification: Uses local and global connectivity measures
+       to intelligently prune non-promising edges while preserving connectivity
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input with values in [0, 1]
+    """
+    
+    def _analyze_problem(dist_mat: np.ndarray, n: int) -> dict:
+        """Analyze problem characteristics for adaptive parameter tuning."""
+        # Extract upper triangle (excluding diagonal)
+        triu_indices = np.triu_indices(n, 1)
+        distances = dist_mat[triu_indices]
+        
+        # Basic statistics
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        variance = std_dist / (mean_dist + 1e-12)
+        
+        # Sparsity measure (ratio of distances > 2*mean)
+        sparsity = np.sum(distances > 2 * mean_dist) / len(distances)
+        
+        # Clustering tendency (using nearest neighbor distances)
+        nn_dists = []
+        for i in range(n):
+            row = dist_mat[i].copy()
+            row[i] = np.inf
+            nn_dists.append(np.min(row))
+        avg_nn_dist = np.mean(nn_dists)
+        clustering = 1.0 - min(avg_nn_dist / mean_dist, 1.0)
+        
+        # Average degree in MST (estimate)
+        mst = minimum_spanning_tree(dist_mat)
+        avg_degree = 2  # Base for tree
+        
+        return {
+            'variance': min(variance, 2.0),
+            'sparsity': min(sparsity, 0.8),
+            'clustering': min(clustering, 0.9),
+            'avg_degree': avg_degree
+        }
+    
+    def _compute_weighted_mst(dist_mat: np.ndarray, n: int) -> tuple:
+        """Compute MST with edge importance weighting using Prim's algorithm."""
+        visited = np.zeros(n, dtype=bool)
+        min_edge = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        min_edge[0] = 0
+        
+        for _ in range(n):
+            # Find minimum edge from visited to unvisited
+            u = -1
+            min_val = np.inf
+            for i in range(n):
+                if not visited[i] and min_edge[i] < min_val:
+                    min_val = min_edge[i]
+                    u = i
+            
+            if u == -1:
+                break
+            visited[u] = True
+            
+            # Update distances to unvisited nodes
+            for v in range(n):
+                if not visited[v] and dist_mat[u, v] < min_edge[v]:
+                    min_edge[v] = dist_mat[u, v]
+                    parent[v] = u
+        
+        # Create MST mask and importance matrix
+        mst_mask = np.zeros((n, n), dtype=bool)
+        mst_importance = np.zeros((n, n))
+        
+        # Assign importance based on alternative edges
+        for v in range(1, n):
+            u = parent[v]
+            if u != -1:
+                mst_mask[u, v] = mst_mask[v, u] = True
+                
+                # Calculate importance: how much worse is the second best connection?
+                row_u = dist_mat[u].copy()
+                row_u[u] = np.inf
+                row_v = dist_mat[v].copy()
+                row_v[v] = np.inf
+                
+                # Find two smallest distances for each node
+                u_sorted = np.partition(row_u, 1)
+                v_sorted = np.partition(row_v, 1)
+                
+                # Importance = 1 - (second_best_avg / current_distance)
+                second_best_avg = (u_sorted[1] + v_sorted[1]) / 2
+                importance = 1.0 - min(second_best_avg / dist_mat[u, v], 1.0)
+                mst_importance[u, v] = mst_importance[v, u] = importance
+        
+        return mst_mask, mst_importance
+    
+    def _compute_regret_matrix(dist_mat: np.ndarray, n: int, 
+                              regret_power: float, variance: float) -> np.ndarray:
+        """Compute regret-based penalization matrix with variance adjustment."""
+        regret_matrix = np.ones((n, n))
+        
+        for i in range(n):
+            # Get distances to other nodes
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+            valid_indices = np.where(mask)[0]
+            
+            if len(valid_indices) >= 2:
+                dists = dist_mat[i, valid_indices]
+                sorted_indices = np.argsort(dists)
+                sorted_dists = dists[sorted_indices]
+                
+                # Normalize distances
+                min_dist = sorted_dists[0]
+                max_dist = sorted_dists[-1]
+                dist_range = max_dist - min_dist + 1e-12
+                
+                # Calculate regret for each edge
+                for rank, idx in enumerate(valid_indices[sorted_indices]):
+                    normalized_rank = rank / (len(valid_indices) - 1)
+                    dist_ratio = (dist_mat[i, idx] - min_dist) / dist_range
+                    
+                    # Combine rank and distance information
+                    # Higher variance -> rely more on distance ratios
+                    alpha = 0.3 + 0.4 * min(variance, 1.0)
+                    regret_score = alpha * normalized_rank + (1 - alpha) * dist_ratio
+                    
+                    # Apply power law with variance-based smoothing
+                    smooth_power = regret_power * (1.0 + 0.2 * np.tanh(variance - 1.0))
+                    penalty = np.exp(-smooth_power * regret_score)
+                    regret_matrix[i, idx] = penalty
+        
+        # Symmetrize using geometric mean
+        regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+        
+        return regret_matrix
+    
+    def _multi_hop_efficiency(dist_mat: np.ndarray, n: int, 
+                             k_neighbors: int, max_hops: int) -> np.ndarray:
+        """Evaluate edge efficiency through systematic multi-hop path analysis."""
+        efficiency = np.ones((n, n))
+        
+        if n < 4 or max_hops < 2:
+            return efficiency
+        
+        # Precompute k nearest neighbors for each node
+        k_neighbors = min(k_neighbors, n - 1)
+        neighbor_indices = np.argsort(dist_mat, axis=1)[:, 1:k_neighbors+1]
+        
+        # Build neighbor sets for fast access
+        neighbor_sets = [set(neighbor_indices[i]) for i in range(n)]
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_dist = dist_mat[i, j]
+                if direct_dist <= 0:
+                    continue
+                
+                # 2-hop paths (i -> a -> j)
+                candidates_a = neighbor_sets[i].intersection(neighbor_sets[j])
+                best_two_hop = np.inf
+                
+                if candidates_a:
+                    for a in candidates_a:
+                        if a != i and a != j:
+                            two_hop_dist = dist_mat[i, a] + dist_mat[a, j]
+                            best_two_hop = min(best_two_hop, two_hop_dist)
+                
+                # 3-hop paths if allowed and 2-hop wasn't great
+                best_three_hop = np.inf
+                if max_hops >= 3 and (best_two_hop / direct_dist > 1.5):
+                    # Sample some 3-hop paths through i's and j's neighbors
+                    for a in list(neighbor_sets[i])[:min(4, len(neighbor_sets[i]))]:
+                        if a == j:
+                            continue
+                        for b in list(neighbor_sets[j])[:min(4, len(neighbor_sets[j]))]:
+                            if b == i or b == a:
+                                continue
+                            # Check if a and b are connected or share a neighbor
+                            if dist_mat[a, b] < np.inf:
+                                three_hop = (dist_mat[i, a] + 
+                                            dist_mat[a, b] + 
+                                            dist_mat[b, j])
+                                best_three_hop = min(best_three_hop, three_hop)
+                            else:
+                                # Check for common neighbor c
+                                common_c = neighbor_sets[a].intersection(neighbor_sets[b])
+                                if common_c:
+                                    for c in list(common_c)[:2]:
+                                        if c not in (i, j, a, b):
+                                            three_hop = (dist_mat[i, a] +
+                                                        dist_mat[a, c] +
+                                                        dist_mat[c, b] +
+                                                        dist_mat[b, j])
+                                            best_three_hop = min(best_three_hop, three_hop)
+                
+                # Calculate efficiency score
+                best_alt = min(best_two_hop, best_three_hop)
+                if best_alt < np.inf:
+                    # Efficiency = how much better is direct edge?
+                    # Values > 1 favor direct edge, < 1 favor alternative path
+                    eff = best_alt / direct_dist
+                    # Transform to [0.5, 2.0] range with sigmoid-like function
+                    score = 0.5 + 1.5 / (1.0 + np.exp(-2.0 * (eff - 1.0)))
+                    efficiency[i, j] = efficiency[j, i] = score
+        
+        return efficiency
+    
+    def _connectivity_sparsification(heuristics_mat: np.ndarray, mst_mask: np.ndarray,
+                                    target_degree: int, n: int) -> np.ndarray:
+        """Apply connectivity-aware edge pruning."""
+        result = heuristics_mat.copy()
+        
+        # Calculate local connectivity scores
+        connectivity = np.zeros(n)
+        for i in range(n):
+            row = result[i].copy()
+            row[i] = -np.inf
+            top_k = min(5, n - 1)
+            if np.sum(row > 0) >= top_k:
+                top_values = np.partition(row, -top_k)[-top_k:]
+                connectivity[i] = np.mean(top_values[top_values > -np.inf])
+        
+        # Normalize connectivity
+        max_conn = np.max(connectivity)
+        if max_conn > 0:
+            connectivity = connectivity / max_conn
+        
+        # Adaptive thresholding per node
+        for i in range(n):
+            row = result[i].copy()
+            row[i] = -np.inf
+            
+            # Always keep MST edges
+            mst_edges = np.where(mst_mask[i])[0]
+            
+            # Determine number of edges to keep
+            if connectivity[i] > 0.7:  # Well-connected node
+                keep_count = min(int(target_degree * 1.5), n - 1)
+            elif connectivity[i] < 0.3:  # Poorly-connected node
+                keep_count = min(int(target_degree * 0.7), n - 1)
+            else:
+                keep_count = target_degree
+            
+            # Ensure we keep at least MST edges + 1
+            keep_count = max(keep_count, len(mst_edges) + 1)
+            
+            # Keep top edges
+            if np.sum(row > 0) > keep_count:
+                threshold = np.partition(row, -keep_count)[-keep_count]
+                mask = (row < threshold) & (~mst_mask[i])
+                row[mask] = 0
+            
+            result[i] = row
+        
+        # Ensure symmetry
+        result = np.maximum(result, result.T)
+        return result
+    
+    # Main function body
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # 1. Analyze problem characteristics for adaptive parameter tuning
+    problem_stats = _analyze_problem(distance_matrix, n)
+    
+    # 2. Dynamic parameter adjustments
+    base_mst_weight = 1.8
+    min_regret_power = 1.0
+    max_regret_power = 2.5
+    
+    mst_weight = base_mst_weight * (1.0 + 0.3 * problem_stats['clustering'])
+    regret_power = min_regret_power + (max_regret_power - min_regret_power) * problem_stats['sparsity']
+    
+    # 3. Base inverse distance with log transformation for better scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_dist = np.log1p(distance_matrix)  # log(1 + d) to handle zero distances
+        inv_dist = 1.0 / (log_dist + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 4. Minimum Spanning Tree with importance weighting
+    mst_mask, mst_importance = _compute_weighted_mst(distance_matrix, n)
+    
+    # 5. Enhanced regret-based penalization with dynamic parameters
+    regret_matrix = _compute_regret_matrix(distance_matrix, n, regret_power, 
+                                          problem_stats['variance'])
+    
+    # 6. Multi-hop path efficiency analysis
+    lookahead_hops = 2
+    if lookahead_hops >= 2:
+        efficiency_matrix = _multi_hop_efficiency(distance_matrix, n, 
+                                                 min(problem_stats['avg_degree'], 8),
+                                                 lookahead_hops)
+    else:
+        efficiency_matrix = np.ones((n, n))
+    
+    # 7. Combine components with adaptive weights
+    heuristics = inv_dist.copy()
+    
+    # Apply MST bonus with importance weighting
+    mst_bonus = 1.0 + (mst_weight - 1.0) * mst_importance
+    heuristics *= mst_bonus
+    
+    # Apply regret penalty
+    heuristics *= regret_matrix
+    
+    # Apply multi-hop efficiency
+    heuristics *= efficiency_matrix
+    
+    # 8. Connectivity-aware sparsification
+    adaptive_sparsity = True
+    if adaptive_sparsity and n > 3:
+        heuristics = _connectivity_sparsification(heuristics, mst_mask, 
+                                                 problem_stats['avg_degree'], n)
+    
+    # Ensure symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize to [0, 1] range for consistency
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    return heuristics
+
+
+# Example usage and test
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_nodes = 15
+    coords = np.random.rand(n_nodes, 2) * 100
+    dist_matrix = squareform(pdist(coords))
+    
+    heuristics = heuristics_v2(dist_matrix.copy())
+    
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+    
+    # Count edges per node
+    edges_per_node = np.sum(heuristics > 0, axis=1)
+    print(f"Non-zero edges per node: min={edges_per_node.min()}, "
+          f"max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+    
+    print("\nSample edge scores:")
+    for i, j in [(0, 1), (0, 2), (1, 2), (3, 4), (5, 6)]:
+        print(f"({i}, {j}): dist={dist_matrix[i, j]:.2f}, "
+              f"heuristic={heuristics[i, j]:.4f}")
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"\nMatrix is symmetric: {is_symmetric}")
+```

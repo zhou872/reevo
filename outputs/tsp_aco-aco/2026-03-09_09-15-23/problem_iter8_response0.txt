@@ -1,0 +1,260 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret-Weighted Scoring", "Two-Hop Shortcut Efficiency Analysis", "Minimum Spanning Tree Edge Prioritization", "Density-Aware Normalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic function focusing on regret-weighted scoring,
+    efficient multi-hop analysis, and minimum spanning tree integration.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ADAPTIVE K-NN SPARSIFICATION ====================
+    base_k = max(3, int(np.log2(n)))
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_distances = np.sort(distance_matrix, axis=1)
+    
+    # Adaptive neighborhood based on local density variation
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        k_reg = min(5, base_k)
+        neighbor_dists = sorted_distances[i, 1:k_reg+1]
+        mean_dist = np.mean(neighbor_dists)
+        std_dist = np.std(neighbor_dists) if len(neighbor_dists) > 1 else 0
+        
+        if mean_dist > 0:
+            cv = std_dist / mean_dist
+            adaptive_k = min(n-1, int(base_k * (1.0 + 0.3 * cv)))
+        else:
+            adaptive_k = base_k
+        
+        neighbors = sorted_indices[i, 1:adaptive_k+1]
+        adjacency_mask[i, neighbors] = True
+    
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. REGRET-WEIGHTED INVERSE DISTANCE ====================
+    # Precompute nearest and second nearest distances for regret calculation
+    nearest_dists = np.zeros(n)
+    second_nearest_dists = np.zeros(n)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            if len(valid_dists) >= 2:
+                sorted_dists = np.sort(valid_dists)[:2]
+                nearest_dists[i] = sorted_dists[0]
+                second_nearest_dists[i] = sorted_dists[1]
+            elif len(valid_dists) == 1:
+                nearest_dists[i] = valid_dists[0]
+                second_nearest_dists[i] = valid_dists[0] * 1.5  # Estimate
+    
+    # Compute regret-weighted scores
+    regret_scores = np.ones_like(distance_matrix, dtype=float)
+    base_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            valid_indices = np.where(valid_mask)[0]
+            
+            for idx, j in enumerate(valid_indices):
+                dist_ij = valid_dists[idx]
+                
+                # Compute regret: how much better is this edge than alternatives?
+                if i < j:  # Compute once per undirected edge
+                    # Regret compared to nearest neighbor (for node i)
+                    if nearest_dists[i] > 0:
+                        regret_i = 1.0 + (nearest_dists[i] - dist_ij) / (nearest_dists[i] + 1e-10)
+                        regret_i = np.clip(regret_i, 0.5, 2.0)
+                    else:
+                        regret_i = 1.0
+                    
+                    # Regret compared to nearest neighbor (for node j)
+                    if nearest_dists[j] > 0:
+                        regret_j = 1.0 + (nearest_dists[j] - dist_ij) / (nearest_dists[j] + 1e-10)
+                        regret_j = np.clip(regret_j, 0.5, 2.0)
+                    else:
+                        regret_j = 1.0
+                    
+                    # Combined regret score
+                    regret_combined = (regret_i + regret_j) / 2
+                    regret_scores[i, j] = regret_scores[j, i] = regret_combined
+                    
+                    # Base score: inverse distance weighted by regret
+                    base_score = 1.0 / (dist_ij + 1e-10)
+                    base_scores[i, j] = base_scores[j, i] = base_score * regret_combined
+    
+    # ==================== 3. MULTI-HOP SHORTCUT EFFICIENCY ====================
+    # Fast two-hop analysis using precomputed sorted neighbors
+    shortcut_scores = np.ones_like(distance_matrix, dtype=float)
+    top_m = min(10, int(np.sqrt(n)))
+    
+    for i in range(n):
+        i_neighbors = sorted_indices[i, 1:top_m+1]
+        
+        for j in range(i+1, n):
+            if not adjacency_mask[i, j]:
+                continue
+                
+            j_neighbors = sorted_indices[j, 1:top_m+1]
+            
+            # Find common neighbors for two-hop paths
+            common = np.intersect1d(i_neighbors, j_neighbors)
+            if len(common) > 0 and common[0] != -1:
+                # Remove i and j from common if present
+                common = common[(common != i) & (common != j)]
+                
+                if len(common) > 0:
+                    # Compute best two-hop distance
+                    two_hop_dists = distance_matrix[i, common] + distance_matrix[common, j]
+                    best_two_hop = np.min(two_hop_dists) if len(two_hop_dists) > 0 else np.inf
+                    
+                    # Compare to direct distance
+                    direct_dist = distance_matrix[i, j]
+                    if direct_dist > 0 and best_two_hop < np.inf:
+                        ratio = direct_dist / best_two_hop
+                        
+                        # Score: direct edge is better when ratio < 1
+                        if ratio < 0.8:  # Excellent shortcut
+                            score = 1.5
+                        elif ratio < 1.0:  # Good shortcut
+                            score = 1.2
+                        elif ratio < 1.2:  # Moderate
+                            score = 1.0
+                        else:  # Poor shortcut
+                            score = 0.8
+                        
+                        shortcut_scores[i, j] = shortcut_scores[j, i] = score
+    
+    # ==================== 4. MINIMUM SPANNING TREE INTEGRATION ====================
+    mst_boost = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Compute MST using Prim's algorithm for better control
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    # Start from node 0
+    visited[0] = True
+    for v in range(1, n):
+        min_edge[v] = distance_matrix[0, v]
+        parent[v] = 0
+    
+    for _ in range(n - 1):
+        # Find unvisited node with minimum edge to tree
+        unvisited = np.where(~visited)[0]
+        if len(unvisited) == 0:
+            break
+            
+        u = unvisited[np.argmin(min_edge[unvisited])]
+        visited[u] = True
+        
+        if parent[u] != -1:
+            # Boost MST edges based on their relative importance
+            mst_boost[u, parent[u]] = mst_boost[parent[u], u] = 1.3
+        
+        # Update distances from newly added node
+        for v in unvisited:
+            if distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    # ==================== 5. LOCAL DENSITY AWARENESS ====================
+    density_scores = np.ones_like(distance_matrix, dtype=float)
+    
+    # Compute local density for each node
+    local_density = np.zeros(n)
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            local_density[i] = 1.0 / (np.mean(valid_dists) + 1e-10)
+    
+    # Normalize densities
+    if local_density.max() > 0:
+        local_density = local_density / local_density.max()
+    
+    # Penalize edges between nodes with very different densities
+    for i in range(n):
+        for j in range(i+1, n):
+            if adjacency_mask[i, j]:
+                density_diff = abs(local_density[i] - local_density[j])
+                penalty = 1.0 - 0.4 * density_diff
+                density_scores[i, j] = density_scores[j, i] = np.clip(penalty, 0.6, 1.0)
+    
+    # ==================== 6. COMBINE ALL COMPONENTS ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Weights for different components (evolutionary-tuned values)
+    w_base = 0.4
+    w_shortcut = 0.3
+    w_mst = 0.2
+    w_density = 0.1
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if adjacency_mask[i, j]:
+                # Get all component scores
+                base = max(base_scores[i, j], 1e-10)
+                shortcut = max(shortcut_scores[i, j], 1e-10)
+                mst = max(mst_boost[i, j], 1e-10)
+                density = max(density_scores[i, j], 1e-10)
+                
+                # Combine using weighted geometric mean
+                log_score = (
+                    w_base * np.log(base) +
+                    w_shortcut * np.log(shortcut) +
+                    w_mst * np.log(mst) +
+                    w_density * np.log(density)
+                )
+                
+                heuristics[i, j] = heuristics[j, i] = np.exp(log_score)
+    
+    # ==================== 7. FINAL NORMALIZATION ====================
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure connectivity: add small boost to at least the MST edges
+    mst_mask = (mst_boost > 0)
+    if np.any(mst_mask):
+        mst_values = heuristics[mst_mask]
+        if len(mst_values) > 0:
+            min_mst = np.min(mst_values)
+            median_all = np.median(heuristics[adjacency_mask]) if np.any(adjacency_mask) else 1.0
+            heuristics[mst_mask] = np.maximum(heuristics[mst_mask], min(median_all, min_mst * 1.5))
+    
+    # Row-wise softmax normalization
+    for i in range(n):
+        row = heuristics[i]
+        row_max = row.max()
+        if row_max > 0:
+            # Temperature scaling for sharper distribution in dense regions
+            temp = 1.0 if local_density[i] < 0.5 else 0.8
+            exp_row = np.exp(row / (row_max * temp + 1e-10))
+            heuristics[i] = exp_row / (exp_row.sum() + 1e-10)
+    
+    # Symmetrize
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

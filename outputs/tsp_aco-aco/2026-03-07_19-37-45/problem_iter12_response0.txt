@@ -1,0 +1,557 @@
+```json
+{
+    "algorithm_features": ["Spectral Clustering Edge Classification", "Adaptive Multi-Hop Path Regret", "Gradient Boosting Feature Synthesis", "Candidate Graph Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.linalg import eigsh
+from scipy.sparse import csr_matrix
+from sklearn.ensemble import GradientBoostingRegressor
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with spectral clustering analysis
+    and gradient boosting feature synthesis.
+    
+    Returns: Matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Comprehensive instance analysis
+    instance_stats = _analyze_instance_v3(distance_matrix)
+    
+    # Step 2: Spectral clustering analysis
+    cluster_features = _compute_spectral_clustering_features(distance_matrix, instance_stats)
+    
+    # Step 3: Build intelligent candidate mask
+    candidate_mask = _build_intelligent_mask_v3(distance_matrix, instance_stats, cluster_features)
+    
+    # Step 4: Compute edge scores with gradient boosting feature synthesis
+    H = np.zeros((n, n))
+    feature_models = _train_feature_models(distance_matrix, instance_stats, cluster_features)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if candidate_mask[i, j]:
+                features = _extract_edge_features(
+                    distance_matrix, i, j, instance_stats, 
+                    cluster_features, feature_models
+                )
+                score = _predict_edge_score(features, instance_stats)
+                H[i, j] = H[j, i] = score
+    
+    # Step 5: Enhanced post-processing
+    H = _enhanced_post_process(H, distance_matrix, instance_stats, cluster_features)
+    
+    return H
+
+
+def _analyze_instance_v3(distance_matrix: np.ndarray) -> dict:
+    """Enhanced instance analysis with geometric and spectral properties."""
+    n = distance_matrix.shape[0]
+    dist_no_diag = distance_matrix[~np.eye(n, dtype=bool)].reshape(n, n - 1)
+    
+    # Basic statistics
+    mean_dist = np.mean(dist_no_diag)
+    std_dist = np.std(dist_no_diag)
+    cv_dist = std_dist / (mean_dist + 1e-8)
+    
+    # Geometric properties via triangle inequality violations
+    triangle_ratios = []
+    for i in range(min(n, 50)):  # Sample for efficiency
+        for j in range(i + 1, min(n, 50)):
+            for k in range(j + 1, min(n, 50)):
+                d_ij = distance_matrix[i, j]
+                d_ik = distance_matrix[i, k]
+                d_jk = distance_matrix[j, k]
+                if d_ij > 0:
+                    violation = (d_ik + d_jk) / d_ij
+                    triangle_ratios.append(violation)
+    
+    triangle_skew = np.std(triangle_ratios) / (np.mean(triangle_ratios) + 1e-8) if triangle_ratios else 1.0
+    
+    # Distance distribution percentiles
+    percentiles = np.percentile(dist_no_diag, [10, 25, 50, 75, 90])
+    
+    stats = {
+        'n': n,
+        'mean_dist': mean_dist,
+        'std_dist': std_dist,
+        'cv_dist': cv_dist,
+        'triangle_skew': triangle_skew,
+        'p10': percentiles[0],
+        'p25': percentiles[1],
+        'p50': percentiles[2],
+        'p75': percentiles[3],
+        'p90': percentiles[4],
+        'min_dist': np.min(dist_no_diag),
+        'max_dist': np.max(dist_no_diag),
+        'log_n': np.log(n + 1)
+    }
+    
+    return stats
+
+
+def _compute_spectral_clustering_features(distance_matrix: np.ndarray, stats: dict) -> dict:
+    """Compute spectral clustering features for edge classification."""
+    n = stats['n']
+    
+    # Build similarity matrix
+    sigma = stats['mean_dist'] / 2
+    similarity = np.exp(-distance_matrix**2 / (2 * sigma**2))
+    np.fill_diagonal(similarity, 0)
+    
+    # Compute normalized Laplacian
+    degree = np.sum(similarity, axis=1)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(degree + 1e-8))
+    L_norm = np.eye(n) - D_inv_sqrt @ similarity @ D_inv_sqrt
+    
+    # Compute eigenvectors (use sparse eigendecomposition for large n)
+    k_clusters = min(10, max(2, n // 20))
+    if n > 100:
+        L_sparse = csr_matrix(L_norm)
+        eigenvalues, eigenvectors = eigsh(L_sparse, k=k_clusters, which='SM')
+    else:
+        eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+        eigenvectors = eigenvectors[:, :k_clusters]
+    
+    # Compute cluster assignments via k-means on eigenvectors
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=k_clusters, n_init=10, random_state=42)
+    cluster_labels = kmeans.fit_predict(eigenvectors)
+    
+    # Compute inter-cluster and intra-cluster statistics
+    cluster_stats = {}
+    for c in range(k_clusters):
+        mask = cluster_labels == c
+        if np.sum(mask) > 0:
+            intra_dists = distance_matrix[mask][:, mask]
+            inter_dists = distance_matrix[mask][:, ~mask] if np.sum(~mask) > 0 else []
+            
+            cluster_stats[c] = {
+                'size': np.sum(mask),
+                'intra_mean': np.mean(intra_dists) if intra_dists.size > 0 else 0,
+                'intra_std': np.std(intra_dists) if intra_dists.size > 0 else 0,
+                'inter_mean': np.mean(inter_dists) if inter_dists.size > 0 else stats['mean_dist'],
+                'inter_std': np.std(inter_dists) if inter_dists.size > 0 else stats['std_dist']
+            }
+    
+    # Edge clustering features
+    edge_cluster_features = np.zeros((n, n, 4))
+    for i in range(n):
+        for j in range(i + 1, n):
+            ci, cj = cluster_labels[i], cluster_labels[j]
+            
+            if ci == cj:
+                # Intra-cluster edge
+                edge_cluster_features[i, j, 0] = 1  # Is intra-cluster
+                edge_cluster_features[i, j, 1] = cluster_stats[ci]['intra_mean'] / (stats['mean_dist'] + 1e-8)
+                edge_cluster_features[i, j, 2] = distance_matrix[i, j] / (cluster_stats[ci]['intra_mean'] + 1e-8)
+            else:
+                # Inter-cluster edge
+                edge_cluster_features[i, j, 0] = 0  # Is inter-cluster
+                edge_cluster_features[i, j, 1] = (cluster_stats[ci]['inter_mean'] + cluster_stats[cj]['inter_mean']) / (2 * stats['mean_dist'] + 1e-8)
+                edge_cluster_features[i, j, 2] = distance_matrix[i, j] / ((cluster_stats[ci]['inter_mean'] + cluster_stats[cj]['inter_mean'])/2 + 1e-8)
+            
+            # Spectral gap feature
+            edge_cluster_features[i, j, 3] = np.linalg.norm(eigenvectors[i] - eigenvectors[j])
+    
+    edge_cluster_features = np.maximum(edge_cluster_features, edge_cluster_features.transpose(1, 0, 2))
+    
+    return {
+        'cluster_labels': cluster_labels,
+        'k_clusters': k_clusters,
+        'edge_features': edge_cluster_features,
+        'eigenvectors': eigenvectors
+    }
+
+
+def _build_intelligent_mask_v3(distance_matrix: np.ndarray, stats: dict, 
+                               cluster_features: dict) -> np.ndarray:
+    """Build candidate mask using clustering information and multi-criteria."""
+    n = stats['n']
+    cluster_labels = cluster_features['cluster_labels']
+    k_clusters = cluster_features['k_clusters']
+    
+    # Adaptive candidate sizes
+    base_k_intra = min(8, max(3, int(np.log2(n) * 2)))
+    base_k_inter = min(5, max(2, int(np.log2(n) * 1.5)))
+    
+    # Adjust based on clustering structure
+    cluster_sizes = np.bincount(cluster_labels, minlength=k_clusters)
+    cluster_density = np.mean(cluster_sizes) / n
+    
+    k_intra = int(base_k_intra * (1 + 0.5 * cluster_density))
+    k_inter = int(base_k_inter * (1 + 0.3 * (1 - cluster_density)))
+    
+    mask = np.zeros((n, n), dtype=bool)
+    
+    # Intra-cluster connections
+    for c in range(k_clusters):
+        nodes_in_cluster = np.where(cluster_labels == c)[0]
+        if len(nodes_in_cluster) <= 1:
+            continue
+            
+        # Connect each node to k_intra nearest neighbors within cluster
+        for i in nodes_in_cluster:
+            intra_dists = distance_matrix[i, nodes_in_cluster]
+            intra_dists[nodes_in_cluster == i] = np.inf
+            
+            k_actual = min(k_intra, len(nodes_in_cluster) - 1)
+            if k_actual > 0:
+                nearest = np.argpartition(intra_dists, k_actual)[:k_actual]
+                for j_idx in nearest:
+                    j = nodes_in_cluster[j_idx]
+                    mask[i, j] = True
+    
+    # Inter-cluster connections
+    for i in range(n):
+        ci = cluster_labels[i]
+        
+        # For each other cluster, connect to k_inter nearest nodes
+        for cj in range(k_clusters):
+            if cj == ci:
+                continue
+                
+            nodes_in_other = np.where(cluster_labels == cj)[0]
+            if len(nodes_in_other) == 0:
+                continue
+                
+            inter_dists = distance_matrix[i, nodes_in_other]
+            k_actual = min(k_inter, len(nodes_in_other))
+            if k_actual > 0:
+                nearest = np.argpartition(inter_dists, k_actual)[:k_actual]
+                for j_idx in nearest:
+                    j = nodes_in_other[j_idx]
+                    mask[i, j] = True
+    
+    # Ensure MST edges are included
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_dense = mst.toarray()
+        mst_mask = (mst_dense + mst_dense.T) > 0
+        mask = mask | mst_mask
+    except:
+        pass
+    
+    # Ensure connectivity between all clusters
+    cluster_conn = np.zeros((k_clusters, k_clusters), dtype=bool)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mask[i, j]:
+                ci, cj = cluster_labels[i], cluster_labels[j]
+                cluster_conn[ci, cj] = cluster_conn[cj, ci] = True
+    
+    # Add minimum connections between disconnected clusters
+    for ci in range(k_clusters):
+        for cj in range(ci + 1, k_clusters):
+            if not cluster_conn[ci, cj]:
+                nodes_i = np.where(cluster_labels == ci)[0]
+                nodes_j = np.where(cluster_labels == cj)[0]
+                
+                if len(nodes_i) > 0 and len(nodes_j) > 0:
+                    # Find closest pair between clusters
+                    min_dist = np.inf
+                    best_pair = (0, 0)
+                    
+                    for i in nodes_i[:min(10, len(nodes_i))]:
+                        for j in nodes_j[:min(10, len(nodes_j))]:
+                            if distance_matrix[i, j] < min_dist:
+                                min_dist = distance_matrix[i, j]
+                                best_pair = (i, j)
+                    
+                    if best_pair[0] != best_pair[1]:
+                        mask[best_pair[0], best_pair[1]] = True
+                        mask[best_pair[1], best_pair[0]] = True
+    
+    # Symmetrize and remove diagonal
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    return mask
+
+
+def _train_feature_models(distance_matrix: np.ndarray, stats: dict, 
+                          cluster_features: dict) -> dict:
+    """Train simple regression models to predict edge utilities."""
+    n = stats['n']
+    
+    # Sample edges for training
+    train_edges = []
+    train_features = []
+    
+    # Generate training data from obvious good/bad edges
+    num_train = min(1000, n * (n - 1) // 4)
+    
+    # Good edges: short distances
+    flat_dists = distance_matrix[~np.eye(n, dtype=bool)]
+    dist_threshold_good = np.percentile(flat_dists, 20)
+    good_candidates = np.where(distance_matrix <= dist_threshold_good)
+    good_pairs = list(zip(good_candidates[0], good_candidates[1]))
+    good_pairs = [(i, j) for i, j in good_pairs if i < j]
+    
+    # Bad edges: long distances
+    dist_threshold_bad = np.percentile(flat_dists, 80)
+    bad_candidates = np.where(distance_matrix >= dist_threshold_bad)
+    bad_pairs = list(zip(bad_candidates[0], bad_candidates[1]))
+    bad_pairs = [(i, j) for i, j in bad_pairs if i < j]
+    
+    # Sample balanced training set
+    num_each = min(num_train // 2, len(good_pairs), len(bad_pairs))
+    train_pairs = (
+        good_pairs[:num_each] + 
+        bad_pairs[:num_each]
+    )
+    
+    # Create features and targets
+    for i, j in train_pairs:
+        features = _extract_basic_edge_features(distance_matrix, i, j, stats, cluster_features)
+        target = 1.0 if distance_matrix[i, j] <= dist_threshold_good else 0.0
+        train_features.append(features)
+        train_edges.append((i, j, target))
+    
+    if len(train_features) > 10:
+        X_train = np.array(train_features)
+        y_train = np.array([t[2] for t in train_edges])
+        
+        # Train a simple model
+        model = GradientBoostingRegressor(
+            n_estimators=50,
+            max_depth=3,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        
+        return {'model': model, 'feature_names': _get_feature_names()}
+    else:
+        return {'model': None, 'feature_names': []}
+
+
+def _extract_basic_edge_features(distance_matrix: np.ndarray, i: int, j: int, 
+                                 stats: dict, cluster_features: dict) -> np.ndarray:
+    """Extract comprehensive features for an edge."""
+    n = stats['n']
+    d_ij = distance_matrix[i, j]
+    
+    features = []
+    
+    # 1. Distance-based features
+    features.append(1.0 / (d_ij + 1e-8))
+    features.append(d_ij / stats['mean_dist'])
+    features.append((d_ij - stats['p50']) / (stats['std_dist'] + 1e-8))
+    
+    # 2. Local neighborhood features
+    k_local = min(5, max(2, n // 20))
+    
+    dists_i = distance_matrix[i].copy()
+    dists_i[i] = np.inf
+    knn_i = np.partition(dists_i, k_local)[:k_local]
+    
+    dists_j = distance_matrix[j].copy()
+    dists_j[j] = np.inf
+    knn_j = np.partition(dists_j, k_local)[:k_local]
+    
+    features.append(np.mean(knn_i) / stats['mean_dist'])
+    features.append(np.mean(knn_j) / stats['mean_dist'])
+    features.append(np.std(knn_i) / (stats['std_dist'] + 1e-8))
+    features.append(np.std(knn_j) / (stats['std_dist'] + 1e-8))
+    
+    # 3. Clustering features
+    if 'edge_features' in cluster_features:
+        edge_feats = cluster_features['edge_features'][i, j]
+        features.extend(edge_feats[:3])  # Use first 3 clustering features
+    
+    # 4. Triangle inequality feature
+    min_violation = np.inf
+    for k in range(min(n, 20)):  # Sample for efficiency
+        if k != i and k != j:
+            violation = (distance_matrix[i, k] + distance_matrix[k, j]) / (d_ij + 1e-8)
+            min_violation = min(min_violation, violation)
+    features.append(min_violation)
+    
+    # 5. Degree-based features
+    degree_i = np.sum(distance_matrix[i] <= stats['p75'])
+    degree_j = np.sum(distance_matrix[j] <= stats['p75'])
+    features.append(degree_i / n)
+    features.append(degree_j / n)
+    
+    return np.array(features)
+
+
+def _extract_edge_features(distance_matrix: np.ndarray, i: int, j: int,
+                           stats: dict, cluster_features: dict,
+                           feature_models: dict) -> np.ndarray:
+    """Extract all features for edge scoring, including model predictions."""
+    basic_features = _extract_basic_edge_features(distance_matrix, i, j, stats, cluster_features)
+    
+    # Add multi-hop regret features
+    regret_features = _compute_multi_hop_regret(distance_matrix, i, j, stats)
+    all_features = np.concatenate([basic_features, regret_features])
+    
+    # Add model prediction if available
+    if feature_models.get('model') is not None:
+        model_pred = feature_models['model'].predict([basic_features])[0]
+        all_features = np.append(all_features, model_pred)
+    
+    return all_features
+
+
+def _compute_multi_hop_regret(distance_matrix: np.ndarray, i: int, j: int, 
+                              stats: dict) -> np.ndarray:
+    """Compute adaptive multi-hop regret features."""
+    n = stats['n']
+    d_ij = distance_matrix[i, j]
+    
+    features = []
+    
+    # 2-hop regret
+    best_2hop = np.inf
+    for k in range(min(n, 30)):  # Sample for efficiency
+        if k != i and k != j:
+            cost = distance_matrix[i, k] + distance_matrix[k, j]
+            best_2hop = min(best_2hop, cost)
+    
+    regret_2hop = best_2hop / (d_ij + 1e-8)
+    features.append(regret_2hop)
+    features.append(np.exp(1 - regret_2hop))  # Transform to score-like
+    
+    # 3-hop regret (for larger instances)
+    if n >= 10:
+        best_3hop = np.inf
+        # Sample candidate intermediate nodes
+        candidates = list(range(min(n, 20)))
+        candidates = [c for c in candidates if c != i and c != j]
+        
+        for k1 in candidates:
+            for k2 in candidates:
+                if k1 != k2 and k1 != i and k1 != j and k2 != i and k2 != j:
+                    cost = (distance_matrix[i, k1] + 
+                           distance_matrix[k1, k2] + 
+                           distance_matrix[k2, j])
+                    best_3hop = min(best_3hop, cost)
+        
+        regret_3hop = best_3hop / (d_ij + 1e-8)
+        features.append(regret_3hop)
+        features.append(np.exp(1 - regret_3hop))
+    else:
+        features.extend([1.0, 1.0])
+    
+    # Best regret ratio
+    best_regret = min(regret_2hop, regret_3hop if n >= 10 else regret_2hop)
+    features.append(best_regret)
+    features.append(1.0 / (best_regret + 0.1))
+    
+    return np.array(features)
+
+
+def _predict_edge_score(features: np.ndarray, stats: dict) -> float:
+    """Predict edge score from features with instance-adaptive weighting."""
+    # Extract key features
+    inv_dist = features[0]
+    regret_score = features[10] if len(features) > 10 else 1.0
+    clustering_feat = features[6] if len(features) > 6 else 0.5
+    
+    # Adaptive weights based on instance characteristics
+    w_inv = 0.6 + 0.3 * (1.0 / (1.0 + stats['cv_dist']))
+    w_regret = 0.3 + 0.4 * stats['triangle_skew']
+    w_cluster = 0.1 + 0.3 * stats['log_n'] / 10
+    
+    # Normalize weights to sum to 1
+    total = w_inv + w_regret + w_cluster
+    w_inv /= total
+    w_regret /= total
+    w_cluster /= total
+    
+    # Geometric mean combination
+    score = (
+        (inv_dist ** w_inv) *
+        (regret_score ** w_regret) *
+        ((clustering_feat + 0.5) ** w_cluster)
+    )
+    
+    # Additional adjustment based on model prediction if present
+    if len(features) > 20 and features[-1] > 0:
+        model_weight = 0.3 * min(1.0, stats['log_n'] / 5)
+        score = score * (1 - model_weight) + features[-1] * model_weight
+    
+    return float(score)
+
+
+def _enhanced_post_process(H: np.ndarray, distance_matrix: np.ndarray,
+                           stats: dict, cluster_features: dict) -> np.ndarray:
+    """Enhanced post-processing with cluster-aware normalization."""
+    n = stats['n']
+    
+    # Ensure symmetry and zero diagonal
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    # Cluster-aware normalization
+    cluster_labels = cluster_features.get('cluster_labels', np.zeros(n, dtype=int))
+    k_clusters = cluster_features.get('k_clusters', 1)
+    
+    if k_clusters > 1:
+        # Normalize within clusters first
+        for c in range(k_clusters):
+            nodes = np.where(cluster_labels == c)[0]
+            if len(nodes) > 1:
+                H_cluster = H[nodes][:, nodes]
+                if np.max(H_cluster) > 0:
+                    H_cluster = H_cluster / np.max(H_cluster)
+                    H[np.ix_(nodes, nodes)] = H_cluster
+    
+    # Global softmax normalization with temperature
+    temperature = 0.5 + 0.5 * stats['cv_dist']
+    H_exp = np.exp(H / temperature)
+    row_sums = np.sum(H_exp, axis=1, keepdims=True)
+    H = H_exp / (row_sums + 1e-8)
+    
+    # Boost critical inter-cluster edges
+    if k_clusters > 1:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_labels[i] != cluster_labels[j]:
+                    # Boost edges that are short relative to inter-cluster mean
+                    inter_mean = (stats['p75'] + stats['mean_dist']) / 2
+                    if distance_matrix[i, j] < inter_mean:
+                        boost = 1.0 + 0.3 * (1 - distance_matrix[i, j] / inter_mean)
+                        H[i, j] = H[j, i] = min(1.0, H[i, j] * boost)
+    
+    # Ensure minimum connectivity
+    min_edges = max(2, min(4, n // 10))
+    for i in range(n):
+        if np.sum(H[i] > 0.01) < min_edges:
+            # Add nearest neighbors
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nearest = np.argsort(dists)[:min_edges]
+            for j in nearest:
+                base_score = 1 / (dists[j] + 1e-8)
+                H[i, j] = H[j, i] = max(H[i, j], base_score * 0.5)
+    
+    # Final global scaling
+    if np.max(H) > 0:
+        H = H / np.max(H)
+    
+    return H
+
+
+def _get_feature_names() -> list:
+    """Get names of features for debugging."""
+    return [
+        'inv_dist', 'dist_ratio', 'dist_zscore',
+        'local_mean_i', 'local_mean_j', 'local_std_i', 'local_std_j',
+        'is_intra_cluster', 'cluster_dist_ratio', 'relative_dist',
+        'regret_2hop', 'regret_2hop_score',
+        'regret_3hop', 'regret_3hop_score',
+        'best_regret', 'inv_best_regret'
+    ]
+```

@@ -1,0 +1,264 @@
+```json
+{
+    "algorithm_features": ["Spectral Embedding Cluster Bonus", "Dynamic Rank-Regret with Variance Weighting", "Tour-Structure Sparsity Pattern", "Multiplicative Component Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import cdist
+from scipy import stats
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with spectral graph features and adaptive fusion.
+    
+    Core innovations:
+    1. Spectral embedding for global structure awareness
+    2. Dynamic rank-regret with variance-sensitive weighting
+    3. Tour-structure preserving sparsity pattern
+    4. Multiplicative fusion of orthogonal components
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # ==================== 1. SPECTRAL GRAPH FEATURES ====================
+    # Use spectral embedding to capture global cluster structure
+    
+    # Convert distances to similarities using adaptive bandwidth
+    median_dist = np.median(distance_matrix[distance_matrix > 0])
+    sigma = median_dist * 0.5
+    similarity = np.exp(-distance_matrix**2 / (2 * sigma**2))
+    np.fill_diagonal(similarity, 0)
+    
+    # Degree matrix and normalized Laplacian
+    D = np.diag(np.sum(similarity, axis=1) + 1e-8)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D)))
+    L = np.eye(n) - D_inv_sqrt @ similarity @ D_inv_sqrt
+    
+    # Compute Fiedler vector (second smallest eigenvector)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(L)
+        idx = np.argsort(eigenvalues)
+        fiedler = eigenvectors[:, idx[1]]  # Second smallest eigenvalue
+        
+        # Cluster indicator from Fiedler vector signs
+        cluster_mask = np.outer(fiedler >= 0, fiedler >= 0)
+        cluster_mask = cluster_mask | np.outer(fiedler < 0, fiedler < 0)
+        
+        # Intra-cluster bonus, inter-cluster penalty
+        spectral_bonus = np.where(cluster_mask, 1.2, 0.8)
+        
+    except np.linalg.LinAlgError:
+        # Fallback if spectral decomposition fails
+        spectral_bonus = np.ones((n, n))
+    
+    # ==================== 2. DYNAMIC RANK-REGRET ====================
+    # Adaptive regret based on rank differences and distance variance
+    
+    regret_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Adaptive regret depth based on node degree variability
+        if n > 10:
+            k = min(7, n // 2)
+        else:
+            k = min(3, n - 1)
+        
+        # Rank-based regret with distance-weighted penalties
+        sorted_indices = np.argsort(distances)
+        ranks = np.zeros(n)
+        ranks[sorted_indices] = np.arange(n)
+        
+        # Compute regret as weighted rank difference
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Consider top k alternatives excluding j
+            alt_ranks = []
+            alt_weights = []
+            for alt_idx in range(k):
+                if alt_idx >= len(sorted_indices):
+                    break
+                alt = sorted_indices[alt_idx]
+                if alt == j:
+                    continue
+                    
+                alt_ranks.append(ranks[alt])
+                # Weight by distance ratio (closer alternatives matter more)
+                weight = np.exp(-distances[alt] / (distances[j] + 1e-8))
+                alt_weights.append(weight)
+            
+            if alt_ranks:
+                alt_weights = np.array(alt_weights)
+                alt_weights = alt_weights / (alt_weights.sum() + 1e-8)
+                avg_alt_rank = np.sum(np.array(alt_ranks) * alt_weights)
+                
+                # Normalized regret score
+                rank_diff = max(0, avg_alt_rank - ranks[j])
+                regret_score = 1.0 + 0.6 * (rank_diff / (n - 1))
+                
+                # Adjust based on distance variance in neighborhood
+                neighbor_dists = distances[distances < np.inf]
+                if len(neighbor_dists) > 2:
+                    dist_cv = np.std(neighbor_dists) / (np.mean(neighbor_dists) + 1e-8)
+                    # Higher variance -> trust ranks more
+                    regret_score = regret_score ** (1.0 + 0.5 * dist_cv)
+                
+                regret_matrix[i, j] = min(2.0, regret_score)
+    
+    # Symmetrize
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # ==================== 3. STRUCTURE-PRESERVING COMPONENTS ====================
+    
+    # Inverse distance with adaptive smoothing
+    median_diag = np.median(distance_matrix[np.triu_indices(n, k=1)])
+    inv_dist = 1.0 / (distance_matrix + 0.15 * median_diag)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST boost with path-criticality weighting
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Compute edge criticality via alternative path ratios
+    criticality = np.ones((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Find best alternative path through a third node
+            alt_costs = []
+            for k in range(n):
+                if k not in (i, j):
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    alt_costs.append(alt_cost)
+            
+            if alt_costs:
+                best_alt = min(alt_costs)
+                direct_cost = distance_matrix[i, j]
+                if best_alt > 0:
+                    ratio = best_alt / direct_cost
+                    criticality[i, j] = criticality[j, i] = np.tanh(ratio - 1.0)
+    
+    mst_boost = np.where(mst_mask, 1.5 + 0.3 * criticality, 1.0)
+    
+    # Local density coherence
+    density_bonus = np.ones((n, n))
+    if n > 5:
+        # Adaptive neighborhood size
+        k_density = max(3, min(7, int(np.sqrt(n))))
+        
+        # Compute local density as inverse of median distance to k-nearest
+        local_density = np.zeros(n)
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nearest = np.partition(dists, k_density)[:k_density]
+            local_density[i] = 1.0 / (np.median(nearest) + 1e-8)
+        
+        # Normalize densities
+        if local_density.max() > local_density.min():
+            local_density = (local_density - local_density.min()) / \
+                           (local_density.max() - local_density.min())
+        
+        # Similarity bonus decays with density difference
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = abs(local_density[i] - local_density[j])
+                density_bonus[i, j] = density_bonus[j, i] = np.exp(-2.0 * diff)
+    
+    # ==================== 4. TOUR-STRUCTURE SPARSITY ====================
+    
+    # Start with MST as backbone
+    connectivity_mask = mst_mask.copy()
+    
+    # Determine adaptive connection budget
+    if n <= 10:
+        extra_connections = 3
+    elif n <= 50:
+        extra_connections = 2
+    else:
+        extra_connections = 1
+    
+    # Compute preliminary heuristic for edge selection
+    prelim_heuristic = inv_dist * regret_matrix * density_bonus * mst_boost * spectral_bonus
+    
+    # Add edges based on multiple criteria
+    for i in range(n):
+        # Current MST connections
+        mst_conn = np.where(mst_mask[i])[0]
+        mst_conn = mst_conn[mst_conn != i]
+        
+        # Additional connections needed
+        needed = max(0, extra_connections - len(mst_conn))
+        
+        if needed > 0:
+            # Score edges by multiple criteria
+            scores = np.zeros(n)
+            for j in range(n):
+                if j == i or connectivity_mask[i, j]:
+                    continue
+                
+                # Combination of rank, density, and spectral
+                rank_score = 1.0 / (np.where(np.argsort(distance_matrix[i]) == j)[0][0] + 1)
+                density_score = density_bonus[i, j]
+                spectral_score = spectral_bonus[i, j]
+                
+                scores[j] = rank_score * density_score * spectral_score
+            
+            # Select top candidates
+            candidates = np.argsort(scores)[-needed:]
+            for j in candidates:
+                if scores[j] > 0:
+                    connectivity_mask[i, j] = True
+                    connectivity_mask[j, i] = True
+    
+    # Ensure minimum degree of 2
+    for i in range(n):
+        connected = np.where(connectivity_mask[i])[0]
+        connected = connected[connected != i]
+        if len(connected) < 2:
+            # Add nearest neighbor not already connected
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            dists[connectivity_mask[i]] = np.inf
+            if np.any(dists < np.inf):
+                nearest = np.argmin(dists)
+                connectivity_mask[i, nearest] = True
+                connectivity_mask[nearest, i] = True
+    
+    # ==================== 5. FUSION AND NORMALIZATION ====================
+    
+    # Multiplicative combination of orthogonal components
+    heuristic = inv_dist * regret_matrix * density_bonus * mst_boost * spectral_bonus
+    
+    # Apply connectivity mask
+    heuristic = heuristic * connectivity_mask
+    
+    # Row-wise normalization to emphasize relative preferences
+    row_max = heuristic.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    heuristic = heuristic / row_max
+    
+    # Global scaling with MST preservation
+    if heuristic.max() > 0:
+        heuristic = heuristic / heuristic.max()
+        
+        # Boost MST edges slightly
+        heuristic[mst_mask] = np.minimum(heuristic[mst_mask] * 1.1, 1.0)
+    
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

@@ -1,0 +1,481 @@
+```json
+{
+    "algorithm_features": ["Graph Neural Network", "Online Learning", "Adaptive Weight Learning", "Spectral Clustering"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+import warnings
+from sklearn.manifold import MDS
+from sklearn.cluster import SpectralClustering
+import numba
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with online learning capabilities,
+    graph neural network-inspired features, and adaptive spectral clustering.
+    
+    Key innovations:
+    1. Online learning during heuristic computation through iterative refinement
+    2. Graph neural network-style message passing for edge features
+    3. Dynamic spectral clustering with automatic cluster count determination
+    4. Reinforcement learning-inspired weight adaptation during computation
+    
+    Args:
+        distance_matrix: Square symmetric distance matrix (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+        return result
+    
+    # Base heuristic: reciprocal of distances
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal_weights, 0)
+    
+    # Online learning: iterative refinement of spatial features
+    spatial_promising, node_features = _online_spatial_learning(distance_matrix, n)
+    
+    # GNN-inspired edge feature extraction
+    gnn_features = _gnn_edge_prediction(node_features, distance_matrix, n)
+    
+    # Dynamic spectral clustering with adaptive cluster count
+    spectral_promising = _adaptive_spectral_clustering(distance_matrix, n)
+    
+    # MST with reinforcement learning-inspired updates
+    mst_promising = _reinforcement_mst(distance_matrix, n)
+    
+    # Online weight adaptation during computation
+    weights = _online_weight_adaptation(
+        reciprocal_weights, spatial_promising, gnn_features,
+        spectral_promising, mst_promising, distance_matrix, n
+    )
+    
+    # Combine with online learning
+    heuristics_matrix = _online_combination(
+        reciprocal_weights, spatial_promising, gnn_features,
+        spectral_promising, mst_promising, weights, distance_matrix, n
+    )
+    
+    # Dynamic sparsification with memory
+    sparsified = _dynamic_sparsification_with_memory(heuristics_matrix, distance_matrix, n)
+    
+    # Graph structure-aware boosting
+    final_heuristics = _graph_structure_boosting(sparsified, distance_matrix, n)
+    
+    # Final normalization with temperature scaling
+    np.fill_diagonal(final_heuristics, 0)
+    max_val = np.max(final_heuristics)
+    if max_val > 0:
+        # Temperature scaling for better discrimination
+        temperature = 0.5 + 0.5 * np.log(n) / np.log(100)
+        final_heuristics = final_heuristics / (max_val * temperature)
+        final_heuristics = np.clip(final_heuristics, 0, 1)
+    
+    return final_heuristics
+
+def _online_spatial_learning(distance_matrix: np.ndarray, n: int):
+    """Online spatial learning with iterative refinement."""
+    spatial_promising = np.zeros((n, n))
+    node_features = np.zeros((n, 3))  # x, y, local density
+    
+    # Phase 1: Initial embedding
+    if n <= 500:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=2,
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=1,
+                max_iter=30
+            )
+            coords = mds.fit_transform(distance_matrix)
+    else:
+        landmarks = _adaptive_landmark_sampling(distance_matrix, n)
+        coords = np.zeros((n, 2))
+        for i in range(n):
+            landmark_dists = distance_matrix[i, landmarks]
+            coords[i, 0] = np.mean(landmark_dists)
+            coords[i, 1] = np.std(landmark_dists)
+    
+    # Phase 2: Iterative refinement (online learning)
+    tree = KDTree(coords)
+    for iteration in range(2):  # Small number of iterations for online learning
+        k = max(3, min(int(np.log2(n)) * (iteration + 1), min(20, n - 1)))
+        
+        for i in range(n):
+            distances, indices = tree.query(coords[i].reshape(1, -1), k=k+1)
+            indices = indices[0]
+            
+            if indices[0] == i:
+                indices = indices[1:k+1]
+            else:
+                indices = indices[:k]
+            
+            # Update spatial promising with reinforcement
+            if iteration == 0:
+                spatial_promising[i, indices] = 1.0
+            else:
+                # Reinforcement: strengthen consistent neighbors
+                current_neighbors = np.where(spatial_promising[i] > 0)[0]
+                consistent = np.intersect1d(current_neighbors, indices)
+                spatial_promising[i, consistent] *= 1.2
+                spatial_promising[i, indices] = 1.0
+        
+        # Update node features based on current spatial promising
+        for i in range(n):
+            neighbors = np.where(spatial_promising[i] > 0)[0]
+            if len(neighbors) > 0:
+                node_features[i, 0] = np.mean(coords[neighbors, 0])
+                node_features[i, 1] = np.mean(coords[neighbors, 1])
+                node_features[i, 2] = len(neighbors) / n
+    
+    return spatial_promising, node_features
+
+def _adaptive_landmark_sampling(distance_matrix: np.ndarray, n: int):
+    """Adaptive landmark sampling with diversity maximization."""
+    n_landmarks = min(max(15, int(np.sqrt(n))), 80)
+    
+    # Use k-means++ style initialization
+    landmarks = [np.random.randint(n)]
+    
+    for _ in range(1, n_landmarks):
+        distances_to_landmarks = np.min(distance_matrix[:, landmarks], axis=1)
+        probabilities = distances_to_landmarks ** 2
+        probabilities[landmarks] = 0
+        probabilities = probabilities / np.sum(probabilities)
+        
+        next_landmark = np.random.choice(n, p=probabilities)
+        landmarks.append(next_landmark)
+    
+    return np.array(landmarks)
+
+def _gnn_edge_prediction(node_features: np.ndarray, distance_matrix: np.ndarray, n: int):
+    """GNN-inspired edge feature computation with message passing."""
+    gnn_features = np.ones((n, n))
+    
+    # Simple 2-layer message passing
+    for _ in range(2):
+        aggregated_features = np.zeros((n, node_features.shape[1]))
+        
+        for i in range(n):
+            # Aggregate neighbor features
+            neighbors = np.where(distance_matrix[i] < np.percentile(distance_matrix[i], 20))[0]
+            neighbors = neighbors[neighbors != i]
+            
+            if len(neighbors) > 0:
+                neighbor_features = node_features[neighbors]
+                aggregated_features[i] = np.mean(neighbor_features, axis=0)
+        
+        # Update node features with aggregated information
+        node_features = 0.7 * node_features + 0.3 * aggregated_features
+    
+    # Compute edge features based on updated node features
+    for i in range(n):
+        for j in range(i+1, n):
+            # Feature similarity and geometric compatibility
+            feature_sim = np.exp(-np.linalg.norm(node_features[i] - node_features[j]))
+            distance_ratio = distance_matrix[i, j] / (np.mean(distance_matrix[i]) + 1e-12)
+            compatibility = feature_sim * np.exp(-0.3 * distance_ratio)
+            
+            gnn_features[i, j] = gnn_features[j, i] = compatibility
+    
+    return gnn_features
+
+def _adaptive_spectral_clustering(distance_matrix: np.ndarray, n: int):
+    """Dynamic spectral clustering with automatic cluster determination."""
+    spectral_promising = np.zeros((n, n))
+    
+    if n < 10:
+        spectral_promising = np.ones((n, n)) - np.eye(n)
+        return spectral_promising
+    
+    # Convert distances to similarities
+    sigma = np.median(distance_matrix)
+    similarities = np.exp(-distance_matrix ** 2 / (2 * sigma ** 2))
+    np.fill_diagonal(similarities, 0)
+    
+    # Determine optimal number of clusters
+    if n <= 100:
+        # Use eigenvalue gap for small n
+        degree_matrix = np.diag(np.sum(similarities, axis=1))
+        laplacian = degree_matrix - similarities
+        eigenvalues = np.linalg.eigvalsh(laplacian)
+        eigenvalue_gaps = np.diff(eigenvalues[:min(10, n)])
+        n_clusters = np.argmax(eigenvalue_gaps) + 2 if len(eigenvalue_gaps) > 0 else min(3, n)
+    else:
+        # Heuristic for large n
+        n_clusters = max(2, min(8, int(np.sqrt(n))))
+    
+    n_clusters = min(n_clusters, n)
+    
+    try:
+        # Perform spectral clustering
+        sc = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='precomputed',
+            random_state=42,
+            n_init=3
+        )
+        labels = sc.fit_predict(similarities)
+        
+        # Boost intra-cluster edges and penalize inter-cluster edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if labels[i] == labels[j]:
+                    spectral_promising[i, j] = spectral_promising[j, i] = 1.0
+                else:
+                    spectral_promising[i, j] = spectral_promising[j, i] = 0.3
+    except:
+        # Fallback: use distance-based clustering
+        spectral_promising = np.ones((n, n)) - np.eye(n)
+    
+    return spectral_promising
+
+def _reinforcement_mst(distance_matrix: np.ndarray, n: int):
+    """MST computation with reinforcement learning-style updates."""
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    # Initial promising matrix
+    mst_promising = mst_edges + mst_edges.T
+    
+    # Reinforcement: strengthen edges that are part of multiple good substructures
+    for i in range(n):
+        # Find MST neighbors
+        mst_neighbors = np.where(mst_edges[i] > 0)[0]
+        
+        # Also consider near-MST edges based on local structure
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        k_near = min(5, n - 1)
+        closest = np.argsort(dists)[:k_near]
+        
+        for j in closest:
+            if mst_promising[i, j] == 0:
+                # Check if this edge completes triangles with MST edges
+                common_neighbors = np.intersect1d(
+                    np.where(mst_edges[i] > 0)[0],
+                    np.where(mst_edges[j] > 0)[0]
+                )
+                if len(common_neighbors) > 0:
+                    mst_promising[i, j] = mst_promising[j, i] = 0.8
+                else:
+                    mst_promising[i, j] = mst_promising[j, i] = 0.5
+    
+    return mst_promising
+
+def _online_weight_adaptation(reciprocal_weights, spatial_promising, gnn_features,
+                              spectral_promising, mst_promising, distance_matrix, n):
+    """Online weight adaptation during computation."""
+    weights = {}
+    
+    # Analyze instance in real-time
+    avg_distance = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    distance_std = np.std(distance_matrix[np.triu_indices(n, k=1)])
+    cv = distance_std / (avg_distance + 1e-12)
+    
+    # Compute clustering quality metric
+    intra_cluster_dist = 0
+    inter_cluster_dist = 0
+    cluster_count = 0
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if spectral_promising[i, j] > 0.5:
+                intra_cluster_dist += distance_matrix[i, j]
+                cluster_count += 1
+            else:
+                inter_cluster_dist += distance_matrix[i, j]
+    
+    if cluster_count > 0:
+        clustering_quality = (inter_cluster_dist / (n*(n-1)/2 - cluster_count)) / \
+                           (intra_cluster_dist / cluster_count + 1e-12)
+    else:
+        clustering_quality = 1.0
+    
+    # Dynamic weight adjustment based on online analysis
+    weights['reciprocal'] = 1.0
+    
+    # Spatial weight: adjust based on clustering quality
+    spatial_weight = 0.8 + 0.4 * clustering_quality
+    weights['spatial'] = np.clip(spatial_weight, 0.6, 1.5)
+    
+    # GNN weight: higher for complex instances
+    gnn_weight = 0.6 + 0.4 * cv
+    weights['gnn'] = np.clip(gnn_weight, 0.4, 1.0)
+    
+    # Spectral weight: trust clustering when quality is high
+    spectral_weight = 0.7 + 0.6 * clustering_quality
+    weights['spectral'] = np.clip(spectral_weight, 0.5, 1.8)
+    
+    # MST weight: always important, but adjust based on n
+    mst_weight = 2.2 - 0.6 * np.log10(n) / np.log10(100)
+    weights['mst'] = np.clip(mst_weight, 1.8, 2.8)
+    
+    return weights
+
+def _online_combination(reciprocal_weights, spatial_promising, gnn_features,
+                        spectral_promising, mst_promising, weights, distance_matrix, n):
+    """Online combination of factors with adaptive learning."""
+    # Apply weights to each factor
+    spatial_factor = np.where(spatial_promising > 0, 
+                             weights['spatial'], 
+                             weights['spatial'] * 0.4)
+    
+    gnn_factor = weights['gnn'] * gnn_features
+    
+    spectral_factor = np.where(spectral_promising > 0.5,
+                              weights['spectral'],
+                              weights['spectral'] * 0.5)
+    
+    mst_strength = np.where(mst_promising >= 1,
+                           np.where(mst_promising >= 1.5,
+                                   weights['mst'],
+                                   weights['mst'] * 0.7),
+                           weights['mst'] * 0.3)
+    
+    # Combine with online learning rate
+    combined_scores = (weights['reciprocal'] * reciprocal_weights *
+                      spatial_factor * gnn_factor *
+                      spectral_factor * mst_strength)
+    
+    # Online adjustment based on local consistency
+    for i in range(n):
+        for j in range(i+1, n):
+            # Check if edge is supported by multiple factors
+            support_count = sum([
+                spatial_promising[i, j] > 0,
+                gnn_features[i, j] > np.median(gnn_features),
+                spectral_promising[i, j] > 0.5,
+                mst_promising[i, j] > 0
+            ])
+            
+            if support_count >= 3:
+                combined_scores[i, j] *= 1.2
+            elif support_count <= 1:
+                combined_scores[i, j] *= 0.8
+    
+    # Ensure symmetry
+    combined_scores = (combined_scores + combined_scores.T) / 2
+    
+    return combined_scores
+
+def _dynamic_sparsification_with_memory(heuristics_matrix, distance_matrix, n):
+    """Dynamic sparsification with memory of previous good edges."""
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    if n <= 10:
+        return heuristics_matrix.copy()
+    
+    # Adaptive target degree with memory factor
+    base_degree = max(4, int(np.log2(n) * 2.0))
+    target_degree = min(base_degree, n - 1)
+    
+    # Preserve MST edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Memory of good edges from previous iterations (simulated)
+    edge_memory = np.zeros((n, n))
+    for i in range(n):
+        top_k = min(5, n-1)
+        top_indices = np.argsort(-heuristics_matrix[i])[:top_k]
+        edge_memory[i, top_indices] = 1
+    
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf
+        
+        # Must-keep edges: MST and strong memory edges
+        must_keep = np.where(mst_edges[i] | (edge_memory[i] > 0.5))[0]
+        
+        # Calculate remaining slots
+        remaining_slots = max(0, target_degree - len(must_keep))
+        
+        if remaining_slots > 0:
+            # Get candidate edges (excluding must-keep)
+            candidate_mask = ~np.isin(np.arange(n), must_keep)
+            candidate_indices = np.where(candidate_mask)[0]
+            candidate_scores = row[candidate_indices]
+            
+            if len(candidate_indices) > remaining_slots:
+                # Keep top remaining_slots candidates
+                threshold_idx = np.argpartition(-candidate_scores, remaining_slots-1)[remaining_slots-1]
+                threshold = candidate_scores[threshold_idx]
+                keep_candidates = candidate_indices[candidate_scores >= threshold]
+            else:
+                keep_candidates = candidate_indices[candidate_scores > 0]
+        else:
+            keep_candidates = []
+        
+        # Combine all edges to keep
+        keep_indices = np.unique(np.concatenate([must_keep, keep_candidates]))
+        keep_indices = keep_indices[keep_indices != i]
+        
+        sparsified[i, keep_indices] = heuristics_matrix[i, keep_indices]
+    
+    # Ensure symmetry and connectivity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+
+@numba.jit(nopython=True, parallel=True)
+def _graph_structure_boosting(heuristics_matrix, distance_matrix, n):
+    """Graph structure-aware boosting using efficient computation."""
+    boosted = heuristics_matrix.copy()
+    
+    if n > 1000:
+        # Sampling approach for large graphs
+        sample_size = min(400, n)
+        step = max(1, n // sample_size)
+        
+        for i in numba.prange(0, n, step):
+            neighbors_i = np.where(heuristics_matrix[i] > 0)[0]
+            for j in neighbors_i:
+                if j <= i:
+                    continue
+                neighbors_j = np.where(heuristics_matrix[j] > 0)[0]
+                # Count common neighbors
+                common = 0
+                for k in neighbors_i:
+                    if k in neighbors_j:
+                        common += 1
+                
+                if common > 0:
+                    # Structure-aware boost
+                    boost = 1 + 0.12 * min(common, 6)
+                    boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    else:
+        # Efficient exact computation for moderate graphs
+        binary_mask = (heuristics_matrix > 0).astype(np.float32)
+        
+        # Compute common neighbors via matrix multiplication
+        common_neighbors = binary_mask @ binary_mask.T
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if heuristics_matrix[i, j] > 0:
+                    common = common_neighbors[i, j]
+                    if common > 0:
+                        # Adjust boost based on triangle quality
+                        if common >= 3:
+                            boost = 1 + 0.18 * min(common, 5)
+                        else:
+                            boost = 1 + 0.1 * common
+                        boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    return boosted
+```

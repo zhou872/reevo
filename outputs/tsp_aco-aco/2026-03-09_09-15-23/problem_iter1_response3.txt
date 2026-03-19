@@ -1,0 +1,182 @@
+```json
+{
+    "algorithm_features": ["Convex Hull Edge Priority", "Neighbor Affinity Clustering", "Regret-based Edge Pruning", "Minimum Spanning Tree Influence"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import ConvexHull
+from scipy.sparse.csgraph import minimum_spanning_tree
+import itertools
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization.
+    Returns a matrix of edge priorities with the same shape as distance_matrix.
+    """
+    n = distance_matrix.shape[0]
+    if n < 4:
+        # Simple fallback for very small instances
+        return 1 / (distance_matrix + np.eye(n))
+    
+    # 1. Base inverse distance (similar to v1 but with regularization)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n))
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Convex hull edge bonus
+    hull_edges = _get_convex_hull_edges(distance_matrix)
+    hull_bonus = np.zeros_like(distance_matrix)
+    for i, j in hull_edges:
+        hull_bonus[i, j] = 1.5
+        hull_bonus[j, i] = 1.5
+    
+    # 3. Minimum spanning tree influence
+    mst_edges = _get_mst_edges(distance_matrix)
+    mst_weight = np.zeros_like(distance_matrix)
+    for i, j in mst_edges:
+        mst_weight[i, j] = 1.2
+        mst_weight[j, i] = 1.2
+    
+    # 4. Neighbor affinity clustering
+    cluster_bonus = _compute_cluster_affinity(distance_matrix)
+    
+    # 5. Regret-based scoring
+    regret_scores = _compute_regret_scores(distance_matrix)
+    
+    # 6. Combine all factors
+    priorities = (inv_dist * 0.4 + 
+                  hull_bonus * 0.25 + 
+                  mst_weight * 0.15 + 
+                  cluster_bonus * 0.1 + 
+                  regret_scores * 0.1)
+    
+    # 7. Sparsify: keep only top edges for each node
+    priorities = _sparsify_matrix(priorities, n)
+    
+    # Ensure symmetry
+    priorities = (priorities + priorities.T) / 2
+    np.fill_diagonal(priorities, 0)
+    
+    return priorities
+
+def _get_convex_hull_edges(distance_matrix: np.ndarray):
+    """
+    Estimate convex hull edges from distance matrix using multidimensional scaling.
+    Returns list of (i, j) tuples representing hull edges.
+    """
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return []
+    
+    # Simple heuristic: edges with smallest distances are likely on convex hull
+    edges = []
+    for i in range(n):
+        # For each node, connect to two nearest distinct neighbors
+        sorted_indices = np.argsort(distance_matrix[i])
+        edges.append((i, sorted_indices[1]))
+        edges.append((i, sorted_indices[2]))
+    
+    # Remove duplicates and self-edges
+    edges = list(set((min(i, j), max(i, j)) for i, j in edges if i != j))
+    return edges
+
+def _get_mst_edges(distance_matrix: np.ndarray):
+    """
+    Get edges from minimum spanning tree.
+    Returns list of (i, j) tuples representing MST edges.
+    """
+    n = distance_matrix.shape[0]
+    mst = minimum_spanning_tree(distance_matrix)
+    edges = []
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst[i, j] > 0 or mst[j, i] > 0:
+                edges.append((i, j))
+    return edges
+
+def _compute_cluster_affinity(distance_matrix: np.ndarray):
+    """
+    Compute affinity scores based on local neighborhood clustering.
+    """
+    n = distance_matrix.shape[0]
+    affinity = np.zeros_like(distance_matrix)
+    
+    # For each node, identify its k nearest neighbors
+    k = max(3, min(8, n // 4))
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        neighbors = np.argsort(distance_matrix[i])[1:k+1]
+        
+        # Boost edges to these neighbors
+        for j in neighbors:
+            affinity[i, j] = 1.0
+            
+            # Additional boost if nodes share many neighbors (triadic closure)
+            common_neighbors = len(set(neighbors) & set(np.argsort(distance_matrix[j])[1:k+1]))
+            affinity[i, j] += 0.3 * common_neighbors / k
+    
+    return affinity
+
+def _compute_regret_scores(distance_matrix: np.ndarray):
+    """
+    Compute regret scores: difference between best and second-best alternative.
+    """
+    n = distance_matrix.shape[0]
+    regret = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Sort distances from node i
+        sorted_indices = np.argsort(distance_matrix[i])
+        
+        if len(sorted_indices) >= 3:
+            # The regret of choosing j is: (second_best_dist - best_dist) / best_dist
+            best_dist = distance_matrix[i, sorted_indices[1]]
+            second_best_dist = distance_matrix[i, sorted_indices[2]]
+            base_regret = (second_best_dist - best_dist) / (best_dist + 1e-10)
+            
+            for rank, j in enumerate(sorted_indices[1:]):
+                if i == j:
+                    continue
+                # Higher regret for not choosing very good edges
+                regret[i, j] = base_regret * (1.0 / (rank + 1))
+    
+    return regret
+
+def _sparsify_matrix(matrix: np.ndarray, n: int):
+    """
+    Keep only promising edges by setting others to zero.
+    """
+    result = matrix.copy()
+    
+    # Keep top k edges for each node
+    k = max(3, min(10, n // 2))
+    
+    for i in range(n):
+        row = result[i, :]
+        
+        # Get indices of top k values (excluding diagonal)
+        non_diag_indices = list(range(n))
+        non_diag_indices.remove(i)
+        top_k_indices = sorted(non_diag_indices, key=lambda j: row[j], reverse=True)[:k]
+        
+        # Zero out non-top edges
+        mask = np.ones(n, dtype=bool)
+        mask[top_k_indices] = False
+        mask[i] = True  # Keep diagonal as zero separately
+        result[i, mask] = 0
+    
+    # Also keep edges that are in top m globally
+    m = min(2 * n, n * (n - 1) // 10)
+    flat_indices = np.argsort(matrix.flatten())[::-1][:m]
+    global_top_i, global_top_j = np.unravel_index(flat_indices, matrix.shape)
+    
+    # Restore globally top edges
+    for i, j in zip(global_top_i, global_top_j):
+        if i != j:
+            result[i, j] = max(result[i, j], matrix[i, j])
+    
+    return result
+```

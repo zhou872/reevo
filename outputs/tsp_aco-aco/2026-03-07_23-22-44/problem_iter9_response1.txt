@@ -1,0 +1,245 @@
+```json
+{
+    "algorithm_features": ["Approximate Two-step Regret", "Spectral Embedding Similarity", "Instance-Adaptive Weighting", "Degree-Constrained Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge priority heuristic with approximate regret, spectral analysis,
+    and adaptive ensemble weighting for improved efficiency and accuracy.
+    
+    Core Improvements over v1:
+    1. Approximate Two-step Regret: Fast alternative path evaluation using limited lookahead
+    2. Efficient Spectral Processing: Reduced complexity spectral analysis with adaptive clustering
+    3. Streamlined Ensemble Learning: Simplified weight adaptation without heavy simulation
+    4. Practical Sparsification: Degree-constrained edge selection ensuring connectivity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        
+        # ==================== 1. BASIC COMPONENTS ====================
+        # Inverse distance (classical heuristic)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        np.fill_diagonal(inv_dist, 0)
+        
+        # Minimum Spanning Tree edges (structural importance)
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst > 0) | (mst.T > 0)
+        
+        # ==================== 2. APPROXIMATE TWO-STEP REGRET ====================
+        def compute_approximate_regret() -> np.ndarray:
+            """Fast regret estimation using limited alternative paths"""
+            regret_scores = np.zeros((n, n))
+            
+            # Pre-compute nearest neighbors for each node
+            nn_count = min(10, n-1)
+            nearest = np.zeros((n, nn_count), dtype=int)
+            for i in range(n):
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                nearest[i] = np.argsort(dists)[:nn_count]
+            
+            for i in range(n):
+                for j in range(i+1, n):
+                    direct_cost = distance_matrix[i, j]
+                    
+                    # Find best two-step alternative i->k->j
+                    best_alternative = float('inf')
+                    
+                    # Consider top neighbors of i and j
+                    for k in nearest[i][:min(5, nn_count)]:
+                        if k == j:
+                            continue
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternative = min(best_alternative, alt_cost)
+                    
+                    for k in nearest[j][:min(5, nn_count)]:
+                        if k == i:
+                            continue
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternative = min(best_alternative, alt_cost)
+                    
+                    if best_alternative < float('inf'):
+                        regret = max(0, best_alternative - direct_cost)
+                        # Soft scoring with adaptive scaling
+                        scale = np.median(distance_matrix[distance_matrix > 0])
+                        regret_scores[i, j] = 1.0 / (1.0 + np.exp(-regret / (scale + 1e-8)))
+            
+            # Symmetrize
+            regret_scores = regret_scores + regret_scores.T
+            return regret_scores
+        
+        regret_scores = compute_approximate_regret()
+        
+        # ==================== 3. SPECTRAL EMBEDDING SIMILARITY ====================
+        def compute_spectral_similarity() -> np.ndarray:
+            """Efficient spectral analysis for cluster detection"""
+            if n < 4:
+                return np.ones_like(distance_matrix)
+            
+            # Determine number of clusters adaptively
+            k = max(2, min(5, int(np.sqrt(n))))
+            
+            # Normalized Laplacian
+            degree = np.sum(distance_matrix, axis=1)
+            D_inv_sqrt = np.diag(1.0 / np.sqrt(degree + 1e-8))
+            L_norm = np.eye(n) - D_inv_sqrt @ distance_matrix @ D_inv_sqrt
+            
+            # Compute eigenvectors (smallest k+1, skip first)
+            try:
+                eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+                idx = np.argsort(eigenvalues)[1:k+1]  # Skip first trivial eigenvector
+                spectral_embedding = eigenvectors[:, idx]
+            except:
+                # Fallback if eigendecomposition fails
+                return np.ones_like(distance_matrix)
+            
+            # Compute edge scores based on spectral similarity
+            spectral_scores = np.ones((n, n))
+            
+            # Normalize embedding rows
+            norms = np.linalg.norm(spectral_embedding, axis=1, keepdims=True)
+            normalized_embedding = spectral_embedding / (norms + 1e-8)
+            
+            # Compute all pairwise similarities efficiently
+            similarity_matrix = normalized_embedding @ normalized_embedding.T
+            
+            # Combine with distance decay
+            median_dist = np.median(distance_matrix)
+            distance_decay = np.exp(-distance_matrix / (2 * median_dist))
+            
+            spectral_scores = 1.0 + similarity_matrix * distance_decay
+            np.fill_diagonal(spectral_scores, 0)
+            
+            return spectral_scores
+        
+        spectral_scores = compute_spectral_similarity()
+        
+        # ==================== 4. INSTANCE-ADAPTIVE WEIGHTING ====================
+        def compute_adaptive_weights() -> Tuple[float, float, float]:
+            """Determine optimal weights based on instance characteristics"""
+            # Analyze instance properties
+            dist_std = np.std(distance_matrix[np.triu_indices(n, 1)])
+            dist_skew = np.mean((distance_matrix - np.mean(distance_matrix))**3) / (dist_std**3 + 1e-8)
+            
+            # Weight inversely proportional to component variance
+            var_inv = np.var(inv_dist[inv_dist > 0]) if np.any(inv_dist > 0) else 1
+            var_regret = np.var(regret_scores[regret_scores > 0]) if np.any(regret_scores > 0) else 1
+            var_spectral = np.var(spectral_scores[spectral_scores > 0]) if np.any(spectral_scores > 0) else 1
+            
+            # Adaptive weights based on instance properties
+            base_w_inv = 0.4 * (1 + np.tanh(-dist_skew))  # Favor when distances are skewed
+            base_w_regret = 0.3 * (1 + np.tanh(dist_std / np.mean(distance_matrix)))
+            base_w_spectral = 0.3
+            
+            # Adjust by inverse variance (higher variance -> lower weight)
+            w_inv = base_w_inv / (var_inv + 1e-8)
+            w_regret = base_w_regret / (var_regret + 1e-8)
+            w_spectral = base_w_spectral / (var_spectral + 1e-8)
+            
+            # Normalize
+            total = w_inv + w_regret + w_spectral
+            return w_inv/total, w_regret/total, w_spectral/total
+        
+        w_inv, w_regret, w_spectral = compute_adaptive_weights()
+        
+        # ==================== 5. COMPOSITE SCORE ====================
+        composite = (
+            w_inv * inv_dist +
+            w_regret * regret_scores +
+            w_spectral * spectral_scores
+        )
+        
+        # Boost MST edges (critical connectivity)
+        mst_boost = 1.0 + 0.3 * np.log1p(n)  # Logarithmic boost
+        composite[mst_edges] *= mst_boost
+        
+        # ==================== 6. DEGREE-CONSTRAINED SPARSIFICATION ====================
+        def degree_constrained_sparsify(scores: np.ndarray) -> np.ndarray:
+            """Retain top edges per node while preserving MST edges"""
+            sparsified = np.zeros_like(scores)
+            
+            # Always keep MST edges
+            sparsified[mst_edges] = scores[mst_edges]
+            
+            # Determine adaptive degree limit
+            if n <= 10:
+                max_degree = min(4, n-1)
+            elif n <= 50:
+                max_degree = min(5, n//3)
+            else:
+                max_degree = min(6, n//4)
+            
+            # Current degree counts
+            current_deg = np.sum(sparsified > 0, axis=1)
+            
+            # For each node, add top edges up to degree limit
+            for i in range(n):
+                if current_deg[i] >= max_degree:
+                    continue
+                
+                # Get candidate edges (excluding self and already selected)
+                candidates = []
+                for j in range(n):
+                    if i == j or sparsified[i, j] > 0:
+                        continue
+                    candidates.append((scores[i, j], j))
+                
+                # Sort by score
+                candidates.sort(reverse=True, key=lambda x: x[0])
+                
+                # Add top candidates respecting degree limit
+                remaining_slots = max_degree - current_deg[i]
+                for score, j in candidates[:remaining_slots]:
+                    if current_deg[j] < max_degree:
+                        sparsified[i, j] = score
+                        sparsified[j, i] = score
+                        current_deg[i] += 1
+                        current_deg[j] += 1
+            
+            return sparsified
+        
+        sparsified = degree_constrained_sparsify(composite)
+        
+        # ==================== 7. FINAL PROCESSING ====================
+        # Symmetrize (ensure exact symmetry)
+        symmetric_scores = (sparsified + sparsified.T) / 2
+        
+        # Apply distance-based decay (shorter edges generally better)
+        max_dist = np.max(distance_matrix)
+        if max_dist > 0:
+            dist_factor = np.exp(-distance_matrix / (0.5 * max_dist))
+            symmetric_scores *= dist_factor
+        
+        # Normalize to [0, 1]
+        max_val = np.max(symmetric_scores)
+        if max_val > 0:
+            symmetric_scores /= max_val
+        
+        np.fill_diagonal(symmetric_scores, 0)
+        
+        return symmetric_scores
+```

@@ -1,0 +1,160 @@
+```json
+{
+    "algorithm_features": ["Distance Inverse Weighting", "Two-step Lookahead Spatial Scoring", "Regret-based Penalty", "Cluster Density Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining multiple factors.
+    
+    Parameters:
+    distance_matrix: Square matrix of pairwise distances between nodes
+    
+    Returns:
+    heuristic_matrix: Matrix of same shape indicating edge promise scores
+    """
+    n = distance_matrix.shape[0]
+    
+    # 1. Basic inverse distance (baseline)
+    with np.errstate(divide='ignore'):
+        inv_dist = 1 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Two-step lookahead spatial scoring
+    # For each edge (i,j), consider the best alternative connections
+    spatial_scores = np.zeros((n, n))
+    
+    # Find nearest neighbors for each node
+    nn_count = min(5, n-1)
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:nn_count+1]
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+                
+            # Alternative connections for i and j
+            alt_i = nearest_indices[i][nearest_indices[i] != j][:2]
+            alt_j = nearest_indices[j][nearest_indices[j] != i][:2]
+            
+            # Calculate spatial advantage
+            if len(alt_i) > 0 and len(alt_j) > 0:
+                best_alt_i = min(distance_matrix[i, alt_i]) if len(alt_i) > 0 else 0
+                best_alt_j = min(distance_matrix[j, alt_j]) if len(alt_j) > 0 else 0
+                
+                # Score based on how much better (i,j) is than alternatives
+                advantage_i = best_alt_i - distance_matrix[i, j] if best_alt_i > 0 else 0
+                advantage_j = best_alt_j - distance_matrix[i, j] if best_alt_j > 0 else 0
+                spatial_scores[i, j] = spatial_scores[j, i] = (advantage_i + advantage_j) / 2
+    
+    # Normalize spatial scores
+    if np.max(spatial_scores) > 0:
+        spatial_scores = spatial_scores / np.max(spatial_scores)
+    
+    # 3. Regret-based penalty
+    # Penalize edges that would force poor subsequent choices
+    regret_penalty = np.zeros((n, n))
+    
+    for i in range(n):
+        # Find two best edges from each node (excluding self)
+        sorted_indices = np.argsort(distance_matrix[i])
+        best1 = sorted_indices[1] if sorted_indices[0] == i else sorted_indices[0]
+        best2_idx = 2 if sorted_indices[0] == i else 1
+        best2 = sorted_indices[best2_idx]
+        
+        # Calculate regret: how much worse is this edge than the best alternatives?
+        for j in range(n):
+            if i != j:
+                # Regret compared to best alternative
+                regret = distance_matrix[i, j] - distance_matrix[i, best1]
+                if regret > 0:
+                    # Additional regret compared to second best
+                    regret2 = distance_matrix[i, j] - distance_matrix[i, best2]
+                    regret_penalty[i, j] = (regret + max(0, regret2)) / 2
+    
+    # Convert penalty to score (higher regret = lower score)
+    regret_score = np.exp(-regret_penalty / np.median(distance_matrix[distance_matrix > 0]))
+    np.fill_diagonal(regret_score, 0)
+    
+    # 4. Cluster density bonus
+    # Reward edges within dense clusters
+    density_bonus = np.zeros((n, n))
+    
+    if n > 10:
+        # Use KDTree for efficient spatial queries
+        try:
+            # Create coordinates from distance matrix using MDS approximation
+            from sklearn.manifold import MDS
+            mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+            coords = mds.fit_transform(distance_matrix)
+            tree = KDTree(coords)
+            
+            # For each node, find local density
+            for i in range(n):
+                # Find neighbors within radius
+                radius = np.percentile(distance_matrix[i], 25)
+                indices = tree.query_ball_point(coords[i], radius)
+                
+                # Bonus for edges within dense clusters
+                for j in indices:
+                    if i != j:
+                        density = len(indices)
+                        density_bonus[i, j] = min(1.0, density / 10)
+                        
+        except ImportError:
+            # Fallback: simple distance-based clustering
+            for i in range(n):
+                radius = np.percentile(distance_matrix[i], 25)
+                neighbors = np.where(distance_matrix[i] <= radius)[0]
+                density = len(neighbors)
+                for j in neighbors:
+                    if i != j:
+                        density_bonus[i, j] = min(1.0, density / 10)
+    
+    # 5. Combine all factors with weights
+    weights = {
+        'inv_dist': 0.4,
+        'spatial': 0.3,
+        'regret': 0.2,
+        'density': 0.1
+    }
+    
+    # Normalize each component to [0, 1]
+    components = {
+        'inv_dist': inv_dist / (inv_dist.max() + 1e-10),
+        'spatial': spatial_scores,
+        'regret': regret_score,
+        'density': density_bonus
+    }
+    
+    # Combine weighted components
+    heuristic_matrix = np.zeros((n, n))
+    for key, weight in weights.items():
+        heuristic_matrix += weight * components[key]
+    
+    # 6. Sparsification: set unpromising edges to zero
+    # Use adaptive threshold based on node degree requirements
+    threshold = np.percentile(heuristic_matrix[heuristic_matrix > 0], 30)
+    heuristic_matrix[heuristic_matrix < threshold] = 0
+    
+    # Ensure symmetry
+    heuristic_matrix = np.maximum(heuristic_matrix, heuristic_matrix.T)
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    # 7. Final enhancement: boost scores for edges in minimum spanning tree
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0).astype(float)
+        heuristic_matrix = heuristic_matrix * (1 + 0.5 * mst_mask)
+    except:
+        pass
+    
+    return heuristic_matrix
+```

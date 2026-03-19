@@ -1,0 +1,221 @@
+```json
+{
+    "algorithm_features": ["Local Density Adaptive Sparsification", "Rank-weighted Inverse Distance Scoring", "Vectorized Two-hop Alternative Analysis", "Lightweight Regret-based Edge Priority"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic function with adaptive local density sparsification
+    and efficient regret-based edge prioritization.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. LOCAL DENSITY ADAPTIVE SPARSIFICATION ====================
+    # Base sparsity level grows logarithmically with problem size
+    base_k = max(3, int(np.log2(n)))
+    
+    # Precompute sorted distances for each node
+    sorted_distances = np.sort(distance_matrix, axis=1)
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    # Estimate local density using distance to base_k-th nearest neighbor
+    local_density = sorted_distances[:, base_k].reshape(-1, 1)
+    
+    # Adaptive neighborhood size based on local density
+    # Denser regions get more connections, sparse regions get fewer
+    global_density = np.mean(local_density)
+    adaptive_k = np.clip(
+        base_k * (global_density / (local_density + 1e-10)),
+        base_k // 2,
+        3 * base_k
+    ).astype(int)
+    
+    # Build sparse adjacency mask with adaptive neighborhood sizes
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        k_i = adaptive_k[i, 0]
+        neighbors = sorted_indices[i, 1:min(k_i + 1, n)]
+        adjacency_mask[i, neighbors] = True
+    
+    # Ensure symmetry for connectivity
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. RANK-WEIGHTED INVERSE DISTANCE SCORING ====================
+    # Compute base scores with rank-based weighting
+    base_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Get distances to neighbors
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Rank neighbors by proximity (closest gets rank 1)
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            
+            # Exponential decay weights: closer neighbors get much higher weights
+            rank_weights = np.exp(-0.5 * (ranks - 1))  # Decay factor of 0.5
+            rank_weights = rank_weights / np.sum(rank_weights)  # Normalize
+            
+            # Compute inverse distance with rank weighting
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            base_scores[i, valid_mask] = inv_vals * rank_weights
+    
+    # Symmetrize base scores
+    base_scores = 0.5 * (base_scores + base_scores.T)
+    
+    # ==================== 3. LIGHTWEIGHT REGRET-BASED EDGE PRIORITY ====================
+    # Compute regret for each node among its sparse neighbors
+    regret_boost = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        valid_indices = np.where(valid_mask)[0]
+        
+        if len(valid_indices) >= 2:
+            # Get distances to neighbors
+            neighbor_dists = distance_matrix[i, valid_indices]
+            
+            # Find best and second-best distances
+            sorted_dists = np.sort(neighbor_dists)
+            best_dist, second_best_dist = sorted_dists[:2]
+            
+            # Compute regret (difference between best and second-best)
+            regret = second_best_dist - best_dist
+            
+            # Identify which neighbor is the best
+            best_neighbor_idx = valid_indices[np.argmin(neighbor_dists)]
+            
+            # Boost the best edge, slightly penalize others
+            for j in valid_indices:
+                if i < j:
+                    if j == best_neighbor_idx:
+                        # Best edge gets boost proportional to regret
+                        regret_factor = 1.0 + 0.3 * (regret / (best_dist + 1e-10))
+                        regret_boost[i, j] = regret_boost[j, i] = min(regret_factor, 1.5)
+                    else:
+                        # Non-best edges get slight penalty
+                        penalty = 0.9 + 0.1 * np.random.random()  # Small random penalty
+                        regret_boost[i, j] = regret_boost[j, i] = penalty
+    
+    # ==================== 4. VECTORIZED TWO-HOP ALTERNATIVE ANALYSIS ====================
+    # Efficient computation of two-hop alternatives using matrix operations
+    two_hop_penalty = np.ones_like(distance_matrix)
+    
+    # Precompute top neighbors for each node (for efficiency)
+    top_m = min(10, int(np.sqrt(n)))
+    top_neighbors = sorted_indices[:, 1:top_m + 1]
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        valid_indices = np.where(valid_mask)[0]
+        
+        for j in valid_indices:
+            if i >= j:
+                continue
+                
+            # Find common neighbors efficiently
+            i_top = set(top_neighbors[i])
+            j_top = set(top_neighbors[j])
+            common_candidates = list(i_top.intersection(j_top) - {i, j})
+            
+            if common_candidates:
+                # Vectorized computation of two-hop distances
+                candidate_array = np.array(common_candidates)
+                two_hop_dists = (distance_matrix[i, candidate_array] + 
+                                distance_matrix[candidate_array, j])
+                
+                if len(two_hop_dists) > 0:
+                    min_two_hop = np.min(two_hop_dists)
+                    direct_dist = distance_matrix[i, j]
+                    
+                    if direct_dist > 1e-10:
+                        # Penalize edges with good two-hop alternatives
+                        ratio = min_two_hop / direct_dist
+                        
+                        # Smooth penalty function
+                        if ratio < 1.2:
+                            # Good alternative exists - penalize more
+                            penalty = 0.6 + 0.2 * (ratio / 1.2)
+                        else:
+                            # No good alternative - penalize less
+                            penalty = 0.8 + 0.2 * min(1.0, (ratio - 1.2) / 2.0)
+                        
+                        two_hop_penalty[i, j] = two_hop_penalty[j, i] = penalty
+    
+    # ==================== 5. COMBINE COMPONENTS ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Only compute scores for edges in sparse adjacency
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                score = base_scores[i, j]
+                score *= regret_boost[i, j]
+                score *= two_hop_penalty[i, j]
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    # ==================== 6. ENHANCE CONNECTIVITY ====================
+    # Ensure connectivity by boosting a small spanning tree
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    # Prim's algorithm for minimal connectivity boost
+    min_edge = distance_matrix[0].copy()
+    min_edge[0] = np.inf
+    closest = np.full(n, 0, dtype=int)
+    
+    for _ in range(min(5, n - 1)):  # Only add few edges for connectivity
+        u = np.argmin(min_edge)
+        v = closest[u]
+        
+        if not mst_mask[v, u]:
+            mst_mask[v, u] = mst_mask[u, v] = True
+            
+            # Boost MST edges that are undervalued
+            if heuristics[u, v] < np.percentile(heuristics[adjacency_mask], 25):
+                heuristics[u, v] = heuristics[v, u] = np.percentile(heuristics[adjacency_mask], 50)
+        
+        visited[u] = True
+        for w in range(n):
+            if not visited[w] and distance_matrix[u, w] < min_edge[w]:
+                min_edge[w] = distance_matrix[u, w]
+                closest[w] = u
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small constant to avoid zeros and normalize
+    min_nonzero = heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 1
+    heuristics[adjacency_mask] += 0.1 * min_nonzero
+    
+    # Row-normalize for probability distribution
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Symmetrize final matrix
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

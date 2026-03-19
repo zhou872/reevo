@@ -1,0 +1,195 @@
+```json
+{
+    "algorithm_features": ["Regret-based Edge Penalization", "Two-step Localized Lookahead Scoring", "Mutual Neighbor Asymmetry Bonus", "Probabilistic Connectivity Guarantee"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics incorporating regret-based opportunity costs
+    and lookahead spatial simulations for improved edge quality estimation.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes.
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores for each edge (higher = more promising).
+        Scores are normalized to [0, 1] range.
+    """
+    n = distance_matrix.shape[0]
+    
+    # 0. Setup: handle self-distances and ensure symmetry
+    np.fill_diagonal(distance_matrix, np.inf)
+    distance_matrix = np.maximum(distance_matrix, distance_matrix.T)
+    
+    # 1. Base attraction: inverse distance with adaptive scaling
+    inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Regret-based opportunity cost penalty
+    regret_penalty = np.ones((n, n))
+    for i in range(n):
+        # Find k best alternative edges for node i
+        k = min(5, n - 1)
+        sorted_idx = np.argsort(distance_matrix[i])[1:k+1]  # Exclude self
+        best_dist = distance_matrix[i, sorted_idx[0]]
+        
+        # Compute regret for each edge: how much worse than best alternative?
+        for j in range(n):
+            if j == i:
+                continue
+            # Regret = current cost - best alternative cost
+            # Higher regret means worse opportunity cost
+            regret = distance_matrix[i, j] - best_dist
+            # Normalize by local distance scale
+            local_scale = distance_matrix[i, sorted_idx].mean()
+            regret_norm = max(0, regret / (local_scale + 1e-10))
+            # Apply penalty: edges with high regret are less attractive
+            regret_penalty[i, j] = np.exp(-regret_norm)
+    
+    # 3. Two-step lookahead spatial simulation
+    lookahead_factor = np.ones((n, n))
+    lookahead_samples = min(10, n - 2)  # Number of nodes to consider in lookahead
+    
+    for i in range(n):
+        for j in range(n):
+            if j == i:
+                continue
+            
+            # Simulate the impact of taking edge (i,j) on future tour segments
+            remaining = [k for k in range(n) if k not in [i, j]]
+            if len(remaining) == 0:
+                continue
+            
+            # Sample random continuation from j
+            sample_size = min(lookahead_samples, len(remaining))
+            np.random.seed(42)  # Deterministic for reproducibility
+            sampled_next = np.random.choice(remaining, size=sample_size, replace=False)
+            
+            # Two-step lookahead simulation
+            total_cost = 0
+            for k in sampled_next:
+                # Cost of edge (j,k)
+                cost_jk = distance_matrix[j, k]
+                
+                # Find best return path from k (simulate returning to start)
+                if len(remaining) > 1:
+                    others = [l for l in remaining if l != k]
+                    min_return = min(distance_matrix[k, l] for l in others[:3])  # Limited lookahead
+                else:
+                    min_return = distance_matrix[k, i]  # Return to start
+                
+                total_cost += cost_jk + min_return
+            
+            avg_lookahead_cost = total_cost / (2 * sample_size)  # Average per step
+            
+            # Normalize lookahead cost by local distances
+            local_mean = distance_matrix[i].mean()
+            lookahead_factor[i, j] = local_mean / (avg_lookahead_cost + 1e-10)
+    
+    # 4. Enhanced mutual neighbor scoring with asymmetry awareness
+    k_neighbors = max(2, n // 8)
+    mutual_bonus = np.ones((n, n))
+    
+    for i in range(n):
+        # Find i's k nearest neighbors
+        i_neighbors = np.argsort(distance_matrix[i])[1:k_neighbors+1]
+        
+        for j in range(n):
+            if j == i:
+                continue
+            
+            # Check if j is in i's neighborhood
+            j_in_i_neighborhood = j in i_neighbors
+            
+            # Find j's k nearest neighbors
+            j_neighbors = np.argsort(distance_matrix[j])[1:k_neighbors+1]
+            i_in_j_neighborhood = i in j_neighbors
+            
+            # Different bonus levels based on mutual relationship
+            if j_in_i_neighborhood and i_in_j_neighborhood:
+                mutual_bonus[i, j] = 2.0  # Strong mutual attraction
+            elif j_in_i_neighborhood:
+                mutual_bonus[i, j] = 1.5  # Asymmetric attraction
+            elif i_in_j_neighborhood:
+                mutual_bonus[i, j] = 1.3  # Reverse asymmetric attraction
+            else:
+                mutual_bonus[i, j] = 1.0  # No special relationship
+    
+    # 5. Connectivity preservation with probabilistic guarantee
+    connectivity_weight = np.ones((n, n))
+    node_isolation = np.zeros(n)
+    
+    # Measure how isolated each node is
+    for i in range(n):
+        # Average distance to nearest 3 neighbors
+        nearest = np.partition(distance_matrix[i], 3)[:4]
+        node_isolation[i] = nearest.mean()
+    
+    # Boost edges connecting isolated nodes
+    max_isolation = node_isolation.max()
+    if max_isolation > 0:
+        for i in range(n):
+            for j in range(n):
+                if j == i:
+                    continue
+                isolation_score = (node_isolation[i] + node_isolation[j]) / (2 * max_isolation)
+                connectivity_weight[i, j] = 1.0 + 0.5 * isolation_score
+    
+    # 6. Combine all factors with balanced weights
+    heuristic_matrix = (inv_dist * 
+                       regret_penalty * 
+                       lookahead_factor * 
+                       mutual_bonus * 
+                       connectivity_weight)
+    
+    # 7. Adaptive sparsification with connectivity guarantee
+    # Keep top edges per node while ensuring graph remains connected
+    sparsity_mask = np.zeros_like(heuristic_matrix, dtype=bool)
+    
+    # Primary selection: keep adaptive number of top edges per node
+    base_keep = max(3, n // 10)
+    for i in range(n):
+        row_scores = heuristic_matrix[i].copy()
+        row_scores[i] = -np.inf  # Exclude self
+        top_idx = np.argsort(row_scores)[-base_keep:]
+        sparsity_mask[i, top_idx] = True
+    
+    # Ensure connectivity via probabilistic MST edges
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = mst + mst.T > 0
+    
+    # Blend MST guarantee with heuristic scores
+    for i in range(n):
+        for j in range(n):
+            if mst_edges[i, j]:
+                # Keep MST edges with probability based on heuristic quality
+                prob_keep = 0.3 + 0.7 * heuristic_matrix[i, j] / (heuristic_matrix.max() + 1e-10)
+                if np.random.random() < prob_keep:
+                    sparsity_mask[i, j] = True
+    
+    # Apply final mask
+    heuristic_matrix[~sparsity_mask] = 0
+    
+    # Ensure symmetry
+    heuristic_matrix = np.maximum(heuristic_matrix, heuristic_matrix.T)
+    
+    # Normalize to [0, 1] range
+    min_val = heuristic_matrix.min()
+    max_val = heuristic_matrix.max()
+    if max_val > min_val:
+        heuristic_matrix = (heuristic_matrix - min_val) / (max_val - min_val)
+    
+    # Restore diagonal to 0
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    return heuristic_matrix
+```

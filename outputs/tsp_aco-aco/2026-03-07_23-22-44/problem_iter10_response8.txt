@@ -1,0 +1,564 @@
+```json
+{
+    "algorithm_features": ["Parallel Beam Search with Dynamic Programming", "Spectral Embedding with Adaptive Clustering", "Cross-Validated Ensemble Learning", "Multi-Opt Tour Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple
+import itertools
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Next-generation TSP heuristic with dynamic programming beam search,
+    spectral embedding, cross-validated ensemble learning, and multi-opt
+    tour reinforcement.
+    
+    Core Innovations:
+    1. Dynamic Programming Beam Search: Efficient regret computation using
+       DP with pruning and memoization
+    2. Spectral Embedding with Gap Analysis: Adaptive clustering via 
+       eigenvalue gap detection
+    3. Cross-Validated Ensemble Learning: Robust weight optimization using
+       k-fold validation on diverse tour generation
+    4. Multi-Opt Tour Reinforcement: 2-opt and 3-opt improved tours for
+       pattern learning
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    
+    # ==================== 1. PRELIMINARY COMPUTATIONS ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST for connectivity
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. DYNAMIC PROGRAMMING BEAM SEARCH ====================
+    def dp_beam_search_regret(beam_width: int = None, max_depth: int = 4) -> np.ndarray:
+        """Compute regret using dynamic programming with beam pruning"""
+        if beam_width is None:
+            beam_width = min(8, max(3, n // 15))
+        
+        # Adaptive depth based on problem size
+        adaptive_depth = min(max_depth, max(2, int(np.log2(n))))
+        
+        regret_scores = np.zeros((n, n))
+        
+        # Precompute sorted neighbors for each node
+        sorted_neighbors = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            sorted_neighbors.append(np.argsort(dists)[:beam_width*2])
+        
+        # Process each node pair
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # Initialize DP table: (cost, visited_mask, current_node)
+                # visited_mask is a bitmask of visited nodes
+                dp = [(0, 1 << i, i)]  # Start at i
+                
+                best_alternative = float('inf')
+                
+                for depth in range(1, adaptive_depth + 1):
+                    new_dp = []
+                    
+                    for cost, visited, current in dp:
+                        # If we've reached j, update best alternative
+                        if current == j and depth > 1:
+                            best_alternative = min(best_alternative, cost)
+                            continue
+                        
+                        # Get candidate next nodes from sorted neighbors
+                        candidates = sorted_neighbors[current]
+                        for k in candidates:
+                            if visited & (1 << k):
+                                continue
+                            
+                            new_cost = cost + distance_matrix[current, k]
+                            new_visited = visited | (1 << k)
+                            new_dp.append((new_cost, new_visited, k))
+                    
+                    # Prune to beam_width best (lowest cost) paths
+                    if not new_dp:
+                        break
+                    
+                    new_dp.sort(key=lambda x: x[0])
+                    dp = new_dp[:beam_width]
+                
+                # Calculate regret-based score
+                if best_alternative < float('inf'):
+                    regret = max(0, best_alternative - direct_cost)
+                    # Sigmoid scaling with adaptive temperature
+                    scale = np.median(distance_matrix) * 0.5
+                    regret_scores[i, j] = 1.0 / (1.0 + np.exp(-regret / (scale + epsilon)))
+        
+        # Symmetrize and fill diagonal
+        regret_scores = np.maximum(regret_scores, regret_scores.T)
+        np.fill_diagonal(regret_scores, 0)
+        return regret_scores
+    
+    regret_scores = dp_beam_search_regret()
+    
+    # ==================== 3. SPECTRAL EMBEDDING WITH GAP ANALYSIS ====================
+    def spectral_embedding_affinity() -> np.ndarray:
+        """Compute edge affinity using spectral embedding with eigenvalue gap analysis"""
+        if n < 4:
+            return np.ones_like(distance_matrix)
+        
+        # Normalized Laplacian
+        degree = np.sum(distance_matrix, axis=1)
+        degree_sqrt_inv = 1.0 / np.sqrt(degree + epsilon)
+        L_norm = np.eye(n) - degree_sqrt_inv[:, None] * distance_matrix * degree_sqrt_inv[None, :]
+        
+        # Compute eigenvalues
+        eigenvalues = np.linalg.eigvalsh(L_norm)
+        eigenvalues = np.sort(eigenvalues)
+        
+        # Find optimal cluster count via eigenvalue gap
+        gaps = eigenvalues[1:] - eigenvalues[:-1]
+        # Look for significant gaps after the first few eigenvalues
+        k_candidates = min(10, n // 2)
+        if k_candidates > 2:
+            significant_gaps = gaps[1:k_candidates]
+            optimal_k = np.argmax(significant_gaps) + 2  # +2 because we skipped first gap
+        else:
+            optimal_k = min(3, n)
+        
+        # Compute eigenvectors for optimal_k smallest eigenvalues
+        _, eigenvectors = np.linalg.eigh(L_norm)
+        spectral_embedding = eigenvectors[:, :optimal_k]
+        
+        # Normalize rows to unit length
+        row_norms = np.linalg.norm(spectral_embedding, axis=1, keepdims=True)
+        spectral_embedding_normalized = spectral_embedding / (row_norms + epsilon)
+        
+        # Compute affinity scores based on cosine similarity in embedding space
+        affinity = spectral_embedding_normalized @ spectral_embedding_normalized.T
+        affinity = np.clip(affinity, 0, 1)  # Cosine similarity is in [-1, 1], but we clip
+        
+        # Combine with distance information
+        median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+        distance_decay = np.exp(-distance_matrix / (median_dist + epsilon))
+        
+        cluster_scores = 1.0 + affinity * distance_decay
+        np.fill_diagonal(cluster_scores, 0)
+        return cluster_scores
+    
+    cluster_scores = spectral_embedding_affinity()
+    
+    # ==================== 4. CROSS-VALIDATED ENSEMBLE LEARNING ====================
+    def cross_validated_weights(num_folds: int = 5, num_tours_per_fold: int = 15) -> Tuple[float, float, float]:
+        """Learn optimal weights using k-fold cross-validation"""
+        if n < 4:
+            return 0.4, 0.3, 0.3
+        
+        # Generate diverse initial tours
+        all_tours = []
+        tour_methods = ['nearest_neighbor', 'random', 'greedy']
+        
+        for method in tour_methods:
+            for _ in range(num_tours_per_fold // 3):
+                if method == 'nearest_neighbor':
+                    tour = _nearest_neighbor_tour(distance_matrix)
+                elif method == 'random':
+                    tour = list(range(n))
+                    np.random.shuffle(tour)
+                    tour.append(tour[0])
+                else:  # greedy
+                    tour = _greedy_tour(distance_matrix)
+                all_tours.append(tour)
+        
+        if not all_tours:
+            return 0.4, 0.3, 0.3
+        
+        # Score components
+        components = {
+            'regret': regret_scores,
+            'inv_dist': inv_dist,
+            'cluster': cluster_scores
+        }
+        
+        # K-fold cross-validation
+        fold_size = len(all_tours) // num_folds
+        if fold_size == 0:
+            num_folds = 1
+            fold_size = len(all_tours)
+        
+        fold_performances = []
+        
+        for fold in range(num_folds):
+            start_idx = fold * fold_size
+            end_idx = min((fold + 1) * fold_size, len(all_tours))
+            
+            val_tours = all_tours[start_idx:end_idx]
+            train_tours = all_tours[:start_idx] + all_tours[end_idx:]
+            
+            if not train_tours or not val_tours:
+                continue
+            
+            # Evaluate on training tours
+            train_scores = []
+            for comp_name, comp_matrix in components.items():
+                perf = _evaluate_component(comp_matrix, train_tours, distance_matrix)
+                train_scores.append(perf)
+            
+            # Normalize training scores to get candidate weights
+            train_sum = sum(train_scores)
+            if train_sum > 0:
+                cand_weights = [s / train_sum for s in train_scores]
+            else:
+                cand_weights = [1/3, 1/3, 1/3]
+            
+            # Evaluate on validation tours
+            combined = (cand_weights[0] * components['regret'] +
+                       cand_weights[1] * components['inv_dist'] +
+                       cand_weights[2] * components['cluster'])
+            
+            val_perf = _evaluate_component(combined, val_tours, distance_matrix)
+            fold_performances.append((val_perf, cand_weights))
+        
+        if not fold_performances:
+            return 0.4, 0.3, 0.3
+        
+        # Choose weights from best fold
+        best_fold = max(fold_performances, key=lambda x: x[0])
+        return best_fold[1][0], best_fold[1][1], best_fold[1][2]
+    
+    def _nearest_neighbor_tour(dist_mat: np.ndarray) -> List[int]:
+        """Generate tour using nearest neighbor heuristic"""
+        start = np.random.randint(0, n)
+        tour = [start]
+        unvisited = set(range(n)) - {start}
+        
+        current = start
+        while unvisited:
+            # Find nearest unvisited neighbor
+            dists = dist_mat[current]
+            nearest = min(unvisited, key=lambda x: dists[x])
+            tour.append(nearest)
+            unvisited.remove(nearest)
+            current = nearest
+        
+        tour.append(tour[0])  # Return to start
+        return tour
+    
+    def _greedy_tour(dist_mat: np.ndarray) -> List[int]:
+        """Generate tour using greedy edge construction"""
+        # Create list of all edges sorted by distance
+        edges = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                edges.append((dist_mat[i, j], i, j))
+        edges.sort()
+        
+        # Greedy construction
+        degree = [0] * n
+        adj = [[] for _ in range(n)]
+        
+        for _, i, j in edges:
+            if degree[i] < 2 and degree[j] < 2:
+                # Check if adding this edge creates a cycle prematurely
+                if _would_create_cycle(adj, i, j, n):
+                    continue
+                
+                adj[i].append(j)
+                adj[j].append(i)
+                degree[i] += 1
+                degree[j] += 1
+                
+                if all(d == 2 for d in degree):
+                    break
+        
+        # Convert adjacency list to tour
+        tour = []
+        current = 0
+        prev = -1
+        
+        while len(tour) < n:
+            tour.append(current)
+            neighbors = adj[current]
+            if len(neighbors) == 1:
+                next_node = neighbors[0]
+            else:
+                next_node = neighbors[0] if neighbors[0] != prev else neighbors[1]
+            prev, current = current, next_node
+        
+        tour.append(tour[0])
+        return tour
+    
+    def _would_create_cycle(adj: List[List[int]], u: int, v: int, n_nodes: int) -> bool:
+        """Check if adding edge (u,v) would create a cycle before completing the tour"""
+        # Simple DFS to check connectivity
+        visited = [False] * n_nodes
+        stack = [u]
+        visited[u] = True
+        
+        count = 1
+        while stack:
+            node = stack.pop()
+            for neighbor in adj[node]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    stack.append(neighbor)
+                    count += 1
+        
+        # If v is already connected to u, adding the edge would create a cycle
+        return visited[v]
+    
+    def _evaluate_component(scores: np.ndarray, tours: List[List[int]], 
+                           dist_mat: np.ndarray) -> float:
+        """Evaluate component quality on tours"""
+        total_score = 0.0
+        
+        for tour in tours:
+            # Calculate tour length
+            tour_length = sum(dist_mat[tour[k], tour[k+1]] for k in range(len(tour)-1))
+            
+            # Calculate average score of edges in tour
+            tour_score = sum(scores[tour[k], tour[k+1]] for k in range(len(tour)-1))
+            avg_tour_score = tour_score / (len(tour) - 1)
+            
+            # Components that give high scores to short tours are better
+            total_score += avg_tour_score / (tour_length + epsilon)
+        
+        return total_score / len(tours) if tours else 0.0
+    
+    # Learn optimal weights
+    w_regret, w_inv, w_cluster = cross_validated_weights()
+    
+    # ==================== 5. MULTI-OPT TOUR REINFORCEMENT ====================
+    def multi_opt_reinforcement(base_scores: np.ndarray) -> np.ndarray:
+        """Reinforce scores based on patterns from 2-opt and 3-opt improved tours"""
+        reinforced = base_scores.copy()
+        
+        # Generate diverse high-quality tours
+        high_quality_tours = []
+        num_tours = min(12, max(3, n // 5))
+        
+        # Generate initial tours with different methods
+        for _ in range(num_tours):
+            # Random start tour
+            tour = list(range(n))
+            np.random.shuffle(tour)
+            tour.append(tour[0])
+            
+            # Apply 2-opt and 3-opt improvements
+            improved_2opt = _two_opt_improvement(tour, distance_matrix)
+            improved_3opt = _three_opt_improvement(improved_2opt, distance_matrix)
+            high_quality_tours.append(improved_3opt)
+        
+        # Boost edges that appear frequently in high-quality tours
+        edge_counts = np.zeros_like(reinforced)
+        
+        for tour in high_quality_tours:
+            for k in range(len(tour) - 1):
+                i, j = tour[k], tour[k + 1]
+                edge_counts[i, j] += 1.0
+                edge_counts[j, i] += 1.0
+        
+        # Normalize and apply reinforcement
+        if np.max(edge_counts) > 0:
+            edge_boost = edge_counts / np.max(edge_counts)
+            reinforcement = 1.0 + 0.6 * edge_boost  # Boost up to 60%
+            reinforced *= reinforcement
+        
+        # Additional boost for MST edges
+        mst_boost = np.where(mst_edges, 1.0 + 0.3 * np.log1p(n), 1.0)
+        reinforced *= mst_boost
+        
+        return reinforced
+    
+    def _two_opt_improvement(tour: List[int], dist_mat: np.ndarray) -> List[int]:
+        """2-opt local search improvement"""
+        tour = tour[:-1]  # Remove closing edge
+        n_nodes = len(tour)
+        improved = True
+        
+        while improved:
+            improved = False
+            best_gain = 0
+            best_i, best_j = -1, -1
+            
+            for i in range(n_nodes - 1):
+                for j in range(i + 2, n_nodes):
+                    a, b = tour[i], tour[(i + 1) % n_nodes]
+                    c, d = tour[j], tour[(j + 1) % n_nodes]
+                    
+                    current = dist_mat[a, b] + dist_mat[c, d]
+                    new = dist_mat[a, c] + dist_mat[b, d]
+                    gain = current - new
+                    
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_i, best_j = i, j
+            
+            if best_gain > 0:
+                # Reverse segment between i+1 and j
+                tour[best_i + 1:best_j + 1] = reversed(tour[best_i + 1:best_j + 1])
+                improved = True
+        
+        return tour + [tour[0]]
+    
+    def _three_opt_improvement(tour: List[int], dist_mat: np.ndarray) -> List[int]:
+        """3-opt local search improvement (simplified version)"""
+        tour = tour[:-1]
+        n_nodes = len(tour)
+        best_tour = tour[:]
+        best_length = _tour_length(tour, dist_mat)
+        
+        # Try a limited number of 3-opt moves
+        for i in range(n_nodes):
+            for j in range(i + 2, n_nodes):
+                for k in range(j + 2, n_nodes):
+                    if k == n_nodes - 1 and i == 0:
+                        continue
+                    
+                    # Get the three edges to potentially break
+                    a, b = tour[i], tour[(i + 1) % n_nodes]
+                    c, d = tour[j], tour[(j + 1) % n_nodes]
+                    e, f = tour[k], tour[(k + 1) % n_nodes]
+                    
+                    # Current cost
+                    current = dist_mat[a, b] + dist_mat[c, d] + dist_mat[e, f]
+                    
+                    # Try different reconnections
+                    # Type 0: Original
+                    # Type 1: 2-opt between (a,b) and (c,d)
+                    new1 = dist_mat[a, c] + dist_mat[b, d] + dist_mat[e, f]
+                    # Type 2: 2-opt between (c,d) and (e,f)
+                    new2 = dist_mat[a, b] + dist_mat[c, e] + dist_mat[d, f]
+                    # Type 3: 3-opt reversal
+                    new3 = dist_mat[a, d] + dist_mat[e, b] + dist_mat[c, f]
+                    
+                    best_new = min(new1, new2, new3)
+                    
+                    if best_new < current:
+                        # Apply the best reconnection
+                        if best_new == new1:
+                            # Reverse segment b..c
+                            segment = tour[(i + 1) % n_nodes:(j + 1) % n_nodes]
+                            tour[(i + 1) % n_nodes:(j + 1) % n_nodes] = reversed(segment)
+                        elif best_new == new2:
+                            # Reverse segment d..e
+                            segment = tour[(j + 1) % n_nodes:(k + 1) % n_nodes]
+                            tour[(j + 1) % n_nodes:(k + 1) % n_nodes] = reversed(segment)
+                        else:  # new3
+                            # More complex 3-opt move
+                            new_segment = (tour[(j + 1) % n_nodes:(k + 1) % n_nodes] +
+                                         tour[(i + 1) % n_nodes:(j + 1) % n_nodes])
+                            tour[(i + 1) % n_nodes:(k + 1) % n_nodes] = new_segment
+        
+        return best_tour + [best_tour[0]]
+    
+    def _tour_length(tour: List[int], dist_mat: np.ndarray) -> float:
+        """Calculate total length of a tour"""
+        return sum(dist_mat[tour[i], tour[i + 1]] for i in range(len(tour) - 1))
+    
+    # ==================== 6. COMPOSITE SCORE CALCULATION ====================
+    # Weighted combination
+    base_composite = (
+        w_regret * regret_scores +
+        w_inv * inv_dist +
+        w_cluster * cluster_scores
+    )
+    
+    # Apply reinforcement
+    reinforced_composite = multi_opt_reinforcement(base_composite)
+    
+    # ==================== 7. ADAPTIVE CONNECTIVITY-PRESERVING SPARSIFICATION ====================
+    def connectivity_sparsification(scores: np.ndarray) -> np.ndarray:
+        """Intelligent edge retention ensuring connectivity"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine adaptive degree limits
+        if n <= 10:
+            max_degree = min(4, n - 1)
+        elif n <= 50:
+            max_degree = min(5, n // 3)
+        else:
+            max_degree = min(6, n // 4)
+        
+        # Collect candidate non-MST edges
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    # Score adjusted by node degree in current sparsification
+                    current_deg_i = np.sum(sparsified[i] > 0)
+                    current_deg_j = np.sum(sparsified[j] > 0)
+                    
+                    degree_penalty = (1.0 - 0.1 * (current_deg_i + current_deg_j))
+                    effective_score = scores[i, j] * degree_penalty
+                    
+                    candidates.append((effective_score, i, j))
+        
+        # Sort by effective score
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Add edges while respecting degree constraints
+        current_degrees = np.sum(sparsified > 0, axis=1)
+        
+        for score, i, j in candidates:
+            if current_degrees[i] < max_degree and current_degrees[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[j, i]
+                current_degrees[i] += 1
+                current_degrees[j] += 1
+        
+        return sparsified
+    
+    sparsified_scores = connectivity_sparsification(reinforced_composite)
+    
+    # ==================== 8. FINAL PROCESSING ====================
+    # Ensure symmetry
+    symmetric_scores = (sparsified_scores + sparsified_scores.T) / 2
+    
+    # Apply final distance-based attenuation
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        # Adaptive decay factor based on distance distribution
+        median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+        decay_factor = np.exp(-distance_matrix / (0.4 * median_dist + epsilon))
+        symmetric_scores *= decay_factor
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    # Apply soft threshold to remove very weak edges
+    threshold = np.percentile(symmetric_scores[symmetric_scores > 0], 10) if np.any(symmetric_scores > 0) else 0
+    symmetric_scores[symmetric_scores < threshold] = 0
+    
+    # Final MST protection
+    symmetric_scores[mst_edges] = np.maximum(symmetric_scores[mst_edges], threshold * 0.5)
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

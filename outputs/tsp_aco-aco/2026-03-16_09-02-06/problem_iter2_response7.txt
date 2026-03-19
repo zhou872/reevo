@@ -1,0 +1,199 @@
+```json
+{
+    "algorithm_features": ["Regret-Aware Edge Prioritization", "Two-Step Lookahead Cost Estimation", "Dynamic Feature Weighting", "Clustering-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with regret-based mechanisms,
+    lookahead strategies, and dynamic weight adjustments.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Priority matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Dynamic weight adjustments based on problem size
+    base_weights = {
+        'inverse_dist': max(0.3, 0.5 - 0.01 * n),  # Decrease with size
+        'regret': min(0.4, 0.2 + 0.005 * n),       # Increase with size
+        'lookahead': max(0.2, 0.4 - 0.01 * n),     # Decrease with size
+        'clustering': 0.1                           # Constant small weight
+    }
+    
+    # Normalize weights to sum to 1
+    total = sum(base_weights.values())
+    weights = {k: v/total for k, v in base_weights.items()}
+    
+    # 1. Base inverse distance with neighbor scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-9)
+    
+    # Scale by nearest neighbor distances
+    k_nn = min(3, n-1)
+    nearest_dists = np.partition(distance_matrix, k_nn, axis=1)[:, 1:k_nn+1].mean(axis=1)
+    scaling_factors = nearest_dists[:, None] * nearest_dists[None, :]
+    inv_dist_scaled = inv_dist * scaling_factors
+    
+    # 2. Regret-based prioritization
+    regret_matrix = np.zeros((n, n))
+    
+    # For each node, compute the "regret" of not choosing each edge
+    for i in range(n):
+        # Sort distances from node i to all other nodes
+        sorted_dists = np.sort(distance_matrix[i])
+        sorted_indices = np.argsort(distance_matrix[i])
+        
+        # The best edge has distance sorted_dists[1] (index 0 is self)
+        best_dist = sorted_dists[1] if n > 1 else 0
+        
+        for rank, j in enumerate(sorted_indices[1:], 1):
+            if i == j:
+                continue
+                
+            # Regret factor: how much worse is this edge compared to the best?
+            # Higher regret means this edge is a poor alternative to the best edge
+            dist_ij = distance_matrix[i, j]
+            
+            # Compute rank-based regret
+            if rank == 1:
+                # This is the best edge - no regret
+                regret_ij = 0
+            else:
+                # Regret increases with rank and distance ratio
+                dist_ratio = dist_ij / (best_dist + 1e-9)
+                regret_ij = (rank - 1) * dist_ratio
+            
+            # Also consider mutual regret (symmetry)
+            regret_matrix[i, j] = 1.0 / (1.0 + regret_ij)
+    
+    # Symmetrize regret matrix
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # 3. Two-step lookahead cost estimation
+    lookahead_matrix = np.zeros((n, n))
+    
+    # Precompute nearest neighbors for each node
+    k_lookahead = min(5, n-1)
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_lookahead+1]
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if i == j:
+                continue
+                
+            # Current edge cost
+            current_cost = distance_matrix[i, j]
+            
+            # Estimate best possible extensions from both endpoints
+            # Find best next node from i (excluding j)
+            mask_i = np.ones(n, dtype=bool)
+            mask_i[[i, j]] = False
+            if np.any(mask_i):
+                best_from_i = np.min(distance_matrix[i, mask_i])
+            else:
+                best_from_i = 0
+                
+            # Find best next node from j (excluding i)
+            mask_j = np.ones(n, dtype=bool)
+            mask_j[[i, j]] = False
+            if np.any(mask_j):
+                best_from_j = np.min(distance_matrix[j, mask_j])
+            else:
+                best_from_j = 0
+            
+            # Two-step lookahead cost
+            lookahead_cost = current_cost + best_from_i + best_from_j
+            
+            # Normalize by average edge cost
+            avg_cost = np.mean(distance_matrix[distance_matrix > 0])
+            lookahead_score = avg_cost / (lookahead_cost + 1e-9)
+            
+            lookahead_matrix[i, j] = lookahead_score
+            lookahead_matrix[j, i] = lookahead_score
+    
+    # 4. Clustering-aware component
+    clustering_matrix = np.zeros((n, n))
+    
+    # Simple clustering coefficient approximation
+    for i in range(n):
+        # Find k nearest neighbors for node i
+        k_cluster = min(4, n-1)
+        nearest_to_i = np.argsort(distance_matrix[i])[1:k_cluster+1]
+        
+        for j in range(i+1, n):
+            if i == j:
+                continue
+                
+            # Find k nearest neighbors for node j
+            nearest_to_j = np.argsort(distance_matrix[j])[1:k_cluster+1]
+            
+            # Count common neighbors (excluding i and j themselves)
+            common_neighbors = len(set(nearest_to_i) & set(nearest_to_j) - {i, j})
+            
+            # Clustering bonus: edges between nodes that share neighbors
+            clustering_bonus = common_neighbors / k_cluster
+            
+            clustering_matrix[i, j] = clustering_bonus
+            clustering_matrix[j, i] = clustering_bonus
+    
+    # 5. Combine all components with dynamic weights
+    heuristic_matrix = np.zeros((n, n))
+    
+    # Normalize each component
+    components = {
+        'inverse_dist': inv_dist_scaled,
+        'regret': regret_matrix,
+        'lookahead': lookahead_matrix,
+        'clustering': clustering_matrix
+    }
+    
+    for name, matrix in components.items():
+        if np.max(matrix) > 0:
+            norm_matrix = matrix / np.max(matrix)
+            heuristic_matrix += weights[name] * norm_matrix
+    
+    # 6. Adaptive sparsification
+    # Keep edges that are strong in multiple metrics
+    sparsified = np.zeros_like(heuristic_matrix)
+    
+    # For each node, keep top edges based on combined score
+    k_keep = min(max(2, n//4), 8)  # Adaptive k based on problem size
+    
+    for i in range(n):
+        row = heuristic_matrix[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Keep top k edges
+        top_indices = np.argpartition(row, -k_keep)[-k_keep:]
+        sparsified[i, top_indices] = row[top_indices]
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Additional global threshold
+    non_zero = sparsified[sparsified > 0]
+    if len(non_zero) > 0:
+        threshold = np.percentile(non_zero, 30)  # Keep top 70%
+        sparsified[sparsified < threshold] = 0
+    
+    # Final normalization
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    np.fill_diagonal(sparsified, 0)
+    
+    return sparsified
+```

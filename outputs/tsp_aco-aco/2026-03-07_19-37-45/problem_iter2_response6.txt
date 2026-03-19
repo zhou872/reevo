@@ -1,0 +1,186 @@
+```json
+{
+    "algorithm_features": ["Dynamic Power Scaling", "Regret-Based Penalty", "Local Cluster Density", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with regret-based penalization and adaptive scaling.
+    
+    Key improvements over v1:
+    1. Dynamic power scaling based on distance distribution
+    2. Regret-based penalty prioritizing edges with fewer good alternatives
+    3. Local cluster density metrics for intra-region connectivity
+    4. Adaptive sparsification with degree constraints
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # 1. Dynamic power scaling based on distance distribution
+    # Shorter edges get exponentially more weight when distances are concentrated
+    flat_distances = distance_matrix[np.triu_indices(n, k=1)]
+    if len(flat_distances) > 0:
+        distance_std = np.std(flat_distances)
+        distance_mean = np.mean(flat_distances)
+        # Higher power when distances are concentrated (low std/mean ratio)
+        concentration = distance_std / (distance_mean + 1e-12)
+        power = 1.5 + 1.0 * np.exp(-concentration)  # Dynamic between 1.5-2.5
+    else:
+        power = 1.5
+    
+    inv_dist = 1 / (distance_matrix + 1e-12)
+    inv_dist_pow = inv_dist ** power
+    
+    # 2. Regret-based penalty
+    # Prioritize edges that are much better than alternatives from both endpoints
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    # For each node, identify top-k alternative edges
+    k_regret = min(5, n - 1)
+    for i in range(n):
+        # Get distances from node i, excluding self
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        
+        # Find k+1 smallest distances for regret calculation
+        if k_regret < len(distances_i):
+            # Get indices of k+1 smallest distances
+            k_plus_1_indices = np.argpartition(distances_i, k_regret + 1)[:k_regret + 1]
+            k_plus_1_distances = distances_i[k_plus_1_indices]
+            
+            # Sort the k+1 distances
+            sorted_k_plus_1 = np.sort(k_plus_1_distances)
+            
+            # For each edge from i, calculate regret as difference to (k+1)th best
+            for j in range(n):
+                if i != j:
+                    dist_ij = distance_matrix[i, j]
+                    # Find kth best distance (excluding current edge if it's in top k)
+                    kth_best = sorted_k_plus_1[k_regret - 1] if dist_ij <= sorted_k_plus_1[k_regret] else sorted_k_plus_1[k_regret]
+                    regret = max(0, dist_ij - kth_best)
+                    # Normalize regret by typical distance
+                    regret_norm = regret / (sorted_k_plus_1[0] + 1e-12)
+                    # Apply penalty: higher regret -> lower penalty factor
+                    regret_matrix[i, j] *= np.exp(-regret_norm)
+    
+    # Symmetrize regret penalty (geometric mean of both directions)
+    regret_matrix = np.sqrt(regret_matrix * regret_matrix.T)
+    
+    # 3. Local cluster density
+    density_factor = np.ones_like(distance_matrix)
+    k_density = min(8, n - 1)
+    
+    for i in range(n):
+        # Find k_density nearest neighbors for node i
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        nn_indices = np.argpartition(distances_i, k_density)[:k_density]
+        
+        # Calculate average distance within this local cluster
+        if len(nn_indices) > 1:
+            # Create submatrix for these nodes
+            cluster_indices = np.append(nn_indices, i)
+            cluster_distances = distance_matrix[np.ix_(cluster_indices, cluster_indices)]
+            
+            # Calculate density as inverse of average intra-cluster distance
+            intra_cluster_mask = np.triu(np.ones_like(cluster_distances), k=1).astype(bool)
+            if np.any(intra_cluster_mask):
+                avg_intra_distance = np.mean(cluster_distances[intra_cluster_mask])
+                density = 1 / (avg_intra_distance + 1e-12)
+                
+                # Boost edges within dense clusters
+                for idx, j in enumerate(cluster_indices):
+                    if i != j:
+                        # Normalize density factor
+                        density_factor[i, j] *= 1.0 + 0.5 * np.tanh(density / 100)
+    
+    # 4. Degree-aware normalization (preserved from v1)
+    node_avg_dist = np.mean(distance_matrix, axis=1)
+    node_weights = node_avg_dist.max() / (node_avg_dist + 1e-12)
+    degree_matrix = np.outer(node_weights, node_weights)
+    
+    # 5. Combine all factors
+    heuristics_matrix = inv_dist_pow * regret_matrix * density_factor * degree_matrix
+    
+    # 6. Adaptive sparsification
+    # a) Nearest neighbor mask with adaptive k
+    k_nn = min(max(3, n // 8), n - 1)
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        distances_i = distance_matrix[i].copy()
+        distances_i[i] = np.inf
+        nn_indices = np.argpartition(distances_i, k_nn)[:k_nn]
+        nn_mask[i, nn_indices] = True
+    
+    # Symmetrize: edge is promising if either endpoint considers it in top-k
+    nn_mask = nn_mask | nn_mask.T
+    
+    # b) Distance threshold based on adaptive quantile
+    if len(flat_distances) > 0:
+        # Use more aggressive threshold for larger instances
+        quantile = 0.7 if n > 20 else 0.75
+        threshold = np.quantile(flat_distances, quantile)
+        dist_mask = distance_matrix <= threshold
+        np.fill_diagonal(dist_mask, False)
+    else:
+        dist_mask = np.ones_like(distance_matrix, dtype=bool)
+        np.fill_diagonal(dist_mask, False)
+    
+    # c) Apply combined mask
+    combined_mask = nn_mask & dist_mask
+    heuristics_matrix = heuristics_matrix * combined_mask
+    
+    # d) Ensure minimum degree of 2 for each node
+    min_degree = min(2, n - 1)
+    for i in range(n):
+        non_zero = np.where(heuristics_matrix[i] > 0)[0]
+        if len(non_zero) < min_degree:
+            # Find strongest missing edges from original combined score
+            original_scores = inv_dist_pow[i] * regret_matrix[i] * density_factor[i] * degree_matrix[i]
+            original_scores[i] = 0  # Exclude self
+            # Select top min_degree edges not already included
+            candidate_indices = np.argsort(original_scores)[-min_degree:]
+            for j in candidate_indices:
+                if heuristics_matrix[i, j] == 0 and i != j:
+                    heuristics_matrix[i, j] = original_scores[j]
+    
+    # 7. Symmetrize and normalize
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    
+    max_val = heuristics_matrix.max()
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # 8. Ensure diagonal is zero
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+
+# Example usage and validation
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_cities = 10
+    coords = np.random.rand(n_cities, 2) * 100
+    
+    # Create distance matrix
+    distances = squareform(pdist(coords, 'euclidean'))
+    
+    # Compute heuristics
+    h_matrix = heuristics_v2(distances)
+    
+    print("Distance matrix (first 4x4):")
+    print(distances[:4, :4])
+    print("\nHeuristics matrix (first 4x4):")
+    print(h_matrix[:4, :4])
+    print(f"\nSparsity: {(h_matrix == 0).sum() / h_matrix.size:.1%}")
+    print(f"Non-zero entries: {(h_matrix != 0).sum()}")
+    print(f"Average degree: {np.sum(h_matrix > 0) / n_cities:.1f}")
+```

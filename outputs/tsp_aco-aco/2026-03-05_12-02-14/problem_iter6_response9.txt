@@ -1,0 +1,279 @@
+```json
+{
+    "algorithm_features": ["DBSCAN Clustering", "Local Search Integration", "Adaptive Parameter Tuning", "Sparsity Control"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection with enhanced clustering,
+    local search integration, and online parameter adaptation.
+    
+    Features:
+    1. DBSCAN clustering for robust cluster identification
+    2. Local search heuristic integration (nearest-neighbor and 2-opt awareness)
+    3. Online parameter tuning during heuristic computation
+    4. Intelligent sparsity control based on problem structure
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, with higher values
+        indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            reciprocal = 1 / distance_matrix
+            reciprocal[np.isinf(reciprocal)] = 0
+            reciprocal[np.nan_to_num(reciprocal, nan=0)] = 0
+        np.fill_diagonal(reciprocal, 0)
+        return reciprocal
+    
+    # 1. DBSCAN Clustering for robust cluster identification
+    def dbscan_clustering(dist_matrix, eps_quantile=0.2, min_samples=5):
+        """Custom DBSCAN implementation for distance matrices"""
+        n = dist_matrix.shape[0]
+        labels = -np.ones(n, dtype=int)  # -1 for unvisited/noise
+        cluster_id = 0
+        
+        # Adaptive epsilon based on distance distribution
+        upper_tri = dist_matrix[np.triu_indices(n, k=1)]
+        eps = np.percentile(upper_tri, eps_quantile * 100)
+        
+        visited = np.zeros(n, dtype=bool)
+        
+        for i in range(n):
+            if not visited[i]:
+                visited[i] = True
+                
+                # Find neighbors within epsilon
+                neighbors = np.where(dist_matrix[i] <= eps)[0]
+                neighbors = neighbors[neighbors != i]
+                
+                if len(neighbors) < min_samples:
+                    labels[i] = -1  # Noise point
+                else:
+                    # Expand cluster
+                    labels[i] = cluster_id
+                    seed_set = set(neighbors)
+                    
+                    while seed_set:
+                        j = seed_set.pop()
+                        
+                        if not visited[j]:
+                            visited[j] = True
+                            j_neighbors = np.where(dist_matrix[j] <= eps)[0]
+                            j_neighbors = j_neighbors[j_neighbors != j]
+                            
+                            if len(j_neighbors) >= min_samples:
+                                seed_set.update(j_neighbors)
+                        
+                        if labels[j] == -1:
+                            labels[j] = cluster_id
+                    
+                    cluster_id += 1
+        
+        return labels, cluster_id
+    
+    # Run DBSCAN with adaptive parameters
+    eps_quantile = 0.15 if n > 50 else 0.25
+    min_samples = max(2, min(5, n // 20))
+    cluster_labels, n_clusters = dbscan_clustering(
+        distance_matrix, eps_quantile, min_samples
+    )
+    
+    # 2. Reciprocal distance with safe handling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    # 3. Local search heuristic integration
+    # Build nearest neighbor tour to identify promising edges
+    def build_nn_tour(start_node=0):
+        """Build a tour using nearest neighbor heuristic"""
+        tour = [start_node]
+        visited = np.zeros(n, dtype=bool)
+        visited[start_node] = True
+        
+        current = start_node
+        for _ in range(n - 1):
+            # Find nearest unvisited neighbor
+            row = distance_matrix[current].copy()
+            row[visited] = np.inf
+            if np.all(row == np.inf):
+                break
+            next_node = np.argmin(row)
+            tour.append(next_node)
+            visited[next_node] = True
+            current = next_node
+        
+        return np.array(tour)
+    
+    # Generate multiple NN tours from different starting points
+    nn_starts = min(10, n)
+    tour_edges = defaultdict(int)
+    
+    for start in range(0, n, max(1, n // nn_starts)):
+        tour = build_nn_tour(start)
+        # Add edges from tour
+        for i in range(len(tour)):
+            u, v = tour[i], tour[(i + 1) % len(tour)]
+            tour_edges[(min(u, v), max(u, v))] += 1
+    
+    # Create tour boost matrix
+    tour_boost = np.ones_like(reciprocal)
+    for (u, v), count in tour_edges.items():
+        boost = 1.0 + 0.1 * count  # Linear boost based on frequency
+        tour_boost[u, v] = tour_boost[v, u] = boost
+    
+    # 4. Cluster-based adjustments with online parameter learning
+    # Compute cluster statistics for adaptive tuning
+    cluster_stats = {}
+    for cluster_id in range(n_clusters):
+        mask = cluster_labels == cluster_id
+        if np.sum(mask) > 0:
+            intra_distances = distance_matrix[mask][:, mask]
+            if intra_distances.size > 0:
+                cluster_stats[cluster_id] = {
+                    'size': np.sum(mask),
+                    'mean_intra': np.mean(intra_distances),
+                    'std_intra': np.std(intra_distances) if intra_distances.size > 1 else 0
+                }
+    
+    # Create cluster adjustment matrix
+    cluster_adj = np.ones_like(reciprocal)
+    
+    if n_clusters > 0:
+        # Intra-cluster boost
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cluster_labels[i] == cluster_labels[j] and cluster_labels[i] != -1:
+                    # Stronger boost for denser clusters
+                    cluster_id = cluster_labels[i]
+                    if cluster_id in cluster_stats:
+                        density = 1.0 / (cluster_stats[cluster_id]['mean_intra'] + 1e-10)
+                        boost = 1.0 + 0.3 * min(1.0, density / n)  # Normalized boost
+                        cluster_adj[i, j] = cluster_adj[j, i] = boost
+        
+        # Inter-cluster penalty
+        if n_clusters > 1:
+            # Compute cluster centroids (approximate)
+            centroids = {}
+            for cluster_id in range(n_clusters):
+                mask = cluster_labels == cluster_id
+                if np.any(mask):
+                    # Use geometric median approximation
+                    centroids[cluster_id] = np.median(distance_matrix[mask], axis=0)
+            
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if cluster_labels[i] != cluster_labels[j] and \
+                       cluster_labels[i] != -1 and cluster_labels[j] != -1:
+                        c1, c2 = cluster_labels[i], cluster_labels[j]
+                        if c1 in centroids and c2 in centroids:
+                            # Distance between cluster centroids
+                            cluster_dist = np.linalg.norm(centroids[c1] - centroids[c2])
+                            max_dist = np.max(list(centroids.values()), axis=0)
+                            max_dist = np.linalg.norm(max_dist) if max_dist.size > 0 else 1
+                            penalty = 0.5 + 0.5 * (cluster_dist / (max_dist + 1e-10))
+                            cluster_adj[i, j] = cluster_adj[j, i] = max(0.3, penalty)
+    
+    # 5. Adaptive combination with online learning
+    # Analyze distance distribution for weight adaptation
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_stats = {
+        'mean': np.mean(flat_dists),
+        'std': np.std(flat_dists),
+        'cv': np.std(flat_dists) / (np.mean(flat_dists) + 1e-10)
+    }
+    
+    # Adaptive weights based on problem characteristics
+    if dist_stats['cv'] < 0.3:  # Uniform distances
+        w_rec = 0.6
+        w_cluster = 0.2
+        w_tour = 0.2
+    elif dist_stats['cv'] > 0.7:  # Highly variable distances
+        w_rec = 0.4
+        w_cluster = 0.4
+        w_tour = 0.2
+    else:  # Moderate variability
+        w_rec = 0.5
+        w_cluster = 0.3
+        w_tour = 0.2
+    
+    # Adjust weights based on clustering quality
+    if n_clusters > 1 and n_clusters < n / 2:
+        # Good clustering found, emphasize it more
+        w_cluster = min(0.5, w_cluster * 1.5)
+        w_rec = 1.0 - w_cluster - w_tour
+    
+    # Combine components
+    combined = (w_rec * reciprocal +
+                w_cluster * cluster_adj +
+                w_tour * tour_boost)
+    
+    # 6. Intelligent sparsity control
+    # Determine optimal sparsity level
+    if n < 20:
+        top_k = n - 1  # Keep all edges for small problems
+    elif n < 100:
+        top_k = int(np.sqrt(n) * 2)
+    else:
+        top_k = int(np.sqrt(n) * 1.5)
+    
+    sparsified = np.zeros_like(combined)
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        if top_k < n - 1:
+            # Get top-k edges efficiently
+            top_k_idx = np.argpartition(row, -top_k)[-top_k:]
+            top_k_vals = row[top_k_idx]
+            
+            # Sort only top-k edges
+            sorted_idx = top_k_idx[np.argsort(top_k_vals)[::-1]]
+            
+            # Apply smooth decay based on rank
+            for rank, j in enumerate(sorted_idx):
+                # Adaptive decay rate based on problem size
+                decay_rate = 3.0 if n > 100 else 2.0
+                decay = np.exp(-rank / decay_rate)
+                sparsified[i, j] = combined[i, j] * decay
+        else:
+            # Keep all edges with mild decay
+            all_idx = np.arange(n)
+            all_idx = all_idx[all_idx != i]
+            sorted_idx = all_idx[np.argsort(row[all_idx])[::-1]]
+            
+            for rank, j in enumerate(sorted_idx):
+                decay = np.exp(-rank / 3.0)
+                sparsified[i, j] = combined[i, j] * decay
+    
+    # 7. Final processing
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

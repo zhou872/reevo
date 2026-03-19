@@ -1,0 +1,331 @@
+```json
+{
+    "algorithm_features": ["Lightweight Christofides Approximation", "Dynamic Sparsity-Adaptive Parameters", "Regret-Strength Balanced Scoring", "Tour-Completion Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with lightweight global approximations and
+    dynamic parameter adaptation based on instance characteristics.
+    
+    Key innovations:
+    1. Lightweight Christofides-like approximation for global guidance
+    2. Dynamic parameter tuning based on instance sparsity and uniformity
+    3. Regret-strength balanced scoring with tour-completion weighting
+    4. Efficient candidate selection with connectivity preservation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. INSTANCE ANALYSIS & DYNAMIC PARAMETER ADAPTATION
+    # ------------------------------------------------------------
+    
+    # Extract upper triangular distances for analysis
+    triu_indices = np.triu_indices(n, k=1)
+    distances = safe_dist[triu_indices]
+    
+    # Compute instance characteristics
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + eps)  # Coefficient of variation
+    sparsity = np.percentile(distances, 25) / (np.percentile(distances, 75) + eps)
+    
+    # Dynamic parameter adaptation
+    if n < 20:
+        k_candidate = min(n - 1, 6)
+        regret_strength = 0.8
+        global_weight = 0.3
+    elif dist_cv < 0.25 or sparsity > 0.8:
+        # Uniform or dense instances
+        k_candidate = max(5, int(np.sqrt(n)))
+        regret_strength = 0.6
+        global_weight = 0.4
+    else:
+        # Sparse or varied instances
+        k_candidate = max(4, int(n ** 0.35))
+        regret_strength = 0.9
+        global_weight = 0.2
+    
+    # ------------------------------------------------------------
+    # 2. LIGHTWEIGHT CHRISTOFIDES-LIKE APPROXIMATION
+    # ------------------------------------------------------------
+    
+    global_prior = np.zeros_like(distance_matrix)
+    
+    if n <= 1000:  # Practical limit for MST-based heuristic
+        try:
+            # Minimum Spanning Tree
+            mst = minimum_spanning_tree(safe_dist).toarray()
+            mst_edges = (mst + mst.T) > 0
+            
+            # Identify odd-degree vertices in MST
+            degrees = mst_edges.sum(axis=1)
+            odd_vertices = np.where(degrees % 2 == 1)[0]
+            
+            if len(odd_vertices) >= 2:
+                # Build minimum weight matching (simplified greedy approximation)
+                odd_dist = safe_dist[np.ix_(odd_vertices, odd_vertices)]
+                np.fill_diagonal(odd_dist, np.inf)
+                
+                matching_edges = np.zeros_like(odd_dist, dtype=bool)
+                used = np.zeros(len(odd_vertices), dtype=bool)
+                
+                for _ in range(len(odd_vertices) // 2):
+                    # Find minimum unused edge
+                    mask = np.ones_like(odd_dist, dtype=bool)
+                    mask[used] = True
+                    mask[:, used] = True
+                    np.fill_diagonal(mask, True)
+                    
+                    if not np.any(odd_dist[mask == False]):
+                        break
+                    
+                    min_idx = np.unravel_index(np.argmin(np.where(mask, np.inf, odd_dist)), odd_dist.shape)
+                    i, j = min_idx
+                    
+                    matching_edges[i, j] = True
+                    matching_edges[j, i] = True
+                    used[i] = used[j] = True
+                
+                # Convert matching edges back to original indices
+                for idx_i, i in enumerate(odd_vertices):
+                    for idx_j, j in enumerate(odd_vertices):
+                        if matching_edges[idx_i, idx_j] and i < j:
+                            global_prior[i, j] = 0.25
+                            global_prior[j, i] = 0.25
+            
+            # Boost MST edges
+            global_prior[mst_edges] = np.maximum(global_prior[mst_edges], 0.15)
+            
+            # Add nearest neighbor path edges (lightweight greedy)
+            for start in range(min(3, n)):
+                unvisited = set(range(n))
+                current = start
+                unvisited.remove(current)
+                
+                while unvisited:
+                    # Find nearest unvisited neighbor
+                    available = list(unvisited)
+                    nearest = available[np.argmin(safe_dist[current, available])]
+                    global_prior[current, nearest] += 0.1
+                    global_prior[nearest, current] += 0.1
+                    unvisited.remove(nearest)
+                    current = nearest
+            
+            # Normalize global prior
+            max_global = np.max(global_prior)
+            if max_global > eps:
+                global_prior = global_prior / max_global
+        
+        except:
+            # Fallback: use inverse distance as global prior
+            global_prior = 1.0 / (safe_dist + eps)
+            np.fill_diagonal(global_prior, 0)
+            if np.max(global_prior) > 0:
+                global_prior = global_prior / np.max(global_prior)
+    
+    # ------------------------------------------------------------
+    # 3. REGRET-STRENGTH BALANCED SCORING
+    # ------------------------------------------------------------
+    
+    # Base inverse distance (robust normalization)
+    median_dist = np.median(distances)
+    inv_dist = median_dist / (safe_dist + eps)
+    
+    # Regret matrix with adaptive strength
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        
+        # Sort distances to find best and alternative options
+        sorted_dists = np.sort(dists)
+        best_dist = sorted_dists[0]
+        alt_idx = min(3, len(sorted_dists) - 1)
+        alt_dist = sorted_dists[alt_idx]
+        worst_dist = sorted_dists[-1]
+        
+        # Compute regret for each edge
+        for j in range(n):
+            if i == j:
+                continue
+                
+            edge_dist = dists[j]
+            
+            if edge_dist <= alt_dist + eps:
+                # Good edge: minimal to moderate regret
+                if edge_dist <= best_dist + eps:
+                    regret = 0.0
+                else:
+                    # Smooth transition based on position
+                    rank = np.searchsorted(sorted_dists, edge_dist)
+                    norm_rank = rank / max(1, len(sorted_dists) - 1)
+                    regret = 0.1 + 0.2 * norm_rank
+            else:
+                # Poor edge: higher regret with adaptive scaling
+                poorness = (edge_dist - alt_dist) / (worst_dist - alt_dist + eps)
+                regret = 0.3 + 0.7 * poorness
+            
+            regret_matrix[i, j] = regret
+    
+    # Apply regret strength parameter
+    regret_penalty = np.exp(-regret_strength * regret_matrix)
+    
+    # ------------------------------------------------------------
+    # 4. ADAPTIVE CANDIDATE SELECTION WITH TOUR-COMPLETION
+    # ------------------------------------------------------------
+    
+    candidate_scores = inv_dist * regret_penalty
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Select top-k candidates
+        scores = candidate_scores[i].copy()
+        scores[i] = -np.inf  # Exclude self
+        
+        if np.all(scores == -np.inf):
+            # Fallback: nearest neighbors
+            k_actual = min(k_candidate, n - 1)
+            neighbors = np.argsort(safe_dist[i])[:k_actual]
+            candidate_mask[i, neighbors] = True
+        else:
+            # Dynamic threshold based on score distribution
+            valid_scores = scores[scores > -np.inf]
+            if len(valid_scores) > 0:
+                threshold = np.percentile(valid_scores, 100 * (1 - k_candidate / (n - 1)))
+                candidate_mask[i, scores >= threshold] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # ------------------------------------------------------------
+    # 5. TOUR-COMPLETION WEIGHTING
+    # ------------------------------------------------------------
+    
+    # Estimate completion difficulty for each edge
+    completion_weights = np.ones_like(distance_matrix)
+    
+    if n >= 4:
+        for i in range(n):
+            # Find candidate neighbors
+            neighbors = np.where(candidate_mask[i])[0]
+            if len(neighbors) < 2:
+                continue
+            
+            # For each candidate edge (i,j), estimate remaining tour difficulty
+            for j in neighbors:
+                if i >= j:
+                    continue
+                
+                # Simulate taking edge (i,j) and estimate remaining connectivity
+                remaining_nodes = set(range(n)) - {i, j}
+                
+                # Check connectivity of remaining graph without i and j
+                if len(remaining_nodes) > 0:
+                    # Simple approximation: median distance in remaining graph
+                    rem_distances = []
+                    for a in remaining_nodes:
+                        for b in remaining_nodes:
+                            if a < b:
+                                rem_distances.append(safe_dist[a, b])
+                    
+                    if rem_distances:
+                        median_rem = np.median(rem_distances)
+                        # Weight based on edge length vs remaining difficulty
+                        ratio = safe_dist[i, j] / (median_rem + eps)
+                        completion_weights[i, j] = np.exp(-0.5 * ratio)
+                        completion_weights[j, i] = completion_weights[i, j]
+    
+    # ------------------------------------------------------------
+    # 6. INTEGRATED SCORING WITH GLOBAL GUIDANCE
+    # ------------------------------------------------------------
+    
+    # Combine components
+    heuristics = np.zeros_like(distance_matrix)
+    
+    # Base score: regret-penalized inverse distance
+    base_score = inv_dist * regret_penalty
+    
+    # Apply completion weighting
+    weighted_score = base_score * completion_weights
+    
+    # Add global guidance with adaptive weight
+    final_score = weighted_score * (1 + global_weight * global_prior)
+    
+    # Apply candidate mask
+    heuristics = final_score * candidate_mask
+    
+    # ------------------------------------------------------------
+    # 7. CONNECTIVITY ENFORCEMENT & NORMALIZATION
+    # ------------------------------------------------------------
+    
+    # Ensure minimum connectivity (at least 2 edges per node)
+    min_edges = min(2, n - 1)
+    for i in range(n):
+        row = heuristics[i]
+        nonzero_count = np.sum(row > eps)
+        
+        if nonzero_count < min_edges:
+            # Find additional promising edges
+            scores = base_score[i].copy()
+            scores[i] = -np.inf
+            scores[row > eps] = -np.inf  # Exclude already selected
+            
+            additional = min_edges - nonzero_count
+            if additional > 0 and np.any(scores > -np.inf):
+                top_additional = np.argsort(-scores)[:additional]
+                boost_value = np.max(heuristics[heuristics > eps]) if np.any(heuristics > eps) else 0.5
+                
+                for j in top_additional:
+                    if scores[j] > -np.inf:
+                        heuristics[i, j] = boost_value
+                        heuristics[j, i] = boost_value
+    
+    # Symmetrize and zero diagonal
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-wise softmax normalization with adaptive temperature
+    if n > 2:
+        for i in range(n):
+            row = heuristics[i]
+            if np.sum(row) > eps:
+                # Adaptive temperature based on row entropy
+                row_std = np.std(row[row > eps]) if np.any(row > eps) else 1.0
+                temperature = max(0.1, row_std * 2.0)
+                
+                exp_row = np.exp(row / temperature)
+                row_sum = np.sum(exp_row)
+                if row_sum > eps:
+                    heuristics[i] = exp_row / row_sum
+    
+    # Final cleanup
+    np.fill_diagonal(heuristics, 0)
+    heuristics = np.clip(heuristics, 0.0, 1.0)
+    
+    return heuristics
+```

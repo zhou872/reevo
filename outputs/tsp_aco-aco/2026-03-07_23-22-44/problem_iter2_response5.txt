@@ -1,0 +1,313 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Boost", "Christofides Matching Bonus", "Spatial Cluster Density", "Adaptive Regret Scaling"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization.
+    Combines graph-theoretic structures (MST, Christofides matching),
+    geometric clustering, and adaptive regret mechanisms.
+    Returns a matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        heuristics = np.zeros_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        if n == 2:
+            heuristics[0, 1] = heuristics[1, 0] = 1.0
+        return heuristics
+    
+    # Initialize heuristic matrix
+    heuristics = np.zeros((n, n), dtype=np.float64)
+    
+    # Factor 1: Inverse distance baseline (with smoothing)
+    eps = 1e-12
+    inv_dist = 1.0 / (distance_matrix + eps)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Factor 2: Minimum Spanning Tree edges (absolute priority)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # Factor 3: Christofides-style matching on odd-degree MST nodes
+    matching_bonus = _christofides_matching_bonus(distance_matrix, mst_mask)
+    
+    # Factor 4: Spatial clustering via approximated geometry
+    cluster_density = _spatial_cluster_density(distance_matrix)
+    
+    # Factor 5: Adaptive regret mechanism
+    regret_penalty = _adaptive_regret_penalty(distance_matrix)
+    
+    # Combine factors with adaptive weights
+    mst_weight = 2.0  # Strong boost for MST edges
+    matching_weight = 1.5  # Boost for Christofides matching edges
+    cluster_weight = 0.8  # Moderate clustering bonus
+    
+    # Base score combines inverse distance with structural bonuses
+    base_score = inv_dist * (
+        1.0 + mst_weight * mst_mask + 
+        matching_weight * matching_bonus
+    )
+    
+    # Apply spatial clustering bonus
+    heuristics = base_score * (1.0 + cluster_weight * cluster_density)
+    
+    # Apply adaptive regret penalty (reduces score for edges with poor alternatives)
+    regret_factor = 1.0 - 0.4 * regret_penalty
+    heuristics *= regret_factor
+    
+    # Ensure MST edges have minimum priority even if penalized
+    min_mst_value = np.min(heuristics[mst_mask]) if np.any(mst_mask) else 0
+    heuristics[mst_mask] = np.maximum(heuristics[mst_mask], 
+                                      min_mst_value + 0.1 * np.max(heuristics))
+    
+    # Adaptive sparsification: keep edges above instance-specific thresholds
+    heuristics = _adaptive_sparsify(heuristics, distance_matrix, mst_mask)
+    
+    # Normalize to [0, 1] range for consistent scaling
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Final symmetry and diagonal cleanup
+    heuristics = (heuristics + heuristics.T) / 2.0
+    np.fill_diagonal(heuristics, 0.0)
+    
+    return heuristics
+
+
+def _christofides_matching_bonus(distance_matrix: np.ndarray, mst_mask: np.ndarray) -> np.ndarray:
+    """
+    Compute bonus for edges that would be in a Christofides-style minimum perfect matching
+    on the odd-degree nodes of the MST.
+    Returns a matrix with values in [0, 1].
+    """
+    n = distance_matrix.shape[0]
+    bonus = np.zeros((n, n), dtype=np.float64)
+    
+    # Find odd-degree nodes in MST
+    mst_degrees = np.sum(mst_mask, axis=1)
+    odd_nodes = np.where(mst_degrees % 2 == 1)[0]
+    
+    if len(odd_nodes) < 2:
+        return bonus
+    
+    # Create subgraph of odd nodes
+    odd_indices = {node: i for i, node in enumerate(odd_nodes)}
+    m = len(odd_nodes)
+    
+    if m % 2 != 0:
+        # Shouldn't happen with MST properties, but handle gracefully
+        return bonus
+    
+    # Greedy approximation of minimum perfect matching
+    # This is faster than exact matching for large instances
+    available = set(range(m))
+    matched_pairs = []
+    
+    while available:
+        i_idx = min(available)
+        available.remove(i_idx)
+        i_node = odd_nodes[i_idx]
+        
+        # Find closest unmatched odd node
+        best_j_idx = None
+        best_dist = np.inf
+        
+        for j_idx in available:
+            j_node = odd_nodes[j_idx]
+            dist = distance_matrix[i_node, j_node]
+            if dist < best_dist:
+                best_dist = dist
+                best_j_idx = j_idx
+        
+        if best_j_idx is not None:
+            matched_pairs.append((i_idx, best_j_idx))
+            available.remove(best_j_idx)
+    
+    # Apply matching bonus (stronger for shorter edges in matching)
+    for i_idx, j_idx in matched_pairs:
+        i_node = odd_nodes[i_idx]
+        j_node = odd_nodes[j_idx]
+        
+        # Normalize bonus by relative edge length among matched edges
+        edge_dist = distance_matrix[i_node, j_node]
+        max_matched_dist = max(distance_matrix[odd_nodes[a], odd_nodes[b]] 
+                              for a, b in matched_pairs)
+        
+        if max_matched_dist > 0:
+            normalized_bonus = 1.0 - (edge_dist / max_matched_dist)
+            bonus[i_node, j_node] = normalized_bonus
+            bonus[j_node, i_node] = normalized_bonus
+    
+    return bonus
+
+
+def _spatial_cluster_density(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute spatial clustering density bonus using efficient nearest neighbor search.
+    Uses multi-scale density estimation without requiring explicit coordinates.
+    """
+    n = distance_matrix.shape[0]
+    density = np.zeros((n, n), dtype=np.float64)
+    
+    # Use distance matrix directly for density estimation
+    # Adaptive neighborhood size based on instance characteristics
+    k_base = min(15, max(3, n // 10))
+    
+    # Multi-scale analysis: consider different neighborhood sizes
+    scales = [k_base // 2, k_base, k_base * 2]
+    scales = [max(2, s) for s in scales if s <= n - 1]
+    
+    for scale in scales:
+        for i in range(n):
+            # Find k-nearest neighbors at this scale
+            neighbors = np.argsort(distance_matrix[i])[1:scale + 1]
+            
+            # Compute local density: inverse of average distance to neighbors
+            if len(neighbors) > 0:
+                avg_dist = np.mean(distance_matrix[i, neighbors])
+                local_density = 1.0 / (avg_dist + 1e-12)
+                
+                # Scale factor decreases with larger neighborhoods
+                scale_factor = 1.0 / np.sqrt(scale)
+                
+                for j in neighbors:
+                    if i < j:
+                        # Bonus proportional to local density and edge shortness
+                        edge_density = (local_density * scale_factor * 
+                                       (1.0 / (distance_matrix[i, j] + 1e-12)))
+                        density[i, j] += edge_density
+                        density[j, i] += edge_density
+    
+    # Normalize density scores
+    max_density = np.max(density)
+    if max_density > 0:
+        density = density / max_density
+    
+    return density
+
+
+def _adaptive_regret_penalty(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute adaptive regret penalty that scales with instance sparsity.
+    Penalizes edges more severely in sparse regions where alternatives are poor.
+    """
+    n = distance_matrix.shape[0]
+    penalty = np.zeros((n, n), dtype=np.float64)
+    
+    # Analyze global sparsity characteristics
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    if len(upper_tri) == 0:
+        return penalty
+    
+    median_dist = np.median(upper_tri)
+    std_dist = np.std(upper_tri)
+    
+    for i in range(n):
+        # Get distances from node i (excluding self)
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Sort distances
+        sorted_dists = np.sort(dists_i)
+        valid_dists = sorted_dists[sorted_dists < np.inf]
+        
+        if len(valid_dists) < 3:
+            continue
+        
+        # Compute regret: cost of not taking best or second-best edge
+        # Adaptive based on local sparsity
+        best_dist = valid_dists[0]
+        second_best = valid_dists[1]
+        
+        # Local sparsity measure
+        local_median = np.median(valid_dists)
+        local_sparsity = local_median / (median_dist + 1e-12)
+        
+        # Base regret factor
+        regret_factor = min(1.0, (second_best - best_dist) / (best_dist + 1e-12))
+        
+        # Scale regret by local sparsity (higher penalty in sparse regions)
+        scaled_regret = regret_factor * np.sqrt(local_sparsity)
+        
+        # Apply penalty proportionally to edge rank
+        for j in range(n):
+            if i != j:
+                rank = np.sum(dists_i < distance_matrix[i, j])
+                if rank >= 2:  # Not in top 2 choices
+                    penalty_factor = scaled_regret * (rank / n)
+                    penalty[i, j] = max(penalty[i, j], penalty_factor)
+    
+    return penalty
+
+
+def _adaptive_sparsify(heuristics: np.ndarray, 
+                       distance_matrix: np.ndarray,
+                       mst_mask: np.ndarray) -> np.ndarray:
+    """
+    Adaptive sparsification that preserves promising edges based on
+    instance characteristics and structural importance.
+    """
+    n = heuristics.shape[0]
+    result = np.zeros_like(heuristics)
+    
+    # Always preserve MST edges
+    result[mst_mask] = heuristics[mst_mask]
+    
+    # Analyze instance to determine sparsity target
+    upper_tri_dists = distance_matrix[np.triu_indices(n, k=1)]
+    
+    if len(upper_tri_dists) == 0:
+        return result
+    
+    # Dynamic edge retention based on instance size and variance
+    base_retention = min(0.3, 5.0 / n)  # Higher retention for smaller instances
+    dist_variance = np.std(upper_tri_dists) / (np.mean(upper_tri_dists) + 1e-12)
+    
+    # Adjust retention based on distance variance
+    variance_factor = 1.0 + 0.5 * min(1.0, dist_variance)
+    target_density = base_retention * variance_factor
+    
+    # Convert to approximate number of edges
+    target_edges = int(target_density * n * (n - 1) / 2)
+    target_edges = max(np.sum(mst_mask), target_edges)  # At least MST edges
+    
+    # Sort edges by heuristic value
+    edge_indices = np.argsort(heuristics.flatten())[::-1]
+    
+    edges_added = np.sum(mst_mask) // 2  # MST edges already added (counted once per direction)
+    
+    for idx in edge_indices:
+        if edges_added >= target_edges:
+            break
+        
+        i = idx // n
+        j = idx % n
+        
+        if i >= j or result[i, j] > 0:
+            continue
+        
+        # Additional quality checks
+        mst_distances = distance_matrix[mst_mask]
+        if len(mst_distances) > 0:
+            max_mst_dist = np.max(mst_distances)
+            
+            # Don't add very long edges unless they have exceptionally high heuristic
+            if (distance_matrix[i, j] < 2.5 * max_mst_dist or 
+                heuristics[i, j] > 0.8 * np.max(heuristics)):
+                result[i, j] = heuristics[i, j]
+                result[j, i] = heuristics[j, i]
+                edges_added += 1
+    
+    return result
+```

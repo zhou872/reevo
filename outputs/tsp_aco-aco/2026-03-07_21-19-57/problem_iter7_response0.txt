@@ -1,0 +1,379 @@
+```json
+{
+    "algorithm_features": ["Adaptive Density Similarity", "Rank-Based Regret Minimization", "Edge Betweenness Centrality", "Multi-Criteria Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with improved
+    regret minimization and adaptive edge centrality scoring.
+    
+    Core improvements over v1:
+    1. Advanced Regret Minimization: Considers alternatives from both endpoints
+       and scales penalties based on rank difference, not just absolute distance
+    2. Edge Betweenness Centrality: Uses MST betweenness to identify critical
+       structural edges that connect different clusters
+    3. Adaptive Similarity Thresholding: Dynamic bandwidth based on local density
+       variations for more precise cluster identification
+    4. Multi-Criteria Edge Selection: Combines multiple factors with learned
+       weights to create a more balanced heuristic
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # =====================================================================
+    # 1. ADVANCED REGRET MINIMIZATION
+    # =====================================================================
+    regret_matrix = np.ones((n, n))
+    
+    # For each node, find its k best alternatives
+    k_regret = max(3, int(0.15 * n))
+    
+    for i in range(n):
+        # Get distances from node i to all others
+        distances_i = distance_matrix[i, :].copy()
+        distances_i[i] = np.inf
+        
+        # Get k nearest neighbors and their distances
+        sorted_indices_i = np.argsort(distances_i)
+        sorted_distances_i = distances_i[sorted_indices_i]
+        
+        # For each edge (i,j), compute regret
+        for j in range(n):
+            if i == j:
+                continue
+                
+            dist_ij = distance_matrix[i, j]
+            
+            # Find j's rank in i's neighbor list
+            j_rank_i = np.where(sorted_indices_i == j)[0][0]
+            
+            # Get distances from node j to all others
+            distances_j = distance_matrix[j, :].copy()
+            distances_j[j] = np.inf
+            
+            # Find i's rank in j's neighbor list
+            sorted_indices_j = np.argsort(distances_j)
+            i_rank_j = np.where(sorted_indices_j == i)[0][0]
+            
+            # Compute regret based on alternatives from both endpoints
+            if j_rank_i < k_regret and i_rank_j < k_regret:
+                # Both consider this edge among their top choices
+                # Find the next best alternative from i's perspective (excluding j)
+                alt_i_idx = 0 if j_rank_i > 0 else 1
+                alt_i_dist = sorted_distances_i[alt_i_idx]
+                
+                # Find the next best alternative from j's perspective (excluding i)
+                sorted_distances_j = distances_j[sorted_indices_j]
+                alt_j_idx = 0 if i_rank_j > 0 else 1
+                alt_j_dist = sorted_distances_j[alt_j_idx]
+                
+                # Regret is the difference from the best alternative
+                regret_i = max(0, dist_ij - alt_i_dist)
+                regret_j = max(0, dist_ij - alt_j_dist)
+                avg_regret = (regret_i + regret_j) / 2
+                
+                # Normalize regret by the edge distance
+                norm_regret = avg_regret / (dist_ij + 1e-8)
+                
+                # Penalize edges with high normalized regret
+                regret_matrix[i, j] = 1.0 / (1.0 + 2.0 * norm_regret)
+            else:
+                # Edge not in top k for at least one endpoint
+                regret_matrix[i, j] = 0.5
+    
+    # =====================================================================
+    # 2. EDGE BETWEENNESS CENTRALITY IN MST
+    # =====================================================================
+    # Compute MST
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_sym = mst_array + mst_array.T
+    mst_edges = np.where(mst_sym > 0)
+    
+    # Compute edge betweenness centrality in MST
+    centrality_matrix = np.ones((n, n))
+    
+    # For each edge in MST, compute how many shortest paths go through it
+    # In a tree, removing an edge creates two components of sizes a and b
+    # The edge betweenness is a * b (all pairs where nodes are in different components)
+    mst_graph = csr_matrix(mst_sym > 0)
+    
+    def dfs(node, parent, visited, component):
+        visited[node] = True
+        component.append(node)
+        neighbors = mst_graph[node].indices
+        for neighbor in neighbors:
+            if neighbor != parent and not visited[neighbor]:
+                dfs(neighbor, node, visited, component)
+    
+    # For each MST edge, remove it and find component sizes
+    for i, j in zip(*mst_edges):
+        if i >= j:
+            continue
+            
+        # Temporarily remove edge (i,j)
+        original_i = mst_graph[i, j]
+        original_j = mst_graph[j, i]
+        mst_graph[i, j] = 0
+        mst_graph[j, i] = 0
+        
+        # Find components
+        visited = [False] * n
+        component1 = []
+        dfs(i, -1, visited, component1)
+        
+        component2 = []
+        for node in range(n):
+            if not visited[node]:
+                dfs(node, -1, visited, component2)
+                break
+        
+        # Edge betweenness = |component1| * |component2|
+        betweenness = len(component1) * len(component2)
+        
+        # Normalize by maximum possible (n^2/4)
+        norm_betweenness = betweenness / ((n * n) / 4)
+        
+        # Boost edges with high betweenness (critical structural edges)
+        centrality_matrix[i, j] = 1.0 + 0.6 * norm_betweenness
+        centrality_matrix[j, i] = centrality_matrix[i, j]
+        
+        # Restore edge
+        mst_graph[i, j] = original_i
+        mst_graph[j, i] = original_j
+    
+    # =====================================================================
+    # 3. ADAPTIVE DENSITY SIMILARITY WITH DYNAMIC BANDWIDTH
+    # =====================================================================
+    similarity_matrix = np.ones((n, n))
+    
+    # Compute local density using kernel density estimation
+    k_density = max(3, int(0.1 * n))
+    local_density = np.zeros(n)
+    density_var = np.zeros(n)  # Measure of density variation
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Get k nearest distances
+        if len(distances) > k_density:
+            kth_smallest = np.partition(distances, k_density)[k_density]
+            nearest_mask = distances <= kth_smallest
+            nearest_dists = distances[nearest_mask]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        
+        if len(nearest_dists) > 0:
+            # Use Gaussian kernel for density estimation
+            bandwidth = np.std(nearest_dists) + 1e-8
+            density_var[i] = bandwidth
+            # Simplified KDE: inverse of average distance with bandwidth scaling
+            local_density[i] = 1.0 / (np.mean(nearest_dists) + 0.5 * bandwidth)
+        else:
+            local_density[i] = 1.0
+    
+    # Normalize densities
+    if np.max(local_density) > 0:
+        local_density = local_density / np.max(local_density)
+    
+    # Apply similarity with adaptive bandwidth
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            density_diff = abs(local_density[i] - local_density[j])
+            # Use harmonic mean of bandwidths for adaptive scaling
+            bandwidth_ij = 2 * density_var[i] * density_var[j] / (density_var[i] + density_var[j] + 1e-8)
+            # Gaussian similarity with adaptive bandwidth
+            similarity_matrix[i, j] = 1.0 + np.exp(-density_diff * density_diff / (2 * bandwidth_ij * bandwidth_ij + 1e-8))
+    
+    # =====================================================================
+    # 4. PROXIMITY WITH ADAPTIVE THRESHOLDS
+    # =====================================================================
+    proximity_matrix = np.ones((n, n))
+    
+    # Compute adaptive thresholds based on local distance distribution
+    threshold_factors = np.zeros(n)
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Use percentiles for more robust thresholding
+        if len(distances) > 5:
+            threshold_factors[i] = np.percentile(distances[distances < np.inf], 30)
+        else:
+            valid_dists = distances[distances < np.inf]
+            threshold_factors[i] = np.mean(valid_dists) if len(valid_dists) > 0 else 1.0
+    
+    # Apply proximity scoring with smooth transition
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            # Use geometric mean of thresholds for symmetry
+            threshold = np.sqrt(threshold_factors[i] * threshold_factors[j])
+            dist = distance_matrix[i, j]
+            
+            # Smooth proximity function with two regimes
+            if dist <= threshold:
+                # Within preferred distance - quadratic bonus
+                ratio = dist / (threshold + 1e-8)
+                proximity_matrix[i, j] = 1.0 + 0.4 * (1.0 - ratio * ratio)
+            else:
+                # Beyond threshold - exponential decay
+                excess_ratio = (dist - threshold) / (threshold + 1e-8)
+                proximity_matrix[i, j] = np.exp(-1.5 * excess_ratio)
+    
+    # =====================================================================
+    # 5. COMBINE FACTORS WITH ADAPTIVE WEIGHTS
+    # =====================================================================
+    # Base component: inverse distance with regularization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 1e-8 * np.mean(distance_matrix[distance_matrix > 0]))
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Combine factors with emphasis on regret and centrality
+    heuristic = (inv_dist ** 0.3) * \
+                (regret_matrix ** 0.4) * \
+                (centrality_matrix ** 0.5) * \
+                (similarity_matrix ** 0.2) * \
+                (proximity_matrix ** 0.3)
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # =====================================================================
+    # 6. INTELLIGENT MULTI-CRITERIA SPARSIFICATION
+    # =====================================================================
+    final_mask = np.zeros((n, n), dtype=bool)
+    
+    # Criterion 1: Always include MST edges
+    final_mask = final_mask | (mst_sym > 0)
+    
+    # Criterion 2: For each node, include edges that are good by multiple metrics
+    edge_scores = np.zeros((n, n))
+    
+    # Compute combined score for each edge based on rank in each metric
+    metrics = [regret_matrix, centrality_matrix, similarity_matrix, proximity_matrix]
+    metric_weights = [0.35, 0.3, 0.2, 0.15]
+    
+    for i in range(n):
+        for metric, weight in zip(metrics, metric_weights):
+            # Get ranks for this metric
+            metric_vals = metric[i, :].copy()
+            metric_vals[i] = -np.inf
+            ranks = np.argsort(metric_vals)[::-1]  # Descending order
+            
+            # Assign scores based on rank (higher rank = higher score)
+            for rank_idx, j in enumerate(ranks):
+                if i != j:
+                    # Linear decay: best gets 1.0, worst gets 0.0
+                    rank_score = 1.0 - (rank_idx / (n - 1))
+                    edge_scores[i, j] += weight * rank_score
+    
+    # Include top edges based on combined score
+    for i in range(n):
+        node_scores = edge_scores[i, :].copy()
+        node_scores[i] = -np.inf
+        
+        # Dynamic number of edges to keep based on problem size
+        top_m = max(2, int(0.2 * n))
+        top_indices = np.argpartition(node_scores, -top_m)[-top_m:]
+        final_mask[i, top_indices] = True
+        final_mask[top_indices, i] = True
+    
+    # Criterion 3: Ensure connectivity
+    # Build adjacency from current mask
+    adj = final_mask.astype(int)
+    
+    # Check connectivity using BFS
+    visited = np.zeros(n, dtype=bool)
+    queue = [0]
+    visited[0] = True
+    
+    while queue:
+        node = queue.pop()
+        neighbors = np.where(adj[node] > 0)[0]
+        for neighbor in neighbors:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                queue.append(neighbor)
+    
+    # If not connected, add shortest edges to connect components
+    if not np.all(visited):
+        # Find connected components
+        components = []
+        unvisited = np.where(~visited)[0]
+        
+        while len(unvisited) > 0:
+            start = unvisited[0]
+            comp = []
+            stack = [start]
+            visited[start] = True
+            
+            while stack:
+                node = stack.pop()
+                comp.append(node)
+                neighbors = np.where(adj[node] > 0)[0]
+                for neighbor in neighbors:
+                    if not visited[neighbor]:
+                        visited[neighbor] = True
+                        stack.append(neighbor)
+            
+            components.append(comp)
+            unvisited = np.where(~visited)[0]
+        
+        # Connect components with shortest edges
+        for i in range(len(components)):
+            for j in range(i + 1, len(components)):
+                # Find shortest edge between components
+                min_dist = np.inf
+                best_pair = (0, 0)
+                
+                for node_i in components[i]:
+                    for node_j in components[j]:
+                        dist = distance_matrix[node_i, node_j]
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_pair = (node_i, node_j)
+                
+                # Add this edge
+                u, v = best_pair
+                final_mask[u, v] = True
+                final_mask[v, u] = True
+                adj[u, v] = 1
+                adj[v, u] = 1
+    
+    # Apply sparsification mask
+    heuristic = heuristic * final_mask
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    return heuristic
+```

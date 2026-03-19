@@ -1,0 +1,313 @@
+```json
+{
+    "algorithm_features": ["Spectral Graph Embedding", "Adaptive Component Fusion", "Hierarchical Sparsification", "Geometric Regularization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with geometric regularization and hierarchical sparsification.
+    
+    Key improvements:
+    1. Robust spectral embedding with graph diffusion regularization
+    2. Multi-scale geometric features (curvature, manifold density)
+    3. Hierarchical sparsification preserving both local and global structure
+    4. Adaptive fusion with instance-aware regularization
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    eps = 1e-10
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # ========== 1. INSTANCE CHARACTERIZATION ==========
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    cv = dist_std / (dist_mean + eps)
+    
+    # Multi-scale statistics
+    q10, q50, q90 = np.percentile(distances, [10, 50, 90])
+    iqr = q90 - q10
+    
+    # Distance distribution type
+    if cv < 0.3:
+        dist_type = 'uniform'
+        spectral_dim = min(3, n-1)
+        local_k = max(2, int(np.log2(n + 1)))
+    elif cv < 1.0:
+        dist_type = 'moderate'
+        spectral_dim = min(5, n-1)
+        local_k = max(3, int(np.sqrt(n)))
+    else:
+        dist_type = 'clustered'
+        spectral_dim = min(8, n-1)
+        local_k = max(4, int(n**0.4))
+    
+    # ========== 2. GEOMETRIC REGULARIZATION ==========
+    # Compute manifold-aware distance scaling
+    if n > 3:
+        # Local density estimation
+        local_density = np.zeros(n)
+        for i in range(n):
+            dists = np.sort(distance_matrix[i])[1:local_k+1]
+            local_density[i] = 1.0 / (np.mean(dists) + eps)
+        
+        # Density-regularized distances
+        density_weights = np.sqrt(local_density[:, None] * local_density[None, :])
+        reg_dist = distance_matrix / (density_weights + eps)
+        
+        # Estimate local curvature via triangle inequality violations
+        curvature = np.zeros(n)
+        for i in range(n):
+            for j in range(i+1, n):
+                for k in range(n):
+                    if k not in (i, j):
+                        violation = (distance_matrix[i, j] - 
+                                    (distance_matrix[i, k] + distance_matrix[k, j]))
+                        if violation > 0:
+                            curvature[i] += violation
+                            curvature[j] += violation
+        
+        # Curvature regularization factor
+        curv_factor = 1.0 / (1.0 + np.tanh(curvature / (dist_mean + eps)))
+        geom_factor = curv_factor[:, None] * curv_factor[None, :]
+        reg_dist = reg_dist * geom_factor
+    else:
+        reg_dist = distance_matrix
+    
+    # ========== 3. SPECTRAL EMBEDDING WITH DIFFUSION ==========
+    embedding_score = np.zeros((n, n))
+    
+    if n > 3 and spectral_dim > 0:
+        try:
+            # Graph diffusion kernel
+            sigma = np.median(reg_dist[triu_indices])
+            affinity = np.exp(-reg_dist**2 / (2 * sigma**2 + eps))
+            np.fill_diagonal(affinity, 0)
+            
+            # Regularize affinity matrix
+            row_sums = np.sum(affinity, axis=1)
+            D_inv = np.diag(1.0 / (row_sums + eps))
+            
+            # Diffusion matrix for better global structure
+            alpha = 0.5  # Teleportation probability
+            P = D_inv @ affinity
+            P_alpha = alpha * P + (1 - alpha) * np.ones((n, n)) / n
+            
+            # Compute eigenvectors of diffusion operator
+            D_alpha = np.diag(np.sum(P_alpha, axis=1))
+            L_diff = D_alpha - P_alpha
+            
+            # Normalize and get eigenvectors
+            D_alpha_sqrt = np.diag(1.0 / np.sqrt(np.diag(D_alpha) + eps))
+            L_norm = D_alpha_sqrt @ L_diff @ D_alpha_sqrt
+            
+            eigvals, eigvecs = np.linalg.eigh(L_norm)
+            sorted_idx = np.argsort(eigvals)
+            eigvecs = eigvecs[:, sorted_idx]
+            
+            # Use eigenvectors corresponding to smallest non-zero eigenvalues
+            embedding = eigvecs[:, 1:min(spectral_dim+1, n)]
+            
+            if embedding.shape[1] > 0:
+                # Compute edge affinity in embedding space
+                embedding_norm = embedding / (np.linalg.norm(embedding, axis=1, keepdims=True) + eps)
+                embedding_sim = embedding_norm @ embedding_norm.T
+                
+                # Emphasize mid-range similarities (avoid overemphasizing very similar/dissimilar)
+                embedding_score = 2.0 / (1.0 + np.exp(-3.0 * (embedding_sim - 0.5))) - 1.0
+                np.fill_diagonal(embedding_score, 0)
+                
+        except np.linalg.LinAlgError:
+            # Fallback to simpler approach
+            embedding_score = np.exp(-distance_matrix / (dist_mean + eps))
+    
+    # ========== 4. MULTI-SCALE LOCAL FEATURES ==========
+    # Inverse distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (reg_dist + eps)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Multi-radius neighborhood analysis
+    local_features = np.zeros((n, n))
+    
+    # Small radius (immediate neighbors)
+    k_small = max(2, min(5, n//4))
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        small_nn = np.argpartition(dists, k_small)[:k_small]
+        local_features[i, small_nn] = 1.0 / (dists[small_nn] + eps)
+    
+    # Medium radius (structural neighbors)
+    if n > 10:
+        k_medium = max(k_small, min(10, n//3))
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            medium_nn = np.argpartition(dists, k_medium)[k_small:k_medium]
+            if len(medium_nn) > 0:
+                weights = 0.5 / (dists[medium_nn] + eps)
+                local_features[i, medium_nn] = np.maximum(local_features[i, medium_nn], weights)
+    
+    # Make symmetric
+    local_features = (local_features + local_features.T) / 2.0
+    
+    # ========== 5. CONNECTIVITY PRESERVATION ==========
+    # Minimum spanning tree
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Edge importance in MST
+    mst_importance = np.zeros((n, n))
+    if np.any(mst_mask):
+        # Compute MST edge betweenness approximation
+        mst_edges = np.argwhere(mst_mask & (np.triu(np.ones((n, n)), k=1)))
+        for i, j in mst_edges:
+            # Importance proportional to subtree sizes
+            importance = np.log(1.0 + min(i+1, j+1, n-i, n-j))
+            mst_importance[i, j] = mst_importance[j, i] = importance
+    
+    # ========== 6. ADAPTIVE FUSION ==========
+    # Instance-aware component weighting
+    if dist_type == 'uniform':
+        weights = np.array([0.4, 0.4, 0.2])  # embedding, local, mst
+    elif dist_type == 'moderate':
+        weights = np.array([0.5, 0.3, 0.2])
+    else:  # clustered
+        weights = np.array([0.3, 0.5, 0.2])
+    
+    # Adjust based on problem size
+    size_factor = min(1.0, n / 100.0)
+    weights[0] *= (0.8 + 0.4 * size_factor)  # More embedding for larger instances
+    weights[1] *= (1.2 - 0.4 * size_factor)  # Less local for larger instances
+    weights /= np.sum(weights)
+    
+    # Normalize components
+    def robust_normalize(x):
+        x_flat = x[triu_indices]
+        if len(x_flat) > 0 and np.max(x_flat) > 0:
+            q95 = np.percentile(x_flat, 95)
+            return np.clip(x / q95, 0, 1.5)
+        return x
+    
+    embedding_norm = robust_normalize(embedding_score)
+    local_norm = robust_normalize(local_features)
+    mst_norm = robust_normalize(mst_importance)
+    
+    # Fused heuristic
+    heuristic = (weights[0] * embedding_norm + 
+                weights[1] * local_norm + 
+                weights[2] * mst_norm)
+    
+    # Boost MST edges with adaptive strength
+    mst_boost = 1.5 + 0.5 * np.tanh(cv)  # Stronger boost for varied instances
+    heuristic[mst_mask] *= mst_boost
+    
+    # ========== 7. HIERARCHICAL SPARSIFICATION ==========
+    # Level 1: Keep MST for connectivity
+    sparsity_mask = mst_mask.copy()
+    
+    # Level 2: Adaptive per-node top-k
+    k_adaptive = max(3, min(10, int(np.log2(n + 1) * (1.5 if cv > 0.7 else 1.0))))
+    
+    for i in range(n):
+        # Already have MST edges
+        current_mask = sparsity_mask[i].copy()
+        current_mask[i] = False
+        
+        # Add top remaining edges
+        remaining_scores = heuristic[i].copy()
+        remaining_scores[current_mask] = -np.inf
+        remaining_scores[i] = -np.inf
+        
+        if np.any(remaining_scores > -np.inf):
+            # Select top edges, ensuring diversity in scores
+            valid_scores = remaining_scores[remaining_scores > -np.inf]
+            if len(valid_scores) >= k_adaptive:
+                threshold = np.partition(valid_scores, -k_adaptive)[-k_adaptive]
+                new_mask = remaining_scores >= threshold
+                sparsity_mask[i, new_mask] = True
+    
+    # Level 3: Global density control
+    if n > 20:
+        target_density = min(0.15, 30.0 / n)
+        current_density = np.mean(sparsity_mask)
+        
+        if current_density > target_density:
+            # Remove lower-scoring edges
+            scores_triu = heuristic[triu_indices]
+            mask_triu = sparsity_mask[triu_indices]
+            
+            if np.sum(mask_triu) > 0:
+                masked_scores = scores_triu[mask_triu]
+                keep_threshold = np.percentile(masked_scores, 
+                                             (1 - target_density/current_density) * 100)
+                
+                # Don't remove MST edges
+                mst_triu = mst_mask[triu_indices]
+                remove_candidates = mask_triu & (scores_triu < keep_threshold) & (~mst_triu)
+                
+                # Update mask
+                remove_indices = np.where(remove_candidates)[0]
+                sparsity_mask[triu_indices[0][remove_indices], 
+                            triu_indices[1][remove_indices]] = False
+    
+    # Ensure symmetry and minimum degree
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    min_degree = max(2, int(np.ceil(np.log2(n + 1))))
+    degrees = np.sum(sparsity_mask, axis=1)
+    
+    for i in range(n):
+        if degrees[i] < min_degree:
+            needed = min_degree - degrees[i]
+            scores = heuristic[i].copy()
+            scores[sparsity_mask[i]] = -np.inf
+            scores[i] = -np.inf
+            
+            if np.any(scores > -np.inf):
+                top_idx = np.argpartition(scores, -needed)[-needed:]
+                sparsity_mask[i, top_idx] = True
+                sparsity_mask[top_idx, i] = True
+    
+    # ========== 8. FINAL REFINEMENT ==========
+    # Apply sparsification
+    heuristic = heuristic * sparsity_mask
+    
+    # Geometric mean with original distances for edge preservation
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dist_normalized = distance_matrix / (np.max(distance_matrix) + eps)
+        heuristic = np.sqrt(heuristic * (1.0 / (dist_normalized + eps)))
+    
+    # Final normalization
+    heuristic_max = np.max(heuristic)
+    if heuristic_max > eps:
+        heuristic = heuristic / heuristic_max
+    
+    # Soft thresholding to emphasize promising edges
+    heuristic = np.tanh(2.0 * heuristic)
+    
+    # Zero diagonal and ensure symmetry
+    np.fill_diagonal(heuristic, 0)
+    heuristic = (heuristic + heuristic.T) / 2.0
+    
+    return heuristic
+```

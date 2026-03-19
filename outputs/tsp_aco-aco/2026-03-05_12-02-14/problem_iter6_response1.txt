@@ -1,0 +1,192 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "Ensemble Centrality", "Dynamic Sparsification", "Multi-Parameter Heuristics"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection with dynamic weight tuning
+    and ensemble centrality methods.
+    
+    Features:
+    1. Adaptive weight tuning: Weights adjust based on problem characteristics
+    2. Ensemble centrality: Multiple centrality measures with automatic selection
+    3. Dynamic sparsification: Adaptive edge pruning based on problem density
+    4. Enhanced MST integration: Weighted MST edges with distance awareness
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic[np.isnan(heuristic)] = 0
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # 1. Base reciprocal distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    
+    # 2. Ensemble centrality measures
+    centrality_matrices = []
+    
+    # 2a. Closeness centrality
+    row_sums = np.sum(distance_matrix, axis=1, where=distance_matrix > 0)
+    closeness_centrality = np.zeros(n)
+    valid_mask = row_sums > 0
+    closeness_centrality[valid_mask] = 1 / row_sums[valid_mask]
+    if np.any(closeness_centrality > 0):
+        min_val = np.min(closeness_centrality[closeness_centrality > 0])
+        max_val = np.max(closeness_centrality)
+        closeness_centrality = (closeness_centrality - min_val) / (max_val - min_val + 1e-10)
+    centrality_matrices.append(np.outer(closeness_centrality, closeness_centrality))
+    
+    # 2b. Shortest path centrality
+    if n <= 1000:  # Only compute for manageable sizes
+        all_pairs_shortest = csgraph.shortest_path(distance_matrix, directed=False, unweighted=False)
+        all_pairs_shortest = np.where(all_pairs_shortest > 0, all_pairs_shortest, np.inf)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_shortest = 1 / all_pairs_shortest
+            inv_shortest[np.isinf(inv_shortest)] = 0
+            inv_shortest[np.isnan(inv_shortest)] = 0
+        shortest_path_centrality = np.sum(inv_shortest, axis=1)
+        if np.any(shortest_path_centrality > 0):
+            min_val = np.min(shortest_path_centrality[shortest_path_centrality > 0])
+            max_val = np.max(shortest_path_centrality)
+            shortest_path_centrality = (shortest_path_centrality - min_val) / (max_val - min_val + 1e-10)
+        centrality_matrices.append(np.outer(shortest_path_centrality, shortest_path_centrality))
+    
+    # 2c. Degree centrality (simplified - inverse of max distance to neighbors)
+    neighbor_avg = np.zeros(n)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        if np.all(np.isinf(row)):
+            neighbor_avg[i] = 0
+        else:
+            neighbor_avg[i] = 1 / np.min(row[row < np.inf])
+    if np.any(neighbor_avg > 0):
+        min_val = np.min(neighbor_avg[neighbor_avg > 0])
+        max_val = np.max(neighbor_avg)
+        neighbor_avg = (neighbor_avg - min_val) / (max_val - min_val + 1e-10)
+    centrality_matrices.append(np.outer(neighbor_avg, neighbor_avg))
+    
+    # Combine centrality measures with dynamic weights
+    if len(centrality_matrices) > 1:
+        # Weight by their variance (more discriminative measures get higher weight)
+        variances = [np.var(mat[np.triu_indices_from(mat, k=1)]) for mat in centrality_matrices]
+        total_var = sum(variances)
+        if total_var > 0:
+            weights = [v/total_var for v in variances]
+            centrality_matrix = sum(w * m for w, m in zip(weights, centrality_matrices))
+        else:
+            centrality_matrix = np.mean(centrality_matrices, axis=0)
+    else:
+        centrality_matrix = centrality_matrices[0]
+    
+    # 3. Enhanced MST integration
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_indicator = (mst > 0).astype(float)
+    
+    # Give MST edges bonus proportional to their inverse distance
+    mst_enhanced = mst_indicator.copy()
+    for i in range(n):
+        for j in range(n):
+            if mst_indicator[i, j] > 0:
+                # MST edges with shorter distances get higher bonus
+                mst_enhanced[i, j] = 1.0 / (1.0 + distance_matrix[i, j])
+    
+    # 4. Dynamic weight tuning based on problem characteristics
+    # Analyze distance distribution
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / (dist_mean + 1e-10)
+    
+    # Analyze graph density (estimated by nearest neighbor distances)
+    nearest_dists = np.zeros(n)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        nearest_dists[i] = np.min(row)
+    avg_nearest = np.mean(nearest_dists)
+    
+    # Dynamic weight adjustment
+    # More weight to reciprocal when distances are uniform (low CV)
+    w_reciprocal = 0.7 - 0.3 * min(dist_cv, 1.0)
+    
+    # More weight to centrality for larger problems
+    w_centrality = 0.25 + 0.15 * min(n / 100, 1.0)
+    
+    # MST weight depends on graph sparsity (denser graphs benefit more from MST)
+    density_factor = avg_nearest / (dist_mean + 1e-10)
+    w_mst = 0.05 + 0.1 * min(density_factor, 1.0)
+    
+    # Normalize weights to sum to 1
+    total_w = w_reciprocal + w_centrality + w_mst
+    w_reciprocal /= total_w
+    w_centrality /= total_w
+    w_mst /= total_w
+    
+    # 5. Combine factors with dynamic weights
+    combined = (w_reciprocal * reciprocal + 
+                w_centrality * centrality_matrix + 
+                w_mst * mst_enhanced)
+    
+    # 6. Adaptive sparsification with problem-aware parameters
+    sparsified = np.zeros_like(combined)
+    
+    # Determine k based on problem characteristics
+    # More edges for problems with high distance variability
+    base_k = int(np.ceil(np.log2(n + 1) * (1.0 + min(dist_cv, 2.0))))
+    k = max(2, min(base_k, n // 2))
+    
+    # Adjust decay rate based on problem size
+    decay_rate = 1.0 + np.log10(n + 1) / 2.0
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf
+        
+        if k < n:
+            # Get top k edges with efficient numpy operations
+            top_k_idx = np.argpartition(row, -k)[-k:]
+            top_k_values = row[top_k_idx]
+            sorted_idx = top_k_idx[np.argsort(top_k_values)[::-1]]
+        else:
+            all_idx = np.arange(n)
+            all_idx = all_idx[all_idx != i]
+            sorted_idx = all_idx[np.argsort(row[all_idx])[::-1]]
+        
+        # Apply exponential decay with adaptive rate
+        for rank, j in enumerate(sorted_idx):
+            decay = np.exp(-rank / decay_rate)
+            sparsified[i, j] = combined[i, j] * decay
+    
+    # 7. Symmetrize and final adjustments
+    sparsified = (sparsified + sparsified.T) / 2
+    np.fill_diagonal(sparsified, 0)
+    
+    # Ensure numerical stability and proper scaling
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

@@ -1,0 +1,161 @@
+```json
+{
+    "algorithm_features": ["Adaptive Stochastic Ranking", "Centrality-MST Hybrid", "Lightweight Instance Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection with adaptive stochastic parameters
+    and lightweight instance-based tuning. Returns a matrix of edge promise indicators
+    suitable for stochastic solution sampling.
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        # For trivial cases, return zeros or simple reciprocal
+        result = np.zeros_like(distance_matrix)
+        if n == 2:
+            result[0, 1] = result[1, 0] = 1.0
+        return result
+    
+    # 1. Compute basic instance statistics for adaptation
+    # Exclude diagonal distances
+    mask = ~np.eye(n, dtype=bool)
+    distances = distance_matrix[mask]
+    if len(distances) == 0:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    cv_dist = std_dist / (mean_dist + 1e-10)  # Coefficient of variation
+    
+    # 2. Base reciprocal distance heuristic
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # 3. Node centrality based on inverse distance aggregation
+    centrality = np.zeros(n)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        centrality[i] = np.sum(1 / (1 + row))  # Smoother aggregation
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # Boost centrality for nodes in dense regions (low average distance to others)
+    if cv_dist < 0.5:  # Uniform distances, emphasize centrality more
+        centrality = centrality ** 0.8  # Slight boost
+    
+    centrality_matrix = np.outer(centrality, centrality)
+    centrality_matrix = centrality_matrix * reciprocal  # Weight by reciprocal distance
+    
+    # 4. MST indicator with instance-adaptive boosting
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_indicator = (mst > 0).astype(float)
+        # Adaptive boosting based on instance sparsity
+        if cv_dist > 1.0:  # High variability, boost MST edges more
+            boost_factor = 1.5
+        else:
+            boost_factor = 1.2
+        for i in range(n):
+            mst_neighbors = np.where(mst_indicator[i] > 0)[0]
+            if len(mst_neighbors) > 0:
+                avg_centrality = centrality[mst_neighbors].mean()
+                mst_indicator[i, mst_neighbors] *= (1 + boost_factor * centrality[i] * avg_centrality)
+    except Exception:
+        mst_indicator = np.zeros_like(distance_matrix)
+    
+    # 5. Adaptive weighting based on instance statistics and size
+    size_factor = min(1.0, np.log1p(n) / np.log1p(50))  # Logarithmic scaling
+    if cv_dist > 1.0:
+        # For variable distances, emphasize structural heuristics
+        w1 = 0.3  # Reciprocal weight
+        w2 = 0.4  # Centrality weight
+        w3 = 0.3  # MST weight
+    elif cv_dist < 0.3:
+        # For uniform distances, emphasize local proximity
+        w1 = 0.6
+        w2 = 0.3
+        w3 = 0.1
+    else:
+        # Default weights with size adaptation
+        w1 = 0.5 - 0.1 * size_factor
+        w2 = 0.3 + 0.1 * size_factor
+        w3 = 0.2
+    
+    # Normalize weights to sum to 1
+    total = w1 + w2 + w3
+    w1, w2, w3 = w1 / total, w2 / total, w3 / total
+    
+    combined = (w1 * reciprocal + 
+                w2 * centrality_matrix + 
+                w3 * mst_indicator)
+    
+    # 6. Stochastic sparsification with adaptive parameters
+    sparsified = np.zeros_like(combined)
+    
+    # Adaptive number of edges per node based on instance size and variability
+    base_k = max(2, int(np.sqrt(n)))  # Scale with sqrt(n) for balance
+    if cv_dist > 1.0:
+        # For variable instances, keep more edges for exploration
+        k_min = base_k + 1
+        k_max = min(n-1, base_k * 2)
+    else:
+        k_min = max(2, base_k - 1)
+        k_max = min(n-1, base_k + 2)
+    
+    for i in range(n):
+        # Stochastic selection of k for this node
+        k = np.random.randint(k_min, k_max + 1)
+        k = min(k, n-1)
+        
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Get top k indices
+        if k < n-1:
+            sorted_indices = np.argsort(row)[::-1]
+            keep_indices = sorted_indices[:k]
+        else:
+            keep_indices = np.arange(n)
+            keep_indices = keep_indices[keep_indices != i]
+        
+        # Apply stochastic exponential decay based on rank
+        sorted_keep = keep_indices[np.argsort(row[keep_indices])[::-1]]
+        for rank, j in enumerate(sorted_keep):
+            # Adaptive decay rate: faster decay for larger instances or higher variability
+            decay_rate = 1.5 + 0.5 * size_factor
+            if cv_dist > 0.8:
+                decay_rate *= 0.9  # Slower decay for variable distances
+            decay = np.exp(-rank / decay_rate)
+            
+            # Add controlled random noise to break ties
+            noise = 1 + 0.05 * np.random.randn()
+            noise = np.clip(noise, 0.8, 1.2)
+            sparsified[i, j] = combined[i, j] * decay * noise
+    
+    # 7. Symmetrization with probabilistic smoothing
+    symmetric = (sparsified + sparsified.T) / 2
+    # Add instance-adaptive noise: less noise for large instances
+    noise_scale = 0.01 / (1 + size_factor)
+    noise_matrix = np.random.randn(n, n) * noise_scale
+    np.fill_diagonal(noise_matrix, 0)
+    symmetric = symmetric + noise_matrix
+    symmetric = np.maximum(symmetric, 0)
+    
+    # Final normalization per row for stochastic sampling
+    row_sums = symmetric.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    symmetric = symmetric / row_sums
+    
+    np.fill_diagonal(symmetric, 0)
+    return symmetric
+```

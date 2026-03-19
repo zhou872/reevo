@@ -1,0 +1,160 @@
+```json
+{
+    "algorithm_features": ["Inverse Distance Weighting", "Minimum Spanning Tree", "Adaptive Nearest Neighbor", "Probabilistic Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with adaptive weight tuning
+    and probabilistic edge selection. Returns a matrix where higher values indicate
+    more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Handle zero distances to avoid division errors
+    eps = 1e-10
+    dist = np.maximum(distance_matrix, eps)
+    
+    # 1. Dynamic weight adaptation based on problem characteristics
+    avg_dist = np.mean(dist[dist > eps])
+    std_dist = np.std(dist[dist > eps])
+    cv_dist = std_dist / (avg_dist + eps)  # Coefficient of variation
+    
+    # Adjust weights based on distance distribution characteristics
+    if cv_dist < 0.3:  # Uniform distances
+        w_inv_dist, w_nn, w_mst, w_centrality = 0.7, 0.5, 1.5, 0.2
+    elif cv_dist < 0.7:  # Moderate variation
+        w_inv_dist, w_nn, w_mst, w_centrality = 0.8, 0.6, 1.3, 0.3
+    else:  # High variation
+        w_inv_dist, w_nn, w_mst, w_centrality = 0.9, 0.7, 1.1, 0.4
+    
+    # 2. Base inverse distance component
+    inv_dist = 1 / dist
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 3. Adaptive nearest neighbor emphasis
+    # Scale k with problem size and distance variability
+    base_k = max(2, min(6, n // 5))
+    k = int(base_k * (1 + 0.5 * cv_dist))  # More neighbors in variable graphs
+    nn_mask = np.zeros_like(dist, dtype=bool)
+    
+    for i in range(n):
+        # Get indices of k nearest neighbors
+        nn_indices = np.argsort(dist[i])[1:k+1]
+        nn_mask[i, nn_indices] = True
+    
+    # Make symmetric - if j is in i's k-NN, mark both directions
+    nn_mask = nn_mask | nn_mask.T
+    
+    # 4. Minimum spanning tree component with distance thresholding
+    mst = minimum_spanning_tree(dist).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # 5. Enhanced node centrality using harmonic centrality
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Harmonic centrality: sum of reciprocal distances
+        valid_dists = dist[i]
+        valid_dists = valid_dists[valid_dists > eps]
+        if len(valid_dists) > 0:
+            centrality[i] = np.sum(1 / valid_dists)
+    
+    # Normalize centrality to [0,1]
+    max_centrality = np.max(centrality)
+    if max_centrality > eps:
+        centrality = centrality / max_centrality
+    
+    # Edge potential based on centrality product
+    edge_potential = np.outer(centrality, centrality)
+    
+    # 6. Combine all factors with adaptive weights
+    heuristics_matrix = w_inv_dist * inv_dist
+    
+    # Apply multiplicative boosts
+    heuristics_matrix[nn_mask] *= (1 + w_nn)
+    heuristics_matrix[mst_mask] *= (1 + w_mst)
+    
+    # Add centrality component
+    heuristics_matrix += w_centrality * edge_potential
+    
+    # 7. Probabilistic edge sparsification
+    # Keep edges based on their relative promise, not just top-K
+    sparsity_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+    
+    for i in range(n):
+        row_vals = heuristics_matrix[i].copy()
+        row_vals[i] = -np.inf  # Ignore diagonal
+        
+        # Determine number of edges to keep adaptively
+        min_edges = max(3, min(8, n // 4))
+        max_edges = max(8, min(15, n // 2))
+        
+        # Dynamic threshold based on value distribution
+        sorted_vals = np.sort(row_vals)[::-1]
+        if len(sorted_vals) > min_edges:
+            # Find natural elbow in values
+            diffs = np.diff(sorted_vals[:max_edges])
+            if len(diffs) > 0:
+                rel_diffs = diffs / (sorted_vals[:len(diffs)] + eps)
+                # Look for significant drop
+                drop_indices = np.where(rel_diffs > 0.3)[0]
+                if len(drop_indices) > 0:
+                    keep_count = min(max_edges, max(min_edges, drop_indices[0] + 1))
+                else:
+                    keep_count = min(max_edges, int(min_edges * (1 + cv_dist)))
+            else:
+                keep_count = min_edges
+        else:
+            keep_count = min_edges
+        
+        # Keep top edges based on adaptive count
+        top_indices = np.argsort(row_vals)[-keep_count:]
+        sparsity_mask[i, top_indices] = True
+    
+    # Ensure symmetry and minimum connectivity
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Additional check: ensure graph connectivity
+    # Count connections per node
+    connections = np.sum(sparsity_mask, axis=1)
+    for i in range(n):
+        if connections[i] < 2 and n > 2:
+            # Add nearest neighbor if node is isolated
+            neighbors = np.argsort(dist[i])[1:3]  # Two nearest
+            sparsity_mask[i, neighbors] = True
+            sparsity_mask[neighbors, i] = True
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # 8. Final refinement: smooth extreme values
+    # Apply softmax-like normalization per row
+    for i in range(n):
+        row = heuristics_matrix[i]
+        max_val = np.max(row)
+        if max_val > eps:
+            # Soft thresholding: boost promising edges, suppress others
+            exp_row = np.exp(2 * (row / (max_val + eps) - 0.5))
+            heuristics_matrix[i] = exp_row / (np.sum(exp_row) + eps)
+    
+    # Ensure symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # Zero diagonal
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Global normalization to [0,1]
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

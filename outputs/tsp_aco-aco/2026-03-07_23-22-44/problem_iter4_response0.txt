@@ -1,0 +1,200 @@
+```json
+{
+    "algorithm_features": ["Clustered Spatial Density", "Two-step Regret Lookahead", "MST Topology Reinforcement", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with:
+    1. Hierarchical clustering for density estimation
+    2. Two-step lookahead regret computation
+    3. MST-based topology reinforcement
+    4. Cluster-aware adaptive sparsification
+    
+    Returns a heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # ==================== 1. Hierarchical Clustering for Density Estimation ====================
+    clusters = np.zeros(n, dtype=int)
+    if n > 3:
+        # Convert distance matrix to condensed form for linkage
+        condensed_dist = squareform(distance_matrix, checks=False)
+        Z = linkage(condensed_dist, method='average')
+        
+        # Determine optimal number of clusters (sqrt(n) to balance granularity)
+        n_clusters = max(2, int(np.sqrt(n)))
+        clusters = fcluster(Z, t=n_clusters, criterion='maxclust')
+    
+    # Compute cluster-based density weights
+    cluster_density = np.zeros(n)
+    for cluster_id in np.unique(clusters):
+        mask = (clusters == cluster_id)
+        if np.sum(mask) > 1:
+            # Average intra-cluster distance as density measure
+            intra_distances = distance_matrix[mask][:, mask]
+            avg_intra_dist = np.mean(intra_distances[np.triu_indices(intra_distances.shape[0], k=1)])
+            cluster_density[mask] = 1.0 / (avg_intra_dist + 1e-8)
+    
+    # Normalize densities
+    if np.max(cluster_density) > 0:
+        cluster_density = cluster_density / np.max(cluster_density)
+    
+    # ==================== 2. Base Inverse Distance with Density Weighting ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Apply cluster-density weighting
+    density_weights = 0.5 + 0.5 * np.outer(cluster_density, cluster_density)
+    base_scores = inv_dist * density_weights
+    
+    # ==================== 3. MST Topology Reinforcement ====================
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_active = (mst > 0) | (mst.T > 0)
+    
+    # Strong reinforcement for MST edges (weighted by cluster coherence)
+    mst_cluster_bonus = np.where(mst_active, 2.0, 1.0)
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_active[i, j]:
+                # Extra bonus if edge connects same cluster (likely optimal)
+                if clusters[i] == clusters[j]:
+                    mst_cluster_bonus[i, j] *= 1.5
+                    mst_cluster_bonus[j, i] *= 1.5
+    
+    enhanced_scores = base_scores * mst_cluster_bonus
+    
+    # ==================== 4. Two-step Lookahead Regret Computation ====================
+    regret_scores = np.zeros_like(enhanced_scores)
+    
+    for i in range(n):
+        # Get distances from node i
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find two nearest neighbors (one-step alternatives)
+        idx_sorted = np.argsort(dists_i)
+        d1_idx, d2_idx = idx_sorted[0], idx_sorted[1]
+        d1, d2 = dists_i[d1_idx], dists_i[d2_idx]
+        
+        # Two-step lookahead: consider best two-step path alternatives
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Direct edge cost
+            direct_cost = distance_matrix[i, j]
+            
+            # Find best two-step alternative path (i -> k -> j)
+            best_two_step = np.inf
+            for k in range(n):
+                if k == i or k == j:
+                    continue
+                two_step_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                if two_step_cost < best_two_step:
+                    best_two_step = two_step_cost
+            
+            # Regret is minimum of one-step and two-step alternative cost minus direct cost
+            one_step_alt = d1 if j != d1_idx else d2
+            best_alternative = min(one_step_alt, best_two_step)
+            regret = max(best_alternative - direct_cost, 1e-8)
+            
+            # Regret score: exponential decay with normalized regret
+            norm_regret = regret / (direct_cost + 1e-8)
+            regret_scores[i, j] = np.exp(-norm_regret)
+    
+    # Symmetrize regret scores
+    regret_symmetric = (regret_scores + regret_scores.T) / 2
+    
+    # Combine with enhanced scores
+    combined_scores = enhanced_scores * (1.0 + regret_symmetric)
+    
+    # ==================== 5. Cluster-aware Adaptive Sparsification ====================
+    # Determine MST degree for each node
+    mst_degree = np.sum(mst_active, axis=1)
+    
+    # Compute cluster connectivity statistics
+    cluster_sizes = np.bincount(clusters)
+    cluster_connectivity = np.zeros(n)
+    for i in range(n):
+        cluster_i = clusters[i]
+        # Count connections to nodes in same cluster
+        same_cluster = (clusters == cluster_i)
+        cluster_connectivity[i] = np.sum(same_cluster) - 1  # exclude self
+    
+    sparsified = np.zeros_like(combined_scores)
+    for i in range(n):
+        row_scores = combined_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Dynamic k based on MST degree, cluster connectivity, and problem size
+        base_k = max(2, int(np.sqrt(n)))
+        adaptive_k = min(n - 1, base_k + int(mst_degree[i] * 1.2 + cluster_connectivity[i] * 0.8))
+        
+        # Separate intra-cluster and inter-cluster edges
+        intra_mask = (clusters == clusters[i])
+        intra_mask[i] = False  # exclude self
+        inter_mask = ~intra_mask
+        inter_mask[i] = False  # exclude self
+        
+        # Keep top edges proportionally from intra and inter clusters
+        intra_scores = row_scores[intra_mask]
+        inter_scores = row_scores[inter_mask]
+        
+        if len(intra_scores) > 0:
+            intra_k = min(len(intra_scores), max(2, adaptive_k // 2))
+            if intra_k > 0:
+                intra_threshold = np.partition(intra_scores, -intra_k)[-intra_k]
+                intra_keep = intra_scores >= intra_threshold
+                intra_indices = np.where(intra_mask)[0][intra_keep]
+                sparsified[i, intra_indices] = combined_scores[i, intra_indices]
+        
+        if len(inter_scores) > 0:
+            inter_k = min(len(inter_scores), max(2, adaptive_k - intra_k))
+            if inter_k > 0:
+                inter_threshold = np.partition(inter_scores, -inter_k)[-inter_k]
+                inter_keep = inter_scores >= inter_threshold
+                inter_indices = np.where(inter_mask)[0][inter_keep]
+                sparsified[i, inter_indices] = combined_scores[i, inter_indices]
+    
+    # ==================== 6. Final Length Penalty with Cluster Adaptation ====================
+    max_dist = np.max(distance_matrix)
+    
+    # Different length penalties for intra-cluster vs inter-cluster edges
+    same_cluster = (clusters[:, None] == clusters[None, :])
+    
+    # Intra-cluster edges: stricter penalty (shorter edges preferred within clusters)
+    intra_penalty = np.exp(-distance_matrix / (0.2 * max_dist + 1e-8))
+    
+    # Inter-cluster edges: more lenient penalty (allow longer connections between clusters)
+    inter_penalty = np.exp(-distance_matrix / (0.4 * max_dist + 1e-8))
+    
+    # Apply appropriate penalty
+    length_penalty = np.where(same_cluster, intra_penalty, inter_penalty)
+    np.fill_diagonal(length_penalty, 0)
+    
+    final_scores = sparsified * length_penalty
+    
+    # ==================== 7. Symmetrization and Normalization ====================
+    # Ensure symmetry for undirected TSP
+    symmetric = (final_scores + final_scores.T) / 2
+    np.fill_diagonal(symmetric, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(symmetric)
+    if max_val > 0:
+        symmetric = symmetric / max_val
+    
+    return symmetric
+```

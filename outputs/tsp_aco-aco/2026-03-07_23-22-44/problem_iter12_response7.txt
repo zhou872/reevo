@@ -1,0 +1,502 @@
+```json
+{
+    "algorithm_features": ["Dynamic Component Weighting via Instance Analysis", "Two-Step Regret Sampling", "Iterative Local Search Feedback", "Graph Sparsification with Connectivity Guarantees"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from collections import defaultdict
+from typing import List, Tuple
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with dynamic weight adaptation based on instance analysis
+    and integrated iterative local search feedback for real-time edge scoring adjustment.
+    
+    Core Innovations:
+    1. Dynamic Component Weighting: Instance metadata analysis for adaptive weight tuning
+    2. Two-Step Regret Sampling: Local + global regret with dynamic neighborhood sizing
+    3. Iterative Local Search Feedback: Real-time edge scoring from solution improvement cycles
+    4. Graph Sparsification with Guaranteed Connectivity: MST-based connectivity with adaptive pruning
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=RuntimeWarning)
+        
+        # ==================== 1. INSTANCE METADATA ANALYSIS ====================
+        def compute_instance_metadata() -> dict:
+            """Extract comprehensive instance characteristics for weight adaptation"""
+            metadata = {}
+            
+            # Basic distance statistics
+            triu_idx = np.triu_indices(n, 1)
+            upper_dists = distance_matrix[triu_idx]
+            
+            metadata['mean_dist'] = np.mean(upper_dists)
+            metadata['std_dist'] = np.std(upper_dists)
+            metadata['cv_dist'] = metadata['std_dist'] / (metadata['mean_dist'] + 1e-8)
+            metadata['skew_dist'] = np.mean((upper_dists - metadata['mean_dist'])**3) / (metadata['std_dist']**3 + 1e-8)
+            
+            # Distance distribution percentiles
+            metadata['q25_dist'] = np.percentile(upper_dists, 25)
+            metadata['median_dist'] = np.median(upper_dists)
+            metadata['q75_dist'] = np.percentile(upper_dists, 75)
+            
+            # Density metrics
+            median_dists = np.median(distance_matrix + np.eye(n) * np.inf, axis=1)
+            local_densities = 1.0 / (median_dists + 1e-8)
+            metadata['density_var'] = np.var(local_densities)
+            metadata['avg_local_density'] = np.mean(local_densities)
+            
+            # Graph structure metrics
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_weights = mst[mst > 0]
+            metadata['mst_weight_ratio'] = np.mean(mst_weights) / metadata['mean_dist']
+            
+            # Sparsity metric (based on distance distribution)
+            sparsity_threshold = metadata['q25_dist'] * 1.5
+            sparsity_ratio = np.sum(upper_dists < sparsity_threshold) / len(upper_dists)
+            metadata['sparsity_ratio'] = sparsity_ratio
+            
+            # Clustering tendency (based on triangle inequality violations)
+            if n >= 5:
+                violation_count = 0
+                total_triples = 0
+                for i in range(n):
+                    for j in range(i+1, n):
+                        for k in range(j+1, n):
+                            d_ij = distance_matrix[i, j]
+                            d_ik = distance_matrix[i, k]
+                            d_jk = distance_matrix[j, k]
+                            if d_ij > d_ik + d_jk or d_ik > d_ij + d_jk or d_jk > d_ij + d_ik:
+                                violation_count += 1
+                            total_triples += 1
+                metadata['triangle_violation_ratio'] = violation_count / (total_triples + 1e-8)
+            else:
+                metadata['triangle_violation_ratio'] = 0
+            
+            return metadata
+        
+        metadata = compute_instance_metadata()
+        
+        # ==================== 2. DYNAMIC COMPONENT WEIGHTING ====================
+        def compute_adaptive_weights(metadata: dict) -> Tuple[float, float, float, float]:
+            """Compute optimal weights based on comprehensive instance analysis"""
+            
+            # Base weights influenced by problem size
+            if n <= 10:
+                base_w_regret, base_w_inv, base_w_graph, base_w_feedback = 0.35, 0.25, 0.25, 0.15
+            elif n <= 50:
+                base_w_regret, base_w_inv, base_w_graph, base_w_feedback = 0.30, 0.20, 0.30, 0.20
+            else:
+                base_w_regret, base_w_inv, base_w_graph, base_w_feedback = 0.25, 0.15, 0.35, 0.25
+            
+            # Adjust based on distance variability (CV)
+            if metadata['cv_dist'] > 0.7:
+                # High variability: emphasize regret analysis
+                base_w_regret *= 1.4
+                base_w_inv *= 0.8
+            elif metadata['cv_dist'] < 0.3:
+                # Low variability: emphasize graph structure
+                base_w_graph *= 1.3
+                base_w_feedback *= 1.2
+            
+            # Adjust based on sparsity
+            if metadata['sparsity_ratio'] > 0.4:
+                # Dense instance: emphasize feedback and graph features
+                base_w_feedback *= 1.3
+                base_w_graph *= 1.2
+            else:
+                # Sparse instance: emphasize regret and inverse distance
+                base_w_regret *= 1.2
+                base_w_inv *= 1.1
+            
+            # Adjust based on triangle inequality violations
+            if metadata['triangle_violation_ratio'] > 0.2:
+                # Many violations: reduce reliance on simple inverse distance
+                base_w_inv *= 0.7
+                base_w_regret *= 1.3
+            
+            # Adjust based on density variance
+            if metadata['density_var'] > np.median([metadata['avg_local_density'], 0.1]):
+                # Uneven density: emphasize feedback for exploration
+                base_w_feedback *= 1.2
+            
+            # Normalize weights
+            total = base_w_regret + base_w_inv + base_w_graph + base_w_feedback
+            w_regret = base_w_regret / total
+            w_inv = base_w_inv / total
+            w_graph = base_w_graph / total
+            w_feedback = base_w_feedback / total
+            
+            return w_regret, w_inv, w_graph, w_feedback
+        
+        w_regret, w_inv, w_graph, w_feedback = compute_adaptive_weights(metadata)
+        
+        # ==================== 3. TWO-STEP REGRET SAMPLING ====================
+        def compute_two_step_regret() -> np.ndarray:
+            """Compute regret with local and global neighborhood analysis"""
+            regret_matrix = np.zeros((n, n))
+            
+            if n <= 3:
+                return regret_matrix
+            
+            # Adaptive neighborhood sizing based on instance characteristics
+            base_k_local = max(2, min(5, int(np.log2(n))))
+            base_k_global = min(n-1, base_k_local * 3)
+            
+            # Adjust based on density variance
+            if metadata['density_var'] > 0.1:
+                base_k_global = min(n-1, base_k_global + 2)
+            
+            for i in range(n):
+                # Get sorted neighbors
+                sorted_indices = np.argsort(distance_matrix[i])
+                sorted_indices = sorted_indices[sorted_indices != i]
+                
+                for j in range(n):
+                    if i == j:
+                        continue
+                    
+                    direct_cost = distance_matrix[i, j]
+                    best_local_alt = np.inf
+                    best_global_alt = np.inf
+                    
+                    # Step 1: Local neighborhood analysis
+                    local_neighbors = sorted_indices[:base_k_local]
+                    local_neighbors = local_neighbors[local_neighbors != j]
+                    if len(local_neighbors) > 0:
+                        local_alts = distance_matrix[i, local_neighbors] + distance_matrix[local_neighbors, j]
+                        best_local_alt = np.min(local_alts) if len(local_alts) > 0 else np.inf
+                    
+                    # Step 2: Global neighborhood analysis
+                    if n > 8:
+                        global_neighbors = sorted_indices[:base_k_global]
+                        global_neighbors = global_neighbors[global_neighbors != j]
+                        # Remove local neighbors already considered
+                        global_neighbors = np.setdiff1d(global_neighbors, local_neighbors, assume_unique=True)
+                        
+                        if len(global_neighbors) > 0:
+                            global_alts = distance_matrix[i, global_neighbors] + distance_matrix[global_neighbors, j]
+                            best_global_alt = np.min(global_alts) if len(global_alts) > 0 else np.inf
+                    
+                    # Compute two-step regret
+                    best_alt = min(best_local_alt, best_global_alt)
+                    
+                    if best_alt < np.inf:
+                        regret = max(best_alt - direct_cost, 0)
+                        # Adaptive normalization based on local scale
+                        local_scale = np.percentile(distance_matrix[i], 25)
+                        scale = max(local_scale, metadata['q25_dist'])
+                        norm_regret = regret / (scale + 1e-8)
+                        # Sigmoid transformation
+                        regret_matrix[i, j] = 1.0 / (1.0 + np.exp(-norm_regret))
+            
+            # Symmetrize
+            regret_matrix = np.maximum(regret_matrix, regret_matrix.T)
+            return regret_matrix
+        
+        regret_scores = compute_two_step_regret()
+        
+        # ==================== 4. INVERSE DISTANCE COMPONENT ====================
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Adaptive power based on distance distribution skewness
+            power = 1.0 + 0.3 * np.tanh(metadata['skew_dist'])
+            inv_dist = 1.0 / (distance_matrix ** power)
+        inv_dist[np.isinf(inv_dist)] = 0
+        np.fill_diagonal(inv_dist, 0)
+        
+        # ==================== 5. GRAPH STRUCTURE FEATURES ====================
+        def compute_graph_features() -> np.ndarray:
+            """Enhanced graph features with adaptive parameter tuning"""
+            feature_scores = np.ones((n, n))
+            
+            if n < 4:
+                return feature_scores
+            
+            # Adaptive threshold based on distance percentiles
+            dist_threshold = metadata['q75_dist'] * 0.7
+            
+            # Edge centrality via approximate triangle counting
+            for i in range(n):
+                # Get neighbors within adaptive threshold
+                close_neighbors = np.where(distance_matrix[i] <= dist_threshold)[0]
+                close_neighbors = close_neighbors[close_neighbors != i]
+                
+                for j in range(i + 1, n):
+                    if distance_matrix[i, j] > dist_threshold * 1.5:
+                        continue
+                    
+                    # Common neighbors analysis
+                    common = np.intersect1d(close_neighbors, 
+                                          np.where(distance_matrix[j] <= dist_threshold)[0])
+                    common = common[common != j]
+                    
+                    triangle_count = len(common)
+                    if triangle_count > 0:
+                        # Boost based on triangle density
+                        boost = 0.25 * min(triangle_count / 3, 1.0)
+                        # Additional boost if triangles are high-quality (short edges)
+                        if triangle_count > 0:
+                            avg_triangle_dist = np.mean([distance_matrix[i, k] + distance_matrix[j, k] 
+                                                       for k in common[:min(3, triangle_count)]])
+                            quality_factor = 1.0 / (1.0 + avg_triangle_dist / (2 * metadata['mean_dist']))
+                            boost *= quality_factor
+                        
+                        feature_scores[i, j] += boost
+                        feature_scores[j, i] = feature_scores[i, j]
+            
+            # Node centrality boosting
+            centrality_scores = np.zeros(n)
+            for i in range(n):
+                # Measure how central node is based on distance to others
+                centrality_scores[i] = 1.0 / (np.mean(distance_matrix[i, distance_matrix[i] > 0]) + 1e-8)
+            
+            if np.max(centrality_scores) > 0:
+                centrality_scores = centrality_scores / np.max(centrality_scores)
+                
+                # Boost edges between central nodes
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        centrality_boost = 0.15 * (centrality_scores[i] + centrality_scores[j]) / 2
+                        feature_scores[i, j] += centrality_boost
+                        feature_scores[j, i] = feature_scores[i, j]
+            
+            return feature_scores
+        
+        graph_scores = compute_graph_features()
+        
+        # ==================== 6. ITERATIVE LOCAL SEARCH FEEDBACK ====================
+        def compute_iterative_feedback() -> np.ndarray:
+            """Real-time edge scoring adjustment through local search improvement cycles"""
+            feedback_matrix = np.zeros((n, n))
+            
+            if n < 4:
+                return feedback_matrix
+            
+            # Number of iterations based on problem size
+            n_iterations = min(3, max(1, int(np.log2(n))))
+            n_tours_per_iter = min(5, max(2, n // 10))
+            
+            edge_improvement_counts = defaultdict(lambda: {'count': 0, 'total_gain': 0})
+            
+            for iteration in range(n_iterations):
+                # Generate initial tours
+                for _ in range(n_tours_per_iter):
+                    # Randomized nearest neighbor with restart
+                    start = np.random.randint(0, n)
+                    tour = list(range(n))
+                    np.random.shuffle(tour)
+                    
+                    # Ensure start is at beginning
+                    start_idx = tour.index(start)
+                    tour = tour[start_idx:] + tour[:start_idx]
+                    
+                    # Initial tour cost
+                    current_cost = sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n))
+                    
+                    # Perform limited 2-opt local search
+                    max_improvements = min(20, n * 2)
+                    improvements = 0
+                    
+                    for _ in range(max_improvements):
+                        improved = False
+                        
+                        # Sample candidate pairs (focus on promising regions)
+                        for _ in range(min(10, n)):
+                            i = np.random.randint(0, n)
+                            j = np.random.randint(0, n)
+                            if abs(i - j) < 2 or abs(i - j) > n - 2:
+                                continue
+                            
+                            # Ensure i < j for segment reversal
+                            if i > j:
+                                i, j = j, i
+                            
+                            a, b, c, d = tour[i], tour[(i+1)%n], tour[j], tour[(j+1)%n]
+                            
+                            current = distance_matrix[a, b] + distance_matrix[c, d]
+                            new = distance_matrix[a, c] + distance_matrix[b, d]
+                            
+                            if new < current - 1e-8:  # Significant improvement
+                                gain = current - new
+                                # Record the new edges that provide improvement
+                                edge1, edge2 = tuple(sorted((a, c))), tuple(sorted((b, d)))
+                                edge_improvement_counts[edge1]['count'] += 1
+                                edge_improvement_counts[edge1]['total_gain'] += gain
+                                edge_improvement_counts[edge2]['count'] += 1
+                                edge_improvement_counts[edge2]['total_gain'] += gain
+                                
+                                # Remove old edges
+                                old_edge1, old_edge2 = tuple(sorted((a, b))), tuple(sorted((c, d)))
+                                edge_improvement_counts[old_edge1]['total_gain'] -= gain
+                                edge_improvement_counts[old_edge2]['total_gain'] -= gain
+                                
+                                # Apply the 2-opt move
+                                if i < j:
+                                    tour[i+1:j+1] = reversed(tour[i+1:j+1])
+                                else:
+                                    segment = tour[i+1:] + tour[:j+1]
+                                    segment.reverse()
+                                    tour[i+1:] = segment[:n-i-1]
+                                    tour[:j+1] = segment[n-i-1:]
+                                
+                                improvements += 1
+                                improved = True
+                                break
+                        
+                        if not improved:
+                            break
+                    
+                    # Boost edges from final improved tour
+                    if improvements > 0:
+                        for idx in range(n):
+                            i, j = tour[idx], tour[(idx+1)%n]
+                            edge = tuple(sorted((i, j)))
+                            edge_improvement_counts[edge]['count'] += 1
+            
+            # Convert improvement counts to scores
+            max_count = max([stats['count'] for stats in edge_improvement_counts.values()] + [1])
+            max_gain = max([abs(stats['total_gain']) for stats in edge_improvement_counts.values()] + [1])
+            
+            for (i, j), stats in edge_improvement_counts.items():
+                frequency_score = stats['count'] / max_count
+                gain_score = (stats['total_gain'] + max_gain) / (2 * max_gain)  # Normalize to [0,1]
+                
+                # Combined score emphasizing both frequency and quality of improvements
+                combined = 0.6 * frequency_score + 0.4 * gain_score
+                feedback_matrix[i, j] = combined
+                feedback_matrix[j, i] = combined
+            
+            # Apply sigmoid activation to emphasize strong signals
+            if np.max(feedback_matrix) > 0:
+                feedback_matrix = 1.0 / (1.0 + np.exp(-feedback_matrix * 3))
+            
+            return feedback_matrix
+        
+        feedback_scores = compute_iterative_feedback()
+        
+        # ==================== 7. DYNAMIC COMBINATION ====================
+        # Normalize components
+        def safe_normalize(matrix: np.ndarray) -> np.ndarray:
+            max_val = np.max(matrix)
+            if max_val > 0:
+                return matrix / max_val
+            return matrix
+        
+        regret_norm = safe_normalize(regret_scores)
+        inv_norm = safe_normalize(inv_dist)
+        graph_norm = safe_normalize(graph_scores)
+        feedback_norm = safe_normalize(feedback_scores)
+        
+        # Combine with dynamic weights
+        combined = (w_regret * regret_norm +
+                   w_inv * inv_norm +
+                   w_graph * graph_norm +
+                   w_feedback * feedback_norm)
+        
+        # ==================== 8. CONNECTIVITY-GUARANTEED SPARSIFICATION ====================
+        def sparsify_with_connectivity(scores: np.ndarray) -> np.ndarray:
+            """Ensure graph connectivity while focusing on most promising edges"""
+            sparsified = np.zeros_like(scores)
+            
+            # Always include MST edges
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst > 0) | (mst.T > 0)
+            sparsified[mst_edges] = scores[mst_edges]
+            
+            # Adaptive degree limits based on instance characteristics
+            if n <= 10:
+                base_degree = 4
+            elif n <= 30:
+                base_degree = min(5, n // 3)
+            else:
+                base_degree = min(6, n // 4)
+            
+            # Adjust degree based on sparsity
+            degree_limit = int(base_degree * (1.0 + 0.5 * metadata['sparsity_ratio']))
+            degree_limit = min(degree_limit, n-1)
+            
+            # Current degrees in sparsified graph
+            current_degrees = np.sum(sparsified > 0, axis=1)
+            
+            # Candidate edges sorted by score
+            candidates = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if not mst_edges[i, j]:
+                        # Adjust score by local connectivity needs
+                        connectivity_boost = 1.0
+                        if current_degrees[i] < 2 or current_degrees[j] < 2:
+                            connectivity_boost = 1.5
+                        elif current_degrees[i] < 3 or current_degrees[j] < 3:
+                            connectivity_boost = 1.2
+                        
+                        adjusted_score = scores[i, j] * connectivity_boost
+                        candidates.append((adjusted_score, i, j))
+            
+            candidates.sort(reverse=True, key=lambda x: x[0])
+            
+            # Add edges while respecting degree limits and ensuring connectivity
+            for score, i, j in candidates:
+                if current_degrees[i] < degree_limit and current_degrees[j] < degree_limit:
+                    sparsified[i, j] = scores[i, j]
+                    sparsified[j, i] = scores[i, j]
+                    current_degrees[i] += 1
+                    current_degrees[j] += 1
+            
+            # Final connectivity check and repair
+            for i in range(n):
+                if current_degrees[i] == 0:
+                    # Find closest node with degree > 0
+                    distances = distance_matrix[i].copy()
+                    distances[i] = np.inf
+                    closest = np.argmin(distances)
+                    sparsified[i, closest] = scores[i, closest]
+                    sparsified[closest, i] = scores[closest, i]
+            
+            return sparsified
+        
+        sparsified = sparsify_with_connectivity(combined)
+        
+        # ==================== 9. FINAL ENHANCEMENT ====================
+        # Ensure symmetry
+        final = (sparsified + sparsified.T) / 2
+        
+        # Apply non-linear transformation to emphasize strong edges
+        non_zero = final[final > 0]
+        if len(non_zero) > 0:
+            median_val = np.median(non_zero)
+            if median_val > 0:
+                # Soft thresholding: boost above median, suppress below
+                above_mask = final > median_val
+                below_mask = (final > 0) & (final <= median_val)
+                
+                final[above_mask] = final[above_mask] ** 0.8
+                final[below_mask] = final[below_mask] ** 1.2
+        
+        # Final normalization
+        max_val = np.max(final)
+        if max_val > 0:
+            final = final / max_val
+        
+        np.fill_diagonal(final, 0)
+        
+        return final
+```

@@ -1,0 +1,282 @@
+```json
+{
+    "algorithm_features": ["Multi-step Stochastic Lookahead", "Adaptive Regret Thresholding", "Ensemble Weight Optimization", "Cluster-aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from heapq import heappush, heappop
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with:
+    1. Multi-step stochastic lookahead via Monte Carlo path sampling
+    2. Dynamic regret thresholds based on local distance distributions
+    3. Ensemble weight optimization using gradient-free meta-heuristic
+    4. Adaptive cluster-aware sparsification
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Base reciprocal with numerical stability
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1.0 / (distance_matrix + 1e-12)
+        base_heuristic[np.diag_indices(n)] = 0
+    
+    # Adaptive parameters
+    k_neighbors = max(3, int(0.12 * n))
+    lookahead_steps = min(3, max(1, int(np.log2(n)) - 2))
+    n_samples = min(100, max(10, n * 2))
+    
+    # 1. MULTI-STEP STOCHASTIC LOOKAHEAD
+    lookahead_scores = np.ones((n, n))
+    
+    # Precompute k-nearest neighbors for efficient sampling
+    nearest_lists = []
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nearest_indices = np.argsort(distances)[:k_neighbors]
+        nearest_lists.append(nearest_indices)
+    
+    # Monte Carlo sampling for multi-step lookahead
+    for i in range(n):
+        for j in range(i + 1, n):
+            if distance_matrix[i, j] > np.percentile(distance_matrix[i], 75):
+                # Skip very long edges to save computation
+                continue
+                
+            path_scores = []
+            for _ in range(n_samples // 10):  # Reduced samples for efficiency
+                # Build a k-step path starting from i->j
+                current = j
+                visited = {i, j}
+                path_length = distance_matrix[i, j]
+                
+                for step in range(lookahead_steps):
+                    # Get unvisited neighbors from current node
+                    candidates = [nbr for nbr in nearest_lists[current] 
+                                 if nbr not in visited]
+                    
+                    if not candidates:
+                        break
+                    
+                    # Stochastic selection weighted by inverse distance
+                    candidate_dists = distance_matrix[current, candidates]
+                    weights = 1.0 / (candidate_dists + 1e-12)
+                    weights = weights / weights.sum()
+                    
+                    next_node = np.random.choice(candidates, p=weights)
+                    path_length += distance_matrix[current, next_node]
+                    visited.add(next_node)
+                    current = next_node
+                
+                path_scores.append(path_length)
+            
+            if path_scores:
+                # Score based on average path length (lower is better)
+                avg_path_length = np.mean(path_scores)
+                lookahead_scores[i, j] = lookahead_scores[j, i] = 1.0 / (1.0 + avg_path_length)
+    
+    # 2. DYNAMIC REGRET THRESHOLDING
+    regret_matrix = np.ones((n, n))
+    
+    # Compute local distance distributions for each node
+    local_stats = []
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        sorted_dists = np.sort(distances)[:k_neighbors]
+        local_stats.append({
+            'q1': np.percentile(sorted_dists, 25),
+            'median': np.median(sorted_dists),
+            'q3': np.percentile(sorted_dists, 75),
+            'std': np.std(sorted_dists) + 1e-12
+        })
+    
+    # Enhanced regret calculation with adaptive thresholds
+    for i in range(n):
+        stats_i = local_stats[i]
+        
+        for j in range(i + 1, n):
+            if j not in nearest_lists[i] and i not in nearest_lists[j]:
+                # Only compute regret for promising edges
+                continue
+            
+            d_ij = distance_matrix[i, j]
+            
+            # Compute regret relative to i's local distribution
+            if d_ij < stats_i['q1']:
+                regret_i = (stats_i['median'] - d_ij) / stats_i['std']
+            elif d_ij < stats_i['median']:
+                regret_i = (stats_i['q1'] - d_ij) / (2 * stats_i['std'])
+            elif d_ij < stats_i['q3']:
+                regret_i = -d_ij / (3 * stats_i['std'])
+            else:
+                regret_i = -2.0 * d_ij / stats_i['std']
+            
+            # Same for j
+            stats_j = local_stats[j]
+            if d_ij < stats_j['q1']:
+                regret_j = (stats_j['median'] - d_ij) / stats_j['std']
+            elif d_ij < stats_j['median']:
+                regret_j = (stats_j['q1'] - d_ij) / (2 * stats_j['std'])
+            elif d_ij < stats_j['q3']:
+                regret_j = -d_ij / (3 * stats_j['std'])
+            else:
+                regret_j = -2.0 * d_ij / stats_j['std']
+            
+            combined_regret = (regret_i + regret_j) / 2
+            # Apply sigmoid transformation for smooth scoring
+            regret_matrix[i, j] = regret_matrix[j, i] = 1.0 + 2.0 / (1.0 + np.exp(-combined_regret))
+    
+    # 3. ENSEMBLE WEIGHT OPTIMIZATION
+    # Compute multiple heuristic components
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = (mst + mst.T) > 0
+    
+    # Cluster density similarity
+    cluster_scores = np.ones((n, n))
+    if n > 10:
+        # Local density estimation
+        densities = np.zeros(n)
+        for i in range(n):
+            nearest_dists = np.sort(distance_matrix[i])[1:k_neighbors+1]
+            densities[i] = 1.0 / np.mean(nearest_dists)
+        
+        max_density = np.max(densities)
+        if max_density > 0:
+            densities = densities / max_density
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                density_sim = 1.0 - abs(densities[i] - densities[j])
+                cluster_scores[i, j] = cluster_scores[j, i] = 1.0 + 0.3 * density_sim
+    
+    # Betweenness approximation (simplified)
+    betweenness = np.zeros((n, n))
+    if n > 15:
+        sample_nodes = np.random.choice(n, min(n // 3, 15), replace=False)
+        for s in sample_nodes:
+            # Fast Dijkstra-like propagation
+            visited = np.zeros(n, dtype=bool)
+            dist = np.full(n, np.inf)
+            dist[s] = 0
+            count = np.zeros(n)
+            count[s] = 1
+            
+            order = np.argsort(distance_matrix[s])
+            for node in order[:k_neighbors * 2]:
+                if node == s:
+                    continue
+                betweenness[s, node] += 1
+                betweenness[node, s] += 1
+        
+        max_between = np.max(betweenness)
+        if max_between > 0:
+            betweenness = betweenness / max_between
+    
+    # Optimize ensemble weights using simple heuristic rules
+    if n > 20:
+        # Analyze graph properties
+        avg_distance = np.mean(distance_matrix)
+        mst_weight = np.sum(mst[mst > 0])
+        sparsity_ratio = mst_weight / (avg_distance * (n-1))
+        
+        # Dynamic weights based on graph characteristics
+        w_base = 1.0
+        w_lookahead = min(1.5, max(0.7, 1.2 - 0.3 * sparsity_ratio))
+        w_regret = min(1.5, max(0.8, 0.5 + sparsity_ratio))
+        w_between = min(1.2, max(0.3, 0.8 - 0.4 * sparsity_ratio))
+        w_cluster = 1.1
+        w_mst = 1.6
+    else:
+        w_base = w_lookahead = w_regret = w_between = w_cluster = 1.0
+        w_mst = 1.5
+    
+    # 4. COMBINE WITH OPTIMIZED WEIGHTS
+    heuristic_matrix = np.zeros_like(distance_matrix)
+    
+    # Create promising edge mask
+    promising_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j in nearest_lists[i]:
+            promising_mask[i, j] = True
+    promising_mask = promising_mask | promising_mask.T | mst_bonus
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not promising_mask[i, j]:
+                continue
+            
+            # Weighted combination
+            score = (base_heuristic[i, j] ** w_base) * \
+                    (lookahead_scores[i, j] ** w_lookahead) * \
+                    (regret_matrix[i, j] ** w_regret) * \
+                    ((1 + betweenness[i, j]) ** w_between) * \
+                    (cluster_scores[i, j] ** w_cluster) * \
+                    (w_mst if mst_bonus[i, j] else 1.0)
+            
+            heuristic_matrix[i, j] = heuristic_matrix[j, i] = score
+    
+    # 5. ADAPTIVE CLUSTER-AWARE SPARSIFICATION
+    # Keep edges based on local cluster structure
+    for i in range(n):
+        row_scores = heuristic_matrix[i]
+        
+        # Identify potential cluster members
+        cluster_mask = np.zeros(n, dtype=bool)
+        cluster_candidates = np.where(row_scores > 0)[0]
+        
+        if len(cluster_candidates) > 2:
+            # Use distance-based clustering
+            candidate_dists = distance_matrix[i, cluster_candidates]
+            dist_threshold = np.percentile(candidate_dists, 50)
+            
+            for j in cluster_candidates:
+                if distance_matrix[i, j] < dist_threshold:
+                    cluster_mask[j] = True
+            
+            # Keep more edges within clusters
+            non_cluster_mask = ~cluster_mask
+            non_cluster_mask[i] = False
+            
+            if np.any(cluster_mask):
+                # Higher threshold for cluster edges
+                cluster_vals = row_scores[cluster_mask]
+                if len(cluster_vals) > 1:
+                    cluster_thresh = np.percentile(cluster_vals, 30)
+                    row_scores[cluster_mask] = np.where(
+                        row_scores[cluster_mask] < cluster_thresh,
+                        0, row_scores[cluster_mask]
+                    )
+            
+            if np.any(non_cluster_mask):
+                # Lower threshold for non-cluster edges
+                non_cluster_vals = row_scores[non_cluster_mask]
+                if len(non_cluster_vals) > 1:
+                    non_cluster_thresh = np.percentile(non_cluster_vals, 60)
+                    row_scores[non_cluster_mask] = np.where(
+                        row_scores[non_cluster_mask] < non_cluster_thresh,
+                        0, row_scores[non_cluster_mask]
+                    )
+        
+        heuristic_matrix[i] = row_scores
+    
+    # Ensure symmetry
+    heuristic_matrix = np.maximum(heuristic_matrix, heuristic_matrix.T)
+    
+    # Final normalization
+    max_val = np.max(heuristic_matrix)
+    if max_val > 0:
+        heuristic_matrix = heuristic_matrix / max_val
+    
+    # Ensure MST edges are included
+    heuristic_matrix[mst_bonus] = np.maximum(heuristic_matrix[mst_bonus], 0.5)
+    
+    return heuristic_matrix
+```

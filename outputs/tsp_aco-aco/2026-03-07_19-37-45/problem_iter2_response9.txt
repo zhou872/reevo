@@ -1,0 +1,180 @@
+```json
+{
+    "algorithm_features": ["Dynamic k-NN Cluster Detection", "Lightweight Alternative Edge Regret", "MST Edge Priority", "Multiplicative Factor Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristics for TSP edge selection with dynamic clustering and regret estimation.
+    
+    Args:
+        distance_matrix: Symmetric n×n matrix of pairwise distances
+        
+    Returns:
+        n×n matrix of edge priorities (higher = more promising)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones_like(distance_matrix)
+    
+    # Prevent division issues and self-connections
+    work_matrix = distance_matrix.copy()
+    np.fill_diagonal(work_matrix, np.inf)
+    
+    # 1. Dynamic k-NN cluster detection
+    k = max(2, min(8, n // 3))  # Adaptive neighborhood size
+    local_density = np.zeros(n)
+    is_local = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Get k nearest neighbors
+        dists = work_matrix[i].copy()
+        nn_indices = np.argpartition(dists, k)[:k]
+        local_density[i] = 1.0 / (np.mean(dists[nn_indices]) + 1e-10)
+        is_local[i, nn_indices] = True
+    
+    # Symmetrize local connections
+    is_local = is_local | is_local.T
+    
+    # 2. Lightweight alternative edge regret
+    regret_scores = np.zeros((n, n))
+    
+    # Precompute nearest neighbors for each node
+    nn1 = np.zeros(n, dtype=int)  # First nearest
+    nn2 = np.zeros(n, dtype=int)  # Second nearest
+    d1 = np.zeros(n)  # Distance to first nearest
+    d2 = np.zeros(n)  # Distance to second nearest
+    
+    for i in range(n):
+        dists = work_matrix[i].copy()
+        # Get two smallest distances (excluding self)
+        indices = np.argpartition(dists, 2)[:2]
+        sorted_idx = indices[np.argsort(dists[indices])]
+        nn1[i], nn2[i] = sorted_idx[0], sorted_idx[1]
+        d1[i], d2[i] = dists[nn1[i]], dists[nn2[i]]
+    
+    # Compute regret: how much worse are alternatives to this edge?
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Alternative from i (not going to j)
+            alt_i = d2[i] if j == nn1[i] else d1[i]
+            # Alternative from j (not going to i)
+            alt_j = d2[j] if i == nn1[j] else d1[j]
+            
+            # Regret: average alternative cost minus current edge cost
+            avg_alt = (alt_i + alt_j) / 2.0
+            regret = max(0, avg_alt - work_matrix[i, j])
+            regret_scores[i, j] = regret
+            regret_scores[j, i] = regret
+    
+    # Normalize regret
+    max_regret = np.max(regret_scores)
+    if max_regret > 0:
+        regret_scores = regret_scores / max_regret
+    
+    # 3. MST edge priority
+    mst = minimum_spanning_tree(work_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 4. Base inverse distance (with safe handling)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / work_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+    
+    # Normalize inverse distance
+    max_inv = np.max(inv_dist)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # 5. Multiplicative factor fusion
+    heuristics_matrix = np.zeros_like(work_matrix)
+    
+    # Weight factors based on problem characteristics
+    # Density influences weight allocation
+    avg_density = np.mean(local_density)
+    dense_weight = min(1.5, 0.8 + 0.7 * (avg_density > np.median(local_density)))
+    
+    for i in range(n):
+        # Consider local connections plus a few promising non-local edges
+        local_indices = np.where(is_local[i])[0]
+        
+        # Add top non-local edges by inverse distance
+        non_local_mask = ~is_local[i]
+        non_local_mask[i] = False
+        if np.any(non_local_mask):
+            non_local_indices = np.where(non_local_mask)[0]
+            top_k = min(3, len(non_local_indices))
+            top_non_local = non_local_indices[
+                np.argsort(inv_dist[i, non_local_indices])[-top_k:]
+            ]
+            local_indices = np.union1d(local_indices, top_non_local)
+        
+        for j in local_indices:
+            if j <= i:
+                continue
+                
+            # Component scores
+            base_score = inv_dist[i, j]
+            local_bonus = 1.5 if is_local[i, j] else 0.7
+            regret_bonus = 1.0 + 0.8 * regret_scores[i, j]
+            mst_bonus = 1.6 if mst_mask[i, j] else 0.9
+            
+            # Density-based synergy
+            density_factor = 1.0 + 0.3 * np.sqrt(local_density[i] * local_density[j]) / avg_density
+            
+            # Combine multiplicatively with density-adjusted weights
+            combined = (base_score ** 0.8) * \
+                      (local_bonus ** (dense_weight * 0.3)) * \
+                      (regret_bonus ** 0.6) * \
+                      (mst_bonus ** 0.7) * \
+                      (density_factor ** 0.4)
+            
+            heuristics_matrix[i, j] = combined
+            heuristics_matrix[j, i] = combined
+    
+    # 6. Adaptive sparsification with connectivity guarantee
+    # Determine edges to keep per node
+    edges_per_node = max(3, min(6, n // 2))
+    
+    for i in range(n):
+        node_scores = heuristics_matrix[i].copy()
+        node_scores[i] = -np.inf
+        
+        if n > edges_per_node:
+            threshold = np.sort(node_scores)[-edges_per_node]
+            mask = node_scores >= threshold
+        else:
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+        
+        # Zero out low-scoring edges
+        heuristics_matrix[i, ~mask] = 0
+        heuristics_matrix[~mask, i] = 0
+    
+    # Ensure minimum connectivity
+    min_connections = min(3, n - 1)
+    for i in range(n):
+        connected = np.nonzero(heuristics_matrix[i])[0]
+        if len(connected) < min_connections:
+            # Add nearest neighbors not already connected
+            candidates = np.argsort(work_matrix[i])
+            for j in candidates:
+                if j != i and heuristics_matrix[i, j] == 0:
+                    heuristics_matrix[i, j] = inv_dist[i, j]
+                    heuristics_matrix[j, i] = inv_dist[i, j]
+                    if len(np.nonzero(heuristics_matrix[i])[0]) >= min_connections:
+                        break
+    
+    # Normalize final matrix
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+```

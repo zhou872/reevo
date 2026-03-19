@@ -1,0 +1,255 @@
+```json
+{
+    "algorithm_features": ["Spectral Clustering Edge Preservation", "Adaptive Lookahead via Distribution Moments", "Meta-Heuristic Parameter Adaptation", "Density-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges with spectral clustering,
+    meta-heuristic parameter adaptation, and adaptive lookahead mechanisms.
+    
+    Key innovations:
+    1. Spectral clustering for cluster-aware edge preservation
+    2. Meta-heuristic parameter adaptation using instance characteristics
+    3. Adaptive lookahead based on distance distribution moments
+    4. Density-aware sparsification with hierarchical thresholds
+    
+    Returns a matrix of edge scores with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # For trivial cases, return uniform scores
+        scores = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(scores, 0)
+        return scores
+    
+    # 1. Base processing with safe numerical handling
+    dist = distance_matrix.astype(float, copy=True)
+    np.fill_diagonal(dist, np.inf)
+    
+    # Compute instance characteristics for meta-heuristic adaptation
+    valid_dists = dist[dist < np.inf]
+    if len(valid_dists) == 0:
+        return np.zeros_like(dist)
+    
+    dist_mean = np.mean(valid_dists)
+    dist_std = np.std(valid_dists) if len(valid_dists) > 1 else 1.0
+    dist_cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    
+    # 2. Adaptive parameter initialization based on instance characteristics
+    # These parameters are learned from instance properties
+    density_factor = min(1.0, max(0.2, (n / 100) * 0.5))  # Scale with n
+    variability_factor = min(1.0, max(0.3, dist_cv * 2))
+    
+    # 3. Enhanced inverse distance with instance-aware smoothing
+    smoothing = dist_mean * 0.1 * variability_factor
+    inv_dist = 1 / (dist + smoothing)
+    
+    # 4. MST with graded importance based on edge significance
+    mst = minimum_spanning_tree(dist)
+    mst_array = mst.toarray()
+    mst_mask = mst_array > 0
+    
+    # Compute MST edge importance relative to alternative connections
+    mst_importance = np.ones_like(dist)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_mask[i, j]:
+                # Find second-best connection for each endpoint
+                row_i = dist[i].copy()
+                row_i[j] = np.inf
+                second_best_i = np.min(row_i) if np.any(row_i < np.inf) else np.inf
+                
+                row_j = dist[j].copy()
+                row_j[i] = np.inf
+                second_best_j = np.min(row_j) if np.any(row_j < np.inf) else np.inf
+                
+                # Importance is higher if MST edge is much better than alternatives
+                alt_cost = min(second_best_i, second_best_j)
+                if alt_cost < np.inf:
+                    ratio = alt_cost / dist[i, j]
+                    importance = 1.0 + min(1.0, (ratio - 1.0) * 0.5)
+                    mst_importance[i, j] = mst_importance[j, i] = importance
+    
+    # 5. Spectral-inspired clustering using hierarchical clustering on distances
+    # Convert to condensed form for linkage
+    if n > 2:
+        condensed_dist = squareform(dist, checks=False)
+        Z = linkage(condensed_dist, method='average')
+        
+        # Adaptive cluster count: more clusters for larger/denser graphs
+        n_clusters = max(2, min(int(np.sqrt(n) * density_factor * 0.8), n // 3))
+        clusters = fcluster(Z, n_clusters, criterion='maxclust') - 1
+        
+        # Create cluster connectivity matrix
+        cluster_mask = np.zeros((n, n), dtype=bool)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if clusters[i] == clusters[j]:
+                    cluster_mask[i, j] = cluster_mask[j, i] = True
+    else:
+        cluster_mask = np.ones((n, n), dtype=bool)
+        np.fill_diagonal(cluster_mask, False)
+    
+    # 6. Adaptive lookahead scoring using distribution moments
+    lookahead_scores = np.ones_like(dist)
+    
+    # Precompute neighbor statistics for each node
+    neighbor_stats = []
+    for i in range(n):
+        row_dists = dist[i].copy()
+        row_dists[i] = np.inf
+        valid = row_dists < np.inf
+        
+        if np.sum(valid) >= 2:
+            valid_dists = row_dists[valid]
+            # Adaptive k based on distribution skewness and kurtosis
+            if len(valid_dists) > 3:
+                skew = np.mean((valid_dists - np.mean(valid_dists))**3) / (dist_std**3 + 1e-10)
+                kurt = np.mean((valid_dists - np.mean(valid_dists))**4) / (dist_std**4 + 1e-10) - 3
+                
+                # More neighbors for skewed distributions, fewer for peaked distributions
+                k = max(2, min(5, int(4 - abs(skew) + min(2, kurt))))
+            else:
+                k = min(3, len(valid_dists))
+            
+            # Get k nearest neighbors
+            idx = np.argsort(row_dists)[:k]
+            avg_neighbor_dist = np.mean(dist[i, idx])
+            
+            # Store for use in lookahead calculation
+            neighbor_stats.append({
+                'k': k,
+                'avg_dist': avg_neighbor_dist,
+                'neighbors': idx
+            })
+        else:
+            neighbor_stats.append({
+                'k': 1,
+                'avg_dist': dist_mean,
+                'neighbors': np.where(valid)[0] if np.any(valid) else np.array([], dtype=int)
+            })
+    
+    # Compute lookahead scores
+    for i in range(n):
+        stats_i = neighbor_stats[i]
+        for j in range(n):
+            if i == j:
+                continue
+            
+            if stats_i['neighbors'].size > 0:
+                # Consider continuation from j to i's other good neighbors
+                other_neighbors = [nbr for nbr in stats_i['neighbors'] if nbr != j]
+                
+                if other_neighbors:
+                    # Average distance from j to i's other good neighbors
+                    avg_continuation = np.mean([dist[j, nbr] for nbr in other_neighbors])
+                    
+                    # Score based on how good j is as a bridge to i's neighborhood
+                    if avg_continuation > 0:
+                        base_ratio = dist[i, j] / (avg_continuation + 1e-10)
+                        # Favor edges that lead to nodes close to the rest of i's neighborhood
+                        lookahead_scores[i, j] = 1.0 / (1.0 + base_ratio * 0.5)
+    
+    # 7. Dynamic percentile adjustment with instance-awareness
+    # More selective for dense, uniform instances; more inclusive for sparse, variable instances
+    selectivity = 0.7 * density_factor + 0.3 * (1 - variability_factor)
+    top_percentile = 100 - (15 + 25 * selectivity)  # Range: 15-40%
+    
+    # Compute adaptive regret penalty
+    regret_penalty = np.ones_like(inv_dist)
+    for i in range(n):
+        row_scores = inv_dist[i].copy()
+        row_scores[i] = -np.inf
+        
+        if np.any(row_scores > -np.inf):
+            threshold = np.percentile(row_scores[row_scores > -np.inf], top_percentile)
+            poor_mask = (row_scores < threshold) & (row_scores > -np.inf)
+            regret_penalty[i, poor_mask] = 0.3
+    
+    # Mutual poor penalty
+    mutual_poor = (regret_penalty < 0.5) & (regret_penalty.T < 0.5)
+    regret_penalty[mutual_poor] = 0.1
+    
+    # 8. Combined base scores
+    base_scores = inv_dist * mst_importance * regret_penalty * lookahead_scores
+    
+    # 9. Density-aware sparsification with hierarchical thresholds
+    # Level 1: Local connectivity (MST + cluster edges)
+    level1_mask = mst_mask | cluster_mask
+    
+    # Level 2: Adaptive degree-based sparsification
+    # More neighbors allowed in sparse areas of the graph
+    degree_factor = 2 + int(np.sqrt(n) * (1 - density_factor))
+    level2_mask = np.zeros_like(base_scores, dtype=bool)
+    
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        if np.any(row_scores > -np.inf):
+            k = min(degree_factor, np.sum(row_scores > -np.inf))
+            top_indices = np.argpartition(row_scores, -k)[-k:]
+            level2_mask[i, top_indices] = True
+    
+    # Level 3: Global elite preservation with cluster awareness
+    # Separate scoring for intra-cluster and inter-cluster edges
+    intra_scores = base_scores[cluster_mask]
+    inter_scores = base_scores[~cluster_mask & ~np.eye(n, dtype=bool)]
+    
+    if len(intra_scores) > 0 and len(inter_scores) > 0:
+        # Different thresholds for different edge types
+        intra_threshold = np.percentile(intra_scores, 80)  # Top 20% within clusters
+        inter_threshold = np.percentile(inter_scores, 90)  # Top 10% between clusters
+        
+        intra_elite = cluster_mask & (base_scores >= intra_threshold)
+        inter_elite = (~cluster_mask & ~np.eye(n, dtype=bool) & 
+                      (base_scores >= inter_threshold))
+        level3_mask = intra_elite | inter_elite
+    else:
+        # Fallback to simple threshold
+        all_scores = base_scores[~np.eye(n, dtype=bool)]
+        if len(all_scores) > 0:
+            threshold = np.percentile(all_scores, 85)
+            level3_mask = (base_scores >= threshold) & ~np.eye(n, dtype=bool)
+        else:
+            level3_mask = np.zeros_like(base_scores, dtype=bool)
+    
+    # Combine all levels
+    final_mask = level1_mask | level2_mask | level3_mask
+    
+    # Ensure symmetry
+    final_mask = final_mask | final_mask.T
+    
+    # Apply sparsification
+    final_scores = base_scores * final_mask
+    
+    # 10. Robust normalization preserving relative differences
+    positive_scores = final_scores[final_scores > 0]
+    if len(positive_scores) > 1:
+        # Use IQR-based normalization to handle outliers
+        q75 = np.percentile(positive_scores, 75)
+        q25 = np.percentile(positive_scores, 25)
+        iqr = q75 - q25
+        
+        if iqr > 0:
+            # Map scores to [0, 1] using robust scaling
+            median_score = np.median(positive_scores)
+            scaled_scores = (final_scores - median_score) / iqr
+            # Apply sigmoid-like transformation for bounded output
+            final_scores = 1 / (1 + np.exp(-np.clip(scaled_scores, -6, 6)))
+        else:
+            # All scores similar, normalize to [0, 1]
+            final_scores[final_scores > 0] = 1.0
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

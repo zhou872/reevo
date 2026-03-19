@@ -1,0 +1,273 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret-Based Multi-Hop Analysis", "Selective Spectral Clustering", "Graph Sparsity-Aware Component Weighting", "Distance-Inverse Rank Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+from sklearn.cluster import KMeans
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with adaptive regret analysis, selective spectral clustering,
+    and instance-aware component weighting for improved edge prioritization.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ADAPTIVE SPARSIFICATION ====================
+    base_k = max(3, int(np.log2(n)))
+    mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, base_k)[:base_k]
+        mask[i, nn_indices] = True
+    
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    # Compute graph sparsity metrics
+    avg_degree = np.sum(mask) / (2 * n)
+    edge_density = np.sum(mask) / (n * (n - 1))
+    
+    # ==================== 2. GLOBAL FEATURES ====================
+    # MST bonus
+    mst_bonus = np.ones_like(distance_matrix)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = mst > 0
+    mst_bonus[mst_mask] = 1.3
+    
+    # Local clustering coefficient
+    cluster_coeff = np.zeros(n)
+    for i in range(n):
+        neighbors = np.where(mask[i])[0]
+        if len(neighbors) < 2:
+            cluster_coeff[i] = 0
+            continue
+        
+        triangles = 0
+        for idx, n1 in enumerate(neighbors):
+            for n2 in neighbors[idx+1:]:
+                if mask[n1, n2]:
+                    triangles += 1
+        
+        max_triangles = len(neighbors) * (len(neighbors) - 1) / 2
+        cluster_coeff[i] = triangles / max_triangles if max_triangles > 0 else 0
+    
+    # Normalized centrality
+    centrality = np.zeros(n)
+    for i in range(n):
+        valid_dists = distance_matrix[i, mask[i]]
+        if len(valid_dists) > 0:
+            centrality[i] = len(valid_dists) / (np.mean(valid_dists) + 1e-10)
+    
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # ==================== 3. DISTANCE-INVERSE WITH RANK WEIGHTING ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Rank-based exponential weights
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = np.exp(-0.4 * (ranks - 1))
+            weights = weights / np.sum(weights)
+            
+            # Base inverse with centrality adjustment
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            density_factor = 1.0 + 0.3 * cluster_coeff[i] + 0.2 * centrality[i]
+            
+            inv_dist[i, valid_mask] = inv_vals * weights * density_factor
+    
+    inv_dist = inv_dist * mst_bonus
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ==================== 4. ADAPTIVE REGRET-BASED MULTI-HOP ANALYSIS ====================
+    # Dynamic hop limit based on graph sparsity
+    if edge_density > 0.3:  # Dense graph
+        max_hops = 2
+    elif edge_density > 0.15:  # Medium density
+        max_hops = 3
+    else:  # Sparse graph
+        max_hops = min(4, int(np.log2(n)))
+    
+    regret_penalty = np.ones_like(distance_matrix)
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    lookahead_depth = max(6, int(np.sqrt(n)))
+    top_neighbors = sorted_indices[:, 1:lookahead_depth+1]
+    
+    for i in range(n):
+        valid_j = np.where(mask[i] & (i < np.arange(n)))[0]
+        if len(valid_j) == 0:
+            continue
+            
+        for j in valid_j:
+            direct_dist = distance_matrix[i, j]
+            best_alternative = np.inf
+            
+            # 2-hop analysis (always performed)
+            common_neighbors = np.where(mask[i] & mask[j])[0]
+            common_neighbors = common_neighbors[(common_neighbors != i) & (common_neighbors != j)]
+            
+            if len(common_neighbors) > 0:
+                two_hop_dists = distance_matrix[i, common_neighbors] + distance_matrix[common_neighbors, j]
+                best_alternative = min(best_alternative, np.min(two_hop_dists))
+            
+            # Adaptive deeper analysis based on max_hops
+            if max_hops >= 3:
+                # 3-hop analysis
+                k_options = top_neighbors[i, :min(5, lookahead_depth//2)]
+                for k in k_options:
+                    if k == i or k == j or not mask[i, k]:
+                        continue
+                    
+                    # Find l that connects k to j
+                    possible_l = np.where(mask[k] & mask[j])[0]
+                    possible_l = possible_l[(possible_l != i) & (possible_l != j) & (possible_l != k)]
+                    
+                    if len(possible_l) > 0:
+                        three_hop_dists = (distance_matrix[i, k] + 
+                                         distance_matrix[k, possible_l] + 
+                                         distance_matrix[possible_l, j])
+                        current_best = np.min(three_hop_dists) if len(three_hop_dists) > 0 else np.inf
+                        best_alternative = min(best_alternative, current_best)
+            
+            # Regret calculation
+            if best_alternative < np.inf and direct_dist > 1e-10:
+                regret_ratio = best_alternative / direct_dist
+                
+                # Enhanced penalty function with adaptive threshold
+                if regret_ratio < 1.2:
+                    penalty_val = 0.2 + 0.6 * (regret_ratio / 1.2) ** 1.5
+                elif regret_ratio < 2.0:
+                    penalty_val = 0.7 + 0.3 * ((regret_ratio - 1.2) / 0.8)
+                else:
+                    penalty_val = 1.0
+                
+                # Adjust based on graph sparsity (sparser graphs tolerate less regret)
+                sparsity_factor = 0.6 + 0.4 * edge_density
+                penalty_val = penalty_val ** sparsity_factor
+                
+                regret_penalty[i, j] = regret_penalty[j, i] = penalty_val
+    
+    # ==================== 5. SELECTIVE SPECTRAL CLUSTERING ====================
+    cluster_bonus = np.ones_like(distance_matrix)
+    
+    # Apply spectral clustering only for larger instances or moderate sparsity
+    if n >= 50 and edge_density < 0.4:
+        try:
+            # Create normalized adjacency for spectral embedding
+            W = np.zeros_like(distance_matrix)
+            W[mask] = 1.0 / (distance_matrix[mask] + 1e-10)
+            np.fill_diagonal(W, 0)
+            
+            D = np.diag(W.sum(axis=1))
+            D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+            L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+            
+            # Adaptive number of clusters
+            n_clusters = max(2, min(8, int(np.sqrt(n))))
+            
+            if n_clusters > 1:
+                eigvals, eigvecs = eigsh(L_norm, k=n_clusters, sigma=0, which='SM')
+                kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+                cluster_labels = kmeans.fit_predict(eigvecs)
+                
+                # Compute cluster-based bonuses
+                cluster_sizes = np.bincount(cluster_labels)
+                for i in range(n):
+                    for j in range(i+1, n):
+                        if mask[i, j]:
+                            if cluster_labels[i] == cluster_labels[j]:
+                                # Same cluster: bonus inversely related to cluster size
+                                size = cluster_sizes[cluster_labels[i]]
+                                bonus = 1.2 - 0.2 * min(1.0, np.log1p(size) / 3)
+                                cluster_bonus[i, j] = cluster_bonus[j, i] = bonus
+                            else:
+                                # Different clusters: penalty based on cross-cluster distance
+                                cluster_i_nodes = np.where(cluster_labels == cluster_labels[i])[0]
+                                cluster_j_nodes = np.where(cluster_labels == cluster_labels[j])[0]
+                                
+                                cross_dists = distance_matrix[np.ix_(cluster_i_nodes, cluster_j_nodes)]
+                                avg_cross = np.mean(cross_dists)
+                                avg_all = distance_matrix.mean()
+                                
+                                penalty = 0.8 + 0.2 * np.exp(-avg_cross / (avg_all + 1e-10))
+                                cluster_bonus[i, j] = cluster_bonus[j, i] = penalty
+        except:
+            pass  # Fall back to no clustering bonus
+    
+    # ==================== 6. INSTANCE-AWARE COMPONENT WEIGHTING ====================
+    # Analyze instance characteristics for adaptive weighting
+    dist_mean = distance_matrix.mean()
+    dist_std = distance_matrix.std()
+    cv_dist = dist_std / (dist_mean + 1e-10) if dist_std > 0 else 0
+    
+    # Component weights based on instance characteristics
+    w_inv = 1.2 - 0.4 * min(1.0, cv_dist)  # Inverse distance weight
+    w_regret = 0.6 + 0.6 * min(1.0, cv_dist)  # Regret penalty weight
+    w_cluster = 0.8 - 0.4 * min(1.0, edge_density)  # Clustering weight (lower for dense graphs)
+    
+    # Normalize weights
+    weight_sum = w_inv + w_regret + w_cluster
+    w_inv /= weight_sum
+    w_regret /= weight_sum
+    w_cluster /= weight_sum
+    
+    # ==================== 7. COMBINE COMPONENTS ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply weighted combination only to masked edges
+    base_inv = inv_dist.copy()
+    base_inv[~mask] = 0
+    
+    heuristics = (w_inv * base_inv +
+                  w_regret * (base_inv * regret_penalty) +
+                  w_cluster * (base_inv * cluster_bonus))
+    
+    # Ensure connectivity for isolated nodes
+    for i in range(n):
+        if np.sum(heuristics[i] > 0) == 0:
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            nn_indices = np.argpartition(distances, min(3, n-1))[:min(3, n-1)]
+            for j in nn_indices:
+                inv_val = 1.0 / (distance_matrix[i, j] + 1e-10)
+                heuristics[i, j] = heuristics[j, i] = max(heuristics[i, j], inv_val)
+    
+    # Row-wise softmax normalization
+    for i in range(n):
+        row = heuristics[i]
+        row_max = row.max()
+        if row_max > 0:
+            # Temperature based on local centrality
+            temp = 0.7 + 0.6 * centrality[i]
+            exp_row = np.exp(row / (row_max * temp + 1e-10))
+            heuristics[i] = exp_row / (exp_row.sum() + 1e-10)
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

@@ -1,0 +1,249 @@
+```json
+{
+    "algorithm_features": ["Spectral Node Embedding Similarity", "Multi-Order Distance Statistics", "Spanning Forest Connectivity", "Graph Laplacian Regularization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection incorporating spectral graph
+    embeddings, multi-order distance statistics, and adaptive regularization.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances (symmetric, non-negative)
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges.
+        Diagonal entries are zero (no self-loops).
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # Adaptive parameters based on problem size
+    spectral_dim = min(8, n // 4, max(2, int(np.log2(n))))  # Embedding dimension
+    lookahead_depth = min(3, int(np.log2(n)))  # Dynamic lookahead depth
+    k_neighbors = max(3, min(10, n // 5))  # For local statistics
+    
+    # 1. Spectral node embeddings via graph Laplacian
+    def compute_spectral_embeddings(dist_mat: np.ndarray, dim: int) -> np.ndarray:
+        """Compute node embeddings using Laplacian eigenvectors."""
+        # Create affinity matrix with Gaussian kernel
+        sigma = np.median(dist_mat[dist_mat > 0])
+        W = np.exp(-dist_mat ** 2 / (2 * sigma ** 2))
+        np.fill_diagonal(W, 0)
+        
+        # Normalized Laplacian
+        D = np.diag(np.sum(W, axis=1) ** (-0.5))
+        L_norm = np.eye(n) - D @ W @ D
+        
+        # Compute eigenvectors for smallest eigenvalues (excluding zero)
+        try:
+            eigvals, eigvecs = np.linalg.eigh(L_norm)
+            # Sort by eigenvalue (ascending) and take non-zero eigenvectors
+            idx = np.argsort(eigvals)[1:dim+1]  # Skip first zero eigenvalue
+            embeddings = eigvecs[:, idx]
+            # Normalize rows to unit length
+            embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        except:
+            # Fallback to PCA on distance matrix if eigendecomposition fails
+            cov = -0.5 * (dist_mat ** 2 - np.mean(dist_mat ** 2, axis=1, keepdims=True)
+                          - np.mean(dist_mat ** 2, axis=0, keepdims=True)
+                          + np.mean(dist_mat ** 2))
+            U, S, _ = np.linalg.svd(cov)
+            embeddings = U[:, :dim] * np.sqrt(S[:dim])
+            embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        
+        return embeddings
+    
+    embeddings = compute_spectral_embeddings(distance_matrix, spectral_dim)
+    
+    # 2. Multi-order distance statistics with exponential weighting
+    def compute_multi_order_stats(dist_mat: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute weighted statistics of distance ranks."""
+        # Sort distances for each node
+        sorted_idx = np.argsort(dist_mat, axis=1)
+        sorted_dists = np.take_along_axis(dist_mat, sorted_idx, axis=1)
+        
+        # Exclude self (first column)
+        sorted_dists = sorted_dists[:, 1:k+1]
+        sorted_idx = sorted_idx[:, 1:k+1]
+        
+        # Exponential weights: closer neighbors get higher weight
+        weights = np.exp(-np.arange(k) / (k / 3))
+        weights = weights / weights.sum()
+        
+        # Weighted average distance for each node
+        avg_dists = np.average(sorted_dists, axis=1, weights=weights)
+        
+        # Create weighted adjacency for top-k neighbors
+        adj_weighted = np.zeros((n, n))
+        for i in range(n):
+            for rank, j in enumerate(sorted_idx[i]):
+                if rank < k:
+                    adj_weighted[i, j] = weights[rank]
+        
+        return avg_dists, adj_weighted
+    
+    avg_dists, weighted_adj = compute_multi_order_stats(distance_matrix, k_neighbors)
+    
+    # 3. Spanning forest connectivity with edge criticality
+    def compute_spanning_forest_features(dist_mat: np.ndarray) -> np.ndarray:
+        """Compute MST-based features with edge criticality scores."""
+        # Compute minimum spanning tree
+        mst = minimum_spanning_tree(dist_mat).toarray()
+        mst_sym = mst + mst.T
+        
+        # Edge criticality: how many MST edges bypass this edge?
+        criticality = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if dist_mat[i, j] > 0:
+                    # Find MST edges that connect i's and j's components
+                    i_component = np.where(mst_sym[i] > 0)[0]
+                    j_component = np.where(mst_sym[j] > 0)[0]
+                    
+                    if len(i_component) > 0 and len(j_component) > 0:
+                        # Minimum distance between components via MST
+                        min_cross_dist = np.inf
+                        for a in i_component:
+                            for b in j_component:
+                                if a != b:
+                                    path_dist = dist_mat[i, a] + dist_mat[a, b] + dist_mat[b, j]
+                                    min_cross_dist = min(min_cross_dist, path_dist)
+                        
+                        if np.isfinite(min_cross_dist):
+                            criticality[i, j] = criticality[j, i] = min_cross_dist / (dist_mat[i, j] + 1e-10)
+        
+        # Normalize criticality scores
+        if criticality.max() > 0:
+            criticality = criticality / criticality.max()
+        
+        return mst_sym, criticality
+    
+    mst_adj, edge_criticality = compute_spanning_forest_features(distance_matrix)
+    
+    # 4. Graph Laplacian regularization
+    def compute_laplacian_regularization(dist_mat: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+        """Compute regularization term based on graph smoothness."""
+        # Create graph Laplacian
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / (dist_mat + np.eye(n))
+        np.fill_diagonal(inv_dist, 0)
+        
+        D = np.diag(np.sum(inv_dist, axis=1))
+        L = D - inv_dist
+        
+        # Compute Fiedler vector (second smallest eigenvector of L)
+        try:
+            eigvals, eigvecs = np.linalg.eigh(L)
+            fiedler = eigvecs[:, 1]  # Second smallest eigenvalue corresponds to index 1
+        except:
+            fiedler = np.random.randn(n)
+        
+        # Edge smoothness: similarity of Fiedler vector values
+        smoothness = np.abs(fiedler[:, None] - fiedler[None, :])
+        smoothness = np.exp(-alpha * smoothness / smoothness.std())
+        np.fill_diagonal(smoothness, 0)
+        
+        return smoothness
+    
+    regularization = compute_laplacian_regularization(distance_matrix)
+    
+    # 5. Combine features with adaptive fusion
+    # a) Spectral similarity
+    spectral_sim = embeddings @ embeddings.T
+    np.fill_diagonal(spectral_sim, 0)
+    
+    # b) Inverse distance with local normalization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + np.eye(n))
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize by local average distances
+    local_norm = avg_dists[:, None] @ avg_dists[None, :]
+    inv_dist_norm = inv_dist * np.sqrt(local_norm)
+    
+    # c) Combined weighted adjacency (mutual nearest neighbors)
+    mutual_adj = (weighted_adj * weighted_adj.T) ** 0.5
+    
+    # 6. Adaptive fusion weights based on graph properties
+    # Measure graph regularity via distance variance
+    dist_var = np.var(distance_matrix[distance_matrix > 0])
+    reg_param = min(0.5, dist_var / (dist_var + np.mean(distance_matrix) ** 2))
+    
+    # Weights adapt to graph structure
+    w_spectral = 0.4 * (1 + reg_param)  # Higher for regular graphs
+    w_distance = 0.3 * (1 - reg_param)  # Higher for irregular graphs
+    w_adjacency = 0.2
+    w_mst = 0.15
+    w_critical = 0.1
+    w_regularize = 0.05
+    
+    # Combine features
+    heuristics = (
+        w_spectral * spectral_sim +
+        w_distance * inv_dist_norm +
+        w_adjacency * mutual_adj +
+        w_mst * mst_adj +
+        w_critical * edge_criticality +
+        w_regularize * regularization
+    )
+    
+    # Apply graph-aware sparsification
+    def adaptive_sparsify(matrix: np.ndarray, keep_ratio: float = 0.3) -> np.ndarray:
+        """Keep top edges based on local and global importance."""
+        n_nodes = matrix.shape[0]
+        result = np.zeros_like(matrix)
+        
+        # Global threshold
+        flat_vals = matrix[np.triu_indices(n_nodes, 1)]
+        if len(flat_vals) > 0:
+            global_thresh = np.percentile(flat_vals, 100 * (1 - keep_ratio))
+        else:
+            global_thresh = 0
+        
+        # Local thresholds per node
+        for i in range(n_nodes):
+            row = matrix[i].copy()
+            row[i] = -np.inf
+            
+            # Keep edges above both local and global thresholds
+            local_thresh = np.percentile(row[row > -np.inf], 100 * (1 - keep_ratio / 2))
+            thresh = max(global_thresh, local_thresh)
+            
+            mask = row >= thresh
+            result[i] = matrix[i] * mask
+        
+        # Ensure symmetry
+        result = (result + result.T) / 2
+        return result
+    
+    heuristics = adaptive_sparsify(heuristics, keep_ratio=0.25)
+    
+    # 7. Final normalization with spectral boosting
+    # Boost edges that align with spectral embedding structure
+    for i in range(n):
+        row_sum = heuristics[i].sum()
+        if row_sum > 0:
+            # Preserve relative ordering while normalizing
+            heuristics[i] = heuristics[i] / row_sum
+        else:
+            # Fallback uniform distribution
+            heuristics[i] = 1.0 / (n - 1)
+        heuristics[i, i] = 0
+    
+    # Symmetrize final result
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    return heuristics
+```

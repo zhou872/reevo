@@ -1,0 +1,209 @@
+```json
+{
+    "algorithm_features": ["Clustering-Based Sparsification", "Adaptive Weight Learning", "Graph-Theoretic Heuristics", "Dynamic Edge Selection"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import fcluster, linkage
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristics with adaptive weight learning, graph clustering,
+    and dynamic sparsification based on solution quality metrics.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Adaptive weight initialization based on problem size
+    size_factor = min(1.0, n / 50)  # Normalize by typical TSP size
+    w_inv = 0.4 + 0.2 * size_factor  # More weight to inverse distance for larger problems
+    w_nn = 1.2 + 0.3 * (1 - size_factor)  # Higher NN boost for smaller problems
+    w_mst = 1.8 + 0.4 * size_factor  # Stronger MST emphasis for larger problems
+    w_centrality = 0.3 + 0.2 * size_factor  # Moderate centrality weight
+    
+    # 2. Base components (unchanged core calculations)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Adaptive nearest neighbors
+    k = max(2, min(8, n // 6 + 2))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        nn_indices = np.argsort(distance_matrix[i])[1:k+1]
+        nn_mask[i, nn_indices] = True
+    nn_mask = nn_mask | nn_mask.T
+    
+    # MST component
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Improved centrality with damping
+    row_sums = np.sum(distance_matrix, axis=1) - np.diag(distance_matrix)
+    centrality = 1 / (row_sums / (n - 1) + 1e-10)
+    centrality = centrality / (np.sum(centrality) + 1e-10)
+    edge_potential = np.outer(centrality, centrality)
+    np.fill_diagonal(edge_potential, 0)
+    
+    # 3. Graph clustering for local structure analysis
+    cluster_boost = np.ones_like(distance_matrix)
+    if n >= 8:  # Only cluster for reasonably sized problems
+        try:
+            # Convert to condensed form for hierarchical clustering
+            condensed_dist = squareform(distance_matrix, checks=False)
+            Z = linkage(condensed_dist, method='average')
+            
+            # Adaptive clustering threshold based on problem size
+            cluster_threshold = 0.4 * np.median(distance_matrix) * (n ** 0.25)
+            labels = fcluster(Z, cluster_threshold, criterion='distance')
+            
+            # Boost intra-cluster edges and penalize inter-cluster edges
+            for i in range(n):
+                for j in range(i+1, n):
+                    if labels[i] == labels[j]:
+                        # Same cluster: stronger connection
+                        cluster_boost[i, j] = 1.5
+                        cluster_boost[j, i] = 1.5
+                    elif distance_matrix[i, j] < cluster_threshold:
+                        # Close nodes across clusters: moderate boost
+                        cluster_boost[i, j] = 1.2
+                        cluster_boost[j, i] = 1.2
+                    else:
+                        # Far nodes across clusters: slight penalty
+                        cluster_boost[i, j] = 0.8
+                        cluster_boost[j, i] = 0.8
+        except:
+            # Fallback if clustering fails
+            cluster_boost = np.ones_like(distance_matrix)
+    
+    # 4. Combine components with adaptive weights and clustering
+    heuristic_scores = np.zeros_like(distance_matrix)
+    heuristic_scores = w_inv * inv_dist
+    heuristic_scores[nn_mask] *= w_nn
+    heuristic_scores[mst_mask] *= w_mst
+    heuristic_scores += w_centrality * edge_potential
+    heuristic_scores *= cluster_boost
+    
+    # 5. Dynamic sparsification based on edge quality distribution
+    sparsity_mask = np.zeros_like(heuristic_scores, dtype=bool)
+    
+    # Calculate edge quality metrics
+    edge_quality = heuristic_scores.copy()
+    np.fill_diagonal(edge_quality, 0)
+    
+    # Determine adaptive thresholds based on quality distribution
+    quality_flat = edge_quality.flatten()
+    quality_flat = quality_flat[quality_flat > 0]
+    
+    if len(quality_flat) > 0:
+        q75 = np.percentile(quality_flat, 75)
+        q90 = np.percentile(quality_flat, 90)
+        
+        # High-quality edges (always keep)
+        high_quality_mask = edge_quality >= q90
+        sparsity_mask[high_quality_mask] = True
+        
+        # Medium-quality edges (keep based on local connectivity)
+        medium_quality_mask = (edge_quality >= q75) & (edge_quality < q90)
+        
+        # Ensure each node has at least 3 connections
+        for i in range(n):
+            # Current connections for node i
+            current_connections = np.sum(sparsity_mask[i])
+            
+            # If less than 3, add best medium-quality edges
+            if current_connections < 3:
+                # Get candidate edges (medium quality, not already selected)
+                candidates = np.where(medium_quality_mask[i] & ~sparsity_mask[i])[0]
+                if len(candidates) > 0:
+                    # Sort by quality and take best ones
+                    sorted_idx = np.argsort(edge_quality[i, candidates])[::-1]
+                    needed = min(3 - current_connections, len(candidates))
+                    sparsity_mask[i, candidates[sorted_idx[:needed]]] = True
+        
+        # Ensure MST edges are always included
+        sparsity_mask[mst_mask] = True
+        
+        # Ensure symmetry
+        sparsity_mask = sparsity_mask | sparsity_mask.T
+        
+        # Additional connectivity: ensure graph is not fragmented
+        # By connecting each cluster to at least one other cluster
+        if n >= 8 and 'labels' in locals():
+            unique_clusters = np.unique(labels)
+            for cluster_id in unique_clusters:
+                cluster_nodes = np.where(labels == cluster_id)[0]
+                other_nodes = np.where(labels != cluster_id)[0]
+                
+                if len(other_nodes) > 0:
+                    # Find best connection from this cluster to others
+                    best_i, best_j = None, None
+                    best_score = -np.inf
+                    
+                    for i in cluster_nodes:
+                        for j in other_nodes:
+                            if edge_quality[i, j] > best_score:
+                                best_score = edge_quality[i, j]
+                                best_i, best_j = i, j
+                    
+                    if best_i is not None:
+                        sparsity_mask[best_i, best_j] = True
+                        sparsity_mask[best_j, best_i] = True
+    
+    # 6. Apply sparsification with minimum density guarantee
+    # Ensure at least 20% of possible edges are kept (but not more than needed)
+    current_density = np.sum(sparsity_mask) / (n * n - n)
+    min_density = 0.15 + 0.1 * min(1.0, 50 / n)  # Higher min density for smaller problems
+    
+    if current_density < min_density:
+        # Add more edges based on combined score
+        needed_edges = int(min_density * (n * n - n) - np.sum(sparsity_mask))
+        if needed_edges > 0:
+            # Get all non-selected edges sorted by quality
+            candidate_mask = ~sparsity_mask
+            np.fill_diagonal(candidate_mask, False)
+            candidate_indices = np.where(candidate_mask)
+            candidate_scores = edge_quality[candidate_indices]
+            
+            if len(candidate_scores) > 0:
+                sorted_idx = np.argsort(candidate_scores)[::-1]
+                top_k = min(needed_edges, len(sorted_idx))
+                
+                for idx in sorted_idx[:top_k]:
+                    i, j = candidate_indices[0][idx], candidate_indices[1][idx]
+                    sparsity_mask[i, j] = True
+                    sparsity_mask[j, i] = True
+    
+    # 7. Final refinement and normalization
+    heuristic_scores = heuristic_scores * sparsity_mask
+    
+    # Apply softmax-like normalization for better differentiation
+    max_val = np.max(heuristic_scores)
+    if max_val > 0:
+        # Exponential scaling to emphasize differences
+        scaled_scores = np.exp(heuristic_scores / max_val)
+        scaled_scores = scaled_scores * sparsity_mask
+        # Final normalization to [0, 1]
+        max_scaled = np.max(scaled_scores)
+        if max_scaled > 0:
+            heuristic_scores = scaled_scores / max_scaled
+    
+    return heuristic_scores
+```

@@ -1,0 +1,165 @@
+```json
+{
+    "algorithm_features": ["Adaptive Percentile Thresholds", "Two-step Lookahead Potential", "Connectivity-Aware MST Weighting", "Progressive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges with adaptive mechanisms:
+    1. Inverse distance with dynamic smoothing based on distribution
+    2. Adaptive mutual regret penalization using node-specific percentiles
+    3. Two-step lookahead potential for path continuity
+    4. MST edge weighting based on connectivity importance
+    5. Progressive sparsification with context-aware filtering
+    
+    Returns a matrix of edge scores with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n == 0:
+        return np.array([])
+    
+    # Create a copy for processing
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Adaptive inverse distance with distribution-aware smoothing
+    # Use median distance for smoothing to handle varying scales
+    median_dist = np.median(dist[dist < np.inf])
+    inv_dist = 1 / (dist + 0.1 * median_dist)
+    
+    # 2. Compute MST with connectivity-aware weighting
+    mst = minimum_spanning_tree(dist)
+    mst_array = mst.toarray()
+    
+    # Identify critical edges (those that connect high-degree nodes in MST)
+    mst_degree = (mst_array > 0).sum(axis=1)
+    mst_degree_norm = mst_degree / max(mst_degree.max(), 1)
+    
+    # MST bonus: higher for edges connecting nodes with high MST degree
+    mst_bonus = np.ones_like(dist)
+    for i in range(n):
+        for j in range(n):
+            if mst_array[i, j] > 0:
+                # Bonus depends on connectivity importance of both endpoints
+                connectivity_factor = 1.0 + 0.5 * (mst_degree_norm[i] + mst_degree_norm[j])
+                mst_bonus[i, j] = connectivity_factor
+    
+    # 3. Adaptive mutual regret penalization
+    regret_penalty = np.ones_like(dist)
+    
+    # Node-adaptive percentiles based on distance distribution
+    node_percentiles = np.zeros(n)
+    for i in range(n):
+        valid_dists = dist[i, dist[i] < np.inf]
+        if len(valid_dists) > 0:
+            # Use interquartile range to determine percentile threshold
+            q75 = np.percentile(valid_dists, 75)
+            q25 = np.percentile(valid_dists, 25)
+            iqr = q75 - q25
+            if iqr > 0:
+                # More selective for nodes with tight distance distributions
+                node_percentiles[i] = max(25, min(50, 35 * (1.0 - iqr / (iqr + median_dist))))
+            else:
+                node_percentiles[i] = 40
+        else:
+            node_percentiles[i] = 40
+    
+    # Apply adaptive regret penalty
+    for i in range(n):
+        row_inv = inv_dist[i].copy()
+        if np.any(row_inv > -np.inf):
+            # Use node-specific percentile threshold
+            threshold = np.percentile(row_inv[row_inv > -np.inf], 
+                                    100 - node_percentiles[i])
+            
+            # Mark edges below threshold (poor for this node)
+            poor_edges = (row_inv < threshold) & (row_inv > -np.inf)
+            regret_penalty[i, poor_edges] *= 0.2
+    
+    # Mutual penalty: penalize only if poor for both endpoints
+    mutual_poor_mask = (regret_penalty < 0.25) & (regret_penalty.T < 0.25)
+    regret_penalty[mutual_poor_mask] = 0.15
+    regret_penalty[~mutual_poor_mask] = 1.0
+    
+    # 4. Two-step lookahead potential
+    lookahead_factor = np.ones_like(dist)
+    
+    # For each edge (i,j), consider best alternative continuation from j
+    for i in range(n):
+        for j in range(n):
+            if i != j and dist[i, j] < np.inf:
+                # Find best k (≠ i) from j's perspective
+                mask = np.ones(n, dtype=bool)
+                mask[i] = False
+                mask[j] = False
+                
+                if np.any(mask):
+                    # Look for promising next step from j
+                    j_potentials = inv_dist[j].copy()
+                    j_potentials[~mask] = -np.inf
+                    
+                    if np.any(j_potentials > -np.inf):
+                        best_k = np.argmax(j_potentials)
+                        lookahead_potential = inv_dist[j, best_k]
+                        
+                        # Boost edges that lead to nodes with good continuations
+                        if lookahead_potential > 0:
+                            boost = 1.0 + 0.3 * (lookahead_potential / inv_dist[i, j])
+                            lookahead_factor[i, j] = min(boost, 1.5)
+    
+    # 5. Combine factors with weighted emphasis
+    base_scores = inv_dist * mst_bonus * regret_penalty * lookahead_factor
+    
+    # 6. Progressive sparsification
+    # Stage 1: Strong local connections (top per node)
+    m1 = max(2, int(np.sqrt(n) * 0.8))
+    stage1_mask = np.zeros_like(base_scores, dtype=bool)
+    
+    for i in range(n):
+        row = base_scores[i].copy()
+        row[i] = -np.inf
+        top_indices = np.argpartition(row, -m1)[-m1:]
+        stage1_mask[i, top_indices] = True
+    
+    # Stage 2: Promising medium-range connections
+    # Use MST as guide for connectivity
+    mst_neighbors = mst_array > 0
+    stage2_mask = stage1_mask | mst_neighbors
+    
+    # Stage 3: Global promising edges
+    # Consider edges with good combined score
+    combined_scores = base_scores * stage2_mask
+    if np.any(combined_scores > 0):
+        # Dynamic threshold based on score distribution
+        non_zero_scores = combined_scores[combined_scores > 0]
+        if len(non_zero_scores) > 0:
+            score_threshold = np.percentile(non_zero_scores, 70)
+            global_promising = base_scores >= score_threshold
+            stage3_mask = stage2_mask | global_promising
+        else:
+            stage3_mask = stage2_mask
+    else:
+        stage3_mask = stage2_mask
+    
+    # Ensure symmetry
+    stage3_mask = stage3_mask | stage3_mask.T
+    
+    # Apply final mask
+    final_scores = base_scores * stage3_mask
+    
+    # 7. Normalize with outlier protection
+    valid_scores = final_scores[final_scores > 0]
+    if len(valid_scores) > 0:
+        # Use robust normalization (ignore extreme outliers)
+        q95 = np.percentile(valid_scores, 95)
+        if q95 > 0:
+            final_scores = np.clip(final_scores / q95, 0, 1)
+    
+    np.fill_diagonal(final_scores, 0)
+    return final_scores
+```

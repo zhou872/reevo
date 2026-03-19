@@ -1,0 +1,289 @@
+```json
+{
+    "algorithm_features": ["Multi-Hop Alternative Efficiency", "Adaptive Regret Penalization", "Christofides Edge Boosting", "Connectivity-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization with multi-hop lookahead,
+    adaptive regret penalization, and intelligent sparsification.
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. BASE INVERSE DISTANCE ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        scale = np.median(distance_matrix[np.triu_indices(n, k=1)])
+        scale = max(scale, 1e-8)
+        inv_dist = scale / (distance_matrix + 0.1 * scale * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. MULTI-HOP ALTERNATIVE EFFICIENCY ===
+    efficiency = np.ones((n, n))
+    
+    if n >= 4:
+        # Find nearest neighbors for each node
+        k_neighbors = min(max(4, int(np.sqrt(n))), n - 1)
+        nearest = np.argsort(distance_matrix, axis=1)[:, 1:k_neighbors + 1]
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                best_alt = np.inf
+                
+                # 2-hop alternatives through common neighbors
+                i_neighbors = set(nearest[i].tolist())
+                j_neighbors = set(nearest[j].tolist())
+                common = i_neighbors.intersection(j_neighbors) - {i, j}
+                
+                for k in common:
+                    alt = distance_matrix[i, k] + distance_matrix[k, j]
+                    if alt < best_alt:
+                        best_alt = alt
+                
+                # 3-hop alternatives through two intermediate nodes
+                for k in i_neighbors - {j}:
+                    for l in set(nearest[k].tolist()) - {i, j, k}:
+                        if l in j_neighbors:
+                            alt = distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                            if alt < best_alt:
+                                best_alt = alt
+                
+                # Calculate efficiency score
+                direct = distance_matrix[i, j]
+                if best_alt < np.inf and direct > 0:
+                    # Sigmoid-like transform: edges with no good alternatives score highest
+                    ratio = best_alt / direct
+                    efficiency[i, j] = efficiency[j, i] = 2.0 / (1.0 + np.exp(-(ratio - 1.2)))
+    
+    # === 3. ADAPTIVE REGRET PENALIZATION ===
+    regret = np.ones((n, n))
+    
+    for i in range(n):
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        candidates = np.where(mask)[0]
+        
+        if len(candidates) >= 2:
+            dists = distance_matrix[i, candidates]
+            sorted_indices = np.argsort(dists)
+            
+            # Penalize edges that are much worse than the best alternative
+            best_dist = dists[sorted_indices[0]]
+            for rank, idx in enumerate(sorted_indices):
+                j = candidates[idx]
+                dist_ratio = dists[idx] / (best_dist + 1e-12)
+                
+                if rank == 0:
+                    regret[i, j] = 1.0
+                else:
+                    # Adaptive penalty based on rank and distance ratio
+                    rank_penalty = 1.0 / (1.0 + 0.5 * rank)
+                    ratio_penalty = 1.0 / (1.0 + 0.3 * (dist_ratio - 1.0))
+                    regret[i, j] = rank_penalty * ratio_penalty
+    
+    # Symmetrize regret matrix
+    regret = np.sqrt(regret * regret.T)
+    
+    # === 4. INITIAL HEURISTIC COMBINATION ===
+    heuristics = inv_dist * efficiency * regret
+    
+    # === 5. CHRISTOFIDES-BASED EDGE BOOSTING ===
+    # Compute MST for structural guidance
+    mst_mask = _compute_mst_mask(distance_matrix)
+    christofides_mask = _christofides_edges(distance_matrix)
+    
+    # Boost edges from Christofides algorithm and MST
+    heuristics[christofides_mask] *= 1.8
+    heuristics[mst_mask] *= 1.5
+    
+    # === 6. CONNECTIVITY-AWARE SPARSIFICATION ===
+    if n > 3:
+        # Calculate node connectivity scores
+        connectivity = np.zeros(n)
+        for i in range(n):
+            row = heuristics[i].copy()
+            np.fill_diagonal(row, 0)
+            top_vals = np.sort(row[row > 0])[-min(4, len(row)-1):]
+            connectivity[i] = np.mean(top_vals) if len(top_vals) > 0 else 0
+        
+        # Normalize connectivity
+        if np.max(connectivity) > 0:
+            connectivity = connectivity / np.max(connectivity)
+        
+        # Adaptive thresholding per node
+        for i in range(n):
+            row = heuristics[i].copy()
+            
+            # Always keep Christofides and MST edges
+            keep_mask = christofides_mask[i] | mst_mask[i]
+            
+            # Determine threshold for other edges
+            other_mask = ~keep_mask
+            other_mask[i] = False  # Exclude diagonal
+            
+            if np.any(other_mask):
+                other_vals = row[other_mask]
+                if len(other_vals) > 0:
+                    # Base percentile based on connectivity
+                    if connectivity[i] > 0.7:
+                        percentile = 75
+                    elif connectivity[i] < 0.3:
+                        percentile = 50
+                    else:
+                        percentile = 65
+                    
+                    # Adjust for instance size
+                    size_factor = min(1.0, 15 / n)
+                    percentile *= size_factor
+                    
+                    # Compute threshold and zero out weak edges
+                    pos_vals = other_vals[other_vals > 0]
+                    if len(pos_vals) > 0:
+                        threshold = np.percentile(pos_vals, percentile)
+                        zero_mask = other_mask & (row < threshold)
+                        row[zero_mask] = 0
+            
+            heuristics[i] = row
+        
+        # Final symmetrization
+        heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 7. FINAL PROCESSING ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    non_zero = heuristics > 0
+    if np.any(non_zero):
+        max_val = heuristics[non_zero].max()
+        if max_val > 0:
+            heuristics[non_zero] = heuristics[non_zero] / max_val
+    
+    return heuristics
+
+
+def _compute_mst_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute Minimum Spanning Tree edges using Prim's algorithm."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    visited = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    parent = np.full(n, -1, dtype=int)
+    
+    min_edge[0] = 0
+    
+    for _ in range(n):
+        # Find unvisited node with minimum edge value
+        u = -1
+        min_val = np.inf
+        for i in range(n):
+            if not visited[i] and min_edge[i] < min_val:
+                min_val = min_edge[i]
+                u = i
+        
+        if u == -1:
+            break
+        
+        visited[u] = True
+        
+        # Add edge to MST if not the root
+        if parent[u] != -1:
+            mst_mask[u, parent[u]] = True
+            mst_mask[parent[u], u] = True
+        
+        # Update minimum edges for neighbors
+        for v in range(n):
+            if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                min_edge[v] = distance_matrix[u, v]
+                parent[v] = u
+    
+    return mst_mask
+
+
+def _christofides_edges(distance_matrix: np.ndarray) -> np.ndarray:
+    """Approximate Christofides algorithm to identify promising edges."""
+    n = distance_matrix.shape[0]
+    if n < 4:
+        return _compute_mst_mask(distance_matrix)
+    
+    christofides_mask = _compute_mst_mask(distance_matrix)
+    
+    # Identify odd-degree vertices in MST
+    mst_degrees = np.sum(christofides_mask, axis=1)
+    odd_vertices = np.where(mst_degrees % 2 == 1)[0]
+    
+    # Greedy minimum-weight perfect matching approximation
+    if len(odd_vertices) >= 2:
+        # Sort odd vertices by their minimum distance to other odd vertices
+        odd_distances = distance_matrix[np.ix_(odd_vertices, odd_vertices)]
+        np.fill_diagonal(odd_distances, np.inf)
+        min_dists = np.min(odd_distances, axis=1)
+        sorted_indices = np.argsort(min_dists)
+        sorted_odd = odd_vertices[sorted_indices]
+        
+        # Perform greedy matching
+        matched = np.zeros(len(sorted_odd), dtype=bool)
+        for i in range(len(sorted_odd)):
+            if not matched[i]:
+                u = sorted_odd[i]
+                best_j = -1
+                best_dist = np.inf
+                
+                for j in range(i + 1, len(sorted_odd)):
+                    if not matched[j]:
+                        v = sorted_odd[j]
+                        dist = distance_matrix[u, v]
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_j = j
+                
+                if best_j != -1:
+                    v = sorted_odd[best_j]
+                    christofides_mask[u, v] = True
+                    christofides_mask[v, u] = True
+                    matched[i] = True
+                    matched[best_j] = True
+    
+    return christofides_mask
+
+
+# Example usage and test
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_nodes = 20
+    coords = np.random.rand(n_nodes, 2) * 100
+    dist_matrix = squareform(pdist(coords))
+    
+    heuristics = heuristics_v2(dist_matrix.copy())
+    
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity (zero entries): {(heuristics == 0).sum() / heuristics.size:.1%}")
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"Matrix is symmetric: {is_symmetric}")
+    
+    # Edge statistics
+    non_zero_per_node = np.sum(heuristics > 0, axis=1)
+    print(f"\nNon-zero edges per node:")
+    print(f"  Min: {non_zero_per_node.min()}, Max: {non_zero_per_node.max()}, Mean: {non_zero_per_node.mean():.1f}")
+    
+    # Sample edge scores
+    print("\nSample edge scores (i, j, distance, heuristic):")
+    for i, j in [(0, 1), (0, 5), (2, 8), (3, 7), (10, 15)]:
+        if i < n_nodes and j < n_nodes:
+            print(f"  ({i}, {j}): dist={dist_matrix[i, j]:.2f}, heuristic={heuristics[i, j]:.4f}")
+```

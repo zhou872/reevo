@@ -1,0 +1,325 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sigmoid Regret", "Multi-scale Gaussian Kernel", "Topology-aware Bandwidth", "Entropy-normalized Scoring"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with adaptive parameter tuning and topological analysis.
+    
+    Core innovations:
+    1. Adaptive sigmoid regret with instance-aware scaling
+    2. Multi-scale Gaussian kernel density with topology-aware bandwidth
+    3. Entropy-normalized scoring for balanced edge selection
+    4. Reinforcement-inspired parameter adaptation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix with numerical stability
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. TOPOLOGICAL ANALYSIS & INSTANCE CHARACTERIZATION
+    # ------------------------------------------------------------
+    
+    # Compute global statistics
+    triu_indices = np.triu_indices(n, k=1)
+    distances = safe_dist[triu_indices]
+    
+    global_mean = np.mean(distances)
+    global_std = np.std(distances)
+    global_cv = global_std / (global_mean + eps)
+    
+    # Node-level statistics
+    node_radii = np.zeros(n)
+    node_density = np.zeros(n)
+    for i in range(n):
+        # Adaptive k for nearest neighbors
+        k_nn = min(max(4, int(np.sqrt(n))), n-1)
+        neighbor_dists = np.partition(safe_dist[i], k_nn)[:k_nn]
+        node_radii[i] = np.mean(neighbor_dists[neighbor_dists > 0])
+        
+        # Local density estimation
+        bandwidth = node_radii[i] * 0.5
+        if bandwidth > eps:
+            kernel = np.exp(-0.5 * (safe_dist[i] / bandwidth) ** 2)
+            node_density[i] = np.sum(kernel) - 1  # Exclude self
+    
+    # Normalize node densities
+    if np.max(node_density) > eps:
+        node_density = node_density / np.max(node_density)
+    
+    # ------------------------------------------------------------
+    # 2. ADAPTIVE SIGMOID REGRET WITH INSTANCE-AWARE SCALING
+    # ------------------------------------------------------------
+    
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        
+        # Adaptive parameters based on local density and global CV
+        min_dist = np.min(dists)
+        med_dist = np.median(dists)
+        
+        # Steepness: higher for uniform instances, lower for varied
+        steepness_base = 2.5
+        steepness_adj = 1.5 * (1.0 - global_cv) + 0.5 * (1.0 - node_density[i])
+        steepness = np.clip(steepness_base * steepness_adj, 1.0, 4.0)
+        
+        # Shift: adjust based on local distribution
+        shift_base = 1.0
+        local_spread = np.std(dists) / (med_dist + eps)
+        shift_adj = 0.3 * np.tanh(3.0 * local_spread)
+        shift = np.clip(shift_base + shift_adj, 0.7, 1.3)
+        
+        # Compute sigmoid regret
+        for j in range(n):
+            if i != j:
+                rel_dist = (dists[j] - min_dist) / (med_dist - min_dist + eps)
+                regret = 1.0 / (1.0 + np.exp(-steepness * (rel_dist - shift)))
+                regret_matrix[i, j] = regret
+    
+    # ------------------------------------------------------------
+    # 3. MULTI-SCALE GAUSSIAN KERNEL DENSITY
+    # ------------------------------------------------------------
+    
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute topological bandwidth using MST
+    if n <= 2000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_sparse = (mst + mst.T) > 0
+            
+            # Use MST edge lengths to estimate local connectivity scale
+            mst_lengths = []
+            for i in range(n):
+                for j in range(i+1, n):
+                    if mst_sparse[i, j]:
+                        mst_lengths.append(distance_matrix[i, j])
+            
+            if mst_lengths:
+                med_mst_length = np.median(mst_lengths)
+                # Bandwidth scales with MST length and local density
+                base_bandwidth = med_mst_length * 0.8
+            else:
+                base_bandwidth = global_mean * 0.5
+        except:
+            base_bandwidth = global_mean * 0.5
+    else:
+        base_bandwidth = global_mean * 0.5
+    
+    # Multi-scale density estimation
+    scales = [0.5, 1.0, 2.0]  # Multiple bandwidth scales
+    scale_weights = [0.4, 0.4, 0.2]  # Weight for each scale
+    
+    for scale_idx, scale in enumerate(scales):
+        bandwidth = base_bandwidth * scale
+        if bandwidth < eps:
+            continue
+            
+        for i in range(n):
+            for j in range(i+1, n):
+                # Adaptive bandwidth based on node properties
+                local_bandwidth = bandwidth * np.sqrt(node_radii[i] * node_radii[j]) / base_bandwidth
+                
+                # Gaussian kernel contribution from all nodes
+                kernel_i = np.exp(-0.5 * (safe_dist[i] / local_bandwidth) ** 2)
+                kernel_j = np.exp(-0.5 * (safe_dist[j] / local_bandwidth) ** 2)
+                
+                # Joint density (exclude endpoints)
+                joint_kernel = kernel_i * kernel_j
+                density = np.sum(joint_kernel) - joint_kernel[i] - joint_kernel[j]
+                
+                # Scale-weighted contribution
+                if density > 0:
+                    density_bonus[i, j] += scale_weights[scale_idx] * np.log1p(density / n)
+    
+    density_bonus = np.maximum(density_bonus, density_bonus.T)
+    
+    # ------------------------------------------------------------
+    # 4. DISTRIBUTION-ADAPTIVE RANK WEIGHTING
+    # ------------------------------------------------------------
+    
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Sort distances and get ranks
+        sorted_idx = np.argsort(safe_dist[i])
+        ranks = np.zeros(n, dtype=int)
+        ranks[sorted_idx] = np.arange(n)
+        
+        # Adaptive decay based on distance distribution shape
+        top_k = min(8, n-1)
+        top_dists = safe_dist[i, sorted_idx[1:top_k+1]]
+        
+        if len(top_dists) > 2:
+            # Measure distribution skewness
+            q1, q3 = np.percentile(top_dists, [25, 75])
+            iqr = q3 - q1
+            median = np.median(top_dists)
+            
+            # Skew-sensitive decay rate
+            if iqr > eps:
+                skew_measure = (q3 + q1 - 2*median) / iqr
+                base_decay = 0.6 - 0.2 * np.tanh(skew_measure)
+            else:
+                base_decay = 0.5
+        else:
+            base_decay = 0.5
+        
+        # Node-specific adjustment based on density
+        density_adjust = 0.1 * (1.0 - node_density[i])
+        decay_rate = np.clip(base_decay + density_adjust, 0.3, 0.8)
+        
+        # Apply exponential rank weighting
+        for j in range(n):
+            if i != j:
+                rank = ranks[j] + 1  # Offset by 1
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # ------------------------------------------------------------
+    # 5. COMPOSITE SCORING WITH ENTROPY NORMALIZATION
+    # ------------------------------------------------------------
+    
+    # Base inverse distance (stabilized)
+    inv_dist = global_mean / (safe_dist + eps)
+    
+    # Regret penalty with adaptive strength
+    regret_strength = 2.0 + 1.0 * global_cv  # Stronger for uniform instances
+    penalty_factor = np.exp(-regret_strength * regret_matrix)
+    
+    # Combine components
+    base_score = inv_dist * rank_weights * penalty_factor
+    enhanced_score = base_score * (1.0 + 0.3 * density_bonus)
+    
+    # MST guidance (if available)
+    if n <= 2000:
+        try:
+            mst_bonus = np.zeros_like(distance_matrix)
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_edges = (mst + mst.T) > 0
+            
+            # Weight MST edges by their relative importance
+            mst_weight = 0.25 * np.exp(-n / 300.0)  # Adaptive decay
+            mst_bonus = mst_edges * mst_weight
+            
+            enhanced_score *= (1.0 + mst_bonus)
+        except:
+            pass
+    
+    # ------------------------------------------------------------
+    # 6. INTELLIGENT SPARSIFICATION
+    # ------------------------------------------------------------
+    
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Primary candidates: rank-based threshold
+    k_base = max(3, int(np.sqrt(n) * (1.0 + global_cv)))
+    for i in range(n):
+        # Dynamic k based on local density
+        k_local = int(k_base * (0.7 + 0.6 * node_density[i]))
+        k_actual = min(k_local, n-1)
+        
+        neighbors = np.argsort(safe_dist[i])[:k_actual]
+        candidate_mask[i, neighbors] = True
+    
+    # Secondary candidates: score-based threshold
+    for i in range(n):
+        row_scores = enhanced_score[i].copy()
+        row_scores[i] = -np.inf
+        
+        if np.any(row_scores > -np.inf):
+            # Adaptive threshold based on score distribution
+            valid_scores = row_scores[row_scores > -np.inf]
+            q1, q3 = np.percentile(valid_scores, [25, 75])
+            iqr = q3 - q1
+            
+            if iqr > eps:
+                threshold = q3 + 1.0 * iqr
+                candidate_mask[i, row_scores >= threshold] = True
+    
+    # Ensure symmetry and minimum connectivity
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    min_edges = min(3, n-1)
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < min_edges:
+            additional = np.argsort(safe_dist[i])[min_edges:2*min_edges]
+            candidate_mask[i, additional] = True
+            candidate_mask[additional, i] = True
+    
+    # Apply candidate mask
+    heuristics = enhanced_score * candidate_mask
+    
+    # ------------------------------------------------------------
+    # 7. ENTROPY-NORMALIZED SCORING
+    # ------------------------------------------------------------
+    
+    # Compute entropy-based normalization factors
+    entropy_weights = np.ones(n)
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = 0
+        
+        if np.sum(row) > eps:
+            # Normalize row to probability distribution
+            row_prob = row / np.sum(row)
+            
+            # Compute entropy and use it to adjust temperature
+            row_entropy = entropy(row_prob[row_prob > 0])
+            max_entropy = np.log(np.sum(row > 0))
+            
+            if max_entropy > eps:
+                # Lower temperature for high entropy (more uniform)
+                # Higher temperature for low entropy (more peaked)
+                rel_entropy = row_entropy / max_entropy
+                temperature = 0.3 + 0.7 * (1.0 - rel_entropy)
+            else:
+                temperature = 1.0
+            
+            # Apply temperature scaling
+            exp_row = np.exp(row / (temperature + eps))
+            row_sum = np.sum(exp_row)
+            if row_sum > eps:
+                heuristics[i] = exp_row / row_sum
+    
+    # Final symmetrization and cleanup
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Global normalization to [0, 1]
+    max_val = np.max(heuristics)
+    if max_val > eps:
+        # Use 95th percentile to reduce outlier influence
+        p95 = np.percentile(heuristics[heuristics > 0], 95) if np.any(heuristics > 0) else max_val
+        scale = max(max_val, p95 * 1.2)
+        heuristics = heuristics / scale
+    
+    heuristics = np.clip(heuristics, 0.0, 1.0)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

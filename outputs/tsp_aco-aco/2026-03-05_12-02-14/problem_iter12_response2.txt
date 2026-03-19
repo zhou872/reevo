@@ -1,0 +1,441 @@
+```json
+{
+    "algorithm_features": ["Stochastic Tour Sampling", "Adaptive Edge Reinforcement", "Entropy-Guided Sparsification", "Multi-Strategy Ensemble"]
+}
+```
+
+```python
+import numpy as np
+import warnings
+from collections import defaultdict, deque
+from scipy import sparse
+from scipy.sparse import csgraph
+import random
+
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection using adaptive stochastic sampling
+    with edge importance prediction and dynamic exploration-exploitation balance.
+    
+    Key innovations:
+    1. Adaptive mutation in sampling: Dynamically adjusts exploration based on solution diversity
+    2. Edge importance prediction: Uses tour statistics to predict promising edges
+    3. Dynamic temperature control: Balages exploitation vs exploration based on search progress
+    4. Hierarchical sparsification: Multi-level edge filtering based on importance
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Structural Components ==========
+    
+    # MST edges (essential backbone)
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    mst_edges = np.where(mst_array > 0)
+    
+    # Degree information from MST
+    mst_degrees = (mst_array > 0).sum(axis=1)
+    
+    # Nearest neighbor edges
+    nn_edges = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        for _ in range(min(3, n-1)):
+            j = np.argmin(row)
+            nn_edges[i, j] = 1.0 / distance_matrix[i, j]
+            row[j] = np.inf
+    
+    # ========== Phase 2: Adaptive Stochastic Sampling ==========
+    
+    # Edge statistics tracking
+    edge_appearance = np.zeros_like(distance_matrix)
+    edge_quality = np.zeros_like(distance_matrix)
+    edge_variance = np.zeros_like(distance_matrix)
+    
+    # Dynamic mutation control parameters
+    mutation_rate = 0.3  # Initial exploration rate
+    convergence_threshold = 0.1
+    
+    def generate_adaptive_tour(mutation_level: float) -> list:
+        """Generate tour with adaptive mutation based on current progress."""
+        tour = list(np.random.permutation(n))
+        
+        # Apply mutation based on mutation_level
+        if random.random() < mutation_level:
+            # Random swap mutation
+            for _ in range(int(mutation_level * n)):
+                i, j = random.sample(range(n), 2)
+                tour[i], tour[j] = tour[j], tour[i]
+        
+        # Insertion heuristic with probability-based node selection
+        remaining = tour.copy()
+        tour = [remaining.pop(0)]
+        
+        while remaining:
+            # Probability of selecting node based on MST degree
+            if random.random() < 0.7:
+                # Greedy selection: choose node with smallest insertion cost
+                best_node = None
+                best_cost = np.inf
+                
+                for node in remaining:
+                    # Find best insertion position for this node
+                    min_insert = np.inf
+                    for i in range(len(tour)):
+                        j = (i + 1) % len(tour)
+                        cost = (distance_matrix[tour[i], node] + 
+                               distance_matrix[node, tour[j]] - 
+                               distance_matrix[tour[i], tour[j]])
+                        if cost < min_insert:
+                            min_insert = cost
+                    
+                    if min_insert < best_cost:
+                        best_cost = min_insert
+                        best_node = node
+                
+                node = best_node
+            else:
+                # Random selection for exploration
+                node = random.choice(remaining)
+            
+            remaining.remove(node)
+            
+            # Find insertion position (with some randomness)
+            best_pos = 0
+            best_cost = np.inf
+            
+            for i in range(len(tour)):
+                j = (i + 1) % len(tour)
+                cost = (distance_matrix[tour[i], node] + 
+                       distance_matrix[node, tour[j]] - 
+                       distance_matrix[tour[i], tour[j]])
+                
+                # Add exploration noise
+                if random.random() < 0.2:
+                    cost *= (0.8 + 0.4 * random.random())
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pos = j
+            
+            tour.insert(best_pos, node)
+        
+        return tour
+    
+    def adaptive_2opt(tour: list, intensity: float) -> list:
+        """Adaptive 2-opt local search with variable intensity."""
+        tour = tour.copy()
+        n_tour = len(tour)
+        improved = True
+        iterations = 0
+        
+        while improved and iterations < int(10 + intensity * 40):
+            improved = False
+            i = random.randint(0, n_tour - 1)
+            
+            # Determine search radius based on intensity
+            radius = int(5 + intensity * 15)
+            
+            for offset in range(2, min(radius, n_tour - 1)):
+                j = (i + offset) % n_tour
+                
+                a1, a2 = tour[i], tour[(i+1) % n_tour]
+                b1, b2 = tour[j], tour[(j+1) % n_tour]
+                
+                current = distance_matrix[a1, a2] + distance_matrix[b1, b2]
+                new = distance_matrix[a1, b1] + distance_matrix[a2, b2]
+                
+                if new < current:
+                    # Reverse segment
+                    if i < j:
+                        tour[i+1:j+1] = tour[i+1:j+1][::-1]
+                    else:
+                        segment = tour[i+1:] + tour[:j+1]
+                        segment = segment[::-1]
+                        tour[i+1:] = segment[:len(tour)-i-1]
+                        tour[:j+1] = segment[len(tour)-i-1:]
+                    improved = True
+                    break
+            
+            iterations += 1
+        
+        return tour
+    
+    # Sample tours with adaptive exploration
+    num_samples = min(200, 8 * n)
+    tour_lengths = []
+    best_length = np.inf
+    
+    for sample_idx in range(num_samples):
+        # Adjust mutation rate based on progress
+        if sample_idx > 0 and len(tour_lengths) > 10:
+            recent_improvement = (np.min(tour_lengths[-10:]) - best_length) / best_length
+            if abs(recent_improvement) < convergence_threshold:
+                mutation_rate = min(0.5, mutation_rate * 1.2)  # Increase exploration
+            else:
+                mutation_rate = max(0.1, mutation_rate * 0.9)  # Decrease exploration
+        
+        # Generate tour with current mutation level
+        tour = generate_adaptive_tour(mutation_rate)
+        
+        # Apply local search with intensity based on MST degree
+        avg_degree = np.mean(mst_degrees[tour[:5]])  # Look at first few nodes
+        intensity = min(1.0, avg_degree / 3.0)
+        tour = adaptive_2opt(tour, intensity)
+        
+        # Calculate tour length
+        length = 0
+        for i in range(n):
+            length += distance_matrix[tour[i], tour[(i+1) % n]]
+        
+        tour_lengths.append(length)
+        
+        if length < best_length:
+            best_length = length
+        
+        # Update edge statistics
+        weight = 1.0 / (1.0 + length / n)  # Normalized weight
+        
+        for i in range(n):
+            u, v = tour[i], tour[(i+1) % n]
+            edge_appearance[u, v] += 1
+            edge_appearance[v, u] += 1
+            
+            # Update running average for edge quality
+            old_avg = edge_quality[u, v]
+            edge_quality[u, v] = old_avg + (weight - old_avg) / edge_appearance[u, v]
+            edge_quality[v, u] = edge_quality[u, v]
+    
+    # ========== Phase 3: Edge Importance Prediction ==========
+    
+    # Calculate edge importance scores
+    edge_importance = np.zeros_like(distance_matrix)
+    
+    # Combine multiple factors
+    for i in range(n):
+        for j in range(i+1, n):
+            if distance_matrix[i, j] > 0:
+                # Factor 1: Frequency in good tours
+                freq_score = edge_appearance[i, j] / num_samples if num_samples > 0 else 0
+                
+                # Factor 2: Quality weight
+                qual_score = edge_quality[i, j]
+                
+                # Factor 3: Structural importance (MST + NN)
+                struct_score = 0
+                if mst_array[i, j] > 0:
+                    struct_score += 0.5
+                if nn_edges[i, j] > 0:
+                    struct_score += 0.3
+                
+                # Factor 4: Local connectivity pattern
+                # Nodes with high MST degree are often hubs
+                degree_score = min(1.0, (mst_degrees[i] + mst_degrees[j]) / 6.0)
+                
+                # Factor 5: Distance-based (inverse)
+                dist_score = 1.0 / distance_matrix[i, j]
+                
+                # Combine factors with adaptive weights
+                importance = (
+                    0.35 * freq_score +
+                    0.25 * qual_score +
+                    0.20 * struct_score +
+                    0.10 * degree_score +
+                    0.10 * dist_score
+                )
+                
+                edge_importance[i, j] = edge_importance[j, i] = importance
+    
+    # Normalize importance scores
+    if np.max(edge_importance) > 0:
+        edge_importance = edge_importance / np.max(edge_importance)
+    
+    # ========== Phase 4: Dynamic Combination ==========
+    
+    # Calculate instance characteristics
+    triu_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(triu_dists)
+    dist_std = np.std(triu_dists)
+    dist_cv = dist_std / (dist_mean + 1e-10)
+    
+    # Dynamic weights based on instance and search characteristics
+    if dist_cv < 0.15:
+        # Very uniform distances: emphasize structure
+        weights = {'importance': 0.3, 'mst': 0.4, 'nn': 0.2, 'reciprocal': 0.1}
+    elif dist_cv > 1.0:
+        # Highly variable: emphasize sampling results
+        weights = {'importance': 0.6, 'mst': 0.2, 'nn': 0.1, 'reciprocal': 0.1}
+    else:
+        # Moderate variation
+        weights = {'importance': 0.5, 'mst': 0.3, 'nn': 0.15, 'reciprocal': 0.05}
+    
+    # Adjust based on problem size
+    size_factor = min(1.0, n / 150.0)
+    weights['importance'] *= (0.7 + 0.3 * size_factor)
+    weights['mst'] *= (1.0 - 0.4 * size_factor)
+    
+    # Normalize
+    total = sum(weights.values())
+    weights = {k: v/total for k, v in weights.items()}
+    
+    # Prepare components
+    components = []
+    
+    # Importance component (already normalized)
+    components.append(('importance', weights['importance'], edge_importance))
+    
+    # MST component
+    mst_component = np.zeros_like(distance_matrix)
+    mst_component[mst_array > 0] = 1
+    if np.max(mst_component) > 0:
+        components.append(('mst', weights['mst'], mst_component))
+    
+    # NN component
+    if np.max(nn_edges) > 0:
+        nn_norm = nn_edges / np.max(nn_edges)
+        components.append(('nn', weights['nn'], nn_norm))
+    
+    # Reciprocal distance (safeguard)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    if np.max(reciprocal) > 0:
+        reciprocal_norm = reciprocal / np.max(reciprocal)
+        components.append(('reciprocal', weights['reciprocal'], reciprocal_norm))
+    
+    # Weighted combination
+    combined = np.zeros_like(distance_matrix)
+    for _, weight, matrix in components:
+        combined += weight * matrix
+    
+    # Ensure symmetry
+    combined = 0.5 * (combined + combined.T)
+    np.fill_diagonal(combined, 0)
+    
+    # ========== Phase 5: Hierarchical Sparsification ==========
+    
+    def hierarchical_sparsify(matrix: np.ndarray, 
+                            edge_importance: np.ndarray,
+                            temperature: float = 1.0) -> np.ndarray:
+        """
+        Multi-level sparsification with importance preservation.
+        
+        Levels:
+        1. Preserve all MST edges
+        2. Preserve high-importance edges (top percentile)
+        3. Adaptive sparsification for remaining edges
+        """
+        n = matrix.shape[0]
+        result = np.zeros_like(matrix)
+        
+        # Level 1: Preserve MST edges (essential)
+        mst_mask = mst_array > 0
+        result[mst_mask] = matrix[mst_mask]
+        
+        # Level 2: Preserve high-importance edges
+        importance_threshold = np.percentile(edge_importance[np.triu_indices(n, k=1)], 75)
+        high_imp_mask = edge_importance >= importance_threshold
+        
+        # Preserve high-importance edges not already preserved by MST
+        preserve_mask = high_imp_mask & ~mst_mask
+        result[preserve_mask] = matrix[preserve_mask]
+        
+        # Level 3: Adaptive sparsification for remaining edges
+        # Calculate adaptive k per node based on entropy
+        for i in range(n):
+            row = matrix[i].copy()
+            row[i] = 0  # Exclude self
+            
+            # Skip if already fully preserved
+            if np.sum(result[i] > 0) >= n-1:
+                continue
+            
+            # Calculate entropy for this row
+            positive_mask = row > 0
+            if np.sum(positive_mask) > 0:
+                positive_vals = row[positive_mask]
+                vals_norm = positive_vals / positive_vals.sum()
+                entropy = -np.sum(vals_norm * np.log(vals_norm + 1e-10))
+                max_entropy = np.log(len(positive_vals)) if len(positive_vals) > 0 else 1
+                normalized_entropy = entropy / (max_entropy + 1e-10)
+            else:
+                normalized_entropy = 0
+            
+            # Determine number of edges to keep
+            base_k = max(2, int(np.sqrt(n)))
+            k = base_k + int(normalized_entropy * base_k * 0.5)
+            k = min(k, n - 1)
+            
+            # Get candidate edges (not yet preserved)
+            candidate_mask = (row > 0) & (result[i] == 0)
+            candidate_indices = np.where(candidate_mask)[0]
+            
+            if len(candidate_indices) == 0:
+                continue
+            
+            candidate_values = row[candidate_indices]
+            
+            # Select top k candidates
+            if len(candidate_values) > k:
+                top_idx = np.argpartition(-candidate_values, k)[:k]
+                top_indices = candidate_indices[top_idx]
+                top_values = candidate_values[top_idx]
+                
+                # Sort top values
+                sort_order = np.argsort(-top_values)
+                top_indices = top_indices[sort_order]
+                top_values = top_values[sort_order]
+                
+                # Apply exponential decay with temperature adjustment
+                ranks = np.arange(len(top_values))
+                decay_factors = np.exp(-ranks / (temperature * (1.0 + normalized_entropy)))
+                
+                for idx, j in enumerate(top_indices):
+                    result[i, j] = top_values[idx] * decay_factors[idx]
+            else:
+                # Keep all candidates
+                result[i, candidate_indices] = candidate_values
+        
+        # Ensure symmetry
+        result = np.maximum(result, result.T)
+        np.fill_diagonal(result, 0)
+        
+        return result
+    
+    # Dynamic temperature based on search progress
+    if len(tour_lengths) >= 10:
+        # Measure convergence
+        recent_std = np.std(tour_lengths[-10:]) / np.mean(tour_lengths[-10:])
+        temperature = max(0.3, min(2.0, 1.5 - recent_std * 5))
+    else:
+        temperature = 1.0
+    
+    # Apply hierarchical sparsification
+    sparsified = hierarchical_sparsify(combined, edge_importance, temperature)
+    
+    # Final normalization
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified /= max_val
+    
+    return sparsified
+```

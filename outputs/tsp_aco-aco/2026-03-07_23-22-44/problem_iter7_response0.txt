@@ -1,0 +1,231 @@
+```json
+{
+    "algorithm_features": ["Exponential Regret Penalization", "Dynamic Ensemble Weighting", "MST Connectivity Bonus", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic combining exponential regret penalization,
+    dynamic ensemble weighting, MST connectivity bonus, and adaptive sparsification.
+    
+    Core Features:
+    1. Exponential Regret Penalization: Smooth opportunity cost scoring with exponential decay
+    2. Dynamic Ensemble Weighting: Adaptive component weighting based on problem characteristics
+    3. MST Connectivity Bonus: Multiplicative bonus for Minimum Spanning Tree edges
+    4. Adaptive Sparsification: Intelligent edge retention preserving connectivity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. PRELIMINARY COMPUTATIONS ====================
+    # Inverse distance (closer nodes get higher scores)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distance
+    inv_max = np.max(inv_dist)
+    if inv_max > 0:
+        inv_dist = inv_dist / inv_max
+    
+    # MST for connectivity bonus
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. EXPONENTIAL REGRET PENALIZATION ====================
+    def compute_regret_scores() -> np.ndarray:
+        """Compute regret scores with exponential penalization"""
+        regret_scores = np.zeros_like(distance_matrix)
+        
+        # Compute regret: opportunity cost of not taking an edge
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best alternative from i to j (minimum 2-step path)
+                best_alternative = float('inf')
+                
+                # Look for intermediate node k
+                for k in range(n):
+                    if k == i or k == j:
+                        continue
+                    alternative_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alternative = min(best_alternative, alternative_cost)
+                
+                if best_alternative < float('inf'):
+                    # Exponential regret penalization
+                    regret = max(0, best_alternative - direct_cost)
+                    # Normalize by median distance for stability
+                    median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+                    scale_factor = max(median_dist, 1e-8)
+                    
+                    # Exponential decay: exp(-regret/best_alternative)
+                    regret_scores[i, j] = np.exp(-regret / (best_alternative + 1e-8))
+                    regret_scores[j, i] = regret_scores[i, j]
+        
+        return regret_scores
+    
+    regret_scores = compute_regret_scores()
+    
+    # ==================== 3. DYNAMIC ENSEMBLE WEIGHTING ====================
+    def compute_ensemble_weights() -> tuple:
+        """Compute adaptive weights for ensemble components"""
+        # Analyze problem characteristics
+        distances_flat = distance_matrix[np.triu_indices(n, 1)]
+        
+        # Feature 1: Problem sparsity (not applicable for complete TSP, use size instead)
+        size_factor = min(1.0, 50.0 / n)  # Smaller problems get more emphasis on regret
+        
+        # Feature 2: Distance variability
+        dist_std = np.std(distances_flat)
+        dist_mean = np.mean(distances_flat)
+        variability_factor = min(1.0, dist_std / (dist_mean + 1e-8))
+        
+        # Feature 3: Problem size
+        size_norm = min(1.0, n / 100.0)
+        
+        # Dynamic weighting scheme
+        # Higher variability -> more weight on regret
+        # Larger size -> more weight on MST connectivity
+        w_regret = 0.4 * (1.0 + variability_factor - size_norm) * size_factor
+        w_inv = 0.3 * (1.0 - 0.5 * variability_factor)
+        w_mst = 0.3 * (size_norm + 0.5 * variability_factor)
+        
+        # Normalize to sum to 1
+        total = w_regret + w_inv + w_mst
+        w_regret /= total
+        w_inv /= total
+        w_mst /= total
+        
+        return w_regret, w_inv, w_mst
+    
+    w_regret, w_inv, w_mst = compute_ensemble_weights()
+    
+    # ==================== 4. MST CONNECTIVITY BONUS ====================
+    def apply_mst_bonus(base_scores: np.ndarray) -> np.ndarray:
+        """Apply multiplicative bonus to MST edges"""
+        enhanced = base_scores.copy()
+        
+        # MST bonus factor: increases with problem size
+        mst_bonus_factor = 1.0 + np.log1p(n) / 10.0
+        
+        # Apply bonus to MST edges
+        enhanced[mst_edges] *= mst_bonus_factor
+        
+        # Additional smooth bonus for edges similar to MST connections
+        # Find nearest neighbors in MST for each node
+        for i in range(n):
+            # Get MST neighbors
+            mst_neighbors = np.where(mst_edges[i])[0]
+            if len(mst_neighbors) > 0:
+                # For non-MST edges to these neighbors' neighbors, apply smaller bonus
+                for neighbor in mst_neighbors:
+                    # Get neighbors of the neighbor
+                    second_degree = np.where(mst_edges[neighbor])[0]
+                    for node in second_degree:
+                        if node != i and not mst_edges[i, node]:
+                            # Apply decaying bonus based on distance
+                            dist_factor = np.exp(-distance_matrix[i, node] / 
+                                                np.median(distance_matrix))
+                            enhanced[i, node] *= (1.0 + 0.3 * dist_factor)
+                            enhanced[node, i] = enhanced[i, node]
+        
+        return enhanced
+    
+    # ==================== 5. COMPOSITE SCORE CALCULATION ====================
+    # Weighted combination of components
+    base_composite = (
+        w_regret * regret_scores +
+        w_inv * inv_dist
+    )
+    
+    # Apply MST connectivity bonus
+    enhanced_composite = apply_mst_bonus(base_composite)
+    
+    # Add MST component (treated separately for connectivity preservation)
+    mst_component = np.zeros_like(enhanced_composite)
+    mst_component[mst_edges] = w_mst
+    enhanced_composite += mst_component
+    
+    # ==================== 6. ADAPTIVE SPARSIFICATION ====================
+    def adaptive_sparsification(scores: np.ndarray) -> np.ndarray:
+        """Intelligent edge retention with connectivity preservation"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges with full scores
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine adaptive degree limit
+        if n <= 10:
+            max_degree = 4
+        elif n <= 50:
+            max_degree = min(5, n // 4)
+        else:
+            max_degree = min(6, n // 5)
+        
+        current_degree = np.sum(sparsified > 0, axis=1)
+        
+        # Collect candidate edges (non-MST, sorted by effective score)
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    # Effective score with distance penalty
+                    median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+                    dist_penalty = np.exp(-distance_matrix[i, j] / (2 * median_dist))
+                    effective_score = scores[i, j] * dist_penalty
+                    candidates.append((effective_score, i, j))
+        
+        # Sort by effective score (descending)
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Greedy selection respecting degree constraints
+        for score, i, j in candidates:
+            if current_degree[i] < max_degree and current_degree[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[j, i]
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparsified
+    
+    sparsified_scores = adaptive_sparsification(enhanced_composite)
+    
+    # ==================== 7. FINAL PROCESSING ====================
+    # Ensure symmetry (though sparsification already maintains it)
+    symmetric_scores = (sparsified_scores + sparsified_scores.T) / 2
+    
+    # Final distance-based attenuation (penalize very long edges)
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        # Stronger attenuation for larger distances
+        dist_decay = np.exp(-distance_matrix / (0.25 * max_dist + 1e-8))
+        symmetric_scores *= dist_decay
+    
+    # Normalize to [0, 1]
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    # Zero diagonal
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

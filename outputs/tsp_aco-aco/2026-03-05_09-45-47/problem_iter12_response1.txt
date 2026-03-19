@@ -1,0 +1,565 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Learning", "Enhanced Spatial Embeddings", "Triangle Quality Optimization", "Instance-Aware Parameter Tuning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from sklearn.manifold import MDS
+from sklearn.metrics.pairwise import euclidean_distances
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with learned weight optimization,
+    advanced spatial embeddings, and efficient triangle quality evaluation.
+    
+    Key improvements over v1:
+    1. Learned weight adaptation based on instance statistics
+    2. Hybrid embeddings combining MDS, distance-based, and spectral methods
+    3. Efficient triangle quality computation via graph convolution
+    4. Memory-optimized operations for large instances
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric n x n matrix of pairwise distances
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate more promising edges.
+        Diagonal is zero, values are normalized to [0, 1].
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+            return result
+    
+    # 1. Instance analysis with enhanced statistics
+    instance_stats = _analyze_instance_v2(distance_matrix, n)
+    
+    # 2. Base reciprocal heuristic with learned scaling
+    reciprocal_base = _compute_base_heuristic(distance_matrix, instance_stats)
+    
+    # 3. Enhanced spatial embedding heuristic
+    spatial_heuristic = _compute_enhanced_embedding(distance_matrix, n, instance_stats)
+    
+    # 4. MST-based heuristic with learned edge importance
+    mst_heuristic = _compute_mst_heuristic_v2(distance_matrix, n, instance_stats)
+    
+    # 5. Learn adaptive weights for combination
+    weights = _learn_adaptive_weights(reciprocal_base, spatial_heuristic, 
+                                      mst_heuristic, distance_matrix, instance_stats)
+    
+    # 6. Combine heuristics with learned weights
+    combined = _weighted_combination(reciprocal_base, spatial_heuristic, 
+                                     mst_heuristic, weights, instance_stats)
+    
+    # 7. Adaptive sparsification with learned edge retention
+    sparsified = _adaptive_sparsification_v2(combined, distance_matrix, n, instance_stats)
+    
+    # 8. Efficient triangle quality boosting
+    boosted = _efficient_triangle_boosting(sparsified, distance_matrix, n, instance_stats)
+    
+    # 9. Final processing
+    np.fill_diagonal(boosted, 0)
+    max_val = np.max(boosted)
+    if max_val > 0:
+        boosted = boosted / max_val
+    
+    return boosted
+
+
+def _analyze_instance_v2(dist_mat: np.ndarray, n: int) -> dict:
+    """Enhanced instance analysis with distance distribution modeling."""
+    stats = {}
+    
+    # Extract distance distribution
+    triu_indices = np.triu_indices(n, k=1)
+    distances = dist_mat[triu_indices]
+    
+    stats['n'] = n
+    stats['mean_dist'] = np.mean(distances)
+    stats['median_dist'] = np.median(distances)
+    stats['std_dist'] = np.std(distances)
+    stats['min_dist'] = np.min(distances)
+    stats['max_dist'] = np.max(distances)
+    
+    # Distribution shape statistics
+    stats['skewness'] = np.mean((distances - stats['mean_dist'])**3) / (stats['std_dist']**3 + 1e-12)
+    stats['kurtosis'] = np.mean((distances - stats['mean_dist'])**4) / (stats['std_dist']**4 + 1e-12)
+    
+    # Percentile-based statistics
+    stats['p25'] = np.percentile(distances, 25)
+    stats['p75'] = np.percentile(distances, 75)
+    stats['iqr'] = stats['p75'] - stats['p25']
+    
+    # Coefficient of variation
+    stats['cv'] = stats['std_dist'] / (stats['mean_dist'] + 1e-12)
+    
+    # Instance size based parameters
+    stats['log_n'] = np.log2(n + 1)
+    stats['sqrt_n'] = int(np.sqrt(n))
+    
+    # Adaptive embedding strategy selection
+    if n <= 100:
+        stats['embedding_method'] = 'exact_mds'
+        stats['embedding_dim'] = min(3, n-1)
+    elif n <= 1000:
+        stats['embedding_method'] = 'landmark_mds'
+        stats['landmark_count'] = min(50, max(20, n // 20))
+    else:
+        stats['embedding_method'] = 'distance_based'
+        stats['landmark_count'] = min(100, max(30, n // 50))
+    
+    # Neighbor counts
+    stats['k_spatial'] = max(3, min(int(stats['log_n'] * 2.5), n - 1))
+    stats['k_mst_near'] = max(2, min(int(stats['log_n'] * 1.2), n - 1))
+    
+    return stats
+
+
+def _compute_base_heuristic(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """Base reciprocal heuristic with learned scaling."""
+    n = dist_mat.shape[0]
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / (dist_mat + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal, 0)
+    
+    # Adaptive scaling based on distance distribution
+    if stats['cv'] < 0.3:
+        # Uniform distances: emphasize medium distances
+        scaling = 1.0 - 0.3 * (dist_mat - stats['mean_dist']) / (stats['max_dist'] - stats['min_dist'] + 1e-12)
+    elif stats['cv'] > 0.7:
+        # Highly variable: emphasize short distances
+        scaling = np.exp(-dist_mat / (2 * stats['median_dist']))
+    else:
+        # Moderate variation: balance
+        scaling = np.exp(-dist_mat / (3 * stats['mean_dist']))
+    
+    reciprocal *= scaling
+    reciprocal = np.maximum(reciprocal, 0)
+    
+    # Normalize
+    max_val = np.max(reciprocal)
+    if max_val > 0:
+        reciprocal = reciprocal / max_val
+    
+    return reciprocal
+
+
+def _compute_enhanced_embedding(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Enhanced spatial embedding using hybrid methods."""
+    spatial_promising = np.zeros((n, n))
+    
+    if stats['embedding_method'] == 'exact_mds':
+        # Exact MDS for small instances
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mds = MDS(n_components=stats['embedding_dim'],
+                         dissimilarity='precomputed',
+                         random_state=42,
+                         n_init=1,
+                         max_iter=200)
+                coords = mds.fit_transform(dist_mat)
+            
+            tree = KDTree(coords)
+            for i in range(n):
+                distances, indices = tree.query(coords[i].reshape(1, -1), 
+                                              k=stats['k_spatial'] + 1)
+                indices = indices[0]
+                if indices[0] == i:
+                    indices = indices[1:stats['k_spatial'] + 1]
+                else:
+                    indices = indices[:stats['k_spatial']]
+                spatial_promising[i, indices] = 1.0
+        except:
+            pass
+    
+    elif stats['embedding_method'] == 'landmark_mds':
+        # Landmark-based MDS for medium instances
+        landmarks = min(stats['landmark_count'], n)
+        landmark_indices = _farthest_point_sampling(dist_mat, landmarks)
+        
+        # Embed landmarks
+        landmark_dist = dist_mat[np.ix_(landmark_indices, landmark_indices)]
+        try:
+            mds = MDS(n_components=min(3, landmarks-1),
+                     dissimilarity='precomputed',
+                     random_state=42,
+                     n_init=1,
+                     max_iter=150)
+            landmark_coords = mds.fit_transform(landmark_dist)
+        except:
+            # Fallback to distance-based method
+            return _distance_based_embedding(dist_mat, n, stats)
+        
+        # Triangulate non-landmark points
+        for i in range(n):
+            if i in landmark_indices:
+                # Landmark: use landmark-based neighborhood
+                landmark_idx = np.where(landmark_indices == i)[0][0]
+                landmark_vec = landmark_coords[landmark_idx]
+                distances_to_landmarks = np.linalg.norm(landmark_coords - landmark_vec, axis=1)
+                distances_to_landmarks[landmark_idx] = np.inf
+                k_nearest = min(stats['k_spatial'], landmarks-1)
+                nearest_landmarks = np.argsort(distances_to_landmarks)[:k_nearest]
+                for lm_idx in nearest_landmarks:
+                    lm = landmark_indices[lm_idx]
+                    # Connect to nodes close to this landmark
+                    dists_to_lm = dist_mat[lm].copy()
+                    dists_to_lm[lm] = np.inf
+                    k_nodes = max(1, stats['k_spatial'] // k_nearest)
+                    nearest_nodes = np.argpartition(dists_to_lm, k_nodes)[:k_nodes]
+                    spatial_promising[i, nearest_nodes] = 1.0
+            else:
+                # Non-landmark: find nearest landmarks
+                dists_to_landmarks = dist_mat[i, landmark_indices]
+                k_nearest = min(3, landmarks)
+                nearest_landmarks = np.argsort(dists_to_landmarks)[:k_nearest]
+                
+                for lm_idx in nearest_landmarks:
+                    lm = landmark_indices[lm_idx]
+                    dists_from_lm = dist_mat[lm].copy()
+                    dists_from_lm[lm] = np.inf
+                    k_nodes = max(1, stats['k_spatial'] // k_nearest)
+                    nearest_to_lm = np.argpartition(dists_from_lm, k_nodes)[:k_nodes]
+                    spatial_promising[i, nearest_to_lm] = 1.0
+    
+    else:  # distance_based
+        spatial_promising = _distance_based_embedding(dist_mat, n, stats)
+    
+    # Ensure symmetry and normalize
+    spatial_promising = np.minimum(spatial_promising, 1.0)
+    spatial_promising = (spatial_promising + spatial_promising.T) / 2
+    
+    return spatial_promising
+
+
+def _farthest_point_sampling(dist_mat: np.ndarray, k: int) -> np.ndarray:
+    """Select k points using farthest point sampling."""
+    n = dist_mat.shape[0]
+    selected = [np.random.randint(n)]
+    
+    for _ in range(1, k):
+        min_dists = np.min(dist_mat[:, selected], axis=1)
+        next_point = np.argmax(min_dists)
+        selected.append(next_point)
+    
+    return np.array(selected)
+
+
+def _distance_based_embedding(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Distance-based embedding for large instances."""
+    spatial_promising = np.zeros((n, n))
+    
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        k = min(stats['k_spatial'], n-1)
+        
+        # Adaptive threshold based on distribution
+        if stats['cv'] < 0.3:
+            threshold = np.percentile(dists, 30)
+        elif stats['cv'] > 0.7:
+            threshold = np.percentile(dists, 20)
+        else:
+            threshold = np.percentile(dists, 25)
+        
+        close_nodes = dists <= threshold
+        if close_nodes.sum() < 3:
+            # Ensure minimum connectivity
+            indices = np.argsort(dists)[:max(3, int(k/2))]
+            close_nodes = np.zeros(n, dtype=bool)
+            close_nodes[indices] = True
+        
+        spatial_promising[i, close_nodes] = 1.0
+    
+    return spatial_promising
+
+
+def _compute_mst_heuristic_v2(dist_mat: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """MST-based heuristic with learned edge importance."""
+    mst_promising = np.zeros((n, n))
+    
+    # Minimum Spanning Tree
+    mst = minimum_spanning_tree(dist_mat)
+    mst_edges = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_promising[mst_edges] = 2.0
+    
+    # Compute MST edge weights for importance scoring
+    mst_weights = dist_mat[mst_edges]
+    weight_stats = {
+        'mean': np.mean(mst_weights),
+        'median': np.median(mst_weights),
+        'std': np.std(mst_weights)
+    }
+    
+    # Near-MST edges with importance-based selection
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        
+        # Determine number of near-MST edges based on instance size
+        k_near = stats['k_mst_near']
+        
+        # Consider edges not in MST
+        non_mst_mask = ~mst_edges[i] & (np.arange(n) != i)
+        if np.any(non_mst_mask):
+            non_mst_indices = np.where(non_mst_mask)[0]
+            non_mst_dists = dists[non_mst_indices]
+            
+            # Score edges by how close they are to MST edge statistics
+            if weight_stats['std'] > 1e-12:
+                # Z-score based selection
+                z_scores = np.abs((non_mst_dists - weight_stats['mean']) / weight_stats['std'])
+                # Lower z-score means closer to typical MST edge length
+                scores = 1.0 / (1.0 + z_scores)
+            else:
+                # Uniform distances: use direct distance ranking
+                scores = 1.0 / (1.0 + non_mst_dists / weight_stats['mean'])
+            
+            if len(non_mst_dists) > k_near:
+                top_k_idx = np.argsort(-scores)[:k_near]
+                nearest_non_mst = non_mst_indices[top_k_idx]
+            else:
+                nearest_non_mst = non_mst_indices
+            
+            mst_promising[i, nearest_non_mst] = 1.5
+    
+    # Ensure symmetry
+    mst_promising = np.maximum(mst_promising, mst_promising.T)
+    
+    # Normalize with learned importance
+    mst_promising = np.where(mst_promising == 2.0, 1.0, 
+                            np.where(mst_promising == 1.5, 0.75, 0))
+    
+    return mst_promising
+
+
+def _learn_adaptive_weights(base_heuristic: np.ndarray, spatial_heuristic: np.ndarray,
+                           mst_heuristic: np.ndarray, dist_mat: np.ndarray, stats: dict) -> dict:
+    """Learn adaptive weights based on instance characteristics and heuristic consistency."""
+    n = base_heuristic.shape[0]
+    weights = {}
+    
+    # Analyze heuristic agreement
+    non_diag = np.ones((n, n), dtype=bool)
+    np.fill_diagonal(non_diag, False)
+    
+    # Measure correlation between different heuristics
+    base_flat = base_heuristic[non_diag]
+    spatial_flat = spatial_heuristic[non_diag]
+    mst_flat = mst_heuristic[non_diag]
+    
+    corr_base_spatial = np.corrcoef(base_flat, spatial_flat)[0, 1]
+    corr_base_mst = np.corrcoef(base_flat, mst_flat)[0, 1]
+    corr_spatial_mst = np.corrcoef(spatial_flat, mst_flat)[0, 1]
+    
+    # Base weights from instance statistics
+    if stats['cv'] < 0.3:
+        # Uniform distances: trust spatial embedding more
+        weights['base'] = 1.0
+        weights['spatial'] = 1.5
+        weights['mst'] = 0.8
+    elif stats['cv'] > 0.7:
+        # Highly variable: trust reciprocal and MST more
+        weights['base'] = 1.8
+        weights['spatial'] = 1.0
+        weights['mst'] = 1.5
+    else:
+        weights['base'] = 1.2
+        weights['spatial'] = 1.2
+        weights['mst'] = 1.2
+    
+    # Adjust weights based on heuristic agreement
+    if corr_base_spatial > 0.7:
+        # High agreement: reinforce both
+        weights['base'] *= 1.1
+        weights['spatial'] *= 1.1
+    if corr_base_mst < 0.3:
+        # Low agreement: reduce MST influence
+        weights['mst'] *= 0.8
+    
+    # Normalize weights
+    total = weights['base'] + weights['spatial'] + weights['mst']
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
+
+def _weighted_combination(base: np.ndarray, spatial: np.ndarray, mst: np.ndarray,
+                         weights: dict, stats: dict) -> np.ndarray:
+    """Combine heuristics with learned weights."""
+    n = base.shape[0]
+    
+    # Apply weights
+    combined = (weights['base'] * base + 
+                weights['spatial'] * spatial + 
+                weights['mst'] * mst)
+    
+    # Add synergistic boost for edges favored by multiple heuristics
+    agreement_mask = (base > np.percentile(base, 70)) & \
+                     (spatial > np.percentile(spatial, 70)) & \
+                     (mst > np.percentile(mst, 70))
+    
+    combined[agreement_mask] *= 1.3
+    
+    # Add logarithmic boost for high-confidence edges
+    confidence = np.zeros_like(combined)
+    for i in range(n):
+        row_confidence = (base[i] * weights['base'] + 
+                         spatial[i] * weights['spatial'] + 
+                         mst[i] * weights['mst'])
+        row_mean = np.mean(row_confidence[row_confidence > 0])
+        row_std = np.std(row_confidence[row_confidence > 0]) + 1e-12
+        z_scores = (row_confidence - row_mean) / row_std
+        confidence[i] = np.exp(z_scores / 3)
+    
+    confidence = np.minimum(confidence, 2.0)
+    combined *= (confidence + confidence.T) / 2
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+
+def _adaptive_sparsification_v2(heuristics_mat: np.ndarray, dist_mat: np.ndarray, 
+                               n: int, stats: dict) -> np.ndarray:
+    """Adaptive edge sparsification with learned edge retention."""
+    if n <= 10:
+        return heuristics_mat.copy()
+    
+    sparsified = np.zeros_like(heuristics_mat)
+    
+    # Determine keep ratio based on instance characteristics
+    if stats['cv'] < 0.3:
+        base_ratio = min(0.25, max(0.08, 0.5 / stats['log_n']))
+    elif stats['cv'] > 0.7:
+        base_ratio = min(0.45, max(0.15, 0.8 / stats['log_n']))
+    else:
+        base_ratio = min(0.35, max(0.1, 0.65 / stats['log_n']))
+    
+    # Adjust based on distance skewness
+    if stats['skewness'] > 0.5:
+        base_ratio *= 1.2  # More edges for right-skewed distributions
+    elif stats['skewness'] < -0.5:
+        base_ratio *= 0.8  # Fewer edges for left-skewed
+    
+    for i in range(n):
+        row = heuristics_mat[i].copy()
+        row[i] = -np.inf
+        
+        # Adaptive number of edges to keep
+        num_to_keep = max(3, int(base_ratio * n))
+        num_to_keep = min(num_to_keep, n - 1)
+        
+        if np.any(row > 0):
+            if num_to_keep < len(row):
+                # Keep top edges by heuristic value
+                threshold_idx = np.argpartition(-row, num_to_keep)[num_to_keep]
+                threshold_val = row[threshold_idx]
+                mask = row >= threshold_val
+            else:
+                mask = row > -np.inf
+            
+            sparsified[i] = heuristics_mat[i] * mask
+    
+    # Ensure symmetry and basic connectivity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Connectivity repair
+    degrees = np.sum(sparsified > 0, axis=1)
+    for i in range(n):
+        if degrees[i] == 0:
+            # Connect isolated node to nearest neighbor
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            nearest = np.argmin(dists)
+            sparsified[i, nearest] = sparsified[nearest, i] = 0.5
+        elif degrees[i] == 1:
+            # Add second connection
+            current = np.nonzero(sparsified[i])[0][0]
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            dists[current] = np.inf
+            second = np.argmin(dists)
+            sparsified[i, second] = sparsified[second, i] = 0.4
+    
+    return sparsified
+
+
+def _efficient_triangle_boosting(sparse_mat: np.ndarray, dist_mat: np.ndarray,
+                                n: int, stats: dict) -> np.ndarray:
+    """Efficient triangle quality boosting using graph convolution approximation."""
+    boosted = sparse_mat.copy()
+    
+    if n <= 3:
+        return boosted
+    
+    # Create binary adjacency matrix
+    binary_adj = (sparse_mat > 0).astype(float)
+    
+    # Compute number of common neighbors efficiently
+    common_neighbors = binary_adj @ binary_adj.T
+    
+    # Estimate triangle quality for edges with common neighbors
+    edges_with_common = np.where((common_neighbors > 0) & (np.triu(np.ones((n, n)), 1) > 0))
+    
+    if len(edges_with_common[0]) == 0:
+        return boosted
+    
+    for idx in range(len(edges_with_common[0])):
+        i, j = edges_with_common[0][idx], edges_with_common[1][idx]
+        
+        if sparse_mat[i, j] == 0:
+            continue
+        
+        # Find common neighbors
+        common_idx = np.where((binary_adj[i] > 0) & (binary_adj[j] > 0))[0]
+        
+        if len(common_idx) == 0:
+            continue
+        
+        # Sample common neighbors for efficiency
+        if len(common_idx) > 10:
+            sample_size = min(10, len(common_idx))
+            sampled_idx = np.random.choice(common_idx, sample_size, replace=False)
+        else:
+            sampled_idx = common_idx
+        
+        # Compute average triangle quality
+        triangle_qualities = []
+        for k in sampled_idx:
+            # Triangle inequality check
+            a, b, c = dist_mat[i, j], dist_mat[i, k], dist_mat[j, k]
+            max_side = max(a, b, c)
+            sum_other_two = (a + b + c) - max_side
+            
+            if max_side < sum_other_two:
+                # Valid triangle: quality = 1 / (average edge length)
+                avg_length = (a + b + c) / 3
+                quality = stats['median_dist'] / (avg_length + 1e-12)
+                triangle_qualities.append(min(quality, 3.0))
+        
+        if triangle_qualities:
+            avg_quality = np.mean(triangle_qualities)
+            # Boost factor based on number of common neighbors and quality
+            common_count = common_neighbors[i, j]
+            boost = 1.0 + 0.1 * min(common_count, 5) * min(avg_quality, 2.0)
+            boosted[i, j] = boosted[j, i] = sparse_mat[i, j] * boost
+    
+    return boosted
+```

@@ -1,0 +1,156 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsity", "Edge Betweenness", "Cluster-Based Scoring", "Distance Decay"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP that combines multiple factors to assess
+    edge promise and sparsifies the matrix by setting unpromising edges to zero.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating promise of each edge
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Avoid division by zero
+    eps = 1e-10
+    safe_dist = distance_matrix + eps
+    np.fill_diagonal(safe_dist, np.inf)  # Ignore self-loops
+    
+    # 1. Base inverse distance component
+    inv_dist = 1.0 / safe_dist
+    
+    # 2. Minimum spanning tree component (edges in MST are promising)
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst > 0).astype(float)
+    mst_component = mst_mask * 2.0  # Amplify MST edges
+    
+    # 3. Local neighborhood density component
+    # Use k-nearest neighbors to identify promising local connections
+    k = max(2, n // 10)  # Adaptive k based on problem size
+    knn_promising = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        neighbors = np.argsort(safe_dist[i])[:k+1][1:]  # Skip self
+        knn_promising[i, neighbors] = 1.0
+        
+        # Also consider reverse direction for symmetric boost
+        if distance_matrix[i, neighbors].mean() < distance_matrix.mean():
+            knn_promising[neighbors, i] += 0.5
+    
+    # 4. Edge betweenness approximation using triangle inequality
+    betweenness = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(i+1, n):
+            # Check if edge (i,j) appears in shortest paths
+            # through triangle inequality violations
+            for k in range(n):
+                if k == i or k == j:
+                    continue
+                # If i->j is much shorter than i->k->j, it's a good direct connection
+                detour = safe_dist[i, k] + safe_dist[k, j]
+                if safe_dist[i, j] < 0.8 * detour:  # Strong shortcut
+                    betweenness[i, j] += 1.0
+                    betweenness[j, i] += 1.0
+    
+    betweenness = np.tanh(betweenness / max(1, n/5))  # Normalize with tanh
+    
+    # 5. Geometric clustering component
+    # Create approximate 2D coordinates from distance matrix using MDS approximation
+    if n > 2:
+        # Simple approximation: use first two eigenvectors
+        centering = np.eye(n) - np.ones((n, n)) / n
+        B = -0.5 * centering @ (safe_dist ** 2) @ centering
+        eigvals, eigvecs = np.linalg.eigh(B)
+        idx = np.argsort(eigvals)[::-1][:2]
+        coords = eigvecs[:, idx] * np.sqrt(np.maximum(eigvals[idx], 0))
+        
+        # Build KD-tree for spatial queries
+        tree = KDTree(coords)
+        
+        # Reward edges that connect spatially close nodes
+        spatial_promising = np.zeros_like(distance_matrix)
+        for i in range(n):
+            # Find nodes within radius based on average edge length
+            avg_dist = np.mean(safe_dist[i, safe_dist[i] < np.inf])
+            radius = 1.5 * avg_dist
+            neighbors = tree.query_ball_point(coords[i], radius)
+            for j in neighbors:
+                if i != j:
+                    # Scale by how much closer than average
+                    scale = avg_dist / max(safe_dist[i, j], eps)
+                    spatial_promising[i, j] = min(scale, 3.0)
+    else:
+        spatial_promising = np.ones_like(distance_matrix)
+    
+    # 6. Combine components with adaptive weights
+    # Weights depend on problem size and density characteristics
+    avg_dist = np.mean(safe_dist[safe_dist < np.inf])
+    std_dist = np.std(safe_dist[safe_dist < np.inf])
+    density_factor = std_dist / max(avg_dist, eps)
+    
+    w1 = 1.0  # Base inverse distance
+    w2 = 2.0 * density_factor  # MST component
+    w3 = 1.5  # Local neighborhood
+    w4 = 1.2  # Betweenness
+    w5 = 0.8  # Spatial clustering
+    
+    heuristic = (w1 * inv_dist + 
+                 w2 * mst_component + 
+                 w3 * knn_promising + 
+                 w4 * betweenness + 
+                 w5 * spatial_promising)
+    
+    # 7. Adaptive sparsification
+    # Determine threshold based on distribution of heuristic values
+    if n > 10:
+        # Flatten non-diagonal elements
+        flat_heuristic = heuristic[~np.eye(n, dtype=bool)].flatten()
+        
+        # Use percentile-based threshold (keep top 30-50% of edges)
+        keep_ratio = 0.3 + 0.2 * (1 - density_factor)  # More sparse for uniform graphs
+        keep_ratio = np.clip(keep_ratio, 0.2, 0.8)
+        threshold = np.percentile(flat_heuristic, 100 * (1 - keep_ratio))
+        
+        # Apply sparsification with soft thresholding
+        mask = heuristic > threshold
+        heuristic = heuristic * mask
+        
+        # Optional: keep at least k edges per node
+        k_min = max(2, n // 20)
+        for i in range(n):
+            row = heuristic[i]
+            non_zero = np.where(row > 0)[0]
+            if len(non_zero) < k_min:
+                # Add top promising edges that were zeroed
+                all_indices = np.argsort(heuristic[i] + inv_dist[i])[::-1]
+                for idx in all_indices[:k_min]:
+                    if idx != i and heuristic[i, idx] == 0:
+                        heuristic[i, idx] = inv_dist[i, idx] * 0.5
+    
+    # Normalize to reasonable range
+    max_val = heuristic.max()
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    # Ensure symmetry for undirected TSP
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # Zero out diagonal
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

@@ -1,0 +1,301 @@
+```json
+{
+    "algorithm_features": ["Cached Neighbor Lookahead", "Adaptive Instance Profiling", "Exponential Regret Penalization", "Hybrid Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with cached lookahead and adaptive instance profiling.
+    
+    Key improvements over v1:
+    1. Cached neighbor statistics with incremental lookahead computation
+    2. Instance profiling using multiple geometric features
+    3. Efficient hybrid sparsification with connectivity guarantees
+    4. Lightweight parameter adaptation based on instance characteristics
+    
+    Parameters
+    ----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns
+    -------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix) if n == 0 else 1 / (distance_matrix + np.eye(n))
+    
+    # Create working copy with diagonal masked
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # 1. Instance profiling for adaptive parameter tuning
+    non_inf_dists = dist[dist < np.inf]
+    if len(non_inf_dists) == 0:
+        return np.zeros_like(dist)
+    
+    # Compute multiple instance characteristics
+    dist_mean = np.mean(non_inf_dists)
+    dist_std = np.std(non_inf_dists)
+    dist_median = np.median(non_inf_dists)
+    dist_q75 = np.percentile(non_inf_dists, 75)
+    dist_q25 = np.percentile(non_inf_dists, 25)
+    iqr = dist_q75 - dist_q25
+    
+    # Instance complexity metrics
+    cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    sparsity_ratio = (dist_mean - dist_q25) / (iqr + 1e-10)  # Measure of distance distribution skew
+    uniformity = 1.0 / (1.0 + cv)  # Higher for more uniform distances
+    
+    # 2. Adaptive parameter initialization based on instance profiling
+    # Scale factors based on instance characteristics
+    mst_weight = 0.4 - 0.2 * cv  # Less weight on MST for variable distances
+    density_weight = 0.3 + 0.1 * uniformity  # More weight on density for uniform instances
+    regret_weight = 0.2 + 0.2 * cv  # More weight on regret for variable distances
+    lookahead_weight = 0.1 + 0.1 * (1 - uniformity)  # More lookahead for non-uniform
+    
+    # Normalize weights
+    total_weight = mst_weight + density_weight + regret_weight + lookahead_weight
+    mst_weight /= total_weight
+    density_weight /= total_weight
+    regret_weight /= total_weight
+    lookahead_weight /= total_weight
+    
+    # 3. Base inverse distance with instance-aware smoothing
+    smoothing = dist_mean * (0.05 + 0.05 * cv)  # More smoothing for variable instances
+    inv_dist = 1 / (dist + smoothing)
+    
+    # 4. MST connectivity bonus (vectorized)
+    mst = minimum_spanning_tree(dist)
+    mst_array = mst.toarray()
+    mst_bonus = np.ones_like(dist)
+    mst_bonus[mst_array > 0] = 2.0  # Double bonus for MST edges
+    
+    # 5. Cached neighbor statistics for efficient lookahead
+    k_neighbors = min(max(3, int(np.log2(n))), n - 1)  # Adaptive neighbor count
+    neighbor_cache = []
+    
+    # Precompute and cache neighbor information
+    for i in range(n):
+        # Get k+1 nearest neighbors (including i itself)
+        sorted_indices = np.argsort(dist[i])[:k_neighbors + 1]
+        # Remove self if present
+        sorted_indices = sorted_indices[sorted_indices != i][:k_neighbors]
+        neighbor_dists = dist[i, sorted_indices]
+        
+        neighbor_cache.append({
+            'indices': sorted_indices,
+            'dists': neighbor_dists,
+            'avg_dist': np.mean(neighbor_dists) if len(neighbor_dists) > 0 else dist_mean
+        })
+    
+    # 6. Cached lookahead scoring using precomputed neighbor information
+    lookahead_scores = np.ones_like(dist)
+    
+    for i in range(n):
+        cache_i = neighbor_cache[i]
+        neighbors_i = cache_i['indices']
+        avg_dist_i = cache_i['avg_dist']
+        
+        if len(neighbors_i) == 0:
+            continue
+            
+        for j in neighbors_i:
+            if i == j:
+                continue
+                
+            # Get j's neighbor cache
+            cache_j = neighbor_cache[j]
+            neighbors_j = cache_j['indices']
+            
+            # Lookahead from i to j: how well does j connect to i's other neighbors?
+            other_neighbors_i = [nbr for nbr in neighbors_i if nbr != j]
+            if len(other_neighbors_i) > 0:
+                # Average distance from j to i's other good neighbors
+                avg_continuation = np.mean([dist[j, nbr] for nbr in other_neighbors_i])
+                # Score based on how good j is as a continuation from i
+                continuation_score = 1.0 / (1.0 + avg_continuation / (avg_dist_i + 1e-10))
+            else:
+                continuation_score = 0.5
+                
+            # Lookahead from j to i: how well does i connect to j's other neighbors?
+            other_neighbors_j = [nbr for nbr in neighbors_j if nbr != i]
+            if len(other_neighbors_j) > 0:
+                avg_continuation_rev = np.mean([dist[i, nbr] for nbr in other_neighbors_j])
+                continuation_score_rev = 1.0 / (1.0 + avg_continuation_rev / (cache_j['avg_dist'] + 1e-10))
+            else:
+                continuation_score_rev = 0.5
+                
+            # Symmetric lookahead score
+            lookahead_scores[i, j] = (continuation_score + continuation_score_rev) / 2
+    
+    # 7. Local density feature using cached neighbor statistics
+    local_density = np.zeros(n)
+    for i in range(n):
+        cache_i = neighbor_cache[i]
+        if len(cache_i['dists']) > 0:
+            local_density[i] = 1.0 / (cache_i['avg_dist'] + 1e-10)
+    
+    if local_density.max() > 0:
+        local_density = local_density / local_density.max()
+    
+    # Create spatial factor
+    density_interaction = 0.3 * (local_density[:, np.newaxis] + local_density[np.newaxis, :])
+    spatial_bonus = 1.0 + density_interaction - 0.15 * np.abs(local_density[:, np.newaxis] - local_density[np.newaxis, :])
+    np.fill_diagonal(spatial_bonus, 1.0)
+    
+    # 8. Enhanced regret penalization with instance adaptation
+    dist_copy = dist.copy()
+    dist_copy[np.diag_indices(n)] = np.inf
+    
+    # Get best and second-best distances
+    sorted_idx = np.argsort(dist_copy, axis=1)
+    best_dists = dist_copy[np.arange(n), sorted_idx[:, 0]]
+    second_best_dists = dist_copy[np.arange(n), sorted_idx[:, 1]]
+    
+    # Adaptive regret scaling based on instance characteristics
+    regret_scale = 2.0 + 2.0 * cv  # More aggressive penalization for variable instances
+    
+    # Compute regret matrix
+    regret_numer = dist - best_dists[:, np.newaxis]
+    regret_denom = second_best_dists[:, np.newaxis] - best_dists[:, np.newaxis] + 1e-10
+    regret = regret_numer / regret_denom
+    
+    # Exponential regret with adaptive scaling
+    regret_penalty = np.exp(-regret_scale * np.clip(regret, 0, 2))
+    
+    # Symmetrize regret penalty
+    regret_penalty = (regret_penalty + regret_penalty.T) / 2
+    
+    # 9. Combine factors with adaptive weights
+    base_scores = inv_dist * (
+        mst_weight * mst_bonus +
+        density_weight * spatial_bonus +
+        regret_weight * regret_penalty +
+        lookahead_weight * lookahead_scores
+    )
+    
+    # 10. Hybrid sparsification with connectivity guarantees
+    # Adaptive edge count per node
+    base_edges = max(2, int(np.sqrt(n)))
+    density_factor = 1.0 + 0.5 * (1 - uniformity)  # More edges for non-uniform instances
+    target_edges = min(n - 1, int(base_edges * density_factor))
+    
+    # Initialize mask with MST edges
+    mask = mst_array > 0
+    mask = mask | mask.T  # Ensure symmetry
+    
+    # Add promising edges based on scores
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Sort by score
+        sorted_indices = np.argsort(row_scores)[::-1]
+        
+        # Count existing edges
+        current_edges = np.sum(mask[i])
+        needed_edges = max(0, target_edges - current_edges)
+        
+        # Add top-scoring edges
+        added = 0
+        for j in sorted_indices:
+            if added >= needed_edges:
+                break
+            if not mask[i, j] and i != j:
+                mask[i, j] = True
+                mask[j, i] = True
+                added += 1
+    
+    # Ensure graph connectivity
+    conn_mask = mask.astype(int)
+    n_components, labels = connected_components(conn_mask, directed=False)
+    
+    if n_components > 1:
+        # Build component connectivity using best edges
+        comp_edges = []
+        for comp_i in range(n_components):
+            for comp_j in range(comp_i + 1, n_components):
+                nodes_i = np.where(labels == comp_i)[0]
+                nodes_j = np.where(labels == comp_j)[0]
+                
+                # Find best edge between components
+                best_score = -np.inf
+                best_pair = (0, 0)
+                for i in nodes_i:
+                    for j in nodes_j:
+                        if base_scores[i, j] > best_score:
+                            best_score = base_scores[i, j]
+                            best_pair = (i, j)
+                
+                if best_score > -np.inf:
+                    comp_edges.append((best_pair, best_score))
+        
+        # Connect components using best edges
+        comp_edges.sort(key=lambda x: x[1], reverse=True)
+        
+        # Connect until we have one component
+        for (i, j), score in comp_edges:
+            if n_components <= 1:
+                break
+            if not mask[i, j]:
+                mask[i, j] = True
+                mask[j, i] = True
+                # Recompute connectivity
+                conn_mask = mask.astype(int)
+                n_components, labels = connected_components(conn_mask, directed=False)
+    
+    # Apply final mask
+    final_scores = base_scores * mask
+    
+    # 11. Robust normalization preserving relative differences
+    np.fill_diagonal(final_scores, 0)
+    
+    valid_scores = final_scores[final_scores > 0]
+    if len(valid_scores) > 0:
+        # Use robust scaling based on percentiles
+        q90 = np.percentile(valid_scores, 90)
+        q10 = np.percentile(valid_scores, 10)
+        
+        if q90 > q10:
+            # Linear scaling to [0, 1] with percentile clipping
+            scaled = (final_scores - q10) / (q90 - q10 + 1e-10)
+            final_scores = np.clip(scaled, 0, 1)
+        else:
+            # All scores similar, normalize by max
+            max_score = valid_scores.max()
+            if max_score > 0:
+                final_scores = final_scores / max_score
+    
+    return final_scores
+
+# Test with example
+if __name__ == "__main__":
+    np.random.seed(42)
+    n = 20
+    points = np.random.rand(n, 2)
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(points))
+    
+    heuristics = heuristics_v2(dist_matrix)
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Non-zero elements: {np.count_nonzero(heuristics)} / {n*n}")
+    print(f"Max value: {heuristics.max():.4f}")
+    print(f"Min non-zero value: {heuristics[heuristics > 0].min():.4f}")
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"Matrix is symmetric: {is_symmetric}")
+    
+    # Check connectivity
+    conn_mask = (heuristics > 0).astype(int)
+    n_components, _ = connected_components(conn_mask, directed=False)
+    print(f"Number of connected components: {n_components} (should be 1)")
+```

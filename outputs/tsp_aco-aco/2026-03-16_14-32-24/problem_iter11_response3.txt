@@ -1,0 +1,187 @@
+```json
+{
+    "algorithm_features": ["Kernel Density Estimation", "Rank-Based Exponential Decay", "Local Regret Normalization", "Connectivity-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with kernel density estimation, refined regret modeling,
+    and improved connectivity-aware sparsification.
+    
+    Features:
+    1. Kernel Density Estimation: Gaussian kernel with data-driven bandwidth
+    2. Rank-Based Exponential Decay: Adaptive decay based on distance coefficient of variation
+    3. Local Regret Normalization: Smoother penalty using best vs. median alternatives
+    4. Connectivity-Aware Sparsification: Maintains graph connectivity while reducing edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Safe distance matrix with diagonal set to infinity
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Adaptive candidate selection with connectivity preservation
+    # Select k candidates per node where k scales with log(n) for better sparsity
+    k_candidate = max(3, int(2 * np.log1p(n)))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetric candidate list
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # 2. Kernel Density Estimation with adaptive bandwidth
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute adaptive bandwidth using nearest neighbor distances
+    k_density = min(10, n-1)
+    for i in range(n):
+        # Find k-nearest distances (excluding self)
+        k_nearest = np.partition(safe_dist[i], k_density)[:k_density+1]
+        bandwidth_i = np.median(k_nearest[k_nearest > 0])
+        
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Use harmonic mean of individual bandwidths
+                bandwidth_j = np.median(np.partition(safe_dist[j], k_density)[:k_density+1][np.partition(safe_dist[j], k_density)[:k_density+1] > 0])
+                bandwidth = 2 * bandwidth_i * bandwidth_j / (bandwidth_i + bandwidth_j + eps)
+                
+                # Gaussian kernel density estimation
+                sigma = bandwidth / 3
+                kernel_i = np.exp(-0.5 * (safe_dist[i] / sigma) ** 2)
+                kernel_j = np.exp(-0.5 * (safe_dist[j] / sigma) ** 2)
+                
+                # Joint density (excluding endpoints)
+                joint_density = np.sum(kernel_i * kernel_j) - kernel_i[i] - kernel_j[j]
+                
+                # Normalized density bonus
+                if joint_density > 0:
+                    density_bonus[i, j] = np.log1p(joint_density) / (1 + np.log1p(joint_density))
+                else:
+                    density_bonus[i, j] = -0.05  # Small penalty for isolated edges
+    
+    density_bonus = np.maximum(density_bonus, density_bonus.T)
+    
+    # 3. Local Regret Normalization
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        valid_dists = dists[dists < np.inf]
+        
+        if len(valid_dists) >= 2:
+            sorted_dists = np.sort(valid_dists)
+            best_dist = sorted_dists[0]
+            
+            # Use median of top candidates as alternative
+            alt_idx = min(k_candidate, len(sorted_dists)-1)
+            alt_dist = sorted_dists[alt_idx]
+            
+            # Smoother regret function using logistic transformation
+            for j in range(n):
+                if i != j and dists[j] < np.inf:
+                    edge_dist = dists[j]
+                    if edge_dist <= alt_dist:
+                        # Linear scaling within candidate range
+                        regret = 0.5 * (edge_dist - best_dist) / (alt_dist - best_dist + eps)
+                    else:
+                        # Exponential penalty beyond candidate range
+                        regret = 0.5 + 0.5 * (1 - np.exp(-(edge_dist - alt_dist) / (np.mean(dists) + eps)))
+                    
+                    regret_matrix[i, j] = regret
+    
+    # 4. Rank-Based Exponential Decay with coefficient of variation adaptation
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get sorted indices and distances
+        sorted_idx = np.argsort(safe_dist[i])
+        distances = safe_dist[i, sorted_idx]
+        
+        # Use coefficient of variation for decay rate adaptation
+        k_sample = min(15, n-1)
+        sample_dists = distances[1:k_sample+1]
+        
+        if len(sample_dists) > 1:
+            mean_dist = np.mean(sample_dists)
+            cv = np.std(sample_dists) / (mean_dist + eps)
+            # Higher CV (more variability) leads to steeper decay
+            decay_rate = 0.4 + 0.4 * (1 - np.exp(-cv))
+            decay_rate = np.clip(decay_rate, 0.3, 0.85)
+        else:
+            decay_rate = 0.6
+        
+        # Assign weights with exponential decay
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # 5. Base score with normalized inverse distance
+    mean_dist = np.mean(safe_dist[safe_dist < np.inf])
+    inv_dist = mean_dist / (safe_dist + eps)
+    
+    # 6. Structural bias from Minimum Spanning Tree (for moderate sizes)
+    if n <= 2000:
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            mst_bonus = mst_mask * 0.25
+        except:
+            mst_bonus = np.zeros_like(distance_matrix)
+    else:
+        mst_bonus = np.zeros_like(distance_matrix)
+    
+    # 7. Combine factors with optimized weighting
+    regret_penalty = np.exp(-1.5 * regret_matrix)
+    base_score = inv_dist * rank_weights * regret_penalty
+    
+    # Enhanced combination with saturation control
+    combined = base_score * (1 + 0.8 * density_bonus) * (1 + mst_bonus)
+    
+    # 8. Connectivity-aware sparsification
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Apply candidate mask with density-based enhancement
+    enhanced_candidates = candidate_mask.copy()
+    for i in range(n):
+        row_density = density_bonus[i]
+        if np.sum(row_density > 0) > k_candidate:
+            # Include additional high-density edges
+            density_threshold = np.percentile(row_density[row_density > 0], 70)
+            high_density_mask = row_density > density_threshold
+            enhanced_candidates[i] = enhanced_candidates[i] | high_density_mask
+    
+    enhanced_candidates = enhanced_candidates | enhanced_candidates.T
+    heuristics_matrix[enhanced_candidates] = combined[enhanced_candidates]
+    
+    # Ensure each node has at least degree 2
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero = np.nonzero(row)[0]
+        
+        if len(nonzero) < 2:
+            # Fall back to distance-based selection
+            backup_indices = np.argsort(safe_dist[i])[1:3]  # Exclude self
+            backup_values = inv_dist[i, backup_indices] * 0.5
+            heuristics_matrix[i, backup_indices] = np.maximum(heuristics_matrix[i, backup_indices], backup_values)
+            heuristics_matrix[backup_indices, i] = np.maximum(heuristics_matrix[backup_indices, i], backup_values)
+    
+    # 9. Symmetrize and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Row-wise normalization for stochastic interpretation
+    row_sums = heuristics_matrix.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1  # Avoid division by zero
+    heuristics_matrix = heuristics_matrix / row_sums
+    
+    return heuristics_matrix
+```

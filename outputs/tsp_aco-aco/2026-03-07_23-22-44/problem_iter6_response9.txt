@@ -1,0 +1,193 @@
+```json
+{
+    "algorithm_features": ["Log-distance Inverse Base", "Dual-stage Exponential Regret", "Lookahead Spatial Averaging", "Adaptive Sparsification with MST Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges integrating lookahead spatial averaging
+    and enhanced regret modeling.
+    
+    Key innovations:
+    1. Log-distance inverse base scoring for numerical stability
+    2. Dual-stage exponential regret (local + global opportunity cost)
+    3. Lookahead spatial averaging to estimate detour impact
+    4. Adaptive sparsification preserving MST backbone
+    5. Cluster-aware bonuses using distance quartiles
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix of shape (n, n)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base inverse log-distance (numerically stable)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_inv_dist = 1.0 / (np.log1p(distance_matrix) + 1e-10)
+    log_inv_dist[np.isinf(log_inv_dist)] = 0
+    np.fill_diagonal(log_inv_dist, 0)
+    
+    # 2. Dual-stage regret calculation with exponential decay
+    # Stage 1: Local regret (node-specific opportunity cost)
+    local_regret = np.ones_like(distance_matrix)
+    node_min_dist = np.full(n, np.inf)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if np.any(dists < np.inf):
+            node_min_dist[i] = np.min(dists[dists > 0])
+    
+    for i in range(n):
+        if node_min_dist[i] < np.inf:
+            regret_ratio = distance_matrix[i] / (node_min_dist[i] + 1e-10)
+            local_regret[i] = np.exp(-regret_ratio)
+        local_regret[i, i] = 0
+    
+    # Stage 2: Global regret (cross-node consistency)
+    global_regret = np.ones_like(distance_matrix)
+    if n > 2:
+        for i in range(n):
+            # Compute alternative costs using partition for efficiency
+            row_dists = distance_matrix[i].copy()
+            row_dists[i] = np.inf
+            alt_cost_i = np.mean(np.partition(row_dists, 1)[:3])
+            
+            for j in range(i+1, n):
+                row_dists_j = distance_matrix[j].copy()
+                row_dists_j[j] = np.inf
+                alt_cost_j = np.mean(np.partition(row_dists_j, 1)[:3])
+                
+                best_alt = min(alt_cost_i, alt_cost_j)
+                if best_alt > 0:
+                    regret = distance_matrix[i, j] / best_alt
+                    global_regret[i, j] = global_regret[j, i] = np.exp(-regret)
+    
+    regret_score = local_regret * global_regret
+    
+    # 3. Lookahead spatial averaging
+    spatial_factor = np.ones_like(distance_matrix)
+    if n > 2:
+        total_dist = np.sum(distance_matrix, axis=1)  # sum includes diagonal (0)
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                # Average distance from i to other nodes (excluding j)
+                avg_i_excl_j = (total_dist[i] - distance_matrix[i, j]) / (n - 2)
+                # Average distance from j to other nodes (excluding i)
+                avg_j_excl_i = (total_dist[j] - distance_matrix[i, j]) / (n - 2)
+                
+                avg_other = (avg_i_excl_j + avg_j_excl_i) / 2
+                # Exponential decay: edge is more promising if much shorter than average
+                spatial_factor[i, j] = spatial_factor[j, i] = np.exp(
+                    -distance_matrix[i, j] / (avg_other + 1e-10)
+                )
+    
+    # 4. Proximity cluster detection
+    cluster_bonus = np.ones_like(distance_matrix)
+    if n > 3:
+        upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+        q25 = np.percentile(upper_tri, 25)
+        
+        for i in range(n):
+            close_mask = distance_matrix[i] < q25
+            close_mask[i] = False
+            if np.sum(close_mask) > 1:
+                cluster_bonus[i, close_mask] = 1.2
+    
+    # 5. MST connectivity guarantee
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_bonus = np.ones_like(distance_matrix)
+    mst_bonus[mst_mask] = 1.5
+    
+    # 6. Node degree balancing
+    degree_balance = np.ones_like(distance_matrix)
+    if n > 2:
+        target_degree = 2
+        for i in range(n):
+            potential_connections = np.sum(log_inv_dist[i] > 0)
+            if potential_connections > target_degree:
+                balance_factor = target_degree / (potential_connections + 1e-10)
+                degree_balance[i] = np.sqrt(balance_factor)
+    
+    # 7. Combine all factors
+    base_scores = log_inv_dist * regret_score * spatial_factor * cluster_bonus * mst_bonus * degree_balance
+    
+    # 8. Dynamic sparsification with MST preservation
+    sparsified = np.zeros_like(base_scores)
+    
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        mst_edges = mst_mask[i]
+        mst_count = np.sum(mst_edges)
+        
+        # Adaptive sparsity based on problem size and node centrality
+        if n <= 5:
+            k = n - 1
+        else:
+            centrality = np.mean(1.0 / (distance_matrix[i] + 1e-10))
+            k_base = max(3, int(np.sqrt(n)))
+            k = min(n - 1, k_base + int(centrality * 2))
+        
+        if mst_count > 0:
+            keep_mask = mst_edges.copy()
+            non_mst_count = k - mst_count
+            
+            if non_mst_count > 0:
+                non_mst_scores = row_scores.copy()
+                non_mst_scores[mst_edges] = -np.inf
+                
+                if np.sum(non_mst_scores > -np.inf) >= non_mst_count:
+                    threshold = np.partition(
+                        non_mst_scores[non_mst_scores > -np.inf],
+                        -non_mst_count
+                    )[-non_mst_count]
+                    top_non_mst = non_mst_scores >= threshold
+                    keep_mask = keep_mask | top_non_mst
+                else:
+                    keep_mask = keep_mask | (non_mst_scores > -np.inf)
+        else:
+            if np.any(row_scores > -np.inf):
+                k = min(k, np.sum(row_scores > -np.inf))
+                threshold = np.partition(row_scores[row_scores > -np.inf], -k)[-k]
+                keep_mask = row_scores >= threshold
+            else:
+                keep_mask = np.zeros_like(row_scores, dtype=bool)
+        
+        sparsified[i][keep_mask] = base_scores[i][keep_mask]
+    
+    # 9. Symmetrize and ensure connectivity
+    symmetric_scores = np.maximum(sparsified, sparsified.T)
+    
+    # Ensure MST edges have minimum viable score
+    if np.any(symmetric_scores > 0):
+        min_nonzero = np.min(symmetric_scores[symmetric_scores > 0])
+        symmetric_scores[mst_mask] = np.maximum(symmetric_scores[mst_mask], min_nonzero * 0.5)
+    
+    # 10. Final normalization with gentle exponent
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+        # Soft emphasis on top candidates
+        symmetric_scores = np.power(symmetric_scores, 0.8)
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

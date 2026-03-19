@@ -1,0 +1,309 @@
+```json
+{
+    "algorithm_features": ["Clustering-Coefficient Weighted Density", "Adaptive Distribution-Aware Regret", "Multi-Scale Rank Decay", "Local Structure Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge evaluation integrating clustering coefficients,
+    distribution-aware regret modeling, and multi-scale structural reinforcement.
+    
+    Features:
+    1. Clustering-Coefficient Weighted Density: Combines geometric density with
+       local clustering to identify community structures
+    2. Adaptive Distribution-Aware Regret: Uses quantile regression on distance
+       distributions for smoother penalty transitions
+    3. Multi-Scale Rank Decay: Hierarchical decay rates based on distance
+       distribution shape (skewness, modality)
+    4. Local Structure Reinforcement: Triangle-aware edge scoring with
+       community-aware MST boosting
+    """
+    n = distance_matrix.shape[0]
+    
+    # Safe distance matrix with numerical stability
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ==================== 1. ADAPTIVE CANDIDATE LIST ====================
+    # Logarithmic scaling with instance-size aware bounds
+    k_base = max(4, int(np.log2(n) * 2.5))
+    k_candidate = min(k_base, n // 4, 50)  # Cap at 50 for very large instances
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # ==================== 2. CLUSTERING COEFFICIENT COMPUTATION ====================
+    # Compute local clustering coefficients using candidate graph
+    clustering_coeff = np.zeros(n)
+    
+    for i in range(n):
+        neighbors = np.where(candidate_mask[i])[0]
+        k = len(neighbors)
+        
+        if k < 2:
+            clustering_coeff[i] = 0.0
+            continue
+        
+        # Count triangles among neighbors in candidate graph
+        triangle_count = 0
+        for idx_a, a in enumerate(neighbors):
+            for b in neighbors[idx_a+1:]:
+                if candidate_mask[a, b]:
+                    triangle_count += 1
+        
+        max_triangles = k * (k - 1) / 2
+        clustering_coeff[i] = triangle_count / max_triangles if max_triangles > 0 else 0.0
+    
+    # ==================== 3. DISTRIBUTION-AWARE REGRET PENALTY ====================
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        candidate_idx = np.where(candidate_mask[i])[0]
+        if len(candidate_idx) < 3:
+            continue
+            
+        # Get candidate distances and compute distribution statistics
+        cand_dists = safe_dist[i, candidate_idx]
+        sorted_dists = np.sort(cand_dists)
+        
+        # Use multiple quantiles for smoother penalty transitions
+        q_low = 0.25  # First quartile
+        q_mid = 0.50  # Median
+        q_high = 0.75  # Third quartile
+        
+        idx_low = int(q_low * (len(sorted_dists) - 1))
+        idx_mid = int(q_mid * (len(sorted_dists) - 1))
+        idx_high = int(q_high * (len(sorted_dists) - 1))
+        
+        d_low = sorted_dists[idx_low]
+        d_mid = sorted_dists[idx_mid]
+        d_high = sorted_dists[idx_high]
+        d_best = sorted_dists[0]
+        d_worst = sorted_dists[-1]
+        
+        # Adaptive penalty based on distance distribution skewness
+        dist_skew = 0.0
+        if len(sorted_dists) >= 10:
+            from scipy.stats import skew
+            dist_skew = max(0.0, skew(sorted_dists[:10]))
+        
+        skew_factor = np.tanh(dist_skew) * 0.3  # [-0.3, 0.3] adjustment
+        
+        for j in candidate_idx:
+            edge_dist = safe_dist[i, j]
+            
+            if edge_dist <= d_low:
+                # Top quartile: minimal penalty
+                regret = 0.0
+            elif edge_dist <= d_mid:
+                # Second quartile: gentle penalty
+                t = (edge_dist - d_low) / (d_mid - d_low + eps)
+                regret = (0.1 + skew_factor) * t**0.5
+            elif edge_dist <= d_high:
+                # Third quartile: moderate penalty
+                t = (edge_dist - d_mid) / (d_high - d_mid + eps)
+                regret = (0.2 + skew_factor) + (0.3 - skew_factor) * t
+            else:
+                # Bottom quartile: severe penalty
+                t = (edge_dist - d_high) / (d_worst - d_high + eps)
+                regret = 0.5 + 0.5 * t
+            
+            regret_matrix[i, j] = np.clip(regret, 0.0, 1.0)
+    
+    # ==================== 4. MULTI-SCALE RANK WEIGHTING ====================
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        valid_idx = np.where(safe_dist[i] < np.inf)[0]
+        if len(valid_idx) == 0:
+            continue
+            
+        sorted_idx = valid_idx[np.argsort(safe_dist[i, valid_idx])]
+        distances = safe_dist[i, sorted_idx]
+        
+        # Multi-scale decay based on distribution characteristics
+        if len(distances) >= 8:
+            # First-scale: nearest 4 distances
+            near_dists = distances[:4]
+            near_cv = np.std(near_dists) / (np.mean(near_dists) + eps)
+            
+            # Second-scale: next 4 distances
+            if len(distances) >= 8:
+                mid_dists = distances[4:8]
+                mid_cv = np.std(mid_dists) / (np.mean(mid_dists) + eps)
+            else:
+                mid_cv = near_cv
+            
+            # Combined decay with hierarchy
+            near_decay = 0.4 + 0.4 * np.tanh(near_cv - 0.3)
+            mid_decay = 0.6 + 0.3 * np.tanh(mid_cv - 0.4)
+            
+            # Weighted combination
+            decay_rate = 0.5 * near_decay + 0.5 * mid_decay
+        else:
+            # Fallback for small neighborhoods
+            cv = np.std(distances) / (np.mean(distances) + eps)
+            decay_rate = 0.5 + 0.3 * np.tanh(cv - 0.5)
+        
+        decay_rate = np.clip(decay_rate, 0.3, 0.85)
+        
+        # Apply exponential decay with rank
+        for rank, j in enumerate(sorted_idx):
+            if i != j:
+                # Gradual transition in decay
+                if rank < len(distances) // 2:
+                    rank_weights[i, j] = decay_rate ** rank
+                else:
+                    # Slower decay for farther ranks
+                    slow_decay = min(decay_rate + 0.2, 0.95)
+                    rank_weights[i, j] = decay_rate ** (len(distances) // 2) * \
+                                        slow_decay ** (rank - len(distances) // 2)
+    
+    # ==================== 5. CLUSTERING-WEIGHTED DENSITY BONUS ====================
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    # Compute adaptive node densities with clustering awareness
+    node_densities = np.zeros(n)
+    for i in range(n):
+        # Use clustering-coefficient adjusted radius
+        cc_factor = 0.5 + 0.5 * clustering_coeff[i]  # [0.5, 1.0]
+        k_density = min(6, n-1)
+        
+        valid_dists = safe_dist[i, safe_dist[i] < np.inf]
+        if len(valid_dists) > 0:
+            # Radius adjusted by clustering: tighter clusters get smaller radius
+            base_radius = np.median(np.partition(valid_dists, k_density)[:k_density])
+            adjusted_radius = base_radius * cc_factor
+            
+            # Count nodes within adjusted radius
+            within_radius = np.sum(safe_dist[i] <= adjusted_radius) - 1
+            node_densities[i] = within_radius / (n - 1)
+    
+    # Apply clustering-weighted geometric mean bonus
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                # Geometric mean of densities
+                geo_density = np.sqrt(node_densities[i] * node_densities[j] + eps)
+                
+                # Average clustering coefficient of endpoints
+                avg_cc = (clustering_coeff[i] + clustering_coeff[j]) / 2
+                
+                # Combined bonus with clustering emphasis
+                if geo_density > 0.05 and avg_cc > 0.1:
+                    # Boost edges within well-clustered regions
+                    combined = np.sqrt(geo_density * avg_cc)
+                    density_bonus[i, j] = 0.3 * combined
+                elif geo_density > 0.02:
+                    # Moderate bonus for medium-density regions
+                    density_bonus[i, j] = 0.1 * np.sqrt(geo_density)
+                else:
+                    # Small penalty for isolated edges
+                    density_bonus[i, j] = -0.05 * (1.0 - avg_cc)
+    
+    # Symmetrize
+    density_bonus = np.maximum(density_bonus, density_bonus.T)
+    
+    # ==================== 6. BASE INVERSE DISTANCE ====================
+    inv_dist = np.zeros_like(distance_matrix)
+    for i in range(n):
+        valid_mask = safe_dist[i] < np.inf
+        if np.any(valid_mask):
+            # Local median scaling
+            local_median = np.median(safe_dist[i, valid_mask])
+            inv_dist[i, valid_mask] = local_median / (safe_dist[i, valid_mask] + eps)
+    
+    # ==================== 7. COMBINE FACTORS ====================
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base score with rank weighting
+    base_score = inv_dist * rank_weights
+    
+    # Apply regret penalty
+    regret_penalty = np.exp(-1.8 * regret_matrix)  # Stronger decay
+    score_with_regret = base_score * regret_penalty
+    
+    # Add clustering-weighted density bonus
+    heuristics_matrix = score_with_regret * (1.0 + density_bonus)
+    
+    # ==================== 8. COMMUNITY-AWARE STRUCTURAL REINFORCEMENT ====================
+    if n <= 1000:
+        try:
+            # Minimum Spanning Tree
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_mask = (mst + mst.T) > 0
+            
+            # Boost MST edges with clustering-based amplification
+            for i in range(n):
+                for j in range(i+1, n):
+                    if mst_mask[i, j]:
+                        # Higher boost for edges connecting nodes with high clustering
+                        cc_boost = 0.1 * (clustering_coeff[i] + clustering_coeff[j])
+                        boost_factor = 1.25 + cc_boost
+                        heuristics_matrix[i, j] *= boost_factor
+                        heuristics_matrix[j, i] = heuristics_matrix[i, j]
+        except:
+            pass
+    
+    # ==================== 9. ENHANCED SPARSIFICATION ====================
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Connectivity preservation with clustering awareness
+    min_connections = min(3, n-1)
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_idx = np.where(row > 0)[0]
+        
+        if len(nonzero_idx) < min_connections:
+            # Find promising connections considering clustering
+            candidate_scores = np.zeros(n)
+            for j in range(n):
+                if i != j and not candidate_mask[i, j]:
+                    # Score potential connections by distance and clustering compatibility
+                    dist_score = inv_dist[i, j]
+                    cc_score = 0.5 * (clustering_coeff[i] + clustering_coeff[j])
+                    candidate_scores[j] = dist_score * (0.7 + 0.3 * cc_score)
+            
+            # Select top connections
+            top_count = min_connections - len(nonzero_idx)
+            top_idx = np.argsort(candidate_scores)[-top_count:]
+            
+            for j in top_idx:
+                if candidate_scores[j] > 0:
+                    # Set to median of existing connections
+                    if len(nonzero_idx) > 0:
+                        target_val = np.median(row[nonzero_idx])
+                    else:
+                        target_val = np.percentile(base_score[i], 70)
+                    heuristics_matrix[i, j] = max(heuristics_matrix[i, j], target_val)
+                    heuristics_matrix[j, i] = heuristics_matrix[i, j]
+    
+    # ==================== 10. FINAL PROCESSING ====================
+    # Symmetrize and zero diagonal
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Robust normalization using truncated mean
+    non_zero = heuristics_matrix[heuristics_matrix > 0]
+    if len(non_zero) > 0:
+        # Use 95th percentile as scaling reference
+        scale_ref = np.percentile(non_zero, 95)
+        if scale_ref > eps:
+            heuristics_matrix = heuristics_matrix / scale_ref
+    
+    heuristics_matrix = np.clip(heuristics_matrix, 0.0, 1.0)
+    
+    return heuristics_matrix
+```

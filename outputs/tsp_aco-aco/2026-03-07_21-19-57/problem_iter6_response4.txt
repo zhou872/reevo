@@ -1,0 +1,308 @@
+```json
+{
+    "algorithm_features": ["Additive Multi-component Scoring", "Two-step Lookahead Path Extension", "Rank-based Regret Incentives", "Adaptive Density Similarity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection using additive combination
+    of multiple components and lightweight global lookahead.
+    
+    Core improvements over v1:
+    1. Additive combination of normalized components to avoid multiplicative cascading
+    2. Two-step lookahead via path extension cost estimation
+    3. Tuned parameters for rank incentives and density similarity
+    4. Adaptive sparsification preserving MST backbone with global lookahead support
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # ======================
+    # 1. BASE INVERSE DISTANCE
+    # ======================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Normalize to [0, 1]
+    inv_dist_max = np.max(inv_dist)
+    if inv_dist_max > 0:
+        inv_dist_norm = inv_dist / inv_dist_max
+    else:
+        inv_dist_norm = inv_dist
+    
+    # ======================
+    # 2. RANK-BASED REGRET INCENTIVE
+    # ======================
+    rank_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        sorted_indices = np.argsort(distances)
+        sorted_distances = distances[sorted_indices]
+        
+        if len(sorted_distances) == 0:
+            continue
+            
+        d_best = sorted_distances[0]
+        
+        for rank, j in enumerate(sorted_indices):
+            if i == j:
+                continue
+                
+            if rank == 0:
+                # Best edge gets bonus (tuned parameter)
+                rank_matrix[i, j] = 1.5
+            else:
+                d_rank = sorted_distances[rank]
+                if d_best > 0:
+                    # Direct distance ratio (d_best/d_rank)
+                    rank_matrix[i, j] = d_best / d_rank
+                else:
+                    rank_matrix[i, j] = 1.0
+    
+    # Make symmetric and normalize
+    rank_matrix = (rank_matrix + rank_matrix.T) / 2
+    rank_max = np.max(rank_matrix)
+    if rank_max > 0:
+        rank_norm = rank_matrix / rank_max
+    else:
+        rank_norm = rank_matrix
+    
+    # ======================
+    # 3. ADAPTIVE DENSITY SIMILARITY
+    # ======================
+    # Compute local density using k-nearest neighbors
+    k = max(3, min(15, int(0.12 * n)))
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        if n > k + 1:
+            kth_dist = np.partition(distances, k)[k]
+            nearest_mask = distances <= kth_dist
+            nearest_dists = distances[nearest_mask]
+        else:
+            nearest_dists = distances[distances < np.inf]
+        
+        if len(nearest_dists) > 0:
+            avg_nearest = np.mean(nearest_dists)
+            local_density[i] = 1.0 / (avg_nearest + 1e-8)
+        else:
+            local_density[i] = 1.0
+    
+    # Normalize densities
+    if np.max(local_density) > np.min(local_density):
+        local_density = (local_density - np.min(local_density)) / \
+                       (np.max(local_density) - np.min(local_density) + 1e-8)
+    
+    # Compute density similarity with exponential decay (tuned decay rate)
+    density_similarity = np.ones((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            density_diff = abs(local_density[i] - local_density[j])
+            # Exponential decay bonus
+            density_similarity[i, j] = 1.0 + np.exp(-2.5 * density_diff)
+    
+    # Symmetrize and normalize
+    density_similarity = (density_similarity + density_similarity.T) / 2
+    density_max = np.max(density_similarity)
+    if density_max > 0:
+        density_norm = density_similarity / density_max
+    else:
+        density_norm = density_similarity
+    
+    # ======================
+    # 4. GLOBAL LOOKAHEAD VIA PATH EXTENSION
+    # ======================
+    # Precompute two smallest distances for each node (for efficient lookahead)
+    first_min = np.full(n, np.inf)
+    first_idx = np.full(n, -1, dtype=int)
+    second_min = np.full(n, np.inf)
+    second_idx = np.full(n, -1, dtype=int)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        if n >= 3:
+            # Get two smallest distances and their indices
+            indices = np.argpartition(distances, 2)[:2]
+            values = distances[indices]
+            
+            # Sort the two values
+            sort_order = np.argsort(values)
+            first_min[i] = values[sort_order[0]]
+            first_idx[i] = indices[sort_order[0]]
+            second_min[i] = values[sort_order[1]]
+            second_idx[i] = indices[sort_order[1]]
+        elif n == 2:
+            # Only one other node
+            j = 1 if i == 0 else 0
+            first_min[i] = distance_matrix[i, j]
+            first_idx[i] = j
+            second_min[i] = np.inf
+            second_idx[i] = -1
+    
+    # Compute extension cost for each edge
+    extension_inv = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Minimum distance from i excluding j
+            if first_idx[i] == j:
+                min_from_i = second_min[i]
+            else:
+                min_from_i = first_min[i]
+            
+            # Minimum distance from j excluding i
+            if first_idx[j] == i:
+                min_from_j = second_min[j]
+            else:
+                min_from_j = first_min[j]
+            
+            # Combined cost: current edge + best extensions
+            extension_cost = distance_matrix[i, j] + min_from_i + min_from_j
+            if extension_cost > 0:
+                extension_inv[i, j] = 1.0 / extension_cost
+    
+    # Symmetrize and normalize
+    extension_inv = (extension_inv + extension_inv.T) / 2
+    extension_max = np.max(extension_inv)
+    if extension_max > 0:
+        extension_norm = extension_inv / extension_max
+    else:
+        extension_norm = extension_inv
+    
+    # ======================
+    # 5. MINIMUM SPANNING TREE SUPPORT
+    # ======================
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    except:
+        mst_mask = np.ones((n, n), dtype=bool)
+        np.fill_diagonal(mst_mask, False)
+    
+    # Create MST bonus matrix (binary)
+    mst_bonus = np.where(mst_mask, 1.0, 0.0)
+    # Normalize (already in [0,1])
+    
+    # ======================
+    # 6. ADDITIVE COMBINATION WITH TUNED WEIGHTS
+    # ======================
+    # Weight parameters (tuned for balance)
+    w1 = 0.35  # Inverse distance
+    w2 = 0.25  # Rank incentive
+    w3 = 0.20  # Density similarity
+    w4 = 0.15  # Global lookahead
+    w5 = 0.05  # MST bonus (small since we preserve MST in sparsification)
+    
+    heuristic = (w1 * inv_dist_norm + 
+                 w2 * rank_norm + 
+                 w3 * density_norm + 
+                 w4 * extension_norm + 
+                 w5 * mst_bonus)
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # ======================
+    # 7. INTELLIGENT SPARSIFICATION
+    # ======================
+    # Always keep MST edges as backbone
+    final_mask = mst_mask.copy()
+    
+    # Determine number of additional edges per node based on graph size
+    if n <= 10:
+        extra_edges = 3
+    elif n <= 30:
+        extra_edges = max(2, int(0.2 * n))
+    elif n <= 100:
+        extra_edges = max(3, int(0.15 * n))
+    else:
+        extra_edges = max(3, int(0.1 * n))
+    
+    # For each node, keep top extra edges (excluding MST edges already kept)
+    for i in range(n):
+        node_heuristics = heuristic[i, :].copy()
+        node_heuristics[i] = -np.inf
+        
+        # Get MST edges for this node
+        mst_edges = np.where(mst_mask[i, :])[0]
+        mst_edges = mst_edges[mst_edges != i]
+        
+        # Get non-MST edges
+        non_mst_mask = ~mst_mask[i, :]
+        non_mst_mask[i] = False
+        non_mst_indices = np.where(non_mst_mask)[0]
+        
+        if len(non_mst_indices) > 0:
+            non_mst_heuristics = node_heuristics[non_mst_indices]
+            if len(non_mst_heuristics) > extra_edges:
+                # Select top extra_edges from non-MST
+                threshold = np.partition(non_mst_heuristics, -extra_edges)[-extra_edges]
+                top_non_mst = non_mst_indices[non_mst_heuristics >= threshold]
+            else:
+                top_non_mst = non_mst_indices
+            
+            # Combine with MST edges
+            keep_indices = np.unique(np.concatenate([mst_edges, top_non_mst]))
+        else:
+            keep_indices = mst_edges
+        
+        final_mask[i, keep_indices] = True
+        final_mask[keep_indices, i] = True
+    
+    # Ensure minimum connectivity (each node connects to at least 2 others)
+    for i in range(n):
+        connected = np.where(final_mask[i, :])[0]
+        connected = connected[connected != i]
+        if len(connected) < 2:
+            # Add nearest neighbors not already connected
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            distances[connected] = np.inf
+            needed = 2 - len(connected)
+            if needed > 0:
+                nearest = np.argsort(distances)[:needed]
+                for j in nearest:
+                    if j != i and not final_mask[i, j]:
+                        final_mask[i, j] = True
+                        final_mask[j, i] = True
+    
+    # Apply mask
+    heuristic = heuristic * final_mask
+    
+    # Final normalization
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

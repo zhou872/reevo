@@ -1,0 +1,429 @@
+```json
+{
+    "algorithm_features": ["Multi-Factor Fusion", "Adaptive Weighting", "Vectorized Computation", "Hierarchical Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from sklearn.manifold import MDS
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with multi-factor fusion,
+    adaptive parameter tuning, and hierarchical edge sparsification.
+    
+    Returns a matrix of edge promises with the same shape as distance_matrix,
+    where higher values indicate more promising edges for inclusion in TSP tours.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+        return result
+    
+    # Base reciprocal weights (inverse relationship with distance)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal_weights, 0)
+    
+    # Adaptive graph analysis for parameter tuning
+    graph_stats = _analyze_graph_structure(distance_matrix, n)
+    
+    # Factor 1: Proximity-based clustering
+    proximity_factor = _compute_proximity_clustering(distance_matrix, n, graph_stats)
+    
+    # Factor 2: Structural connectivity (MST-enhanced)
+    structure_factor = _compute_structural_connectivity(distance_matrix, n, graph_stats)
+    
+    # Factor 3: Local neighborhood consistency
+    consistency_factor = _compute_local_consistency(distance_matrix, n, graph_stats)
+    
+    # Multi-factor fusion with adaptive weighting
+    fused_heuristics = _adaptive_fusion(
+        reciprocal_weights, proximity_factor, structure_factor, 
+        consistency_factor, distance_matrix, graph_stats, n
+    )
+    
+    # Hierarchical edge selection
+    selected_edges = _hierarchical_edge_selection(fused_heuristics, distance_matrix, graph_stats, n)
+    
+    # Context-aware enhancement
+    enhanced_heuristics = _context_aware_enhancement(selected_edges, distance_matrix, n)
+    
+    # Final normalization
+    np.fill_diagonal(enhanced_heuristics, 0)
+    max_val = np.max(enhanced_heuristics)
+    if max_val > 0:
+        enhanced_heuristics = enhanced_heuristics / max_val
+    
+    return enhanced_heuristics
+
+def _analyze_graph_structure(distance_matrix: np.ndarray, n: int) -> dict:
+    """Analyze graph properties to adaptively tune algorithm parameters."""
+    # Extract upper triangle distances (excluding diagonal)
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    # Basic statistics
+    stats = {
+        'avg_distance': np.mean(distances),
+        'distance_std': np.std(distances),
+        'distance_cv': np.std(distances) / (np.mean(distances) + 1e-12),
+        'size': n
+    }
+    
+    # Density estimation (based on distance distribution)
+    median_dist = np.median(distances)
+    close_ratio = np.sum(distances < median_dist * 0.7) / len(distances)
+    stats['density_estimate'] = close_ratio
+    
+    # Complexity classification
+    if n < 100:
+        stats['complexity'] = 'small'
+    elif n < 1000:
+        stats['complexity'] = 'medium'
+    else:
+        stats['complexity'] = 'large'
+    
+    # Connectivity pattern (based on distance distribution skew)
+    stats['distance_skew'] = np.mean((distances - stats['avg_distance'])**3) / (stats['distance_std']**3 + 1e-12)
+    
+    return stats
+
+def _compute_proximity_clustering(distance_matrix: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Compute proximity-based clustering factor using adaptive methods."""
+    proximity = np.zeros_like(distance_matrix)
+    
+    # Adaptive neighbor count based on graph properties
+    if stats['complexity'] == 'small':
+        k = max(3, min(int(np.log2(n)) * 2, n // 4))
+    elif stats['complexity'] == 'medium':
+        k = max(3, int(np.log2(n)) + 3)
+    else:
+        k = max(3, int(np.log2(n)))
+    
+    # Method selection based on size and density
+    if stats['complexity'] == 'small' or (stats['complexity'] == 'medium' and stats['density_estimate'] > 0.3):
+        # Use MDS for accurate spatial embedding when feasible
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=min(3, n-1),
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=3,
+                max_iter=100
+            )
+            coords = mds.fit_transform(distance_matrix)
+            tree = KDTree(coords)
+            
+            # Find k-nearest neighbors for each point
+            for i in range(n):
+                _, indices = tree.query(coords[i].reshape(1, -1), k=k+1)
+                indices = indices[0][1:]  # Exclude self
+                # Assign decreasing weights based on proximity rank
+                for rank, j in enumerate(indices):
+                    proximity[i, j] = 1.0 / (rank + 1)
+    else:
+        # Fast distance-based approximation for large/sparse graphs
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            
+            # Adaptive threshold based on local statistics
+            local_median = np.median(dists)
+            if stats['distance_cv'] > 1.0:  # High variability
+                threshold = local_median * 0.8
+            else:
+                threshold = local_median * 1.2
+            
+            # Select neighbors within threshold
+            candidates = np.where(dists <= threshold)[0]
+            if len(candidates) < 3:
+                # Fallback to k-nearest
+                candidates = np.argsort(dists)[:k]
+            
+            # Assign proximity scores
+            sorted_candidates = candidates[np.argsort(distance_matrix[i, candidates])]
+            for rank, j in enumerate(sorted_candidates):
+                proximity[i, j] = 1.0 / (rank + 1)
+    
+    # Ensure symmetry
+    proximity = (proximity + proximity.T) / 2
+    return proximity
+
+def _compute_structural_connectivity(distance_matrix: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Compute structural connectivity factor based on MST and local patterns."""
+    structure = np.zeros_like(distance_matrix)
+    
+    # Compute Minimum Spanning Tree
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    
+    # MST edges get highest weight
+    structure[mst_edges] = 2.0
+    
+    # Additional structural edges based on local connectivity patterns
+    for i in range(n):
+        # Get distances to other nodes
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Consider nodes that are connected via MST to i's neighbors
+        mst_neighbors = np.where(mst_edges[i])[0]
+        if len(mst_neighbors) > 0:
+            # Look at neighbors of MST neighbors
+            secondary_candidates = set()
+            for neighbor in mst_neighbors:
+                secondary_candidates.update(np.where(mst_edges[neighbor])[0])
+            secondary_candidates.discard(i)
+            
+            # Assign weights based on distance and MST connectivity
+            for j in secondary_candidates:
+                if j > i:  # Process each pair once
+                    # Weight decays with distance but boosted by MST connectivity
+                    mst_path_len = 2  # i -> neighbor -> j via MST
+                    distance_factor = np.exp(-dists[j] / (stats['avg_distance'] + 1e-12))
+                    structure[i, j] = structure[j, i] = max(structure[i, j], 1.2 * distance_factor)
+    
+    # Add connections based on geometric proximity (Voronoi-like regions)
+    if stats['complexity'] != 'large':
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            
+            # Consider a few closest nodes not already covered
+            closest = np.argsort(dists)[:min(5, n//10)]
+            for j in closest:
+                if structure[i, j] == 0:
+                    # Weight based on relative distance
+                    rank = np.where(closest == j)[0][0] + 1
+                    structure[i, j] = structure[j, i] = 0.8 / rank
+    
+    return structure
+
+def _compute_local_consistency(distance_matrix: np.ndarray, n: int, stats: dict) -> np.ndarray:
+    """Compute local consistency factor measuring neighborhood similarity."""
+    consistency = np.ones_like(distance_matrix)
+    
+    # Adaptive neighborhood size
+    if stats['complexity'] == 'small':
+        m = min(8, n-1)
+    elif stats['complexity'] == 'medium':
+        m = min(6, n-1)
+    else:
+        m = min(4, n-1)
+    
+    # Precompute local statistics for each node
+    local_means = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if m < n-1:
+            local_means[i] = np.mean(np.partition(dists, m)[:m])
+        else:
+            local_means[i] = np.mean(dists)
+    
+    # Vectorized computation of consistency scores
+    mean_i = local_means.reshape(-1, 1)
+    mean_j = local_means.reshape(1, -1)
+    
+    # Similarity based on local mean distances
+    mean_similarity = np.exp(-np.abs(mean_i - mean_j) / (stats['avg_distance'] + 1e-12))
+    
+    # Distance consistency (how well edge length matches local expectations)
+    expected_length = (mean_i + mean_j) / 2
+    with np.errstate(divide='ignore', invalid='ignore'):
+        length_ratio = distance_matrix / (expected_length + 1e-12)
+    
+    # Combined consistency factor
+    # Edges close to expected length get higher scores
+    length_consistency = np.exp(-0.5 * (length_ratio - 1)**2)
+    consistency = mean_similarity * length_consistency
+    
+    # Adjust based on graph uniformity
+    if stats['distance_cv'] < 0.5:  # Uniform graph
+        consistency = consistency ** 0.8  # Less discrimination
+    elif stats['distance_cv'] > 1.5:  # Highly variable
+        consistency = consistency ** 1.2  # More discrimination
+    
+    np.fill_diagonal(consistency, 0)
+    return consistency
+
+def _adaptive_fusion(reciprocal_weights: np.ndarray,
+                     proximity: np.ndarray,
+                     structure: np.ndarray,
+                     consistency: np.ndarray,
+                     distance_matrix: np.ndarray,
+                     stats: dict,
+                     n: int) -> np.ndarray:
+    """Fuse multiple factors with adaptive weighting based on graph characteristics."""
+    
+    # Base weights for each factor
+    if stats['complexity'] == 'small':
+        w_prox, w_struct, w_cons = 1.4, 1.8, 1.2
+    elif stats['complexity'] == 'medium':
+        w_prox, w_struct, w_cons = 1.3, 2.0, 1.3
+    else:  # large
+        w_prox, w_struct, w_cons = 1.2, 2.2, 1.4
+    
+    # Adjust weights based on graph density and uniformity
+    density_factor = stats['density_estimate']
+    if density_factor > 0.4:  # Dense clusters
+        w_prox *= 1.3
+    elif density_factor < 0.2:  # Sparse
+        w_struct *= 1.2
+    
+    if stats['distance_cv'] > 1.0:  # High variability
+        w_cons *= 1.2
+    
+    # Apply weights
+    weighted_proximity = np.where(proximity > 0, w_prox * proximity, 0.7)
+    weighted_structure = np.where(structure > 0, w_struct * structure, 0.9)
+    weighted_consistency = w_cons * consistency
+    
+    # Combine factors multiplicatively
+    fused = reciprocal_weights * weighted_proximity * weighted_structure * weighted_consistency
+    
+    # Edge-length based adjustment (non-linear)
+    avg_dist = stats['avg_distance']
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Boost very short edges, penalize very long ones
+        edge_ratio = distance_matrix / avg_dist
+        length_adjustment = np.exp(-0.3 * np.abs(edge_ratio - 0.8))
+    
+    fused = fused * length_adjustment
+    
+    # Ensure symmetry
+    fused = (fused + fused.T) / 2
+    np.fill_diagonal(fused, 0)
+    
+    return fused
+
+def _hierarchical_edge_selection(fused_heuristics: np.ndarray,
+                                 distance_matrix: np.ndarray,
+                                 stats: dict,
+                                 n: int) -> np.ndarray:
+    """Perform hierarchical edge selection to focus on most promising connections."""
+    if n <= 10:
+        return fused_heuristics.copy()
+    
+    selected = np.zeros_like(fused_heuristics)
+    
+    # Level 1: Always keep MST edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0)
+    selected[mst_mask] = fused_heuristics[mst_mask]
+    
+    # Level 2: Adaptive edge retention per node
+    retention_ratio = 0.25  # Base retention ratio
+    
+    # Adjust based on graph properties
+    if stats['complexity'] == 'small':
+        retention_ratio = 0.35
+    elif stats['complexity'] == 'large':
+        retention_ratio = 0.2
+    
+    if stats['distance_cv'] > 1.0:
+        retention_ratio *= 0.9  # More selective for variable graphs
+    
+    edges_per_node = max(3, int(retention_ratio * n))
+    edges_per_node = min(edges_per_node, n // 2)
+    
+    # Select top edges for each node
+    for i in range(n):
+        # Get heuristic values for edges from i
+        row = fused_heuristics[i].copy()
+        row[i] = -np.inf
+        
+        # Determine threshold for top edges
+        if edges_per_node < n:
+            # Use argpartition for efficiency
+            top_indices = np.argpartition(-row, edges_per_node)[:edges_per_node]
+        else:
+            top_indices = np.arange(n)
+            top_indices = top_indices[top_indices != i]
+        
+        # Keep these edges
+        selected[i, top_indices] = fused_heuristics[i, top_indices]
+    
+    # Level 3: Symmetry enforcement
+    # Keep edge if selected by at least one endpoint
+    selected = np.maximum(selected, selected.T)
+    
+    # Level 4: Density-based pruning
+    if n > 50:
+        # Remove edges that are too long compared to local alternatives
+        for i in range(n):
+            row_heuristics = selected[i].copy()
+            row_distances = distance_matrix[i].copy()
+            row_distances[i] = np.inf
+            
+            # Find local distance threshold
+            if np.sum(row_heuristics > 0) > 5:
+                connected = np.where(row_heuristics > 0)[0]
+                local_avg_dist = np.mean(row_distances[connected])
+                threshold = local_avg_dist * 1.8
+                
+                # Remove excessively long edges
+                too_long = (row_distances > threshold) & (row_heuristics > 0)
+                selected[i, too_long] = 0
+    
+    # Ensure symmetry after pruning
+    selected = np.maximum(selected, selected.T)
+    
+    return selected
+
+def _context_aware_enhancement(selected_edges: np.ndarray,
+                               distance_matrix: np.ndarray,
+                               n: int) -> np.ndarray:
+    """Apply context-aware enhancements to the selected edges."""
+    enhanced = selected_edges.copy()
+    
+    if n <= 2:
+        return enhanced
+    
+    # Enhancement 1: Triangle closure boost
+    # Boost edges that complete promising triangles
+    edge_mask = (selected_edges > 0)
+    
+    # Only process if there are enough edges
+    if np.sum(edge_mask) > n:
+        # Find promising triangles using matrix multiplication
+        edge_binary = (selected_edges > 0).astype(float)
+        common_neighbors = edge_binary @ edge_binary.T
+        
+        # Apply boost to edges with common neighbors
+        for i in range(n):
+            for j in range(i+1, n):
+                if selected_edges[i, j] > 0 and common_neighbors[i, j] > 0:
+                    # Boost factor increases with number of common neighbors (diminishing returns)
+                    boost = 1 + 0.15 * np.sqrt(min(common_neighbors[i, j], 4))
+                    enhanced[i, j] = enhanced[j, i] = selected_edges[i, j] * boost
+    
+    # Enhancement 2: Local competition adjustment
+    # Reduce weight of edges that have many competitive alternatives
+    for i in range(n):
+        row = enhanced[i].copy()
+        if np.sum(row > 0) > 3:
+            # Compute local competition factor
+            top_edges = row[row > 0]
+            if len(top_edges) >= 3:
+                # Reduce weight if there are many similar-quality alternatives
+                competition = len(top_edges) / (np.max(top_edges) / (np.mean(top_edges) + 1e-12) + 1e-12)
+                if competition > 2.0:
+                    reduction = 1.0 / (1.0 + 0.1 * competition)
+                    enhanced[i, row > 0] = row[row > 0] * reduction
+    
+    # Ensure symmetry
+    enhanced = (enhanced + enhanced.T) / 2
+    
+    return enhanced
+```

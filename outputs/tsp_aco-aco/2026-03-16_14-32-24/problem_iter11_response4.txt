@@ -1,0 +1,178 @@
+```json
+{
+    "algorithm_features": ["Normalized Exponential Regret Penalty", "Geometric Rank-Weighted Scoring", "Adaptive Spatial Sparsification", "Two-Stage Regret Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge evaluation heuristics with improved regret modeling,
+    adaptive sparsification, and computational efficiency optimizations.
+    
+    Key improvements over v1:
+    1. Two-stage regret computation with exponential normalization
+    2. Vectorized rank weighting without explicit loops
+    3. Efficient spatial analysis using precomputed kernels
+    4. Adaptive candidate selection with dynamic thresholds
+    """
+    n = distance_matrix.shape[0]
+    
+    # Safe distance matrix (avoid self-loops and division by zero)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # Base inverse distance (normalized by median distance for robustness)
+    median_dist = np.median(safe_dist[safe_dist < np.inf])
+    inv_dist = median_dist / (safe_dist + eps)
+    
+    # 1. Adaptive candidate selection with dynamic threshold
+    # Use O(log2(n)) candidates per node with adaptive threshold
+    base_candidates = max(4, int(np.log2(n) * 2))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Compute per-node distance statistics for dynamic thresholds
+    row_min = np.min(safe_dist, axis=1, keepdims=True)
+    row_median = np.median(safe_dist, axis=1, keepdims=True)
+    
+    # Dynamic threshold: hybrid of min + scaled median
+    threshold = row_min * 1.5 + 0.3 * row_median
+    
+    # Select candidates based on threshold, ensuring symmetry
+    candidate_mask = safe_dist <= threshold
+    np.fill_diagonal(candidate_mask, False)
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < 2:
+            # Add nearest neighbors to meet minimum
+            nearest = np.argsort(safe_dist[i])[1:3]  # Exclude self (index 0)
+            candidate_mask[i, nearest] = True
+            candidate_mask[nearest, i] = True
+    
+    # 2. Two-stage Exponential Regret Penalty with normalization
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    # Stage 1: Local regret (compared to node's best alternative)
+    # Find best and second-best distances for each node
+    sorted_dists = np.sort(safe_dist, axis=1)
+    best_dist = sorted_dists[:, 1:2]  # Second column (first non-inf)
+    second_best = sorted_dists[:, 2:3] if n > 2 else best_dist * 1.5
+    
+    # Compute normalized local regret using exponential smoothing
+    local_regret = np.exp(-(safe_dist - best_dist) / (second_best - best_dist + eps))
+    
+    # Stage 2: Global regret (compared to overall distribution)
+    # Compute global distance statistics
+    global_min = np.min(safe_dist[safe_dist < np.inf])
+    global_median = np.median(safe_dist[safe_dist < np.inf])
+    
+    # Compute distance percentiles for each edge
+    dist_percentile = np.zeros_like(safe_dist)
+    valid_dists = safe_dist[safe_dist < np.inf]
+    if len(valid_dists) > 0:
+        for i in range(n):
+            for j in range(n):
+                if i != j and safe_dist[i, j] < np.inf:
+                    dist_percentile[i, j] = np.mean(valid_dists <= safe_dist[i, j])
+    
+    # Combine local and global regret
+    regret_matrix = 0.7 * local_regret + 0.3 * (1 - dist_percentile)
+    
+    # 3. Vectorized Geometric Rank-Weighted Scoring
+    # Get ranks for each distance row using argsort
+    ranks = np.argsort(np.argsort(safe_dist, axis=1), axis=1).astype(float)
+    np.fill_diagonal(ranks, np.inf)  # Ignore self
+    
+    # Adaptive decay rate based on distance distribution sparsity
+    # Use coefficient of variation (std/mean) of nearest 5 distances
+    nearest_dists = np.partition(safe_dist, min(5, n-1), axis=1)[:, :min(5, n-1)]
+    cv = np.std(nearest_dists, axis=1, ddof=1) / (np.mean(nearest_dists, axis=1) + eps)
+    decay_rates = 0.4 + 0.3 * cv  # Range: 0.4 to 0.7
+    
+    # Apply exponential decay using broadcasting
+    rank_weights = decay_rates[:, np.newaxis] ** ranks
+    
+    # 4. Efficient Spatial Analysis using precomputed kernels
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    if n > 2:
+        # Adaptive bandwidth: median distance to log2(n) nearest neighbors
+        k_bandwidth = max(2, int(np.log2(n)))
+        bandwidths = np.zeros(n)
+        
+        for i in range(n):
+            k_nearest = np.partition(safe_dist[i], k_bandwidth)[:k_bandwidth+1]
+            bandwidths[i] = np.median(k_nearest[k_nearest > 0])
+        
+        # Precompute Gaussian kernels for each node
+        kernels = np.zeros((n, n))
+        for i in range(n):
+            if bandwidths[i] > 0:
+                sigma = bandwidths[i] / 2
+                kernels[i] = np.exp(-0.5 * (safe_dist[i] / (sigma + eps)) ** 2)
+        
+        # Compute joint density for candidate pairs
+        for i in range(n):
+            candidates = np.where(candidate_mask[i])[0]
+            if len(candidates) > 0:
+                # Vectorized computation for all candidates of node i
+                joint_density = np.sum(kernels[i:i+1] * kernels[candidates], axis=1) - 2
+                
+                # Apply log transform with clipping
+                density_values = np.zeros(len(candidates))
+                pos_mask = joint_density > 0
+                density_values[pos_mask] = np.log1p(joint_density[pos_mask]) * 0.1
+                density_values[~pos_mask] = -0.05
+                
+                density_bonus[i, candidates] = density_values
+        
+        # Ensure symmetry
+        density_bonus = np.maximum(density_bonus, density_bonus.T)
+    
+    # 5. Minimum Spanning Tree bias (efficient implementation)
+    mst_bonus = np.zeros_like(distance_matrix)
+    if n <= 2000:  # Reasonable limit for MST computation
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_mask = (mst.toarray() + mst.toarray().T) > 0
+            mst_bonus = mst_mask * 0.2
+        except:
+            pass
+    
+    # 6. Combine factors with optimized weighting
+    # Base score with rank weighting and regret adjustment
+    base_score = inv_dist * rank_weights
+    score_with_regret = base_score * (0.3 + 0.7 * regret_matrix)
+    
+    # Add bonuses with diminishing returns
+    total_bonus = np.clip(density_bonus + mst_bonus, -0.2, 0.3)
+    heuristics_matrix = score_with_regret * (1 + total_bonus)
+    
+    # 7. Apply candidate mask with gradual tapering
+    # For non-candidate edges, apply exponential decay based on distance percentile
+    non_candidate_mask = ~candidate_mask & (safe_dist < np.inf)
+    if np.any(non_candidate_mask):
+        # Compute penalty based on how far from candidate threshold
+        dist_ratio = safe_dist[non_candidate_mask] / threshold.flatten()[non_candidate_mask]
+        penalty = np.exp(-2 * (dist_ratio - 1))
+        heuristics_matrix[non_candidate_mask] *= penalty
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # 8. Final normalization and symmetry enforcement
+    # Row-wise normalization to [0, 1] range
+    row_max = np.max(heuristics_matrix, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1  # Avoid division by zero
+    heuristics_matrix = heuristics_matrix / row_max
+    
+    # Symmetrize using geometric mean (preserves edge importance)
+    heuristics_matrix = np.sqrt(heuristics_matrix * heuristics_matrix.T)
+    
+    return heuristics_matrix
+```

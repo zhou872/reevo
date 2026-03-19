@@ -1,0 +1,261 @@
+```json
+{
+    "algorithm_features": ["Bidirectional Regret Minimization", "Dynamic Regret Thresholding", "Opportunity Cost Normalization", "Sparsification with Multi-Criteria Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with bidirectional regret
+    minimization and dynamic thresholding.
+    
+    Core improvements:
+    1. Bidirectional Regret Minimization: Computes regret from both endpoints using
+       rank differences of alternatives, penalizing edges where both nodes have
+       better options.
+    2. Dynamic Regret Thresholding: Uses local distance statistics (quartiles, median)
+       to compute regret as deviation from adaptive thresholds.
+    3. Opportunity Cost Normalization: Normalizes regret by edge cost to prioritize
+       edges with large cost differentials.
+    4. Multi-Criteria Sparsification: Preserves edges that are structurally important
+       (MST), locally optimal, or have low opportunity cost.
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Initialize heuristic matrix
+    heuristic = np.zeros((n, n))
+    np.fill_diagonal(heuristic, 0)
+    
+    # 1. BIDIRECTIONAL REGRET MINIMIZATION
+    regret_matrix = np.ones((n, n))
+    
+    # Precompute sorted distances for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_distances = np.sort(distance_matrix, axis=1)
+    
+    # Find best and second best alternatives for each node
+    best_alt = np.zeros((n, n))
+    second_best_alt = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get sorted distances for node i (excluding self)
+        dist_i = distance_matrix[i, :].copy()
+        dist_i[i] = np.inf
+        
+        sorted_idx_i = np.argsort(dist_i)
+        sorted_dist_i = dist_i[sorted_idx_i]
+        
+        # For each j, find best alternative to i (excluding j)
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Find best alternative to i that isn't j
+            alt_candidates = sorted_idx_i[sorted_idx_i != j]
+            if len(alt_candidates) > 0:
+                best_alt[i, j] = dist_i[alt_candidates[0]]
+                if len(alt_candidates) > 1:
+                    second_best_alt[i, j] = dist_i[alt_candidates[1]]
+                else:
+                    second_best_alt[i, j] = np.inf
+            else:
+                best_alt[i, j] = np.inf
+                second_best_alt[i, j] = np.inf
+    
+    # Compute bidirectional regret
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            d_ij = distance_matrix[i, j]
+            
+            # Regret at node i: how much worse is d_ij than best alternative?
+            regret_i = max(0, d_ij - best_alt[i, j])
+            # Regret at node j: how much worse is d_ij than best alternative?
+            regret_j = max(0, d_ij - best_alt[j, i])
+            
+            # Combined regret (penalize when both nodes have better alternatives)
+            combined_regret = regret_i + regret_j
+            
+            # Normalize by edge cost to get opportunity cost factor
+            if d_ij > 0:
+                opportunity_cost = combined_regret / d_ij
+                # Convert to bonus factor (higher when opportunity cost is low)
+                regret_matrix[i, j] = 1.0 / (1.0 + opportunity_cost)
+            else:
+                regret_matrix[i, j] = 1.0
+    
+    # 2. DYNAMIC REGRET THRESHOLDING WITH LOCAL STATISTICS
+    threshold_matrix = np.ones((n, n))
+    
+    for i in range(n):
+        # Get distances from node i to all others (excluding self)
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        valid_distances = distances[distances < np.inf]
+        
+        if len(valid_distances) == 0:
+            continue
+            
+        # Compute local statistics
+        q25 = np.percentile(valid_distances, 25)
+        median = np.percentile(valid_distances, 50)
+        q75 = np.percentile(valid_distances, 75)
+        
+        # Define dynamic thresholds
+        low_threshold = q25
+        high_threshold = q75
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            d_ij = distance_matrix[i, j]
+            
+            if d_ij <= low_threshold:
+                # Strong bonus for very close connections
+                bonus = 1.0 + 0.5 * (1.0 - d_ij / (low_threshold + 1e-8))
+            elif d_ij <= median:
+                # Moderate bonus
+                bonus = 1.0 + 0.2 * (1.0 - (d_ij - low_threshold) / (median - low_threshold + 1e-8))
+            elif d_ij <= high_threshold:
+                # Neutral
+                bonus = 1.0
+            else:
+                # Penalty for distant connections
+                penalty = 0.7 * (high_threshold / (d_ij + 1e-8))
+                bonus = penalty
+            
+            threshold_matrix[i, j] = bonus
+    
+    # Symmetrize threshold matrix
+    threshold_matrix = (threshold_matrix + threshold_matrix.T) / 2
+    
+    # 3. GLOBAL VARIANCE CALIBRATION
+    # Compute global statistics
+    all_distances = distance_matrix[np.triu_indices(n, k=1)]
+    if len(all_distances) > 0:
+        global_mean = np.mean(all_distances)
+        global_std = np.std(all_distances)
+        cv = global_std / (global_mean + 1e-8) if global_mean > 0 else 1.0
+        
+        # Adaptive threshold based on coefficient of variation
+        adaptive_threshold = global_mean + 1.5 * cv * global_std
+        
+        # Apply global calibration factor
+        calibration_factor = np.ones((n, n))
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                d_ij = distance_matrix[i, j]
+                if d_ij <= adaptive_threshold:
+                    calibration_factor[i, j] = 1.0 + 0.3 * (1.0 - d_ij / adaptive_threshold)
+                else:
+                    calibration_factor[i, j] = 0.8 * (adaptive_threshold / d_ij)
+    else:
+        calibration_factor = np.ones((n, n))
+    
+    # 4. MINIMUM SPANNING TREE PRIORITY
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_boost = np.where(mst_mask, 1.4, 1.0)  # 40% boost for MST edges
+    
+    # 5. COMBINE COMPONENTS
+    # Base component: inverse distance (with regularization)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_inv = 1.0 / (distance_matrix + 1e-8 * np.mean(distance_matrix))
+        base_inv[np.diag_indices(n)] = 0
+    
+    # Combine factors multiplicatively with calibrated weights
+    heuristic = base_inv * regret_matrix * threshold_matrix * calibration_factor * mst_boost
+    
+    # Ensure symmetry
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # 6. INTELLIGENT SPARSIFICATION
+    sparsification_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    sparsification_mask = sparsification_mask | mst_mask
+    
+    # Compute average nearest neighbor distance for proximity thresholding
+    avg_nn_dist = np.zeros(n)
+    k_nn = max(3, int(0.1 * n))
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        if len(distances) > k_nn:
+            k_smallest = np.partition(distances, k_nn)[:k_nn]
+            avg_nn_dist[i] = np.mean(k_smallest)
+        else:
+            valid_dists = distances[distances < np.inf]
+            avg_nn_dist[i] = np.mean(valid_dists) if len(valid_dists) > 0 else 1.0
+    
+    # Multi-criteria preservation
+    for i in range(n):
+        # Criterion 1: Top edges by combined heuristic
+        node_scores = heuristic[i, :].copy()
+        node_scores[i] = -np.inf
+        top_k = max(3, int(0.15 * n))
+        top_indices = np.argpartition(node_scores, -top_k)[-top_k:]
+        sparsification_mask[i, top_indices] = True
+        
+        # Criterion 2: Low opportunity cost edges (top by regret_matrix)
+        node_regrets = regret_matrix[i, :].copy()
+        node_regrets[i] = -np.inf
+        top_regret_indices = np.argpartition(node_regrets, -top_k)[-top_k:]
+        sparsification_mask[i, top_regret_indices] = True
+        
+        # Criterion 3: Proximity preservation (within 2x avg nearest neighbor distance)
+        proximity_threshold = 2.0 * avg_nn_dist[i]
+        within_proximity = distance_matrix[i, :] <= proximity_threshold
+        within_proximity[i] = False
+        sparsification_mask[i, within_proximity] = True
+    
+    # Ensure each node has at least 2 connections
+    for i in range(n):
+        connected = np.where(sparsification_mask[i, :])[0]
+        connected = connected[connected != i]
+        if len(connected) < 2:
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            # Add closest nodes not already connected
+            sorted_nodes = np.argsort(distances)
+            added = 0
+            for node in sorted_nodes:
+                if node != i and not sparsification_mask[i, node]:
+                    sparsification_mask[i, node] = True
+                    sparsification_mask[node, i] = True
+                    added += 1
+                    if added >= 2 - len(connected):
+                        break
+    
+    # Ensure symmetry
+    sparsification_mask = sparsification_mask | sparsification_mask.T
+    
+    # Apply sparsification
+    heuristic = heuristic * sparsification_mask
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    return heuristic
+```

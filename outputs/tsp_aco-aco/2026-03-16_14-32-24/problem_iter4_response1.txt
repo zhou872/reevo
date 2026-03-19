@@ -1,0 +1,183 @@
+```json
+{
+    "algorithm_features": ["Regret-Based Penalization", "Adaptive Sparsification", "Two-Step Lookahead Savings", "Variance-Aware Weight Tuning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristics for TSP edge evaluation combining regret-based penalization,
+    adaptive sparsification, two-step lookahead savings, and variance-aware weight tuning.
+    
+    Returns:
+        Matrix of edge promise scores with same shape as input.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Safe distance matrix (avoid self-loops)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # 1. Adaptive candidate sparsification
+    k_neighbors = max(3, int(np.sqrt(n)))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        neighbors = np.argsort(safe_dist[i])[:k_neighbors]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure symmetry
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 2. Compute node densities within median distance
+    density_scores = np.zeros(n)
+    for i in range(n):
+        valid_dists = safe_dist[i][safe_dist[i] < np.inf]
+        if len(valid_dists) > 0:
+            median_dist = np.median(valid_dists)
+            density_scores[i] = np.sum(safe_dist[i] <= median_dist)
+    
+    # Normalize density scores
+    if np.max(density_scores) > 0:
+        density_scores = density_scores / np.max(density_scores)
+    
+    # 3. Two-step lookahead savings (efficient computation)
+    savings_2step = np.zeros_like(distance_matrix)
+    
+    # Precompute nearest neighbor sets for efficiency
+    lookahead_neighbors = max(3, min(10, n // 4))
+    neighbor_indices = np.argsort(safe_dist, axis=1)[:, :lookahead_neighbors]
+    
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                best_saving = 0
+                # Consider intermediate nodes from restricted neighbor sets
+                for k in neighbor_indices[i]:
+                    if k == i or k == j:
+                        continue
+                    saving = safe_dist[i, k] + safe_dist[k, j] - safe_dist[i, j]
+                    if saving > best_saving:
+                        best_saving = saving
+                savings_2step[i, j] = max(best_saving, 0)
+    
+    # Normalize savings
+    max_saving = np.max(savings_2step)
+    if max_saving > 0:
+        savings_2step = savings_2step / max_saving
+    
+    # 4. Regret-based penalization with exponential decay
+    average_distance = np.mean(safe_dist[safe_dist < np.inf])
+    regret_scores = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        if len(dists) >= 2:
+            sorted_dists = np.sort(dists)
+            second_best = sorted_dists[1] if sorted_dists[0] == 0 else sorted_dists[0]
+        else:
+            second_best = average_distance
+        
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                # Regret penalty: (distance - second_best) / average_distance
+                regret_penalty = (safe_dist[i, j] - second_best) / (average_distance + 1e-12)
+                # Apply exponential decay to regret penalty
+                regret_factor = np.exp(-np.abs(regret_penalty))
+                regret_scores[i, j] = regret_factor
+    
+    # 5. Inverse distance component
+    inv_dist = 1.0 / (safe_dist + 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distance per row
+    row_max = np.max(inv_dist, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    inv_dist = inv_dist / row_max
+    
+    # 6. Variance-aware weight tuning
+    dist_values = safe_dist[safe_dist < np.inf]
+    if len(dist_values) > 0:
+        dist_mean = np.mean(dist_values)
+        dist_std = np.std(dist_values)
+        variance_ratio = dist_std / (dist_mean + 1e-12)
+    else:
+        variance_ratio = 1.0
+    
+    # Dynamic weight adjustment based on problem characteristics
+    base_weights = {
+        'regret': 0.35,
+        'inv_dist': 0.25,
+        'savings': 0.25,
+        'density': 0.15
+    }
+    
+    # Adjust weights based on variance
+    if variance_ratio > 1.0:  # High variance - emphasize local information
+        base_weights['regret'] *= 1.2
+        base_weights['inv_dist'] *= 1.1
+        base_weights['savings'] *= 0.8
+        base_weights['density'] *= 0.9
+    elif variance_ratio < 0.5:  # Low variance - emphasize global information
+        base_weights['regret'] *= 0.9
+        base_weights['inv_dist'] *= 0.8
+        base_weights['savings'] *= 1.2
+        base_weights['density'] *= 1.1
+    
+    # Normalize weights
+    total = sum(base_weights.values())
+    for key in base_weights:
+        base_weights[key] /= total
+    
+    # 7. Combine all factors with dynamic weights
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                # Density bonus: geometric mean of node densities
+                density_bonus = np.sqrt(density_scores[i] * density_scores[j] + 1e-12)
+                
+                # Combine components with dynamic weights
+                score = (
+                    base_weights['regret'] * regret_scores[i, j] +
+                    base_weights['inv_dist'] * inv_dist[i, j] +
+                    base_weights['savings'] * savings_2step[i, j] +
+                    base_weights['density'] * density_bonus
+                )
+                heuristics_matrix[i, j] = score
+    
+    # 8. Ensure symmetry
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    
+    # 9. Ensure connectivity: each node must have at least 2 connections
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero = np.nonzero(row)[0]
+        if len(nonzero) < 2:
+            # Find top 2 edges by inverse distance
+            inv_dists = 1.0 / (safe_dist[i] + 1e-12)
+            inv_dists[i] = 0
+            top_indices = np.argsort(inv_dists)[-2:]
+            for idx in top_indices:
+                if heuristics_matrix[i, idx] == 0:
+                    heuristics_matrix[i, idx] = np.mean(heuristics_matrix[heuristics_matrix > 0])
+                    heuristics_matrix[idx, i] = heuristics_matrix[i, idx]
+    
+    # 10. Normalize to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # Set diagonal to zero
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

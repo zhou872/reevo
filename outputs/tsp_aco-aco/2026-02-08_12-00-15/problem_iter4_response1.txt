@@ -1,0 +1,183 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP with refined MST integration and optimized 
+    vectorized operations for better performance and accuracy.
+    
+    Features:
+    1. Advanced MST utilization with distance-weighted influence
+    2. Fully vectorized clustering coefficient computation
+    3. Adaptive parameter selection based on instance characteristics
+    4. Intelligent sparsification preserving structural edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Preprocess distance matrix
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    
+    # ==================== ADAPTIVE PARAMETER SELECTION ====================
+    # Parameters adjust based on problem size and distance distribution
+    median_dist = np.median(dist[dist < np.inf])
+    std_dist = np.std(dist[dist < np.inf])
+    
+    k_neighbors = max(3, min(10, int(np.log2(n)) + 2))
+    k_cluster = max(3, int(np.sqrt(n)))
+    edges_per_node = max(3, int(np.sqrt(n) * 1.5))
+    
+    # ==================== 1. BASE INVERSE DISTANCE ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / dist
+    inv_dist[np.isinf(inv_dist)] = 0
+    
+    # Row-normalized version
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    inv_dist_norm = np.zeros_like(inv_dist)
+    mask = row_sums > 0
+    inv_dist_norm[mask[:, 0]] = inv_dist[mask[:, 0]] / row_sums[mask]
+    
+    # ==================== 2. VECTORIZED LOCAL CLUSTERING ====================
+    # Create k-nearest neighbor adjacency matrix (vectorized)
+    adj_matrix = np.zeros((n, n), dtype=bool)
+    
+    # Get k-nearest neighbors for each node efficiently
+    sorted_indices = np.argsort(dist, axis=1)
+    
+    for i in range(n):
+        # Exclude self and get k nearest
+        neighbors = sorted_indices[i, 1:k_neighbors+1]
+        adj_matrix[i, neighbors] = True
+    
+    # Symmetrize adjacency
+    adj_sym = adj_matrix | adj_matrix.T
+    
+    # Compute common neighbors matrix efficiently
+    adj_int = adj_sym.astype(int)
+    common_neighbors = adj_int @ adj_int.T
+    
+    # Compute clustering coefficient: common neighbors normalized by possible connections
+    degree = adj_int.sum(axis=1, keepdims=True)
+    possible_connections = degree * (degree - 1)
+    clustering = np.zeros((n, n))
+    valid_mask = possible_connections > 0
+    clustering[valid_mask[:, 0]] = common_neighbors[valid_mask[:, 0]] / possible_connections[valid_mask]
+    np.fill_diagonal(clustering, 0)
+    
+    # ==================== 3. ENHANCED MST INFLUENCE ====================
+    # Compute minimum spanning tree
+    mst = minimum_spanning_tree(dist).toarray()
+    mst_binary = (mst > 0).astype(float)
+    
+    # Enhanced MST influence: weight by relative edge importance in MST
+    mst_influence = np.zeros((n, n))
+    mst_edges = np.where(mst_binary > 0)
+    
+    if len(mst_edges[0]) > 0:
+        # Edge importance: inverse of edge weight relative to MST average
+        mst_weights = dist[mst_edges]
+        avg_mst_weight = np.mean(mst_weights)
+        
+        for i, j in zip(*mst_edges):
+            if mst_weights[0] > 0:
+                # Lower weight edges are more important in MST
+                importance = avg_mst_weight / (mst_weights[0] + 1e-10)
+                # Normalize importance
+                importance = min(importance, 2.0) / 2.0
+                mst_influence[i, j] = mst_influence[j, i] = importance
+            else:
+                mst_influence[i, j] = mst_influence[j, i] = 1.0
+    
+    # ==================== 4. DISTANCE RANKING WITH EXPONENTIAL DECAY ====================
+    rank_factor = np.zeros((n, n))
+    
+    for i in range(n):
+        # Get valid distances excluding self
+        valid_indices = np.where(dist[i] < np.inf)[0]
+        sorted_idx = valid_indices[np.argsort(dist[i, valid_indices])]
+        
+        # Take top k ranked neighbors
+        k = min(k_cluster, len(sorted_idx))
+        if k > 0:
+            top_indices = sorted_idx[:k]
+            ranks = np.arange(1, k + 1)
+            # Exponential decay based on rank
+            decay_scores = np.exp(-ranks / (k / 3))
+            rank_factor[i, top_indices] = decay_scores / np.max(decay_scores)
+    
+    # ==================== 5. NODE CENTRALITY & DISTANCE CONSISTENCY ====================
+    # Centrality: nodes with smaller average distance to others are more central
+    avg_distances = np.mean(dist, axis=1, where=dist < np.inf)
+    centrality = 1.0 / (1.0 + avg_distances / median_dist)
+    centrality = centrality / np.max(centrality) if np.max(centrality) > 0 else centrality
+    
+    # Centrality complementarity: prefer edges between nodes with complementary centrality
+    centrality_matrix = np.abs(centrality[:, None] - centrality[None, :])
+    centrality_complement = 1.0 - centrality_matrix / np.max(centrality_matrix)
+    np.fill_diagonal(centrality_complement, 0)
+    
+    # ==================== 6. COMBINE FACTORS WITH ADAPTIVE WEIGHTS ====================
+    # Weights adapt based on instance size and characteristics
+    if n < 20:
+        weights = [0.50, 0.20, 0.15, 0.15, 0.00]  # Small: focus on distance and clustering
+    elif n < 100:
+        weights = [0.40, 0.15, 0.15, 0.20, 0.10]  # Medium: balance all factors
+    else:
+        weights = [0.35, 0.10, 0.15, 0.25, 0.15]  # Large: emphasize MST and complementarity
+    
+    heuristic_matrix = (
+        weights[0] * inv_dist_norm +
+        weights[1] * clustering +
+        weights[2] * rank_factor +
+        weights[3] * mst_influence +
+        weights[4] * centrality_complement
+    )
+    
+    # ==================== 7. INTELLIGENT SPARSIFICATION ====================
+    sparsified = np.zeros((n, n))
+    
+    for i in range(n):
+        row_heuristics = heuristic_matrix[i].copy()
+        row_heuristics[i] = -np.inf
+        
+        # Always include MST edges for this node
+        mst_indices = np.where(mst_binary[i] > 0)[0]
+        
+        # Include top edges per node
+        top_count = max(edges_per_node, len(mst_indices))
+        if top_count < n - 1:
+            top_indices = np.argpartition(row_heuristics, -top_count)[-top_count:]
+            keep_indices = np.union1d(mst_indices, top_indices)
+        else:
+            keep_indices = np.arange(n)
+            keep_indices = keep_indices[keep_indices != i]
+        
+        sparsified[i, keep_indices] = heuristic_matrix[i, keep_indices]
+    
+    # ==================== 8. SYMMETRIZATION AND CONSISTENCY ====================
+    # Symmetrize by taking maximum in both directions
+    symmetric_heuristic = np.maximum(sparsified, sparsified.T)
+    
+    # Ensure MST edges have at least minimal representation
+    for i, j in zip(*mst_edges):
+        if symmetric_heuristic[i, j] == 0:
+            symmetric_heuristic[i, j] = symmetric_heuristic[j, i] = 0.1
+    
+    # ==================== 9. FINAL PROCESSING ====================
+    # Soft normalization preserving relative magnitudes
+    max_val = np.max(symmetric_heuristic)
+    if max_val > 0:
+        # Use softmax-like normalization for better contrast
+        symmetric_heuristic = symmetric_heuristic / max_val
+        symmetric_heuristic = np.power(symmetric_heuristic, 0.8)  # Enhance contrast
+    
+    np.fill_diagonal(symmetric_heuristic, 0)
+    
+    return symmetric_heuristic
+```

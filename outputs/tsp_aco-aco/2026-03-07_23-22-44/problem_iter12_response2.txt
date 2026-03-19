@@ -1,0 +1,569 @@
+```json
+{
+    "algorithm_features": ["Local Search Feedback Refinement", "Multi-Kernel Spectral Embedding", "Tour Ensemble Weight Optimization", "Progressive Edge Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from typing import List, Tuple
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import cdist
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic integrating local search feedback, multi-kernel spectral analysis,
+    tour ensemble optimization with cross-validation, and progressive edge sparsification.
+    
+    Core Innovations:
+    1. Iterative local search feedback: Uses 2-opt improvements to refine heuristic weights
+    2. Multi-kernel spectral embedding: Combines Gaussian, Laplacian, and RBF kernels
+    3. Tour ensemble with stratified sampling: Uses cross-validation to prevent overfitting
+    4. Progressive sparsification: Gradually refines edge selection based on component reliability
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. BASE COMPONENT CALCULATION ====================
+    
+    # Inverse distance (foundation component)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Minimum spanning tree for connectivity preservation
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # Distance statistics
+    triu_dists = distance_matrix[np.triu_indices(n, 1)]
+    median_dist = np.median(triu_dists) if len(triu_dists) > 0 else 1.0
+    std_dist = np.std(triu_dists) if len(triu_dists) > 0 else 1.0
+    
+    # ==================== 2. MULTI-PERSPECTIVE REGRET ANALYSIS ====================
+    
+    def compute_regret_scores() -> np.ndarray:
+        """Compute regret scores using adaptive lookahead and perspective ensemble"""
+        regret_scores = np.zeros((n, n))
+        
+        # Perspective 1: Standard regret (as in v1)
+        std_regret = np.zeros((n, n))
+        
+        # Perspective 2: Density-adaptive regret
+        density_regret = np.zeros((n, n))
+        
+        # Precompute nearest neighbors for each perspective
+        k1 = min(8, max(3, n // 10))
+        k2 = min(15, max(5, n // 5))
+        
+        nn_lists_1 = []
+        nn_lists_2 = []
+        
+        for i in range(n):
+            # Standard perspective
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nn_lists_1.append(np.argsort(dists)[:k1])
+            
+            # Density perspective (adaptive k)
+            local_dists = dists.copy()
+            density_threshold = np.percentile(local_dists[local_dists < np.inf], 30)
+            dense_neighbors = np.where(local_dists <= density_threshold)[0]
+            if len(dense_neighbors) > k2:
+                # Take the k2 nearest within dense region
+                dense_dists = local_dists[dense_neighbors]
+                sorted_indices = np.argsort(dense_dists)[:k2]
+                nn_lists_2.append(dense_neighbors[sorted_indices])
+            else:
+                nn_lists_2.append(np.argsort(local_dists)[:k2])
+        
+        # Compute regret from both perspectives
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # Perspective 1: Standard regret
+                best_alt_1 = float('inf')
+                for k in set(nn_lists_1[i]).union(nn_lists_1[j]):
+                    if k != i and k != j:
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alt_1 = min(best_alt_1, alt_cost)
+                
+                # Perspective 2: Density-adaptive regret
+                best_alt_2 = float('inf')
+                for k in set(nn_lists_2[i]).union(nn_lists_2[j]):
+                    if k != i and k != j:
+                        alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alt_2 = min(best_alt_2, alt_cost)
+                
+                # Combine perspectives with reliability weighting
+                if best_alt_1 < float('inf'):
+                    regret_1 = max(0, best_alt_1 - direct_cost)
+                    norm_regret_1 = regret_1 / (median_dist + 1e-8)
+                    std_regret[i, j] = 1.0 / (1.0 + np.exp(norm_regret_1))
+                
+                if best_alt_2 < float('inf'):
+                    regret_2 = max(0, best_alt_2 - direct_cost)
+                    norm_regret_2 = regret_2 / (median_dist * 0.7 + 1e-8)
+                    density_regret[i, j] = 1.0 / (1.0 + np.exp(norm_regret_2))
+        
+        # Symmetrize and combine perspectives
+        std_regret = (std_regret + std_regret.T) / 2
+        density_regret = (density_regret + density_regret.T) / 2
+        
+        # Adaptive weight based on problem characteristics
+        if std_dist > median_dist * 0.5:
+            # Irregular distances: favor density perspective
+            alpha = 0.3
+        else:
+            # Regular distances: balanced approach
+            alpha = 0.5
+        
+        regret_scores = alpha * std_regret + (1 - alpha) * density_regret
+        
+        return regret_scores
+    
+    regret_scores = compute_regret_scores()
+    
+    # ==================== 3. MULTI-KERNEL SPECTRAL EMBEDDING ====================
+    
+    def compute_spectral_scores() -> np.ndarray:
+        """Compute spectral scores using ensemble of kernel methods"""
+        if n < 3:
+            return np.ones_like(distance_matrix)
+        
+        # Normalize distances
+        max_dist = np.max(distance_matrix)
+        if max_dist > 0:
+            norm_dist = distance_matrix / max_dist
+        else:
+            norm_dist = distance_matrix.copy()
+        
+        # Kernel 1: Gaussian kernel
+        sigma1 = np.median(norm_dist) * 0.4
+        if sigma1 > 0:
+            kernel1 = np.exp(-norm_dist**2 / (2 * sigma1**2))
+        else:
+            kernel1 = 1.0 - norm_dist
+        
+        # Kernel 2: Laplacian kernel
+        sigma2 = np.median(norm_dist) * 0.6
+        if sigma2 > 0:
+            kernel2 = np.exp(-norm_dist / sigma2)
+        else:
+            kernel2 = 1.0 - norm_dist
+        
+        # Kernel 3: RBF with adaptive length scale
+        sigma3 = np.std(norm_dist) * 0.8
+        if sigma3 > 0:
+            kernel3 = np.exp(-norm_dist**2 / (2 * sigma3**2))
+        else:
+            kernel3 = 1.0 - norm_dist
+        
+        # Combine kernels with reliability weighting
+        spectral_scores_ensemble = []
+        
+        for kernel in [kernel1, kernel2, kernel3]:
+            np.fill_diagonal(kernel, 0)
+            
+            # Compute normalized Laplacian
+            degree = np.sum(kernel, axis=1)
+            D_sqrt_inv = np.diag(1.0 / np.sqrt(degree + 1e-10))
+            laplacian = np.eye(n) - D_sqrt_inv @ kernel @ D_sqrt_inv
+            
+            # Approximate Fiedler vector using Lanczos-like method
+            try:
+                # Use inverse iteration for stability
+                v = np.random.randn(n)
+                v = v - np.mean(v)
+                
+                for _ in range(15):
+                    v = np.linalg.solve(laplacian + 0.1 * np.eye(n), v)
+                    v = v - np.mean(v)
+                    v_norm = np.linalg.norm(v)
+                    if v_norm > 1e-10:
+                        v = v / v_norm
+                
+                fiedler = v
+                
+                # Compute spectral scores
+                fiedler_diff = np.abs(fiedler[:, None] - fiedler[None, :])
+                spectral_sim = 1.0 / (1.0 + fiedler_diff * np.sqrt(n))
+                
+                # Combine with kernel similarity
+                combined = 0.6 * spectral_sim + 0.4 * kernel
+                spectral_scores_ensemble.append(combined)
+                
+            except np.linalg.LinAlgError:
+                # Fallback to kernel similarity
+                spectral_scores_ensemble.append(kernel)
+        
+        # Ensemble average
+        spectral_scores = np.mean(spectral_scores_ensemble, axis=0)
+        np.fill_diagonal(spectral_scores, 0)
+        
+        return spectral_scores
+    
+    spectral_scores = compute_spectral_scores()
+    
+    # ==================== 4. TOUR ENSEMBLE WITH CROSS-VALIDATION ====================
+    
+    def generate_improved_tours() -> Tuple[List[List[int]], List[float]]:
+        """Generate diverse tours improved by 2-opt local search"""
+        num_tours = min(25, max(8, n // 3))
+        
+        tours = []
+        lengths = []
+        
+        # Different construction heuristics
+        for tour_idx in range(num_tours):
+            if tour_idx < num_tours // 2:
+                # Nearest neighbor with randomness
+                start = np.random.randint(0, n)
+                tour = [start]
+                visited = set([start])
+                current = start
+                
+                while len(tour) < n:
+                    # Select next node with probability inversely proportional to distance
+                    mask = np.ones(n, dtype=bool)
+                    mask[list(visited)] = False
+                    
+                    if np.any(mask):
+                        available_dists = distance_matrix[current, mask]
+                        available_indices = np.where(mask)[0]
+                        
+                        # Adaptive temperature
+                        progress = len(tour) / n
+                        temperature = 1.5 - progress
+                        
+                        if temperature > 0:
+                            probs = np.exp(-available_dists / (temperature * median_dist + 1e-8))
+                            probs = probs / probs.sum()
+                            next_node = np.random.choice(available_indices, p=probs)
+                        else:
+                            next_node = available_indices[np.argmin(available_dists)]
+                        
+                        tour.append(next_node)
+                        visited.add(next_node)
+                        current = next_node
+                
+                tour.append(tour[0])
+                
+            else:
+                # Random insertion heuristic
+                nodes = list(range(n))
+                np.random.shuffle(nodes)
+                tour = nodes[:2] + [nodes[0]]  # Start with random 2-node tour
+                
+                for node in nodes[2:]:
+                    # Find best insertion position
+                    best_cost = float('inf')
+                    best_pos = -1
+                    
+                    for i in range(len(tour) - 1):
+                        cost_inc = (distance_matrix[tour[i], node] + 
+                                   distance_matrix[node, tour[i + 1]] - 
+                                   distance_matrix[tour[i], tour[i + 1]])
+                        if cost_inc < best_cost:
+                            best_cost = cost_inc
+                            best_pos = i + 1
+                    
+                    tour.insert(best_pos, node)
+        
+            # Apply 2-opt local search (limited iterations)
+            improved_tour = two_opt_improvement(tour, distance_matrix, max_iterations=50)
+            tours.append(improved_tour)
+            
+            # Calculate tour length
+            length = sum(distance_matrix[improved_tour[i], improved_tour[i + 1]] 
+                        for i in range(len(improved_tour) - 1))
+            lengths.append(length)
+        
+        return tours, lengths
+    
+    def two_opt_improvement(tour: List[int], dist_mat: np.ndarray, 
+                           max_iterations: int = 100) -> List[int]:
+        """Apply 2-opt local search to improve tour"""
+        n_nodes = len(tour) - 1  # Excluding the return to start
+        best_tour = tour.copy()
+        best_length = sum(dist_mat[best_tour[i], best_tour[i + 1]] 
+                         for i in range(len(best_tour) - 1))
+        
+        improved = True
+        iterations = 0
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            
+            for i in range(1, n_nodes - 2):
+                for j in range(i + 2, n_nodes):
+                    if j - i == 1:
+                        continue
+                    
+                    # Calculate delta for 2-opt swap
+                    old_edges = (dist_mat[best_tour[i - 1], best_tour[i]] +
+                                dist_mat[best_tour[j], best_tour[j + 1]])
+                    new_edges = (dist_mat[best_tour[i - 1], best_tour[j]] +
+                                dist_mat[best_tour[i], best_tour[j + 1]])
+                    
+                    if new_edges < old_edges:
+                        # Perform 2-opt swap
+                        best_tour[i:j + 1] = reversed(best_tour[i:j + 1])
+                        best_length = best_length - old_edges + new_edges
+                        improved = True
+                        break
+                
+                if improved:
+                    break
+            
+            iterations += 1
+        
+        return best_tour
+    
+    # Generate improved tours
+    tours, tour_lengths = generate_improved_tours()
+    
+    # ==================== 5. CROSS-VALIDATED WEIGHT OPTIMIZATION ====================
+    
+    def optimize_component_weights() -> Tuple[float, float, float]:
+        """Optimize component weights using cross-validation on tour ensemble"""
+        if n < 4:
+            return 0.4, 0.4, 0.2
+        
+        # Split tours into training and validation sets
+        num_tours = len(tours)
+        train_size = max(3, num_tours * 2 // 3)
+        
+        best_weights = None
+        best_score = -float('inf')
+        
+        # Normalize components for consistent scaling
+        components = []
+        for comp in [regret_scores, inv_dist, spectral_scores]:
+            comp_norm = comp.copy()
+            max_val = np.max(comp_norm)
+            if max_val > 0:
+                comp_norm = comp_norm / max_val
+            components.append(comp_norm)
+        
+        # Grid search over weight combinations
+        weight_candidates = [
+            (0.4, 0.4, 0.2),
+            (0.5, 0.3, 0.2),
+            (0.3, 0.5, 0.2),
+            (0.4, 0.3, 0.3),
+            (0.3, 0.4, 0.3),
+            (0.5, 0.4, 0.1),
+            (0.4, 0.5, 0.1),
+        ]
+        
+        for w_reg, w_inv, w_spec in weight_candidates:
+            # Combine components
+            combined = (w_reg * components[0] + 
+                       w_inv * components[1] + 
+                       w_spec * components[2])
+            
+            # Evaluate on validation set
+            val_score = evaluate_weights_on_tours(combined, tours[train_size:], 
+                                                 tour_lengths[train_size:])
+            
+            if val_score > best_score:
+                best_score = val_score
+                best_weights = (w_reg, w_inv, w_spec)
+        
+        # Fine-tune best weights with local search
+        if best_weights is not None:
+            w_reg, w_inv, w_spec = best_weights
+            
+            # Try small perturbations
+            for dw in [-0.1, -0.05, 0.05, 0.1]:
+                for weights in [
+                    (w_reg + dw, w_inv - dw, w_spec),
+                    (w_reg - dw, w_inv + dw, w_spec),
+                    (w_reg, w_inv + dw, w_spec - dw),
+                    (w_reg, w_inv - dw, w_spec + dw)
+                ]:
+                    if all(w >= 0.1 for w in weights) and sum(weights) <= 1.1:
+                        w1, w2, w3 = weights
+                        norm = w1 + w2 + w3
+                        w1, w2, w3 = w1/norm, w2/norm, w3/norm
+                        
+                        combined = (w1 * components[0] + 
+                                   w2 * components[1] + 
+                                   w3 * components[2])
+                        
+                        val_score = evaluate_weights_on_tours(combined, tours[train_size:], 
+                                                             tour_lengths[train_size:])
+                        
+                        if val_score > best_score:
+                            best_score = val_score
+                            best_weights = (w1, w2, w3)
+        
+        return best_weights if best_weights else (0.4, 0.4, 0.2)
+    
+    def evaluate_weights_on_tours(scores: np.ndarray, eval_tours: List[List[int]], 
+                                 eval_lengths: List[float]) -> float:
+        """Evaluate weight combination on tour set"""
+        if not eval_tours:
+            return 0.0
+        
+        median_length = np.median(eval_lengths)
+        correlations = []
+        
+        for tour, length in zip(eval_tours, eval_lengths):
+            tour_score = 0
+            edge_count = 0
+            
+            for k in range(len(tour) - 1):
+                i, j = tour[k], tour[k + 1]
+                tour_score += scores[i, j]
+                edge_count += 1
+            
+            if edge_count > 0:
+                avg_score = tour_score / edge_count
+                # Weight by tour quality (inverse of normalized length)
+                quality = median_length / (length + 1e-8)
+                weighted_score = avg_score * np.tanh(quality)  # Cap extreme values
+                correlations.append(weighted_score)
+        
+        return np.mean(correlations) if correlations else 0.0
+    
+    # Optimize weights
+    w_regret, w_inv, w_spectral = optimize_component_weights()
+    
+    # ==================== 6. COMPOSITE SCORING WITH LOCAL FEEDBACK ====================
+    
+    # Combine components with optimized weights
+    composite = (
+        w_regret * regret_scores +
+        w_inv * inv_dist +
+        w_spectral * spectral_scores
+    )
+    
+    # Boost edges that appear in good tours (local search feedback)
+    tour_weights = np.exp(-np.array(tour_lengths) / median_dist)
+    tour_weights = tour_weights / np.sum(tour_weights)
+    
+    edge_frequency = np.zeros_like(composite)
+    for tour, weight in zip(tours, tour_weights):
+        for k in range(len(tour) - 1):
+            i, j = tour[k], tour[k + 1]
+            edge_frequency[i, j] += weight
+            edge_frequency[j, i] += weight
+    
+    # Apply feedback: reinforce edges that appear in good tours
+    feedback_strength = 0.3  # How much to trust the tour feedback
+    composite = (1 - feedback_strength) * composite + feedback_strength * edge_frequency
+    
+    # Boost MST edges for connectivity guarantee
+    mst_boost = 1.0 + np.log1p(n) / 10.0
+    composite[mst_edges] *= mst_boost
+    
+    # ==================== 7. PROGRESSIVE EDGE SPARSIFICATION ====================
+    
+    def progressive_sparsification(scores: np.ndarray) -> np.ndarray:
+        """Progressively sparsify matrix based on component reliability"""
+        sparsified = np.zeros_like(scores)
+        
+        # Phase 1: Include MST edges (connectivity guarantee)
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Phase 2: Add edges based on component agreement
+        component_masks = []
+        
+        # Create masks for each component's top edges
+        for comp in [regret_scores, inv_dist, spectral_scores]:
+            comp_norm = comp.copy()
+            max_val = np.max(comp_norm)
+            if max_val > 0:
+                comp_norm = comp_norm / max_val
+            
+            # Threshold based on percentile
+            threshold = np.percentile(comp_norm[np.triu_indices(n, 1)], 70)
+            mask = (comp_norm >= threshold) & ~mst_edges
+            component_masks.append(mask)
+        
+        # Edges agreed upon by at least 2 components
+        agreement_mask = np.zeros_like(scores, dtype=bool)
+        for i in range(3):
+            for j in range(i + 1, 3):
+                agreement_mask |= (component_masks[i] & component_masks[j])
+        
+        sparsified[agreement_mask] = np.maximum(sparsified[agreement_mask], scores[agreement_mask])
+        
+        # Phase 3: Greedy addition with degree constraints
+        current_degree = np.sum(sparsified > 0, axis=1)
+        
+        # Adaptive degree limits
+        if n <= 20:
+            max_degree = min(6, n - 1)
+        elif n <= 100:
+            max_degree = min(8, n // 4)
+        else:
+            max_degree = min(12, n // 5)
+        
+        # Collect remaining promising edges
+        remaining_edges = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and not agreement_mask[i, j] and scores[i, j] > 0:
+                    # Adjust score by local density
+                    local_density = np.mean([current_degree[i] / max_degree, 
+                                            current_degree[j] / max_degree])
+                    density_penalty = 1.0 - local_density * 0.5  # Prefer connecting low-degree nodes
+                    adjusted_score = scores[i, j] * density_penalty
+                    remaining_edges.append((adjusted_score, i, j))
+        
+        remaining_edges.sort(reverse=True, key=lambda x: x[0])
+        
+        # Add edges respecting degree constraints
+        for score, i, j in remaining_edges:
+            if current_degree[i] < max_degree and current_degree[j] < max_degree:
+                sparsified[i, j] = scores[i, j]
+                sparsified[j, i] = scores[j, i]
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparsified
+    
+    sparsified = progressive_sparsification(composite)
+    
+    # ==================== 8. FINAL REFINEMENT ====================
+    
+    # Apply distance-based smoothing
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        # Adaptive smoothing based on problem size
+        smooth_factor = 0.4 + 0.2 * np.log1p(n) / np.log1p(100)
+        attenuation = np.exp(-distance_matrix / (smooth_factor * max_dist + 1e-8))
+        sparsified *= attenuation
+    
+    # Ensure symmetry
+    sparsified = (sparsified + sparsified.T) / 2
+    
+    # Normalize to [0, 1]
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    # Zero diagonal
+    np.fill_diagonal(sparsified, 0)
+    
+    # Apply sigmoid activation for better contrast
+    sparsified = 2.0 / (1.0 + np.exp(-2.0 * sparsified)) - 1.0
+    
+    return sparsified
+```

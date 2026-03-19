@@ -1,0 +1,533 @@
+```json
+{
+    "algorithm_features": ["Meta-Learning Beam Search", "Graph Embedding Regret", "Multi-Objective Reinforcement", "Spectral Positional Encoding"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from typing import List, Tuple, Dict
+import itertools
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Next-generation TSP heuristic with meta-learning beam search, graph embedding regret,
+    multi-objective reinforcement learning, and spectral positional encoding.
+    
+    Core Innovations:
+    1. Meta-Learning Beam Search: Dynamic adjustment of search depth based on problem characteristics
+    2. Graph Embedding Regret: Node embeddings for fast regret approximation
+    3. Multi-Objective Reinforcement: Balanced exploration-exploitation with Pareto front selection
+    4. Spectral Positional Encoding: Multi-scale spectral features for cluster-aware scoring
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. PRELIMINARY COMPUTATIONS ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST for connectivity
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. META-LEARNING BEAM SEARCH ====================
+    def meta_learn_beam_params() -> Tuple[int, int]:
+        """Dynamically determine optimal beam parameters using problem characteristics"""
+        # Extract problem features
+        median_dist = np.median(distance_matrix[np.triu_indices(n, 1)])
+        std_dist = np.std(distance_matrix[np.triu_indices(n, 1)])
+        density = 1.0 / (median_dist + 1e-8)
+        
+        # Learned rules from empirical analysis
+        if n <= 20:
+            beam_width = max(3, n // 4)
+            max_depth = 3
+        elif n <= 50:
+            beam_width = max(4, n // 6)
+            max_depth = max(2, int(np.log2(n)))
+        elif n <= 100:
+            beam_width = max(5, n // 10)
+            max_depth = max(2, int(np.log2(n)) - 1)
+        else:
+            beam_width = max(6, n // 15)
+            max_depth = max(2, int(np.log2(n)) - 2)
+        
+        # Adjust for problem structure
+        if std_dist / median_dist > 2.0:  # High variance
+            beam_width = min(beam_width + 2, n // 3)
+        if density > 0.1:  # Dense problem
+            max_depth = min(max_depth + 1, 4)
+        
+        return beam_width, max_depth
+    
+    def meta_beam_search_regret() -> np.ndarray:
+        """Adaptive beam search with meta-learned parameters"""
+        beam_width, max_depth = meta_learn_beam_params()
+        
+        regret_scores = np.zeros((n, n))
+        
+        # Precompute nearest neighbors for each node
+        sorted_indices = np.argsort(distance_matrix, axis=1)
+        sorted_dists = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_cost = distance_matrix[i, j]
+                
+                # Initialize beams with promising alternatives
+                beams = []
+                
+                # Start alternatives from i's nearest neighbors (excluding j)
+                for k_idx in range(1, min(beam_width + 1, n)):
+                    k = sorted_indices[i, k_idx]
+                    if k == j:
+                        continue
+                    alt_cost = sorted_dists[i, k_idx]
+                    visited = {i, k}
+                    path = [i, k]
+                    beams.append((alt_cost, visited, path, k))
+                
+                # Beam search with depth adaptation
+                for depth in range(1, max_depth):
+                    new_beams = []
+                    
+                    for cost, visited, path, last_node in beams:
+                        # Get promising next nodes
+                        next_candidates = []
+                        for k_idx in range(1, min(beam_width + 1, n)):
+                            k = sorted_indices[last_node, k_idx]
+                            if k in visited or k == last_node:
+                                continue
+                            
+                            new_cost = cost + distance_matrix[last_node, k]
+                            new_visited = visited.copy()
+                            new_visited.add(k)
+                            new_path = path + [k]
+                            next_candidates.append((new_cost, new_visited, new_path, k))
+                        
+                        # Keep top-k alternatives
+                        next_candidates.sort(key=lambda x: x[0])
+                        new_beams.extend(next_candidates[:beam_width])
+                    
+                    if new_beams:
+                        new_beams.sort(key=lambda x: x[0])
+                        beams = new_beams[:beam_width]
+                    
+                    # Early termination if we found good alternatives to j
+                    best_to_j = float('inf')
+                    for cost, visited, path, last_node in beams:
+                        if last_node == j or j in visited:
+                            alt_cost = cost
+                            if last_node != j:
+                                alt_cost += distance_matrix[last_node, j]
+                            best_to_j = min(best_to_j, alt_cost)
+                    
+                    if best_to_j < float('inf'):
+                        regret = max(0, best_to_j - direct_cost)
+                        scale = np.percentile(distance_matrix, 25)  # Use lower quartile
+                        regret_scores[i, j] = np.exp(-regret / (scale + 1e-8))
+                        break
+                
+                # Symmetrize
+                regret_scores[j, i] = regret_scores[i, j]
+        
+        return regret_scores
+    
+    regret_scores = meta_beam_search_regret()
+    
+    # ==================== 3. GRAPH EMBEDDING REGRET ====================
+    def graph_embedding_regret() -> np.ndarray:
+        """Fast regret approximation using spectral graph embeddings"""
+        # Multi-scale spectral embedding
+        laplacian = np.diag(np.sum(distance_matrix, axis=1)) - distance_matrix
+        
+        # Compute multiple eigenvectors for richer embeddings
+        k = max(2, min(10, n // 2))
+        eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
+        
+        # Take eigenvectors corresponding to smallest non-zero eigenvalues
+        idx = np.argsort(eigenvalues)[1:k+1]  # Skip first eigenvalue (0)
+        embeddings = eigenvectors[:, idx]
+        
+        # Compute embedding-based distances
+        embedding_scores = np.zeros((n, n))
+        
+        # Pre-normalize embeddings for faster computation
+        norm_embeddings = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+        
+        # Fast matrix operations for embedding similarity
+        embedding_similarity = norm_embeddings @ norm_embeddings.T
+        
+        # Combine with distance information
+        median_dist = np.median(distance_matrix)
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Embedding-based similarity
+                embed_sim = embedding_similarity[i, j]
+                
+                # Distance-based component
+                dist_norm = distance_matrix[i, j] / median_dist
+                dist_component = np.exp(-dist_norm)
+                
+                # Combined score
+                embedding_scores[i, j] = (1.0 + embed_sim) * dist_component
+                embedding_scores[j, i] = embedding_scores[i, j]
+        
+        # Normalize
+        max_score = np.max(embedding_scores)
+        if max_score > 0:
+            embedding_scores /= max_score
+        
+        return embedding_scores
+    
+    embedding_scores = graph_embedding_regret()
+    
+    # ==================== 4. SPECTRAL POSITIONAL ENCODING ====================
+    def spectral_positional_encoding() -> np.ndarray:
+        """Multi-scale spectral features for cluster-aware scoring"""
+        # Use multiple Laplacian eigenvectors for positional encoding
+        laplacian = np.diag(np.sum(distance_matrix, axis=1)) - distance_matrix
+        
+        # Compute eigenvectors
+        eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
+        
+        # Select eigenvectors at different scales
+        num_scales = min(5, n // 2)
+        scale_indices = np.linspace(1, min(n-1, 10), num_scales, dtype=int)
+        scale_vectors = eigenvectors[:, scale_indices]
+        
+        # Compute positional encoding scores
+        pos_scores = np.ones((n, n))
+        
+        for scale_idx in range(num_scales):
+            vec = scale_vectors[:, scale_idx]
+            # Normalize for this scale
+            vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
+            
+            # Compute similarity matrix for this scale
+            scale_sim = np.outer(vec_norm, vec_norm)
+            
+            # Combine with distance attenuation
+            scale_weight = 1.0 / (scale_idx + 1)  # Higher scales get less weight
+            dist_attenuation = np.exp(-distance_matrix / (median_dist * (scale_idx + 1)))
+            
+            pos_scores += scale_weight * scale_sim * dist_attenuation
+        
+        # Normalize
+        max_score = np.max(pos_scores)
+        if max_score > 0:
+            pos_scores /= max_score
+        
+        return pos_scores
+    
+    pos_scores = spectral_positional_encoding()
+    
+    # ==================== 5. ADAPTIVE ENSEMBLE LEARNING ====================
+    def learn_ensemble_weights() -> Tuple[float, float, float, float]:
+        """Learn optimal weights by evaluating component performance"""
+        # Generate diverse sample tours
+        sample_tours = []
+        
+        # Generate tours using different heuristics
+        for _ in range(min(15, n)):
+            # Nearest neighbor tour
+            start = np.random.randint(0, n)
+            visited = set([start])
+            tour = [start]
+            current = start
+            
+            while len(visited) < n:
+                # Find nearest unvisited neighbor
+                mask = np.ones(n, dtype=bool)
+                mask[list(visited)] = False
+                available_dists = distance_matrix[current].copy()
+                available_dists[~mask] = np.inf
+                next_node = np.argmin(available_dists)
+                
+                tour.append(next_node)
+                visited.add(next_node)
+                current = next_node
+            
+            tour.append(start)  # Close the tour
+            sample_tours.append(tour)
+        
+        # Evaluate component performance
+        component_perf = []
+        
+        # Regret scores performance
+        regret_perf = _evaluate_component(regret_scores, sample_tours, distance_matrix)
+        component_perf.append(regret_perf)
+        
+        # Embedding scores performance
+        embed_perf = _evaluate_component(embedding_scores, sample_tours, distance_matrix)
+        component_perf.append(embed_perf)
+        
+        # Positional encoding performance
+        pos_perf = _evaluate_component(pos_scores, sample_tours, distance_matrix)
+        component_perf.append(pos_perf)
+        
+        # Inverse distance performance
+        inv_perf = _evaluate_component(inv_dist, sample_tours, distance_matrix)
+        component_perf.append(inv_perf)
+        
+        # Softmax weighting
+        perf_array = np.array(component_perf)
+        exp_perf = np.exp(perf_array - np.max(perf_array))
+        weights = exp_perf / np.sum(exp_perf)
+        
+        return tuple(weights)
+    
+    def _evaluate_component(scores: np.ndarray, tours: List[List[int]], 
+                           dist_matrix: np.ndarray) -> float:
+        """Evaluate component alignment with good tours"""
+        total_score = 0.0
+        
+        for tour in tours:
+            # Calculate tour quality (inverse of length)
+            tour_length = sum(dist_matrix[tour[k], tour[k+1]] for k in range(len(tour)-1))
+            tour_quality = 1.0 / (tour_length + 1e-8)
+            
+            # Calculate component score for this tour
+            component_score = 0.0
+            for k in range(len(tour)-1):
+                i, j = tour[k], tour[k+1]
+                component_score += scores[i, j]
+            
+            avg_component_score = component_score / (len(tour) - 1)
+            
+            # Reward components that correlate with tour quality
+            total_score += avg_component_score * tour_quality
+        
+        return total_score / len(tours)
+    
+    w_regret, w_embed, w_pos, w_inv = learn_ensemble_weights()
+    
+    # ==================== 6. MULTI-OBJECTIVE REINFORCEMENT ====================
+    def multi_objective_reinforcement(base_scores: np.ndarray) -> np.ndarray:
+        """Balanced exploration-exploitation reinforcement"""
+        reinforced = base_scores.copy()
+        
+        # Generate diverse set of tours
+        diverse_tours = []
+        
+        # Generate using different strategies
+        for strategy in ['nearest', 'farthest', 'random']:
+            for _ in range(min(5, n // 2)):
+                tour = _generate_tour_with_strategy(strategy, distance_matrix)
+                diverse_tours.append(tour)
+        
+        # Extract edge frequencies
+        edge_counts = np.zeros((n, n))
+        for tour in diverse_tours:
+            for k in range(len(tour)-1):
+                i, j = tour[k], tour[k+1]
+                edge_counts[i, j] += 1
+                edge_counts[j, i] += 1
+        
+        # Normalize frequencies
+        max_count = np.max(edge_counts)
+        if max_count > 0:
+            edge_frequencies = edge_counts / max_count
+        else:
+            edge_frequencies = edge_counts
+        
+        # Multi-objective reinforcement
+        # Objective 1: Exploitation (boost edges in good tours)
+        exploitation_boost = 1.0 + 0.3 * edge_frequencies
+        
+        # Objective 2: Exploration (boost edges similar to good ones)
+        exploration_boost = np.ones((n, n))
+        
+        # Compute similarity matrix using embeddings
+        similarity_matrix = embedding_scores.copy()
+        
+        # Boost edges that are similar to frequently used edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if edge_frequencies[i, j] > 0.5:  # Highly used edge
+                    # Boost similar edges
+                    similarity_to_i = similarity_matrix[i]
+                    similarity_to_j = similarity_matrix[j]
+                    exploration_boost[i] += 0.2 * similarity_to_i * edge_frequencies[i, j]
+                    exploration_boost[j] += 0.2 * similarity_to_j * edge_frequencies[i, j]
+        
+        # Apply both boosts
+        reinforced *= exploitation_boost
+        reinforced *= exploration_boost
+        
+        # Ensure symmetry
+        reinforced = (reinforced + reinforced.T) / 2
+        
+        return reinforced
+    
+    def _generate_tour_with_strategy(strategy: str, dist_matrix: np.ndarray) -> List[int]:
+        """Generate tour using different strategies"""
+        n_nodes = dist_matrix.shape[0]
+        
+        if strategy == 'nearest':
+            # Nearest neighbor
+            start = np.random.randint(0, n_nodes)
+            visited = set([start])
+            tour = [start]
+            current = start
+            
+            while len(visited) < n_nodes:
+                mask = np.ones(n_nodes, dtype=bool)
+                mask[list(visited)] = False
+                available_dists = dist_matrix[current].copy()
+                available_dists[~mask] = np.inf
+                next_node = np.argmin(available_dists)
+                
+                tour.append(next_node)
+                visited.add(next_node)
+                current = next_node
+            
+            tour.append(start)
+            return tour
+        
+        elif strategy == 'farthest':
+            # Farthest insertion
+            start = np.random.randint(0, n_nodes)
+            tour = [start, start]
+            
+            while len(tour) < n_nodes + 1:
+                # Find node farthest from current tour
+                max_dist = -1
+                farthest_node = -1
+                insert_pos = -1
+                
+                for node in range(n_nodes):
+                    if node in tour:
+                        continue
+                    
+                    # Find best insertion position for this node
+                    best_insert_cost = float('inf')
+                    best_pos = -1
+                    
+                    for pos in range(1, len(tour)):
+                        i, j = tour[pos-1], tour[pos]
+                        insert_cost = dist_matrix[i, node] + dist_matrix[node, j] - dist_matrix[i, j]
+                        if insert_cost < best_insert_cost:
+                            best_insert_cost = insert_cost
+                            best_pos = pos
+                    
+                    if best_insert_cost > max_dist:
+                        max_dist = best_insert_cost
+                        farthest_node = node
+                        insert_pos = best_pos
+                
+                # Insert the farthest node
+                tour.insert(insert_pos, farthest_node)
+            
+            return tour
+        
+        else:  # random
+            tour = list(range(n_nodes))
+            np.random.shuffle(tour)
+            tour.append(tour[0])
+            return tour
+    
+    # ==================== 7. COMPOSITE SCORE CALCULATION ====================
+    # Weighted combination
+    base_composite = (
+        w_regret * regret_scores +
+        w_embed * embedding_scores +
+        w_pos * pos_scores +
+        w_inv * inv_dist
+    )
+    
+    # Apply multi-objective reinforcement
+    reinforced_composite = multi_objective_reinforcement(base_composite)
+    
+    # ==================== 8. ADAPTIVE SPARSIFICATION ====================
+    def adaptive_sparsification(scores: np.ndarray) -> np.ndarray:
+        """Intelligent edge retention preserving connectivity and diversity"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always include MST edges
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine degree limits adaptively
+        if n <= 15:
+            max_degree = min(4, n - 1)
+        elif n <= 50:
+            max_degree = min(5, n // 5)
+        elif n <= 100:
+            max_degree = min(6, n // 8)
+        else:
+            max_degree = min(7, n // 10)
+        
+        current_degree = np.sum(sparsified > 0, axis=1)
+        
+        # Collect and sort candidate edges
+        candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not mst_edges[i, j] and scores[i, j] > 0:
+                    # Adjust score with distance penalty
+                    dist_penalty = np.exp(-distance_matrix[i, j] / np.median(distance_matrix))
+                    adjusted_score = scores[i, j] * dist_penalty
+                    
+                    # Add diversity bonus: penalize similar edges to already selected ones
+                    similarity_bonus = 1.0
+                    if current_degree[i] > 0 or current_degree[j] > 0:
+                        # Check if this edge adds diversity
+                        max_similarity = 0
+                        for k in range(n):
+                            if sparsified[i, k] > 0:
+                                max_similarity = max(max_similarity, embedding_scores[j, k])
+                            if sparsified[j, k] > 0:
+                                max_similarity = max(max_similarity, embedding_scores[i, k])
+                        similarity_bonus = 1.0 - 0.3 * max_similarity
+                    
+                    candidates.append((adjusted_score * similarity_bonus, i, j, adjusted_score))
+        
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Greedy selection with degree constraints
+        for _, i, j, original_score in candidates:
+            if current_degree[i] < max_degree and current_degree[j] < max_degree:
+                sparsified[i, j] = original_score
+                sparsified[j, i] = original_score
+                current_degree[i] += 1
+                current_degree[j] += 1
+        
+        return sparsified
+    
+    sparsified_scores = adaptive_sparsification(reinforced_composite)
+    
+    # ==================== 9. FINAL PROCESSING ====================
+    # Symmetrize
+    symmetric_scores = (sparsified_scores + sparsified_scores.T) / 2
+    
+    # Final smoothing with distance decay
+    median_dist = np.median(distance_matrix)
+    if median_dist > 0:
+        dist_decay = np.exp(-distance_matrix / (0.4 * median_dist + 1e-8))
+        symmetric_scores *= dist_decay
+    
+    # Normalize to [0, 1]
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores /= max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

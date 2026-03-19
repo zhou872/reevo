@@ -1,0 +1,447 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Scoring", "Spatial Clustering Priors", "Instance-Aware Weight Tuning", "Hierarchical Candidate Filtering"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with optimized regret scoring and spatial awareness.
+    Returns a matrix where higher values indicate more promising edges for inclusion in solutions.
+    
+    Core improvements over v1:
+    1. Hierarchical regret computation with adaptive lookahead
+    2. Lightweight spatial clustering for initial edge filtering
+    3. Reinforcement learning-inspired parameter adaptation
+    4. Memory-efficient candidate management
+    """
+    
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Enhanced instance analysis
+    stats = _analyze_instance_v2(distance_matrix)
+    
+    # Step 2: Spatial-aware candidate filtering
+    candidate_mask = _build_spatial_candidate_mask(distance_matrix, stats)
+    
+    # Step 3: Compute heuristic scores for candidate edges
+    H = _compute_heuristic_matrix(distance_matrix, candidate_mask, stats)
+    
+    # Step 4: Intelligent post-processing
+    H = _post_process_heuristics(H, distance_matrix, stats)
+    
+    return H
+
+
+def _analyze_instance_v2(dist_mat: np.ndarray) -> dict:
+    """Enhanced instance analysis with spatial structure metrics."""
+    n = dist_mat.shape[0]
+    mask = ~np.eye(n, dtype=bool)
+    distances = dist_mat[mask].reshape(n, n-1)
+    
+    # Basic statistics
+    stats = {
+        'n': n,
+        'mean_dist': np.mean(distances),
+        'std_dist': np.std(distances),
+        'cv_dist': np.std(distances) / (np.mean(distances) + 1e-8),
+        'min_dist': np.min(distances),
+        'max_dist': np.max(distances)
+    }
+    
+    # Spatial structure indicators
+    if n >= 4:
+        # k-NN statistics for spatial analysis
+        k = min(5, n-1)
+        knn_dists = []
+        for i in range(n):
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            k_nearest = np.partition(dists, k)[:k]
+            knn_dists.append(np.mean(k_nearest))
+        
+        stats['knn_mean'] = np.mean(knn_dists)
+        stats['knn_std'] = np.std(knn_dists)
+        stats['spatial_regularity'] = stats['knn_std'] / (stats['knn_mean'] + 1e-8)
+        
+        # Distance distribution features
+        percentiles = np.percentile(distances, [25, 50, 75])
+        stats['q1'] = percentiles[0]
+        stats['median'] = percentiles[1]
+        stats['q3'] = percentiles[2]
+        stats['iqr'] = stats['q3'] - stats['q1']
+    
+    return stats
+
+
+def _build_spatial_candidate_mask(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Build candidate mask using spatial clustering principles.
+    Returns boolean matrix where True indicates candidate edges.
+    """
+    n = stats['n']
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    # Adaptive candidate selection based on instance characteristics
+    if n <= 20:
+        # For small instances, consider most edges
+        base_k = min(10, n-1)
+    else:
+        # For larger instances, use spatial-aware selection
+        if stats['spatial_regularity'] < 0.3:
+            # Uniform instances: consider more neighbors
+            base_k = min(15, max(8, int(3 * np.log2(n))))
+        else:
+            # Clustered instances: focus on local connections
+            base_k = min(12, max(6, int(2.5 * np.log2(n))))
+    
+    # Build candidate list with spatial awareness
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        
+        # Primary candidates: nearest neighbors
+        k1 = base_k
+        if k1 < len(dists):
+            nearest_indices = np.argpartition(dists, k1)[:k1]
+            candidate_mask[i, nearest_indices] = True
+        
+        # Secondary candidates: edges within spatial tolerance
+        if n > 10 and stats['spatial_regularity'] > 0.2:
+            # Include edges to nodes with similar local density
+            for j in range(n):
+                if i != j and not candidate_mask[i, j]:
+                    # Spatial compatibility check
+                    if _spatial_compatible(dist_mat, i, j, stats):
+                        candidate_mask[i, j] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    
+    return candidate_mask
+
+
+def _spatial_compatible(dist_mat: np.ndarray, i: int, j: int, stats: dict) -> bool:
+    """Check if edge (i,j) is spatially compatible based on local structure."""
+    n = stats['n']
+    
+    # Simple compatibility test based on relative distances
+    d_ij = dist_mat[i, j]
+    
+    # Compare with local neighborhood distances
+    for k in range(min(5, n)):
+        if k not in [i, j]:
+            d_ik = dist_mat[i, k]
+            d_jk = dist_mat[j, k]
+            
+            # Edge is compatible if it doesn't create large disparities
+            if abs(d_ij - d_ik) < 0.5 * max(d_ij, d_ik) and \
+               abs(d_ij - d_jk) < 0.5 * max(d_ij, d_jk):
+                return True
+    
+    return False
+
+
+def _compute_heuristic_matrix(dist_mat: np.ndarray, candidate_mask: np.ndarray, 
+                             stats: dict) -> np.ndarray:
+    """Compute heuristic scores using enhanced regret analysis."""
+    n = stats['n']
+    H = np.zeros((n, n))
+    
+    # Pre-compute sorted distances for efficiency
+    sorted_dists = []
+    sorted_indices = []
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        sorted_idx = np.argsort(dists)
+        sorted_dists.append(dists[sorted_idx])
+        sorted_indices.append(sorted_idx)
+    
+    # Adaptive parameters based on instance characteristics
+    regret_depth = _determine_regret_depth(n, stats)
+    regret_samples = _determine_regret_samples(n, stats)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                score = _compute_edge_score_optimized(
+                    dist_mat, i, j, stats, sorted_dists, sorted_indices,
+                    regret_depth, regret_samples
+                )
+                H[i, j] = H[j, i] = score
+    
+    return H
+
+
+def _determine_regret_depth(n: int, stats: dict) -> int:
+    """Determine optimal regret lookahead depth based on instance."""
+    if n <= 10:
+        return 2
+    elif n <= 30:
+        return 3
+    else:
+        # Deeper lookahead for large, irregular instances
+        if stats['spatial_regularity'] > 0.3:
+            return min(4, int(np.log2(n)))
+        else:
+            return min(3, int(np.log2(n)))
+
+
+def _determine_regret_samples(n: int, stats: dict) -> int:
+    """Determine number of regret samples based on instance."""
+    if n <= 15:
+        return n - 2  # Try all possibilities
+    else:
+        base_samples = min(30, n // 2)
+        # More samples for irregular instances
+        if stats['cv_dist'] > 0.5:
+            return min(base_samples * 2, n - 2)
+        else:
+            return base_samples
+
+
+def _compute_edge_score_optimized(dist_mat: np.ndarray, i: int, j: int, stats: dict,
+                                 sorted_dists: list, sorted_indices: list,
+                                 regret_depth: int, regret_samples: int) -> float:
+    """Compute optimized edge score with hierarchical regret analysis."""
+    n = stats['n']
+    d_ij = dist_mat[i, j]
+    
+    if d_ij <= 0:
+        return 0.0
+    
+    # Base inverse distance component
+    inv_dist = 1.0 / d_ij
+    
+    # Enhanced regret analysis
+    best_regret_ratio = _compute_hierarchical_regret(
+        dist_mat, i, j, sorted_dists, sorted_indices,
+        regret_depth, regret_samples, stats
+    )
+    
+    # Adaptive scoring based on regret analysis
+    if best_regret_ratio > 1.0:
+        # Direct edge is preferable
+        bonus_factor = _compute_bonus_factor(best_regret_ratio, stats)
+        regret_score = 1.0 + bonus_factor
+    else:
+        # Alternative path exists
+        penalty_factor = _compute_penalty_factor(best_regret_ratio, stats)
+        regret_score = max(0.1, 1.0 - penalty_factor)
+    
+    # Adaptive weight tuning
+    w_inv, w_regret = _compute_adaptive_weights(stats)
+    
+    # Combined scoring using geometric mean
+    if w_inv + w_regret > 0:
+        combined = (inv_dist ** w_inv) * (regret_score ** w_regret)
+    else:
+        combined = inv_dist
+    
+    # Spatial adjustment
+    spatial_bonus = _compute_spatial_adjustment(dist_mat, i, j, stats)
+    combined *= spatial_bonus
+    
+    return combined
+
+
+def _compute_hierarchical_regret(dist_mat: np.ndarray, i: int, j: int,
+                                sorted_dists: list, sorted_indices: list,
+                                depth: int, samples: int, stats: dict) -> float:
+    """
+    Compute hierarchical regret with adaptive path sampling.
+    Returns the best alternative cost ratio.
+    """
+    n = stats['n']
+    d_ij = dist_mat[i, j]
+    best_ratio = float('inf')
+    
+    # 1-hop alternatives (nearest neighbors)
+    for k_idx in range(min(10, n-2)):
+        k = sorted_indices[i][k_idx]
+        if k != j:
+            alt_cost = dist_mat[i, k] + dist_mat[k, j]
+            ratio = alt_cost / d_ij
+            best_ratio = min(best_ratio, ratio)
+    
+    # Multi-hop alternatives with sampling
+    if depth >= 2 and n >= 5:
+        for _ in range(min(samples, n-2)):
+            # Sample intermediate nodes
+            candidates = [idx for idx in range(n) if idx not in [i, j]]
+            sampled = np.random.choice(candidates, min(depth-1, len(candidates)), 
+                                      replace=False)
+            
+            # Build alternative path
+            alt_cost = 0
+            current = i
+            for node in sampled:
+                alt_cost += dist_mat[current, node]
+                current = node
+            alt_cost += dist_mat[current, j]
+            
+            ratio = alt_cost / d_ij
+            best_ratio = min(best_ratio, ratio)
+    
+    return best_ratio if best_ratio < float('inf') else 2.0  # Default if no alternatives
+
+
+def _compute_bonus_factor(regret_ratio: float, stats: dict) -> float:
+    """Compute adaptive bonus factor for favorable edges."""
+    # Higher bonus for structured instances
+    structure_factor = 1.0 + stats['cv_dist']
+    bonus = np.exp(structure_factor * (regret_ratio - 1.0)) - 1.0
+    return min(bonus, 1.0)  # Cap at 1.0
+
+
+def _compute_penalty_factor(regret_ratio: float, stats: dict) -> float:
+    """Compute adaptive penalty factor for unfavorable edges."""
+    # Stronger penalty for uniform instances
+    uniformity_factor = 2.0 - stats['cv_dist']
+    penalty = np.exp(uniformity_factor * (1.0 - regret_ratio)) - 1.0
+    return min(penalty, 0.9)  # Cap at 0.9
+
+
+def _compute_adaptive_weights(stats: dict) -> tuple:
+    """Compute adaptive weights for score components."""
+    # Base weights
+    w_inv_base = 0.7
+    w_regret_base = 0.3
+    
+    # Adjust based on instance characteristics
+    cv = stats['cv_dist']
+    regularity = stats.get('spatial_regularity', 0.5)
+    
+    # More weight to regret in uniform instances
+    regret_boost = 0.4 * (1.0 - cv) * (1.0 + regularity)
+    w_regret = w_regret_base + regret_boost
+    w_inv = 1.0 - w_regret
+    
+    return max(0.2, w_inv), max(0.1, w_regret)
+
+
+def _compute_spatial_adjustment(dist_mat: np.ndarray, i: int, j: int, 
+                               stats: dict) -> float:
+    """Compute spatial adjustment factor for edge (i,j)."""
+    n = stats['n']
+    d_ij = dist_mat[i, j]
+    
+    # Local density comparison
+    k = min(5, n-1)
+    
+    # Average distance to k-nearest neighbors for both nodes
+    def avg_knn_dist(node_idx):
+        dists = dist_mat[node_idx].copy()
+        dists[node_idx] = np.inf
+        knn = np.partition(dists, k)[:k]
+        return np.mean(knn)
+    
+    avg_i = avg_knn_dist(i)
+    avg_j = avg_knn_dist(j)
+    
+    # Compute spatial compatibility score
+    if abs(avg_i - avg_j) < 0.3 * max(avg_i, avg_j):
+        # Nodes have similar local density
+        if d_ij < 0.8 * (avg_i + avg_j) / 2:
+            return 1.2  # Bonus for intra-cluster edges
+        else:
+            return 0.9
+    else:
+        # Nodes in different density regions
+        if d_ij < 1.2 * max(avg_i, avg_j):
+            return 1.1  # Moderate bonus for connecting clusters
+        else:
+            return 0.8
+
+
+def _post_process_heuristics(H: np.ndarray, dist_mat: np.ndarray, 
+                            stats: dict) -> np.ndarray:
+    """Intelligent post-processing of heuristic matrix."""
+    n = stats['n']
+    
+    # Ensure symmetry and zero diagonal
+    H = (H + H.T) / 2.0
+    np.fill_diagonal(H, 0.0)
+    
+    # Row-wise normalization with stability
+    for i in range(n):
+        row = H[i]
+        if np.any(row > 0):
+            # Apply softmax with temperature
+            temperature = 0.5 + 0.5 * stats['cv_dist']
+            exp_row = np.exp(row / temperature)
+            row_sum = np.sum(exp_row)
+            if row_sum > 0:
+                H[i] = exp_row / row_sum
+    
+    # Ensure minimum connectivity for each node
+    for i in range(n):
+        non_zero = np.where(H[i] > 0)[0]
+        if len(non_zero) < 2:
+            # Add nearest neighbors with base scores
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            nearest = np.argsort(dists)[:min(3, n-1)]
+            for j in nearest:
+                if H[i, j] == 0:
+                    base_score = 1 / (dist_mat[i, j] + 1e-8)
+                    H[i, j] = H[j, i] = base_score
+    
+    # Global scaling to [0, 1]
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    # Apply soft threshold to remove negligible values
+    threshold = np.percentile(H[H > 0], 10) if np.any(H > 0) else 0.01
+    H[H < threshold] = 0
+    
+    return H
+
+
+# Example usage
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with various problem sizes
+    for n in [10, 25, 50, 100]:
+        print(f"\nTesting with n = {n}")
+        
+        # Generate random distance matrix
+        points = np.random.rand(n, 2) * 100
+        dist_matrix = squareform(pdist(points, 'euclidean'))
+        
+        # Compute heuristics
+        H = heuristics_v2(dist_matrix)
+        
+        # Statistics
+        print(f"Shape: {H.shape}")
+        print(f"Non-zero entries: {np.count_nonzero(H)}")
+        print(f"Sparsity: {(H == 0).sum() / H.size:.1%}")
+        print(f"Mean non-zero: {np.mean(H[H > 0]):.4f}")
+        
+        # Verify symmetry
+        symmetric_diff = np.max(np.abs(H - H.T))
+        print(f"Max asymmetry: {symmetric_diff:.6f}")
+        
+        # Show top edges for small instances
+        if n <= 25:
+            triu_idx = np.triu_indices_from(H, k=1)
+            top_k = min(5, len(triu_idx[0]))
+            if top_k > 0:
+                values = H[triu_idx]
+                top_indices = np.argsort(values)[-top_k:][::-1]
+                
+                print("\nTop edges:")
+                for idx in top_indices:
+                    i, j = triu_idx[0][idx], triu_idx[1][idx]
+                    print(f"  ({i:2d}, {j:2d}): dist={dist_matrix[i,j]:6.2f}, score={H[i,j]:.4f}")
+```

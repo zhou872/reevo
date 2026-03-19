@@ -1,0 +1,257 @@
+```json
+{
+    "algorithm_features": ["Regret-based Alternative Penalty", "Global-Local Spatial Balance", "Adaptive Density-Sensitive Weighting", "MST Structural Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with regret-based
+    penalization and global-local spatial balance.
+    
+    Key innovations:
+    1. Regret-based alternative penalty that dynamically adjusts based on 
+       multiple alternative path quality
+    2. Global-local spatial balance combining node centrality with local density
+    3. Adaptive density-sensitive weighting for varying point distributions
+    4. MST-based structural reinforcement for connectivity-critical edges
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for
+        more promising edges. Matrix is symmetric and row-normalized.
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ADAPTIVE SPARSIFICATION ====================
+    # Dynamic neighbor selection based on local density and global scale
+    avg_dist = np.mean(distance_matrix[distance_matrix > 0])
+    density_factor = avg_dist / (np.min(distance_matrix[distance_matrix > 0]) + 1e-10)
+    
+    # Base connectivity: logarithmic in n, adjusted by density
+    base_k = max(3, int(np.log2(n) * np.log1p(density_factor)))
+    k_values = np.full(n, base_k, dtype=int)
+    
+    # Adjust k based on local point concentration
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Compute local concentration using distance quartiles
+        valid_dists = distances[distances < np.inf]
+        if len(valid_dists) > 3:
+            q1 = np.percentile(valid_dists, 25)
+            q3 = np.percentile(valid_dists, 75)
+            iqr = q3 - q1
+            concentration = (q1 + 1e-10) / (iqr + 1e-10)
+            k_values[i] = min(n-1, max(3, int(base_k * (1 + np.tanh(concentration - 1)))))
+    
+    # Build sparse adjacency mask
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k_values[i])[:k_values[i]]
+        adjacency_mask[i, nn_indices] = True
+    
+    # Ensure symmetry
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. GLOBAL-LOCAL SPATIAL BALANCE ====================
+    # Compute global node centrality (inverse of average distance to all nodes)
+    global_centrality = np.zeros(n)
+    for i in range(n):
+        valid_dists = distance_matrix[i]
+        valid_dists = valid_dists[valid_dists > 0]
+        if len(valid_dists) > 0:
+            global_centrality[i] = 1.0 / (np.mean(valid_dists) + 1e-10)
+    
+    # Normalize centrality scores
+    if np.max(global_centrality) > 0:
+        global_centrality = global_centrality / np.max(global_centrality)
+    
+    # Compute local density scores
+    local_density = np.zeros(n)
+    for i in range(n):
+        mask_i = adjacency_mask[i]
+        if np.any(mask_i):
+            neighbor_dists = distance_matrix[i, mask_i]
+            local_density[i] = 1.0 / (np.mean(neighbor_dists) + 1e-10)
+    
+    # Normalize density scores
+    if np.max(local_density) > 0:
+        local_density = local_density / np.max(local_density)
+    
+    # Combined spatial score for each edge
+    spatial_scores = np.zeros_like(distance_matrix, dtype=float)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Balance between global centrality and local density
+                global_factor = 0.3 * global_centrality[i] + 0.3 * global_centrality[j]
+                local_factor = 0.2 * local_density[i] + 0.2 * local_density[j]
+                distance_factor = 1.0 / (distance_matrix[i, j] + 1e-10)
+                
+                spatial_scores[i, j] = spatial_scores[j, i] = (
+                    distance_factor * (1.0 + global_factor + local_factor)
+                )
+    
+    # ==================== 3. REGRET-BASED ALTERNATIVE PENALTY ====================
+    # Enhanced penalty considering quality of multiple alternatives
+    regret_penalty = np.ones_like(distance_matrix, dtype=float)
+    
+    # Precompute sorted neighbor indices for efficient alternative analysis
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    analysis_depth = min(8, max(3, n // 4))
+    
+    for i in range(n):
+        # Get edges from i in the sparse mask
+        j_indices = np.where(adjacency_mask[i] & (i < np.arange(n)))[0]
+        
+        for j in j_indices:
+            direct_dist = distance_matrix[i, j]
+            
+            # Get candidate intermediate nodes (top neighbors of i and j)
+            i_top = sorted_indices[i, 1:analysis_depth+1]
+            j_top = sorted_indices[j, 1:analysis_depth+1]
+            candidates = np.unique(np.concatenate([i_top, j_top]))
+            candidates = candidates[(candidates != i) & (candidates != j)]
+            
+            if len(candidates) > 0:
+                # Compute alternative path distances
+                alternative_dists = distance_matrix[i, candidates] + distance_matrix[candidates, j]
+                
+                # Sort alternatives by quality
+                sorted_alternatives = np.sort(alternative_dists)
+                
+                # Compute regret-based penalty using top 3 alternatives
+                k_best = min(3, len(sorted_alternatives))
+                best_alternatives = sorted_alternatives[:k_best]
+                
+                # Dynamic penalty based on how many good alternatives exist
+                good_alternatives = 0
+                for alt_dist in best_alternatives:
+                    if alt_dist <= direct_dist * 1.3:  # Within 30% of direct distance
+                        good_alternatives += 1
+                
+                # Stronger penalty for edges with many good alternatives
+                if good_alternatives > 0:
+                    penalty_factor = 0.5 + 0.5 * np.exp(-good_alternatives / 2.0)
+                    regret_penalty[i, j] = regret_penalty[j, i] = penalty_factor
+                else:
+                    # Bonus for edges with no good alternatives
+                    regret_penalty[i, j] = regret_penalty[j, i] = 1.2
+    
+    # ==================== 4. MST STRUCTURAL REINFORCEMENT ====================
+    # Compute Minimum Spanning Tree for structural importance
+    mst_boost = np.ones_like(distance_matrix, dtype=float)
+    
+    if n > 3:
+        # Prim's algorithm for MST
+        visited = np.zeros(n, dtype=bool)
+        min_edge = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        min_edge[0] = 0
+        
+        for _ in range(n):
+            # Find minimum edge to unvisited node
+            u = np.argmin(np.where(~visited, min_edge, np.inf))
+            visited[u] = True
+            
+            if parent[u] != -1:
+                # Mark MST edges with boost
+                mst_boost[u, parent[u]] = mst_boost[parent[u], u] = 1.3
+            
+            # Update distances to unvisited neighbors
+            for v in range(n):
+                if not visited[v] and distance_matrix[u, v] < min_edge[v]:
+                    min_edge[v] = distance_matrix[u, v]
+                    parent[v] = u
+        
+        # Additional reinforcement for edges connecting high-degree MST nodes
+        mst_degree = np.zeros(n)
+        for v in range(1, n):
+            u = parent[v]
+            if u != -1:
+                mst_degree[u] += 1
+                mst_degree[v] += 1
+        
+        # Apply reinforcement to edges incident to high-degree MST nodes
+        for i in range(n):
+            if mst_degree[i] >= 2 and np.any(adjacency_mask[i]):
+                mask_i = adjacency_mask[i]
+                degree_factor = min(1.5, 1.0 + 0.1 * mst_degree[i])
+                mst_boost[i, mask_i] = np.maximum(mst_boost[i, mask_i], degree_factor)
+                mst_boost[mask_i, i] = mst_boost[i, mask_i]
+    
+    # ==================== 5. ADAPTIVE COMBINATION ====================
+    # Combine components with adaptive weights based on instance characteristics
+    
+    # Compute instance statistics for adaptive weighting
+    edge_density = np.sum(adjacency_mask) / (n * (n - 1))
+    distance_variance = np.var(distance_matrix[distance_matrix > 0])
+    
+    # Adaptive weights based on instance characteristics
+    if edge_density < 0.1 and distance_variance > np.mean(distance_matrix)**2:
+        # Sparse, varied instance: emphasize regret and spatial balance
+        weights = [0.3, 0.4, 0.3]  # [spatial, regret, mst]
+    else:
+        # Denser or more uniform instance: balanced weighting
+        weights = [0.4, 0.3, 0.3]
+    
+    # Combine components
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply combination only to sparse edges
+    mask_indices = np.where(adjacency_mask)
+    if len(mask_indices[0]) > 0:
+        i_indices, j_indices = mask_indices
+        
+        spatial_vals = spatial_scores[mask_indices]
+        regret_vals = regret_penalty[mask_indices]
+        mst_vals = mst_boost[mask_indices]
+        
+        # Normalize spatial scores per edge for combination
+        if np.max(spatial_vals) > 0:
+            spatial_vals = spatial_vals / np.max(spatial_vals)
+        
+        # Weighted geometric mean for balanced combination
+        epsilon = 1e-10
+        combined = (
+            (spatial_vals + epsilon) ** weights[0] *
+            (regret_vals + epsilon) ** weights[1] *
+            (mst_vals + epsilon) ** weights[2]
+        )
+        
+        heuristics[i_indices, j_indices] = combined
+    
+    # ==================== 6. FINAL PROCESSING ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small constant to maintain connectivity
+    heuristics[adjacency_mask] += 1e-8
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    row_sums[zero_rows] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

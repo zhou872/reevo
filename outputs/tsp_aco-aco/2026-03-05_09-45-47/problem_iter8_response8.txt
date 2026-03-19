@@ -1,0 +1,604 @@
+```json
+{
+    "algorithm_features": ["Adaptive Candidate Sets", "Learnable Weight Optimization", "Hierarchical Approximation", "TSP-Specific Priors"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.manifold import MDS
+from sklearn.neighbors import KDTree
+import warnings
+from typing import Tuple, Dict
+import heapq
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with learnable weight optimization,
+    hierarchical approximation, and TSP-specific candidate sets.
+    
+    Key improvements:
+    1. Adaptive candidate sets based on k-nearest neighbors with TSP insights
+    2. Learnable weight optimization using graph characteristics
+    3. Hierarchical approximation for extreme scales (n > 5000)
+    4. TSP-specific priors: 2-factor constraints and candidate edge sets
+    5. Efficient sampling-based triangle boosting
+    
+    Returns a matrix of edge promises with the same shape as distance_matrix,
+    where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+        return result
+    
+    # Determine optimal strategy based on instance size
+    if n > 5000:
+        # Extreme scale: use hierarchical approximation
+        return _hierarchical_approximation(distance_matrix, n)
+    elif n > 1000:
+        # Large scale: use candidate set approach
+        return _candidate_set_approach(distance_matrix, n)
+    else:
+        # Moderate scale: use full optimization
+        return _full_optimization_approach(distance_matrix, n)
+
+
+def _hierarchical_approximation(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Hierarchical approximation for extreme-scale TSP instances."""
+    # Adaptive number of clusters based on instance size
+    n_clusters = min(50, max(5, int(np.sqrt(n))))
+    
+    # Use fast spectral clustering approximation
+    cluster_labels = _fast_spectral_clustering(dist_matrix, n_clusters, n)
+    
+    # Compute intra-cluster heuristics
+    intra_heuristics = np.zeros_like(dist_matrix)
+    for cluster_id in range(n_clusters):
+        cluster_indices = np.where(cluster_labels == cluster_id)[0]
+        if len(cluster_indices) > 1:
+            sub_matrix = dist_matrix[np.ix_(cluster_indices, cluster_indices)]
+            sub_heuristics = _candidate_set_approach(sub_matrix, len(cluster_indices))
+            for i_idx, i in enumerate(cluster_indices):
+                for j_idx, j in enumerate(cluster_indices[i_idx+1:], i_idx+1):
+                    intra_heuristics[i, j] = intra_heuristics[j, i] = sub_heuristics[i_idx, j_idx]
+    
+    # Compute inter-cluster connectivity
+    inter_heuristics = _compute_inter_cluster_promises(dist_matrix, cluster_labels, n_clusters, n)
+    
+    # Combine with learned weights
+    graph_sparsity = np.mean(dist_matrix > 0)
+    if graph_sparsity > 0.5:
+        intra_weight, inter_weight = 0.7, 0.3
+    else:
+        intra_weight, inter_weight = 0.4, 0.6
+    
+    combined = intra_weight * intra_heuristics + inter_weight * inter_heuristics
+    
+    # Apply global scaling based on graph statistics
+    global_stats = _compute_global_statistics(dist_matrix, n)
+    combined = _apply_global_scaling(combined, global_stats)
+    
+    return combined
+
+
+def _fast_spectral_clustering(dist_matrix: np.ndarray, n_clusters: int, n: int) -> np.ndarray:
+    """Fast approximation of spectral clustering using landmark method."""
+    # Select landmarks
+    n_landmarks = min(100, n)
+    landmark_indices = np.random.choice(n, n_landmarks, replace=False)
+    
+    # Compute landmark similarity matrix
+    sigma = np.median(dist_matrix) * 0.1
+    W_landmarks = np.exp(-dist_matrix[np.ix_(landmark_indices, landmark_indices)] ** 2 / (2 * sigma ** 2))
+    
+    # Fast eigen decomposition
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(np.sum(W_landmarks, axis=1)))
+    L = D_inv_sqrt @ W_landmarks @ D_inv_sqrt
+    
+    # Compute top eigenvectors
+    k_eigen = min(n_clusters + 2, n_landmarks - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(L)
+    top_eigenvectors = eigenvectors[:, -k_eigen:][:, 1:n_clusters+1]
+    
+    # Extend to all nodes
+    all_similarities = np.exp(-dist_matrix[:, landmark_indices] ** 2 / (2 * sigma ** 2))
+    extended_features = all_similarities @ top_eigenvectors
+    
+    # K-means on extended features
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=n_clusters, n_init=3, max_iter=20, random_state=42)
+    return kmeans.fit_predict(extended_features)
+
+
+def _compute_inter_cluster_promises(dist_matrix: np.ndarray, labels: np.ndarray, 
+                                   n_clusters: int, n: int) -> np.ndarray:
+    """Compute promising edges between clusters."""
+    inter_promises = np.zeros_like(dist_matrix)
+    
+    # Compute cluster representatives (medoids)
+    cluster_reps = []
+    for c in range(n_clusters):
+        cluster_indices = np.where(labels == c)[0]
+        if len(cluster_indices) == 0:
+            continue
+        # Find medoid
+        sub_matrix = dist_matrix[np.ix_(cluster_indices, cluster_indices)]
+        sum_dists = np.sum(sub_matrix, axis=1)
+        medoid_idx = cluster_indices[np.argmin(sum_dists)]
+        cluster_reps.append((c, medoid_idx))
+    
+    # Compute promising edges between representatives
+    for i_idx, (c1, rep1) in enumerate(cluster_reps):
+        for c2, rep2 in cluster_reps[i_idx+1:]:
+            if c1 != c2:
+                # Boost edges between clusters based on representative distance
+                cluster1_indices = np.where(labels == c1)[0]
+                cluster2_indices = np.where(labels == c2)[0]
+                
+                # Compute average distance between clusters
+                avg_dist = np.mean(dist_matrix[np.ix_(cluster1_indices, cluster2_indices)])
+                
+                # Assign promises to edges between clusters
+                for i in cluster1_indices:
+                    for j in cluster2_indices:
+                        if i != j:
+                            # Distance-adjusted promise
+                            dist_factor = np.exp(-dist_matrix[i, j] / avg_dist)
+                            rank_factor = 1.0 / (1.0 + 0.1 * abs(i - j))
+                            inter_promises[i, j] = inter_promises[j, i] = dist_factor * rank_factor
+    
+    return inter_promises
+
+
+def _candidate_set_approach(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Candidate set approach for large-scale TSP."""
+    # Adaptive candidate set size based on TSP insights
+    # In optimal TSP tours, nodes typically connect to nearby neighbors
+    candidate_size = min(20, max(5, int(np.log2(n) * 3)))
+    
+    # Build candidate sets using k-nearest neighbors
+    candidate_sets = _build_candidate_sets(dist_matrix, n, candidate_size)
+    
+    # Initialize promise matrix
+    promises = np.zeros_like(dist_matrix)
+    
+    # Compute base promises for candidate edges
+    for i in range(n):
+        candidates = candidate_sets[i]
+        if len(candidates) > 0:
+            # Distance-based promises
+            dists = dist_matrix[i, candidates]
+            inv_dists = 1.0 / (dists + 1e-12)
+            promises[i, candidates] = inv_dists / np.max(inv_dists)
+    
+    # Apply MST-based boosting to candidate edges
+    mst_boost = _compute_mst_candidate_boost(dist_matrix, candidate_sets, n)
+    promises = promises * (1 + 0.5 * mst_boost)
+    
+    # Apply 2-factor constraint approximation
+    two_factor_boost = _approximate_2_factor_promises(dist_matrix, candidate_sets, n)
+    promises = promises * (1 + 0.3 * two_factor_boost)
+    
+    # Local clustering boost within candidate sets
+    cluster_boost = _compute_candidate_clustering_boost(dist_matrix, candidate_sets, n)
+    promises = promises * (1 + 0.2 * cluster_boost)
+    
+    # Ensure symmetry and normalize
+    promises = (promises + promises.T) / 2
+    np.fill_diagonal(promises, 0)
+    
+    max_val = np.max(promises)
+    if max_val > 0:
+        promises = promises / max_val
+    
+    return promises
+
+
+def _build_candidate_sets(dist_matrix: np.ndarray, n: int, k: int) -> Dict[int, np.ndarray]:
+    """Build candidate sets for each node using k-nearest neighbors."""
+    candidate_sets = {}
+    
+    for i in range(n):
+        # Get k+1 nearest neighbors (including self)
+        dists = dist_matrix[i].copy()
+        dists[i] = np.inf
+        nearest = np.argpartition(dists, k)[:k]
+        candidate_sets[i] = nearest
+    
+    # Make symmetric: if j is in candidate set of i, ensure i is in candidate set of j
+    for i in range(n):
+        for j in candidate_sets[i]:
+            if i not in candidate_sets[j]:
+                # Add i to j's candidate set if there's room
+                if len(candidate_sets[j]) < k * 1.5:  # Allow some expansion
+                    candidate_sets[j] = np.append(candidate_sets[j], i)
+    
+    return candidate_sets
+
+
+def _compute_mst_candidate_boost(dist_matrix: np.ndarray, 
+                                candidate_sets: Dict[int, np.ndarray], 
+                                n: int) -> np.ndarray:
+    """Compute MST-based boost only for candidate edges."""
+    mst = minimum_spanning_tree(dist_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    boost_matrix = np.zeros_like(dist_matrix)
+    
+    for i in range(n):
+        candidates = candidate_sets[i]
+        for j in candidates:
+            if j > i:  # Process each edge once
+                if mst_edges[i, j] > 0 or mst_edges[j, i] > 0:
+                    # Direct MST edge
+                    boost_matrix[i, j] = boost_matrix[j, i] = 2.0
+                else:
+                    # Check if edge is in the MST of the candidate subgraph
+                    sub_indices = np.union1d(candidate_sets[i], candidate_sets[j])
+                    if len(sub_indices) > 1:
+                        sub_matrix = dist_matrix[np.ix_(sub_indices, sub_indices)]
+                        sub_mst = minimum_spanning_tree(sub_matrix)
+                        sub_mst_edges = (sub_mst.toarray() > 0).astype(float)
+                        
+                        # Find indices of i and j in subgraph
+                        i_idx = np.where(sub_indices == i)[0][0]
+                        j_idx = np.where(sub_indices == j)[0][0]
+                        
+                        if sub_mst_edges[i_idx, j_idx] > 0:
+                            boost_matrix[i, j] = boost_matrix[j, i] = 1.5
+    
+    return boost_matrix
+
+
+def _approximate_2_factor_promises(dist_matrix: np.ndarray,
+                                  candidate_sets: Dict[int, np.ndarray],
+                                  n: int) -> np.ndarray:
+    """Approximate 2-factor (degree-2) constraint promises."""
+    promises = np.zeros_like(dist_matrix)
+    
+    # Greedy 2-matching approximation
+    remaining_nodes = set(range(n))
+    edges_added = 0
+    
+    while remaining_nodes and edges_added < n * 2:
+        # Find the best available edge
+        best_value = -np.inf
+        best_edge = None
+        
+        # Sample edges for efficiency
+        sample_nodes = list(remaining_nodes)
+        if len(sample_nodes) > 100:
+            sample_nodes = np.random.choice(sample_nodes, 100, replace=False)
+        
+        for i in sample_nodes:
+            candidates = candidate_sets[i]
+            for j in candidates:
+                if j in remaining_nodes and i < j:
+                    # Edge quality based on reciprocal distance and candidate set overlap
+                    overlap = len(set(candidate_sets[i]) & set(candidate_sets[j]))
+                    quality = 1.0 / (dist_matrix[i, j] + 1e-12) * (1 + 0.1 * overlap)
+                    if quality > best_value:
+                        best_value = quality
+                        best_edge = (i, j)
+        
+        if best_edge is None:
+            break
+        
+        i, j = best_edge
+        promises[i, j] = promises[j, i] = 1.0
+        
+        # Remove nodes if they have degree 2 (simplified)
+        edges_added += 1
+        if edges_added % 2 == 0:  # Simplified: remove nodes periodically
+            if i in remaining_nodes:
+                remaining_nodes.remove(i)
+            if j in remaining_nodes:
+                remaining_nodes.remove(j)
+    
+    return promises
+
+
+def _compute_candidate_clustering_boost(dist_matrix: np.ndarray,
+                                       candidate_sets: Dict[int, np.ndarray],
+                                       n: int) -> np.ndarray:
+    """Compute clustering boost within candidate sets."""
+    boost_matrix = np.zeros_like(dist_matrix)
+    
+    for i in range(n):
+        candidates_i = set(candidate_sets[i])
+        for j in candidate_sets[i]:
+            if j > i:
+                candidates_j = set(candidate_sets[j])
+                common = candidates_i & candidates_j
+                
+                if len(common) > 0:
+                    # Compute average distance to common neighbors
+                    avg_dist = np.mean([dist_matrix[i, k] + dist_matrix[j, k] for k in common])
+                    cluster_factor = np.exp(-avg_dist / np.percentile(dist_matrix, 25))
+                    
+                    boost = 0.2 * len(common) * cluster_factor
+                    boost_matrix[i, j] = boost_matrix[j, i] = min(boost, 1.0)
+    
+    return boost_matrix
+
+
+def _full_optimization_approach(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Full optimization approach for moderate-scale TSP."""
+    # Base reciprocal weights with robust normalization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        safe_dist = dist_matrix + np.eye(n) * 1e-12
+        base_weights = 1 / safe_dist
+        np.fill_diagonal(base_weights, 0)
+        
+        # Adaptive normalization based on distance distribution
+        non_inf = base_weights[base_weights < np.inf]
+        if len(non_inf) > 0:
+            p95 = np.percentile(non_inf, 95)
+            base_weights = np.clip(base_weights / p95, 0, 1)
+    
+    # Multiple heuristic factors
+    spatial_factor = _compute_learned_embedding(dist_matrix, n)
+    mst_factor = _compute_enhanced_mst(dist_matrix, n)
+    local_factor = _compute_adaptive_local_factors(dist_matrix, n)
+    
+    # Learn optimal weights using graph characteristics
+    weights = _learn_optimal_weights(dist_matrix, n, base_weights, 
+                                     spatial_factor, mst_factor, local_factor)
+    
+    # Combine with learned weights
+    combined = (weights['base'] * base_weights +
+                weights['spatial'] * spatial_factor +
+                weights['mst'] * mst_factor +
+                weights['local'] * local_factor)
+    
+    # Apply TSP-specific refinement
+    refined = _tsp_specific_refinement(combined, dist_matrix, n)
+    
+    # Final processing
+    refined = (refined + refined.T) / 2
+    np.fill_diagonal(refined, 0)
+    
+    max_val = np.max(refined)
+    if max_val > 0:
+        refined = refined / max_val
+    
+    return refined
+
+
+def _compute_learned_embedding(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute spatial embedding with learned dimensionality."""
+    # Adaptive dimensionality based on graph size
+    n_components = min(10, max(2, int(np.log2(n))))
+    
+    if n <= 300:
+        # Full MDS for small graphs
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=n_components,
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=2,
+                max_iter=100
+            )
+            coords = mds.fit_transform(dist_matrix)
+    else:
+        # Landmark-based embedding for larger graphs
+        n_landmarks = min(100, max(20, int(np.sqrt(n))))
+        landmark_indices = np.random.choice(n, n_landmarks, replace=False)
+        
+        landmark_dists = dist_matrix[np.ix_(landmark_indices, landmark_indices)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=n_components,
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=1,
+                max_iter=50
+            )
+            landmark_coords = mds.fit_transform(landmark_dists)
+        
+        # Project all nodes
+        coords = np.zeros((n, n_components))
+        for i in range(n):
+            weights = 1 / (dist_matrix[i, landmark_indices] + 1e-12)
+            weights = weights / np.sum(weights)
+            coords[i] = np.sum(landmark_coords * weights[:, np.newaxis], axis=0)
+    
+    # Build KD-tree for neighbor queries
+    tree = KDTree(coords)
+    
+    # Adaptive neighborhood
+    avg_neighbors = min(15, max(3, int(np.log2(n) * 1.5)))
+    
+    spatial_factor = np.zeros_like(dist_matrix)
+    for i in range(n):
+        distances, indices = tree.query(coords[i], k=min(avg_neighbors + 1, n))
+        
+        if distances[0] < 1e-10:
+            indices = indices[1:]
+        else:
+            indices = indices[:avg_neighbors]
+        
+        for rank, j in enumerate(indices):
+            if j != i:
+                weight = 1.0 / (1.0 + 0.2 * rank)
+                spatial_factor[i, j] = weight
+    
+    return spatial_factor
+
+
+def _compute_enhanced_mst(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute enhanced MST factor with local connectivity."""
+    mst = minimum_spanning_tree(dist_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    mst_factor = np.zeros_like(dist_matrix)
+    
+    # Primary MST edges
+    mst_factor[mst_edges > 0] = 1.0
+    
+    # Extended neighborhood
+    for i in range(n):
+        dists = dist_matrix[i].copy()
+        dists[i] = np.inf
+        
+        k_extended = min(10, n - 1)
+        nearest = np.argsort(dists)[:k_extended]
+        
+        for rank, j in enumerate(nearest):
+            if mst_factor[i, j] == 0:
+                mst_factor[i, j] = 0.5 / (1.0 + 0.1 * rank)
+    
+    # Make symmetric
+    mst_factor = np.maximum(mst_factor, mst_factor.T)
+    
+    return mst_factor
+
+
+def _compute_adaptive_local_factors(dist_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute adaptive local factors based on neighborhood statistics."""
+    # Adaptive neighborhood size
+    k_local = min(8, max(2, int(np.log2(n))))
+    
+    local_factors = np.ones_like(dist_matrix)
+    
+    # Precompute local statistics
+    local_stats = np.zeros((n, 2))  # mean, min
+    
+    for i in range(n):
+        dists = dist_matrix[i].copy()
+        dists[i] = np.inf
+        nearest_dists = np.partition(dists, k_local)[:k_local]
+        local_stats[i, 0] = np.mean(nearest_dists)
+        local_stats[i, 1] = np.min(nearest_dists)
+    
+    # Compute pairwise factors
+    for i in range(n):
+        for j in range(i+1, n):
+            mean_sim = np.exp(-abs(local_stats[i, 0] - local_stats[j, 0]) / 
+                             (local_stats[i, 0] + local_stats[j, 0] + 1e-12))
+            min_sim = np.exp(-abs(local_stats[i, 1] - local_stats[j, 1]) /
+                            (local_stats[i, 1] + local_stats[j, 1] + 1e-12))
+            
+            dist_factor = np.exp(-dist_matrix[i, j] / 
+                                ((local_stats[i, 0] + local_stats[j, 0]) / 2 + 1e-12))
+            
+            local_factors[i, j] = local_factors[j, i] = (mean_sim + min_sim) / 2 * dist_factor
+    
+    np.fill_diagonal(local_factors, 0)
+    return local_factors
+
+
+def _learn_optimal_weights(dist_matrix: np.ndarray, n: int,
+                          base_weights: np.ndarray,
+                          spatial_factor: np.ndarray,
+                          mst_factor: np.ndarray,
+                          local_factor: np.ndarray) -> Dict[str, float]:
+    """Learn optimal combination weights using graph characteristics."""
+    # Compute graph statistics
+    avg_dist = np.mean(dist_matrix[np.triu_indices(n, k=1)])
+    std_dist = np.std(dist_matrix[np.triu_indices(n, k=1)])
+    cv_dist = std_dist / (avg_dist + 1e-12)
+    
+    # Compute factor correlations
+    base_nonzero = base_weights > 0
+    spatial_nonzero = spatial_factor > 0
+    overlap = np.sum(base_nonzero & spatial_nonzero) / np.sum(base_nonzero | spatial_nonzero)
+    
+    # Determine weights based on characteristics
+    if n > 500:
+        if cv_dist > 0.7:  # High variance
+            weights = {'base': 0.3, 'spatial': 0.4, 'mst': 0.2, 'local': 0.1}
+        else:  # Low variance
+            weights = {'base': 0.4, 'spatial': 0.3, 'mst': 0.2, 'local': 0.1}
+    else:
+        if overlap > 0.6:  # High factor agreement
+            weights = {'base': 0.5, 'spatial': 0.3, 'mst': 0.1, 'local': 0.1}
+        else:  # Diverse factors
+            weights = {'base': 0.3, 'spatial': 0.3, 'mst': 0.2, 'local': 0.2}
+    
+    # Normalize weights
+    total = sum(weights.values())
+    weights = {k: v/total for k, v in weights.items()}
+    
+    return weights
+
+
+def _tsp_specific_refinement(heuristics: np.ndarray,
+                            dist_matrix: np.ndarray,
+                            n: int) -> np.ndarray:
+    """Apply TSP-specific refinement to heuristic matrix."""
+    refined = heuristics.copy()
+    
+    # Boost edges that are both spatially close and in candidate tours
+    for i in range(n):
+        # Get top candidate edges for this node
+        row = refined[i].copy()
+        row[i] = -np.inf
+        top_k = min(5, n-1)
+        top_indices = np.argpartition(-row, top_k)[:top_k]
+        
+        for j in top_indices:
+            if j > i:
+                # Check for triangle completion
+                common_score = 0
+                for k in range(n):
+                    if k != i and k != j:
+                        if refined[i, k] > 0 and refined[j, k] > 0:
+                            triangle_dist = (dist_matrix[i, j] + 
+                                           dist_matrix[i, k] + 
+                                           dist_matrix[j, k])
+                            common_score += np.exp(-triangle_dist / np.percentile(dist_matrix, 25))
+                
+                if common_score > 0:
+                    boost = 1 + 0.1 * np.tanh(common_score)
+                    refined[i, j] = refined[j, i] = heuristics[i, j] * boost
+    
+    return refined
+
+
+def _compute_global_statistics(dist_matrix: np.ndarray, n: int) -> Dict[str, float]:
+    """Compute global statistics for scaling."""
+    triu_indices = np.triu_indices(n, k=1)
+    distances = dist_matrix[triu_indices]
+    
+    stats = {
+        'median': np.median(distances),
+        'q1': np.percentile(distances, 25),
+        'q3': np.percentile(distances, 75),
+        'cv': np.std(distances) / (np.mean(distances) + 1e-12),
+        'sparsity': np.mean(distances == 0) if np.any(distances == 0) else 0
+    }
+    
+    return stats
+
+
+def _apply_global_scaling(heuristics: np.ndarray,
+                         stats: Dict[str, float]) -> np.ndarray:
+    """Apply global scaling based on statistics."""
+    scaled = heuristics.copy()
+    
+    # Adjust based on coefficient of variation
+    if stats['cv'] > 0.8:
+        # High variance: emphasize local structure
+        scaled = np.power(scaled, 0.8)
+    elif stats['cv'] < 0.3:
+        # Low variance: spread values more evenly
+        scaled = np.power(scaled, 1.2)
+    
+    # Adjust for sparsity
+    if stats['sparsity'] > 0.1:
+        # Sparse graph: boost non-zero values
+        scaled[scaled > 0] *= 1.2
+    
+    return scaled
+```

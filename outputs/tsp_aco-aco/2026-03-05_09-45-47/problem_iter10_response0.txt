@@ -1,0 +1,198 @@
+```json
+{
+    "algorithm_features": ["Reciprocal Baseline", "Minimum Spanning Tree", "Adaptive Neighborhood", "Deterministic Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved deterministic heuristic for TSP edge selection.
+    
+    Key improvements over v1:
+    1. Cleaner reciprocal baseline with robust handling
+    2. Enhanced MST-based edge identification
+    3. Adaptive neighborhood selection using local statistics
+    4. Deterministic sparsification with connectivity guarantees
+    5. Symmetry enforcement throughout
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric n x n matrix of pairwise distances
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        # For 1 or 2 nodes, all edges are equally promising (or no edges)
+        heuristic = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # 1. Base reciprocal heuristic with robust handling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # Clip extreme values and normalize
+    base_heuristic = np.clip(base_heuristic, 0, np.percentile(base_heuristic[base_heuristic > 0], 99))
+    max_val = np.max(base_heuristic)
+    if max_val > 0:
+        base_heuristic /= max_val
+    
+    # 2. Enhanced MST-based edge identification
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Add edges that are close substitutes for MST edges
+    # For each MST edge, consider k nearest alternatives
+    mst_enhanced = mst_mask.copy()
+    k_alt = min(2, n // 20 + 1)  # Adaptive alternative count
+    
+    for i in range(n):
+        mst_neighbors = np.where(mst_mask[i])[0]
+        if len(mst_neighbors) > 0:
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            # Add k_alt closest non-MST edges as promising alternatives
+            non_mst_mask = ~mst_mask[i]
+            non_mst_mask[i] = False
+            non_mst_indices = np.where(non_mst_mask)[0]
+            
+            if len(non_mst_indices) > 0:
+                non_mst_dists = distance_matrix[i, non_mst_indices]
+                k_actual = min(k_alt, len(non_mst_indices))
+                if k_actual > 0:
+                    alt_indices = non_mst_indices[np.argsort(non_mst_dists)[:k_actual]]
+                    mst_enhanced[i, alt_indices] = True
+    
+    # Ensure symmetry
+    mst_enhanced = mst_enhanced | mst_enhanced.T
+    
+    # 3. Adaptive neighborhood selection using local statistics
+    neighborhood_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Compute adaptive threshold based on local statistics
+        # Use distance to k-th nearest neighbor as threshold
+        k_neighbors = max(3, min(int(np.log2(n)), n // 4))
+        k_neighbors = min(k_neighbors, n - 1)
+        
+        if k_neighbors > 0:
+            threshold = np.sort(dists)[k_neighbors - 1]
+            # Add small margin for robustness
+            threshold *= 1.1
+            
+            # Mark neighbors within threshold
+            close_mask = dists <= threshold
+            neighborhood_mask[i] = close_mask
+    
+    # Ensure symmetry
+    neighborhood_mask = neighborhood_mask | neighborhood_mask.T
+    
+    # 4. Combine factors with clear prioritization
+    heuristic = base_heuristic.copy()
+    
+    # Strong emphasis on MST edges (essential backbone)
+    heuristic[mst_enhanced] *= 3.0
+    
+    # Moderate emphasis on local neighborhood edges
+    heuristic[neighborhood_mask & ~mst_enhanced] *= 1.8
+    
+    # Ensure symmetry after modifications
+    heuristic = (heuristic + heuristic.T) / 2
+    
+    # 5. Deterministic sparsification with connectivity preservation
+    # Target edges per node adapts with problem size
+    target_edges = max(4, min(int(np.log2(n) * 2.2), n - 1))
+    sparsified = np.zeros_like(heuristic)
+    
+    for i in range(n):
+        # Get heuristic values for this node
+        row_heuristics = heuristic[i].copy()
+        row_heuristics[i] = -np.inf
+        
+        # Always include enhanced MST edges
+        essential_neighbors = np.where(mst_enhanced[i])[0]
+        
+        # Determine additional edges to keep
+        additional_needed = max(0, target_edges - len(essential_neighbors))
+        
+        if additional_needed > 0:
+            # Get non-essential edges
+            non_essential_mask = np.ones(n, dtype=bool)
+            non_essential_mask[essential_neighbors] = False
+            non_essential_mask[i] = False
+            
+            non_essential_indices = np.where(non_essential_mask)[0]
+            if len(non_essential_indices) > 0:
+                non_essential_vals = row_heuristics[non_essential_indices]
+                
+                if len(non_essential_indices) > additional_needed:
+                    # Keep top additional_needed non-essential edges
+                    keep_indices = non_essential_indices[
+                        np.argsort(-non_essential_vals)[:additional_needed]
+                    ]
+                else:
+                    keep_indices = non_essential_indices
+            else:
+                keep_indices = []
+        else:
+            keep_indices = []
+        
+        # Combine all edges to keep
+        all_keep = np.concatenate([essential_neighbors, keep_indices])
+        sparsified[i, all_keep] = heuristic[i, all_keep]
+    
+    # Ensure symmetry with element-wise maximum
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # 6. Enhanced connectivity verification and repair
+    # First, ensure graph is connected
+    for i in range(n):
+        degree = np.count_nonzero(sparsified[i])
+        if degree == 0:
+            # Connect isolated node to its two nearest neighbors
+            sorted_indices = np.argsort(distance_matrix[i])[1:3]  # Skip self
+            for j in sorted_indices:
+                sparsified[i, j] = sparsified[j, i] = max(sparsified[i, j], 0.3)
+        
+        elif degree == 1:
+            # Node with only one connection - add second nearest
+            current_neighbor = np.nonzero(sparsified[i])[0][0]
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            dists[current_neighbor] = np.inf
+            second_nearest = np.argmin(dists)
+            sparsified[i, second_nearest] = sparsified[second_nearest, i] = max(
+                sparsified[i, second_nearest], 0.25
+            )
+    
+    # 7. Final processing and normalization
+    np.fill_diagonal(sparsified, 0)
+    
+    # Ensure all values are non-negative
+    sparsified = np.maximum(sparsified, 0)
+    
+    # Final normalization
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified /= max_val
+    
+    # Add small epsilon to non-zero edges for numerical stability
+    sparsified[sparsified > 0] += 1e-8
+    
+    return sparsified
+```

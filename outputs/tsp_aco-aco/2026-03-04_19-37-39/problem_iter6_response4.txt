@@ -1,0 +1,235 @@
+```json
+{
+    "algorithm_features": ["Adaptive Component Fusion", "Instance-Aware Sparsification", "Dynamic Edge Prioritization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic function for TSP edge selection with dynamic adaptation
+    and meta-heuristic inspired parameter tuning.
+    
+    Key improvements:
+    1. Dynamic component weighting based on instance characteristics
+    2. Two-stage sparsification with connectivity preservation
+    3. Adaptive edge potential with geometric neighborhood awareness
+    4. Meta-heuristic inspired parameter adaptation
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== 1. INSTANCE ANALYSIS ==========
+    # Compute instance characteristics for parameter adaptation
+    triu_indices = np.triu_indices(n, k=1)
+    distances_flat = distance_matrix[triu_indices]
+    
+    # Coefficient of variation
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / (dist_mean + 1e-10) if dist_mean > 0 else 1.0
+    
+    # Distance quartiles for parameter adaptation
+    q25, q75 = np.percentile(distances_flat, [25, 75]) if len(distances_flat) > 0 else (0, 0)
+    iqr = max(q75 - q25, 1e-10)
+    
+    # ========== 2. DYNAMIC PARAMETER SETTINGS ==========
+    # Component weights adapt based on instance characteristics
+    if n < 10:
+        # Small instances: emphasize local structure
+        inv_weight_base = 0.7
+        cent_weight_base = 0.3
+        m_factor = 0.6
+    elif n < 50:
+        # Medium instances: balanced approach
+        inv_weight_base = 0.5
+        cent_weight_base = 0.35
+        m_factor = 0.4
+    else:
+        # Large instances: emphasize global structure
+        inv_weight_base = 0.4
+        cent_weight_base = 0.4
+        m_factor = 0.25
+    
+    # Adjust based on distance variability
+    # High CV: emphasize inverse distance (varied distances)
+    # Low CV: emphasize centrality (more uniform distances)
+    cv_factor = np.clip(cv, 0.5, 2.0)
+    inv_weight = inv_weight_base * (1.0 + 0.3 * (cv_factor - 1.0))
+    cent_weight = cent_weight_base * (1.0 - 0.2 * (cv_factor - 1.0))
+    struct_weight = 1.0 - inv_weight - cent_weight
+    
+    # Normalize to ensure sum = 1
+    total = inv_weight + cent_weight + struct_weight
+    inv_weight /= total
+    cent_weight /= total
+    struct_weight /= total
+    
+    # Adaptive sparsification parameters
+    m_base = max(3, min(8, n // 3))
+    m = int(m_base * (1.0 + 0.3 * (1.0 / cv_factor - 1.0)))  # More edges for low CV
+    
+    # Boost factors adapt to instance size and variability
+    mst_boost = 1.5 + 0.5 * np.tanh(cv)  # Stronger boost for varied instances
+    nn_boost = 1.2 + 0.3 * (1.0 - 1.0 / cv_factor)  # Adjust based on uniformity
+    
+    # ========== 3. CORE COMPONENT COMPUTATION ==========
+    # Inverse distance with adaptive regularization
+    reg_factor = np.percentile(distances_flat, 10) if len(distances_flat) > 0 else 1.0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * reg_factor * 0.1)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Enhanced centrality with geometric awareness
+    # Use distance to nearest neighbors for centrality estimation
+    k_nn = max(2, min(5, n // 5))
+    nn_distances = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        # Get average distance to k nearest neighbors
+        nn_idx = np.argpartition(dists, k_nn - 1)[:k_nn]
+        nn_distances[i] = np.mean(dists[nn_idx])
+    
+    # Robust centrality with outlier handling
+    q10, q90 = np.percentile(nn_distances, [10, 90])
+    robust_nn_dist = np.clip(nn_distances, q10, q90)
+    
+    # Inverse centrality (smaller average NN distance -> more central)
+    centrality = 1 / (robust_nn_dist + 1e-10)
+    
+    # Geometric mean based edge potential
+    # Use log-space for numerical stability
+    log_cent = np.log(centrality + 1e-10)
+    edge_potential = np.exp((log_cent[:, np.newaxis] + log_cent[np.newaxis, :]) / 2)
+    np.fill_diagonal(edge_potential, 0)
+    
+    # Structural component: nearest neighbor connectivity
+    k_struct = max(2, min(6, n // 6))
+    struct_scores = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        # Get k_struct nearest neighbors
+        nn_idx = np.argpartition(dists, k_struct - 1)[:k_struct]
+        # Score based on rank, not just distance
+        ranks = np.argsort(dists[nn_idx])
+        struct_scores[i, nn_idx] = 1.0 / (ranks + 2)  # Rank-based weighting
+    
+    # Make symmetric
+    struct_scores = (struct_scores + struct_scores.T) / 2
+    
+    # ========== 4. MINIMUM SPANNING TREE ==========
+    # Always compute MST for connectivity guarantee
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # ========== 5. DYNAMIC COMPONENT FUSION ==========
+    # Normalize components to [0, 1] range
+    def safe_normalize(x):
+        x_max = np.max(x)
+        return x / (x_max + 1e-10) if x_max > 0 else x
+    
+    inv_dist_norm = safe_normalize(inv_dist)
+    edge_potential_norm = safe_normalize(edge_potential)
+    struct_scores_norm = safe_normalize(struct_scores)
+    
+    # Weighted combination
+    heuristic_scores = (
+        inv_weight * inv_dist_norm +
+        cent_weight * edge_potential_norm +
+        struct_weight * struct_scores_norm
+    )
+    
+    # Apply structural boosts
+    heuristic_scores[mst_mask] *= mst_boost
+    
+    # Boost nearest neighbor edges
+    nn_mask = struct_scores > 0
+    heuristic_scores[nn_mask] *= nn_boost
+    
+    # ========== 6. TWO-STAGE SPARSIFICATION ==========
+    # Stage 1: Top-m selection per node
+    sparsity_mask = np.zeros_like(heuristic_scores, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristic_scores[i].copy()
+        scores[i] = -np.inf
+        # Select top m edges, but ensure we don't exceed available edges
+        valid_mask = scores > 0
+        if np.sum(valid_mask) > 0:
+            valid_scores = scores[valid_mask]
+            if len(valid_scores) >= m:
+                threshold = np.partition(valid_scores, -m)[-m]
+            else:
+                threshold = np.min(valid_scores)
+            sparsity_mask[i] = scores >= threshold
+    
+    # Stage 2: Global percentile threshold
+    if n > 10:
+        # Use adaptive threshold based on instance characteristics
+        if cv > 1.0:  # High variability
+            percentile = 60
+        else:  # Low variability
+            percentile = 70
+        global_threshold = np.percentile(heuristic_scores[triu_indices], percentile)
+        global_mask = heuristic_scores >= global_threshold
+        sparsity_mask = sparsity_mask & global_mask
+    
+    # Always include MST edges for connectivity
+    sparsity_mask = sparsity_mask | mst_mask
+    
+    # Ensure each node has at least min_connections
+    min_connections = max(2, int(np.ceil(np.log2(n + 1))))
+    for i in range(n):
+        connections = np.sum(sparsity_mask[i])
+        if connections < min_connections:
+            # Add best missing connections
+            scores = heuristic_scores[i].copy()
+            scores[sparsity_mask[i]] = -np.inf
+            scores[i] = -np.inf
+            needed = min_connections - connections
+            if needed > 0 and np.any(scores > -np.inf):
+                # Get top needed edges
+                top_idx = np.argpartition(scores, -needed)[-needed:]
+                sparsity_mask[i, top_idx] = True
+    
+    # Ensure symmetry
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # ========== 7. FINAL PROCESSING ==========
+    # Apply sparsification
+    heuristic_scores = heuristic_scores * sparsity_mask
+    
+    # Final normalization with softmax-like transformation
+    # This emphasizes relative differences between promising edges
+    max_score = np.max(heuristic_scores)
+    if max_score > 0:
+        # Apply soft scaling to emphasize top edges
+        scale_factor = 0.5 + 0.5 * cv  # Adapt scaling to instance variability
+        heuristic_scores = (heuristic_scores / max_score) ** scale_factor
+    
+    # Zero diagonal
+    np.fill_diagonal(heuristic_scores, 0)
+    
+    return heuristic_scores
+```

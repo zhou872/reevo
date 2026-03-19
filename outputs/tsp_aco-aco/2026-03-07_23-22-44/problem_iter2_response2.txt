@@ -1,0 +1,148 @@
+```json
+{
+    "algorithm_features": ["Distance Inverse with Adaptive Regularization", "MST Connectivity Weighting", "Dynamic K-Neighbor Regret Penalty", "Sparsification via Multi-threshold Filtering"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection combining multiple adaptive factors
+    with regret-based penalties and dynamic parameter adjustment.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12  # Numerical stability constant
+    
+    # ===== 1. ADAPTIVE PARAMETER SETUP =====
+    # Dynamically adjust parameters based on problem size
+    k_nn = max(3, min(8, n // 4))  # Number of nearest neighbors to consider
+    k_regret = max(2, min(5, n // 6))  # Lookahead depth for regret calculation
+    sparsity_factor = max(0.15, min(0.3, 20/n))  # Target sparsity ratio
+    
+    # ===== 2. BASE INVERSE DISTANCE WITH ADAPTIVE REGULARIZATION =====
+    # Use distance-dependent regularization to handle varying scales
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Compute median distance for regularization scaling
+        off_diag = distance_matrix[~np.eye(n, dtype=bool)]
+        median_dist = np.median(off_diag) if len(off_diag) > 0 else 1.0
+        
+        # Adaptive regularization: smaller epsilon for shorter edges
+        regularization = epsilon * (1 + distance_matrix / median_dist)
+        inv_dist = 1 / (distance_matrix + regularization)
+    
+    np.fill_diagonal(inv_dist, 0)  # Remove self-connections
+    
+    # ===== 3. MST-BASED CONNECTIVITY WEIGHTING =====
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_binary = (mst + mst.T) > 0
+    
+    # MST edges get full weight, others get penalized based on MST substitute cost
+    mst_weight = np.ones_like(distance_matrix)
+    
+    # For non-MST edges, compute substitution penalty
+    for i in range(n):
+        for j in range(i+1, n):
+            if not mst_binary[i, j]:
+                # Find cheapest way to connect i and j through MST
+                # This is approximated by the minimum path between them in MST
+                mst_dist_i = mst[i] + mst[:, i]  # Symmetrized row
+                mst_dist_j = mst[j] + mst[:, j]
+                min_mst_path = np.min(mst_dist_i + mst_dist_j)
+                if min_mst_path > 0:
+                    # Penalty inversely proportional to how much better MST path is
+                    penalty = min_mst_path / (distance_matrix[i, j] + epsilon)
+                    mst_weight[i, j] = mst_weight[j, i] = 1.0 / (1.0 + np.log1p(penalty))
+    
+    # ===== 4. DYNAMIC K-NEIGHBOR REGRET PENALTY =====
+    # Sort distances for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+    
+    # Compute regret: cost of not taking edge (i,j) and taking k-th alternative instead
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Find rank of each neighbor j for node i
+        rank_map = np.zeros(n, dtype=int)
+        rank_map[sorted_indices[i]] = np.arange(n)
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            rank_ij = rank_map[j]
+            if rank_ij < k_regret:
+                # Edge (i,j) is among top k_regret edges for i
+                # Regret is the increase if we take the (k_regret)th edge instead
+                alternative_cost = sorted_dists[i, min(k_regret, n-1)]
+                regret = alternative_cost - distance_matrix[i, j]
+            else:
+                # Edge is not in top k, regret is negative (penalty)
+                best_cost = sorted_dists[i, 1]  # Best edge (excluding self)
+                regret = best_cost - distance_matrix[i, j]  # Negative value
+            
+            # Normalize regret by edge distance
+            regret_matrix[i, j] = max(0, regret) / (distance_matrix[i, j] + epsilon)
+    
+    # Symmetrize regret by taking maximum of both directions
+    regret_matrix = np.maximum(regret_matrix, regret_matrix.T)
+    
+    # ===== 5. COMBINE FACTORS WITH ADAPTIVE WEIGHTS =====
+    # Weight factors adaptively based on problem characteristics
+    inv_dist_norm = inv_dist / (np.max(inv_dist) + epsilon)
+    regret_norm = regret_matrix / (np.max(regret_matrix) + epsilon) if np.max(regret_matrix) > 0 else regret_matrix
+    
+    # Adaptive combination: emphasize regret more for larger instances
+    regret_weight = min(0.4, 0.1 + 0.005 * n)
+    mst_weight = mst_weight  # Already in [0,1] range
+    
+    scores = inv_dist_norm * mst_weight * (1.0 + regret_weight * regret_norm)
+    
+    # ===== 6. MULTI-THRESHOLD SPARSIFICATION =====
+    # First: Keep MST edges unconditionally
+    mask = mst_binary.copy()
+    
+    # Second: Keep top k_nn edges per node (by score)
+    top_k_indices = np.argpartition(-scores, k_nn, axis=1)[:, :k_nn]
+    row_indices = np.repeat(np.arange(n), k_nn)
+    col_indices = top_k_indices.flatten()
+    mask[row_indices, col_indices] = True
+    
+    # Third: Symmetrize mask
+    mask = mask | mask.T
+    
+    # Fourth: Apply percentile threshold to remaining edges
+    masked_scores = scores[mask]
+    if len(masked_scores) > 0:
+        # Dynamic threshold based on desired sparsity
+        target_n_edges = int(sparsity_factor * n * (n-1) / 2)
+        if target_n_edges < len(masked_scores):
+            threshold = np.partition(masked_scores, -target_n_edges)[-target_n_edges]
+        else:
+            threshold = np.min(masked_scores) - epsilon
+        
+        # Refine mask with threshold
+        mask = mask & (scores >= threshold)
+    
+    # Apply final mask
+    final_scores = np.zeros_like(scores)
+    final_scores[mask] = scores[mask]
+    
+    # ===== 7. SYMMETRIZE AND NORMALIZE =====
+    final_scores = np.maximum(final_scores, final_scores.T)
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    return final_scores
+```

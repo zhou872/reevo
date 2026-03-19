@@ -1,0 +1,300 @@
+```json
+{
+    "algorithm_features": ["Two-hop Regret with Adaptive Thresholds", "Multi-Factor Geometric Mean", "Instance-Adaptive Weight Tuning", "Candidate Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with two-hop regret computation
+    and adaptive sparsification. Returns a matrix of same shape where higher
+    values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Instance analysis
+    stats = _analyze_instance_v2(distance_matrix)
+    
+    # Step 2: Compute core factors
+    factors = _compute_core_factors_v2(distance_matrix, stats)
+    
+    # Step 3: Adaptive weight tuning
+    weights = _compute_adaptive_weights_v2(stats)
+    
+    # Step 4: Candidate edge identification
+    candidate_mask = _build_candidate_mask_v2(distance_matrix, stats)
+    
+    # Step 5: Combined scoring with geometric mean
+    H = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                combined = (
+                    factors['inv_dist'][i, j] ** weights['w_inv'] *
+                    factors['two_hop_regret'][i, j] ** weights['w_two_hop'] *
+                    factors['density'][i, j] ** weights['w_density'] *
+                    factors['mst'][i, j] ** weights['w_mst']
+                )
+                H[i, j] = H[j, i] = combined
+    
+    # Step 6: Adaptive sparsification
+    H = _sparsify_heuristics_v2(H, distance_matrix, stats)
+    
+    # Final normalization
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    np.fill_diagonal(H, 0)
+    return H
+
+
+def _analyze_instance_v2(dist_mat: np.ndarray) -> dict:
+    """Compute instance statistics for adaptive parameter tuning."""
+    n = dist_mat.shape[0]
+    # Remove diagonal for statistics
+    mask = ~np.eye(n, dtype=bool)
+    flat_dists = dist_mat[mask].flatten()
+    
+    mean_dist = np.mean(flat_dists)
+    std_dist = np.std(flat_dists)
+    cv_dist = std_dist / (mean_dist + 1e-8)
+    
+    # Estimate sparsity via distance distribution
+    hist, _ = np.histogram(flat_dists, bins=min(20, len(flat_dists)), density=True)
+    entropy = -np.sum(hist * np.log(hist + 1e-10))
+    sparsity = 1 - np.exp(-entropy / 10)  # Normalized sparsity measure
+    
+    # Estimate cluster tendency via nearest neighbor ratios
+    if n >= 10:
+        m = min(15, n // 3)
+        sample_idx = np.random.choice(n, m, replace=False)
+        sample_dists = []
+        for i in sample_idx:
+            row = dist_mat[i].copy()
+            row[i] = np.inf
+            sample_dists.append(np.min(row))
+        rand_dists = np.random.choice(flat_dists, m)
+        hopkins = np.sum(sample_dists) / (np.sum(sample_dists) + np.sum(rand_dists) + 1e-8)
+    else:
+        hopkins = 0.5
+    
+    return {
+        'n': n,
+        'mean_dist': mean_dist,
+        'std_dist': std_dist,
+        'cv_dist': cv_dist,
+        'sparsity': sparsity,
+        'cluster_tendency': hopkins
+    }
+
+
+def _compute_core_factors_v2(dist_mat: np.ndarray, stats: dict) -> dict:
+    """Compute inverse distance, two-hop regret, density, and MST factors."""
+    n = stats['n']
+    eps = 1e-8
+    
+    factors = {}
+    
+    # 1. Inverse distance (baseline)
+    inv_dist = 1 / (dist_mat + np.eye(n) * eps)
+    np.fill_diagonal(inv_dist, 0)
+    factors['inv_dist'] = inv_dist
+    
+    # 2. Two-hop regret with adaptive threshold
+    factors['two_hop_regret'] = _compute_two_hop_regret_v2(dist_mat, stats)
+    
+    # 3. Density-based scoring
+    factors['density'] = _compute_density_v2(dist_mat, stats)
+    
+    # 4. MST-based scoring
+    factors['mst'] = _compute_mst_score_v2(dist_mat)
+    
+    return factors
+
+
+def _compute_two_hop_regret_v2(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """
+    Compute two-hop regret scores: penalize edges that have much cheaper
+    two-hop alternatives. Uses adaptive threshold based on coefficient of variation.
+    """
+    n = stats['n']
+    regret = np.ones((n, n))
+    cv = stats['cv_dist']
+    
+    # Adaptive threshold: stricter for uniform instances, looser for variable ones
+    threshold_scale = 0.1 + 0.3 * (1 - np.exp(-cv))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            direct = dist_mat[i, j]
+            
+            # Find minimum two-hop path via intermediate nodes k
+            two_hop_costs = []
+            for k in range(n):
+                if k != i and k != j:
+                    two_hop = dist_mat[i, k] + dist_mat[k, j]
+                    two_hop_costs.append(two_hop)
+            
+            if two_hop_costs:
+                best_two_hop = min(two_hop_costs)
+                regret_val = (best_two_hop - direct) / (direct + 1e-8)
+                
+                # Adaptive penalty: only penalize if regret exceeds threshold
+                threshold = threshold_scale * stats['mean_dist'] / (direct + 1e-8)
+                if regret_val > threshold:
+                    # Scale penalty based on how much above threshold
+                    penalty_ratio = min(1.0, (regret_val - threshold) / (threshold + 1e-8))
+                    score = 1.0 - 0.5 * penalty_ratio
+                else:
+                    # Bonus if two-hop is not significantly better
+                    score = 1.0 + 0.2 * max(0, threshold - regret_val) / (threshold + 1e-8)
+                
+                regret[i, j] = regret[j, i] = max(0.1, min(2.0, score))
+    
+    return regret
+
+
+def _compute_density_v2(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """Compute density scores favoring edges in sparse regions."""
+    n = stats['n']
+    density_scores = np.ones((n, n))
+    
+    # Local density via k-nearest neighbors (adaptive k)
+    k = max(2, min(5, n // 10))
+    local_sparsity = np.zeros(n)
+    
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        k_nearest = np.partition(dists, k)[:k]
+        local_sparsity[i] = np.mean(k_nearest)  # Higher = more sparse
+    
+    # Normalize
+    if np.std(local_sparsity) > 1e-8:
+        local_sparsity = (local_sparsity - np.mean(local_sparsity)) / np.std(local_sparsity)
+    
+    # Score: higher for connecting sparse areas
+    for i in range(n):
+        for j in range(i+1, n):
+            # Geometric mean of sparsity scores
+            combined = np.sqrt((local_sparsity[i] + 1) * (local_sparsity[j] + 1))
+            density_scores[i, j] = density_scores[j, i] = np.exp(0.3 * combined)
+    
+    return density_scores
+
+
+def _compute_mst_score_v2(dist_mat: np.ndarray) -> np.ndarray:
+    """Boost edges that appear in the Minimum Spanning Tree."""
+    n = dist_mat.shape[0]
+    mst_scores = np.ones((n, n))
+    
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(dist_mat).toarray()
+            mst_present = (mst + mst.T) > 0
+            mst_scores[mst_present] = 1.5  # Moderate boost
+        except:
+            pass
+    
+    np.fill_diagonal(mst_scores, 0)
+    return mst_scores
+
+
+def _compute_adaptive_weights_v2(stats: dict) -> dict:
+    """Compute adaptive weights for factor combination based on instance structure."""
+    n = stats['n']
+    cv = stats['cv_dist']
+    sparsity = stats['sparsity']
+    cluster = stats['cluster_tendency']
+    
+    # Base weights adjusted by instance characteristics
+    weights = {
+        'w_inv': 1.2 - 0.2 * cv,  # Less important when distances vary greatly
+        'w_two_hop': 0.8 + 0.4 * sparsity,  # More important for structured instances
+        'w_density': 0.5 + 0.5 * cluster,  # More important for clustered instances
+        'w_mst': max(0.3, 0.7 - 0.05 * n)  # Less important for larger instances
+    }
+    
+    # Normalize to sum to 3.0 (controls overall responsiveness)
+    total = sum(weights.values())
+    scale = 3.0 / total
+    for key in weights:
+        weights[key] *= scale
+    
+    return weights
+
+
+def _build_candidate_mask_v2(dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """Identify candidate edges for scoring (efficiency and sparsification)."""
+    n = stats['n']
+    
+    # Adaptive number of neighbors based on instance size and sparsity
+    base_k = min(15, max(3, int(np.log2(n) * 2.5)))
+    k = int(base_k * (1 + 0.5 * stats['sparsity']))
+    k = min(k, n - 1)
+    
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        dists = dist_mat[i].copy()
+        dists[i] = np.inf
+        
+        # Keep k-nearest neighbors plus any within 1.5x mean distance
+        if k < len(dists):
+            threshold = 1.5 * stats['mean_dist']
+            near_by_dist = dists <= threshold
+            nearest_idx = np.argpartition(dists, k)[:k]
+            
+            candidate_mask[i, near_by_dist] = True
+            candidate_mask[i, nearest_idx] = True
+    
+    # Make symmetric
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    
+    return candidate_mask
+
+
+def _sparsify_heuristics_v2(H: np.ndarray, dist_mat: np.ndarray, stats: dict) -> np.ndarray:
+    """Adaptively sparsify the heuristic matrix by zeroing low-scoring edges."""
+    n = stats['n']
+    
+    # Determine sparsity level based on instance characteristics
+    # More sparse for larger instances and those with clear structure
+    sparsity_target = min(0.7, 0.3 + 0.1 * np.log2(n) * stats['sparsity'])
+    
+    # For each node, keep top edges
+    keep_per_node = max(3, int((n - 1) * (1 - sparsity_target)))
+    
+    H_sparse = H.copy()
+    for i in range(n):
+        row = H[i].copy()
+        row[i] = -np.inf  # Ignore diagonal
+        
+        if keep_per_node < len(row) - 1:
+            # Find threshold for top keep_per_node edges
+            threshold = np.partition(row, -keep_per_node)[-keep_per_node]
+            # Zero out edges below threshold
+            H_sparse[i, row < threshold] = 0
+    
+    # Ensure symmetry
+    H_sparse = np.maximum(H_sparse, H_sparse.T)
+    
+    # Keep at least one connection per node (fallback to nearest neighbor)
+    for i in range(n):
+        if np.sum(H_sparse[i] > 0) == 0:
+            dists = dist_mat[i].copy()
+            dists[i] = np.inf
+            nearest = np.argmin(dists)
+            # Assign base inverse distance score
+            H_sparse[i, nearest] = H_sparse[nearest, i] = 1 / (dist_mat[i, nearest] + 1e-8)
+    
+    return H_sparse
+```

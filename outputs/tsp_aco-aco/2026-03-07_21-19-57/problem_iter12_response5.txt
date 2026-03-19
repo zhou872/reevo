@@ -1,0 +1,364 @@
+```json
+{
+    "algorithm_features": ["Two-step Regret with Multi-step Lookahead", "Density-Aware Adaptive Weighting", "Structural Continuity Scoring", "Dynamic Parameter Tuning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with multi-step lookahead
+    and adaptive parameter optimization.
+    
+    Key innovations:
+    1. Multi-step lookahead assessment evaluating edge continuity over 2-3 steps
+    2. Adaptive parameter tuning based on instance characteristics
+    3. Structural continuity scoring for tour coherence
+    4. Dynamic weight adjustment during computation
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # ==================== 1. INSTANCE ANALYSIS & PARAMETER TUNING ====================
+    # Analyze distance statistics for adaptive parameter setting
+    valid_distances = distance_matrix[~np.eye(n, dtype=bool)]
+    mean_dist = np.mean(valid_distances)
+    std_dist = np.std(valid_distances)
+    cv_dist = std_dist / (mean_dist + 1e-8)  # Coefficient of variation
+    
+    # Adaptive parameters based on instance characteristics
+    base_k = max(3, min(10, int(0.12 * n)))
+    lookahead_depth = 2 if n < 50 else (2 if cv_dist < 0.5 else 3)
+    density_decay = 2.5 * (1.0 + 0.3 * np.log1p(n)) / (1.0 + 0.5 * cv_dist)
+    
+    # ==================== 2. INVERSE DISTANCE WITH ADAPTIVE REGULARIZATION ====================
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reg_factor = 0.04 * mean_dist * (1.0 + 0.2 * cv_dist)
+        inv_dist = 1.0 / (distance_matrix + reg_factor)
+        np.fill_diagonal(inv_dist, 0)
+    
+    # ==================== 3. ENHANCED RANK-REGRET WITH TWO-STEP ASSESSMENT ====================
+    rank_regret = np.ones((n, n))
+    
+    for i in range(n):
+        distances_i = distance_matrix[i, :].copy()
+        distances_i[i] = np.inf
+        
+        if not np.any(np.isfinite(distances_i)):
+            continue
+            
+        # Get sorted distances for node i
+        sorted_idx_i = np.argsort(distances_i)
+        sorted_dist_i = distances_i[sorted_idx_i]
+        
+        # Find first finite distances
+        finite_mask = np.isfinite(sorted_dist_i)
+        if not np.any(finite_mask):
+            continue
+            
+        best_dist_i = sorted_dist_i[finite_mask][0]
+        second_best_i = sorted_dist_i[finite_mask][1] if np.sum(finite_mask) > 1 else best_dist_i
+        
+        for rank, j in enumerate(sorted_idx_i):
+            if i == j or not np.isfinite(distances_i[j]):
+                continue
+                
+            dist_ij = distances_i[j]
+            
+            # Base regret component
+            if rank == 0:
+                base_regret = 1.8
+            elif rank == 1:
+                base_regret = 1.4
+            else:
+                # Normalized regret based on distance ratio and rank
+                dist_ratio = dist_ij / best_dist_i
+                rank_penalty = 1.0 + 0.4 * (rank / max(1, n-2))
+                base_regret = 1.0 / (1.0 + 0.25 * (dist_ratio - 1.0) * rank_penalty)
+            
+            # Two-step regret: consider if this edge is part of a promising 2-edge sequence
+            if rank < min(10, n-1):
+                distances_j = distance_matrix[j, :].copy()
+                distances_j[i] = np.inf
+                distances_j[j] = np.inf
+                
+                if np.any(np.isfinite(distances_j)):
+                    # Best continuation from j (excluding i)
+                    best_cont_j = np.min(distances_j[np.isfinite(distances_j)])
+                    
+                    # Two-step score: favor edges that lead to good continuations
+                    two_step_score = 1.0 - 0.3 * (best_cont_j / (dist_ij + 1e-8) - 1.0)
+                    two_step_score = np.clip(two_step_score, 0.7, 1.3)
+                    
+                    base_regret *= two_step_score
+            
+            rank_regret[i, j] = base_regret
+    
+    # ==================== 4. MULTI-STEP LOOKAHEAD CONTINUITY ASSESSMENT ====================
+    continuity_factor = np.ones((n, n))
+    
+    # Precompute sorted neighbor lists for efficient lookahead
+    sorted_neighbors = []
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        sorted_idx = np.argsort(dists)
+        sorted_neighbors.append((sorted_idx, dists[sorted_idx]))
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            current_edge = distance_matrix[i, j]
+            if not np.isfinite(current_edge) or current_edge <= 0:
+                continue
+            
+            # Multi-step lookahead assessment
+            lookahead_scores = []
+            
+            # Depth-2 lookahead: i -> j -> k
+            if lookahead_depth >= 2:
+                neighbors_j, dists_j = sorted_neighbors[j]
+                
+                # Consider top m continuations from j
+                m_lookahead = min(5, n-2)
+                valid_count = 0
+                total_score = 0
+                
+                for k_idx in range(min(m_lookahead, len(neighbors_j))):
+                    k = neighbors_j[k_idx]
+                    if k == i or k == j:
+                        continue
+                    
+                    dist_jk = dists_j[k_idx]
+                    if not np.isfinite(dist_jk):
+                        continue
+                    
+                    # Depth-3 lookahead: i -> j -> k -> l
+                    if lookahead_depth >= 3:
+                        neighbors_k, dists_k = sorted_neighbors[k]
+                        best_cont = np.inf
+                        
+                        for l_idx in range(min(3, len(neighbors_k))):
+                            l = neighbors_k[l_idx]
+                            if l in (i, j, k):
+                                continue
+                            
+                            dist_kl = dists_k[l_idx]
+                            if np.isfinite(dist_kl):
+                                best_cont = min(best_cont, dist_kl)
+                        
+                        if np.isfinite(best_cont) and best_cont < np.inf:
+                            # Three-step assessment
+                            three_step_dist = dist_jk + best_cont
+                            score = 1.0 / (1.0 + 0.2 * (three_step_dist / (2 * current_edge + 1e-8) - 1.0))
+                        else:
+                            # Fallback to two-step
+                            score = 1.0 / (1.0 + 0.15 * (dist_jk / current_edge - 1.0))
+                    else:
+                        # Two-step assessment
+                        score = 1.0 / (1.0 + 0.15 * (dist_jk / current_edge - 1.0))
+                    
+                    lookahead_scores.append(score)
+                    valid_count += 1
+            
+            # Combine lookahead scores
+            if lookahead_scores:
+                if lookahead_depth >= 3 and len(lookahead_scores) >= 2:
+                    # Use weighted average favoring better scores
+                    weights = np.array(lookahead_scores) ** 2
+                    weighted_score = np.average(lookahead_scores, weights=weights)
+                else:
+                    weighted_score = np.mean(lookahead_scores)
+                
+                continuity_factor[i, j] = 1.0 + 0.5 * np.clip(weighted_score - 1.0, -0.3, 0.3)
+    
+    # Symmetrize continuity factor
+    continuity_factor = (continuity_factor + continuity_factor.T) / 2
+    
+    # ==================== 5. ADAPTIVE DENSITY-BASED CLUSTERING ====================
+    density_bonus = np.ones((n, n))
+    
+    # Compute local density using adaptive neighborhood
+    local_density = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        
+        finite_mask = np.isfinite(dists)
+        if np.sum(finite_mask) >= base_k:
+            # Use adaptive k-nearest neighbors
+            k_adaptive = min(base_k, int(0.2 * np.sum(finite_mask)))
+            if k_adaptive >= 2:
+                kth_dist = np.partition(dists[finite_mask], k_adaptive-1)[k_adaptive-1]
+                nn_mask = finite_mask & (dists <= kth_dist)
+                nn_dists = dists[nn_mask]
+                
+                if len(nn_dists) > 0:
+                    local_density[i] = 1.0 / (np.median(nn_dists) + 1e-8)
+    
+    # Normalize densities
+    max_density = np.max(local_density)
+    if max_density > 0:
+        local_density = local_density / max_density
+    
+    # Apply density similarity bonus
+    for i in range(n):
+        for j in range(i+1, n):
+            density_diff = abs(local_density[i] - local_density[j])
+            similarity = np.exp(-density_decay * density_diff)
+            
+            # Boost based on individual densities (higher for dense areas)
+            density_boost = 0.4 * (local_density[i] + local_density[j]) * similarity
+            
+            density_bonus[i, j] = 1.0 + density_boost
+            density_bonus[j, i] = density_bonus[i, j]
+    
+    # ==================== 6. STRUCTURAL COMPONENTS ====================
+    # Minimum Spanning Tree boost
+    mst_boost = np.ones((n, n))
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+        mst_boost[mst_mask] = 1.6 - 0.1 * min(1.0, cv_dist)  # Adjust based on instance variability
+    except:
+        pass
+    
+    # ==================== 7. DYNAMIC WEIGHTED COMBINATION ====================
+    # Adaptive weights based on instance characteristics
+    if n < 30:
+        # Small instances: emphasize rank and continuity
+        weights = {
+            'distance': 0.9,
+            'rank': 1.3,
+            'continuity': 1.2,
+            'density': 0.7,
+            'structure': 1.1
+        }
+    elif cv_dist > 0.7:
+        # Highly variable instances: emphasize structure and continuity
+        weights = {
+            'distance': 0.8,
+            'rank': 0.9,
+            'continuity': 1.4,
+            'density': 0.8,
+            'structure': 1.3
+        }
+    else:
+        # Balanced approach for medium instances
+        weights = {
+            'distance': 1.0,
+            'rank': 1.1,
+            'continuity': 1.1,
+            'density': 0.9,
+            'structure': 1.2
+        }
+    
+    # Combined heuristic with adaptive weights
+    heuristic = (
+        inv_dist ** weights['distance'] *
+        rank_regret ** weights['rank'] *
+        continuity_factor ** weights['continuity'] *
+        density_bonus ** weights['density'] *
+        mst_boost ** weights['structure']
+    )
+    
+    # Ensure symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    # ==================== 8. ADAPTIVE FOCUSED SPARSIFICATION ====================
+    sparsity_mask = np.zeros((n, n), dtype=bool)
+    
+    # Compute node-specific statistics for adaptive thresholding
+    node_stats = np.zeros((n, 3))  # [median, 75th percentile, best]
+    for i in range(n):
+        dists = distance_matrix[i, :].copy()
+        dists[i] = np.inf
+        finite_dists = dists[np.isfinite(dists)]
+        
+        if len(finite_dists) > 0:
+            node_stats[i, 0] = np.median(finite_dists)
+            if len(finite_dists) >= 4:
+                node_stats[i, 1] = np.percentile(finite_dists, 75)
+            else:
+                node_stats[i, 1] = np.max(finite_dists)
+            node_stats[i, 2] = np.min(finite_dists)
+    
+    # Multi-criteria edge preservation
+    for i in range(n):
+        # Criterion 1: Structural edges (MST)
+        if 'mst_mask' in locals():
+            sparsity_mask[i, :] = sparsity_mask[i, :] | mst_mask[i, :]
+        
+        # Criterion 2: Top heuristic edges (adaptive count)
+        node_scores = heuristic[i, :].copy()
+        node_scores[i] = -np.inf
+        
+        # Adaptive top-k based on instance size and variability
+        base_top_k = max(2, int(0.18 * n))
+        var_adjust = 1.0 + 0.4 * min(1.0, cv_dist)
+        top_k = min(n-1, int(base_top_k * var_adjust))
+        
+        if top_k < n-1:
+            threshold = np.partition(node_scores, -top_k)[-top_k]
+            sparsity_mask[i, node_scores >= threshold] = True
+        
+        # Criterion 3: Spatial proximity with adaptive threshold
+        spatial_thresh = (1.4 + 0.3 * np.log1p(n)) * node_stats[i, 1]
+        within_spatial = distance_matrix[i, :] <= spatial_thresh
+        within_spatial[i] = False
+        sparsity_mask[i, within_spatial] = True
+        
+        # Criterion 4: High continuity edges
+        node_continuity = continuity_factor[i, :].copy()
+        node_continuity[i] = -np.inf
+        cont_thresh = np.percentile(node_continuity[node_continuity > -np.inf], 70)
+        high_continuity = node_continuity >= cont_thresh
+        sparsity_mask[i, high_continuity] = True
+    
+    # Ensure symmetry
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Ensure minimum connectivity of 2 for each node
+    for i in range(n):
+        connected = np.where(sparsity_mask[i, :])[0]
+        connected = connected[connected != i]
+        if len(connected) < 2:
+            dists = distance_matrix[i, :].copy()
+            dists[i] = np.inf
+            needed = 2 - len(connected)
+            candidates = [j for j in range(n) if j != i and not sparsity_mask[i, j]]
+            if candidates:
+                candidate_dists = [(j, dists[j]) for j in candidates]
+                candidate_dists.sort(key=lambda x: x[1])
+                for j, _ in candidate_dists[:needed]:
+                    sparsity_mask[i, j] = True
+                    sparsity_mask[j, i] = True
+    
+    # Apply focused sparsification
+    heuristic = heuristic * sparsity_mask
+    
+    # ==================== 9. FINAL NORMALIZATION & ENHANCEMENT ====================
+    # Boost remaining edges slightly to increase differentiation
+    heuristic = heuristic ** (1.0 + 0.1 * min(1.0, cv_dist))
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    return heuristic
+```

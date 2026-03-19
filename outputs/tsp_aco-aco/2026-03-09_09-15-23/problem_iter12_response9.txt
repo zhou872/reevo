@@ -1,0 +1,420 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Regret with Floyd-Warshall", "2-opt Neighborhood Potential", "Adaptive Sparsity Control", "Christofides-MST Reinforcement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import floyd_warshall
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic with multi-hop regret via Floyd-Warshall,
+    2-opt neighborhood analysis, adaptive sparsity control, and
+    Christofides-MST reinforcement for optimal edge prioritization.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    
+    # Handle trivial cases
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ALL-PAIRS SHORTEST PATH FOR REGRET ====================
+    # Compute Floyd-Warshall for all-pairs shortest paths
+    # This gives us true regret for any edge removal
+    shortest_paths = floyd_warshall(distance_matrix, directed=False)
+    np.fill_diagonal(shortest_paths, 0)
+    
+    # ==================== 2. ADAPTIVE SPARSITY CONTROL ====================
+    # Dynamic neighbor selection based on problem density
+    adjacency_mask = _build_adaptive_sparse_adjacency(distance_matrix, n)
+    
+    # ==================== 3. ENHANCED MULTI-HOP REGRET ====================
+    regret_scores = _compute_floyd_warshall_regret(
+        distance_matrix, shortest_paths, adjacency_mask, n
+    )
+    
+    # ==================== 4. 2-OPT NEIGHBORHOOD POTENTIAL ====================
+    two_opt_scores = _compute_2opt_potential(
+        distance_matrix, adjacency_mask, n
+    )
+    
+    # ==================== 5. CHRISTOFIDES-MST REINFORCEMENT ====================
+    christofides_scores = _compute_christofides_reinforcement(
+        distance_matrix, adjacency_mask, n
+    )
+    
+    # ==================== 6. ADAPTIVE FUSION WITH SPARSITY ====================
+    heuristics = _fuse_with_sparsity_control(
+        regret_scores, two_opt_scores, christofides_scores, 
+        adjacency_mask, distance_matrix, n
+    )
+    
+    return heuristics
+
+def _build_adaptive_sparse_adjacency(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Build adaptive sparse adjacency matrix with dynamic connectivity."""
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Base connectivity: log-scale neighbors
+    base_k = max(3, int(np.log2(n)) + 2)
+    
+    # Estimate problem density
+    avg_dist = np.mean(distance_matrix)
+    std_dist = np.std(distance_matrix)
+    density_coeff = std_dist / (avg_dist + 1e-10)  # Higher = more varied distances
+    
+    # Dynamic neighbor count based on density
+    # More varied distances → fewer but more selective connections
+    if density_coeff > 0.7:  # Highly varied
+        k_factor = 0.8
+    elif density_coeff > 0.3:  # Moderately varied
+        k_factor = 1.2
+    else:  # Uniform distances
+        k_factor = 1.5
+    
+    k_adaptive = int(base_k * k_factor)
+    k_adaptive = max(3, min(k_adaptive, n // 2))
+    
+    # Build adjacency using k-nearest neighbors
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    for i in range(n):
+        neighbors = sorted_indices[i, 1:k_adaptive+1]
+        adjacency_mask[i, neighbors] = True
+    
+    # Ensure symmetry and no self-loops
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    return adjacency_mask
+
+def _compute_floyd_warshall_regret(distance_matrix: np.ndarray, 
+                                  shortest_paths: np.ndarray,
+                                  adjacency_mask: np.ndarray,
+                                  n: int) -> np.ndarray:
+    """Compute regret using Floyd-Warshall all-pairs shortest paths."""
+    regret_scores = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Only compute for edges in adjacency mask
+    edge_indices = np.where(np.triu(adjacency_mask, 1))
+    
+    if len(edge_indices[0]) > 0:
+        i_list, j_list = edge_indices
+        
+        # Get direct distances
+        direct_dists = distance_matrix[i_list, j_list]
+        
+        # Compute alternative path lengths without using the direct edge
+        # For Floyd-Warshall, we can't easily remove one edge, so we approximate
+        # by looking at paths that use at least one intermediate node
+        min_alternatives = np.full(len(i_list), np.inf)
+        
+        # For each edge (i,j), find best alternative path via intermediate k
+        for k in range(n):
+            # Avoid using the direct edge by requiring k != i and k != j
+            mask = (k != i_list) & (k != j_list)
+            if np.any(mask):
+                # Path i -> k -> j
+                alt_length = distance_matrix[i_list[mask], k] + distance_matrix[k, j_list[mask]]
+                min_alternatives[mask] = np.minimum(min_alternatives[mask], alt_length)
+        
+        # Compute regret ratio
+        with np.errstate(divide='ignore', invalid='ignore'):
+            regret_ratio = np.where(direct_dists > 1e-10,
+                                   (min_alternatives - direct_dists) / direct_dists,
+                                   0)
+        
+        # Map regret ratio to score using piecewise function
+        scores = np.ones_like(regret_ratio)
+        
+        # Positive regret: direct edge is better
+        pos_mask = regret_ratio > 0
+        if np.any(pos_mask):
+            # Sigmoid: higher positive regret → higher score
+            pos_scores = 0.5 + 0.5 * np.tanh(np.clip(regret_ratio[pos_mask], 0, 2))
+            scores[pos_mask] = pos_scores
+        
+        # Negative regret: alternative is better
+        neg_mask = regret_ratio < 0
+        if np.any(neg_mask):
+            # Exponential decay: worse negative regret → lower score
+            neg_scores = 0.3 * np.exp(regret_ratio[neg_mask])
+            scores[neg_mask] = neg_scores
+        
+        # Apply scores symmetrically
+        regret_scores[i_list, j_list] = scores
+        regret_scores[j_list, i_list] = scores
+    
+    # Normalize to [0, 1] range
+    max_score = np.max(regret_scores)
+    if max_score > 0:
+        regret_scores = regret_scores / max_score
+    
+    return regret_scores
+
+def _compute_2opt_potential(distance_matrix: np.ndarray,
+                           adjacency_mask: np.ndarray,
+                           n: int) -> np.ndarray:
+    """Score edges based on their 2-opt exchange potential."""
+    two_opt_scores = np.ones_like(distance_matrix, dtype=float)
+    
+    # Precompute sorted neighbors for efficiency
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    neighbor_limit = min(10, n // 4)
+    
+    # Only compute for edges in adjacency mask
+    edge_indices = np.where(np.triu(adjacency_mask, 1))
+    
+    if len(edge_indices[0]) > 0:
+        i_list, j_list = edge_indices
+        
+        # For each edge (i,j), evaluate potential 2-opt moves
+        for idx in range(len(i_list)):
+            i, j = i_list[idx], j_list[idx]
+            
+            # Get potential alternative edges for 2-opt
+            i_neighbors = sorted_indices[i, 1:neighbor_limit+1]
+            j_neighbors = sorted_indices[j, 1:neighbor_limit+1]
+            
+            best_gain = -np.inf
+            
+            # Try potential 2-opt moves (i,k) and (j,l) replacing (i,j) and (k,l)
+            for k in i_neighbors:
+                if k == j:
+                    continue
+                    
+                for l in j_neighbors:
+                    if l == i or l == k:
+                        continue
+                    
+                    # Current edges: (i,j) and (k,l)
+                    # New edges: (i,k) and (j,l)
+                    current_length = distance_matrix[i, j] + distance_matrix[k, l]
+                    new_length = distance_matrix[i, k] + distance_matrix[j, l]
+                    gain = current_length - new_length
+                    
+                    if gain > best_gain:
+                        best_gain = gain
+            
+            # Map gain to score (higher gain → edge is more replaceable → lower score)
+            if best_gain > 0:
+                # Good replacement exists, penalize edge
+                score = 1.0 / (1.0 + np.tanh(best_gain))
+            else:
+                # No good replacement, favor edge
+                score = 1.0 - 0.3 * np.tanh(-best_gain)
+            
+            two_opt_scores[i, j] = two_opt_scores[j, i] = np.clip(score, 0.1, 1.0)
+    
+    return two_opt_scores
+
+def _compute_christofides_reinforcement(distance_matrix: np.ndarray,
+                                       adjacency_mask: np.ndarray,
+                                       n: int) -> np.ndarray:
+    """Reinforce edges based on Christofides algorithm components."""
+    reinforcement = np.ones_like(distance_matrix, dtype=float)
+    
+    # Compute MST using Prim's algorithm
+    mst_mask = _compute_mst_mask(distance_matrix)
+    
+    # Find odd-degree vertices in MST
+    odd_degree_mask = _find_odd_degree_vertices(mst_mask)
+    
+    # Compute minimum weight perfect matching on odd-degree vertices
+    matching_mask = _minimum_weight_perfect_matching(distance_matrix, odd_degree_mask)
+    
+    # Apply reinforcement
+    # MST edges get highest reinforcement
+    reinforcement[mst_mask] = 2.0
+    
+    # Matching edges get medium reinforcement
+    reinforcement[matching_mask] = 1.5
+    
+    # Only keep reinforcement for edges in adjacency mask
+    reinforcement = reinforcement * adjacency_mask
+    
+    return reinforcement
+
+def _compute_mst_mask(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute Minimum Spanning Tree using Prim's algorithm."""
+    n = len(distance_matrix)
+    mst_mask = np.zeros((n, n), dtype=bool)
+    
+    if n == 0:
+        return mst_mask
+    
+    visited = np.zeros(n, dtype=bool)
+    min_edge_weights = np.full(n, np.inf)
+    min_edge_sources = np.full(n, -1, dtype=int)
+    
+    # Start from node 0
+    min_edge_weights[0] = 0
+    
+    for _ in range(n):
+        # Find unvisited vertex with minimum edge weight
+        current = -1
+        min_weight = np.inf
+        for v in range(n):
+            if not visited[v] and min_edge_weights[v] < min_weight:
+                min_weight = min_edge_weights[v]
+                current = v
+        
+        if current == -1:
+            break
+        
+        visited[current] = True
+        
+        # Add edge to MST if not the starting node
+        if min_edge_sources[current] != -1:
+            source = min_edge_sources[current]
+            mst_mask[current, source] = mst_mask[source, current] = True
+        
+        # Update minimum edge weights for neighbors
+        for neighbor in range(n):
+            if (not visited[neighbor] and 
+                distance_matrix[current, neighbor] < min_edge_weights[neighbor]):
+                min_edge_weights[neighbor] = distance_matrix[current, neighbor]
+                min_edge_sources[neighbor] = current
+    
+    return mst_mask
+
+def _find_odd_degree_vertices(mst_mask: np.ndarray) -> np.ndarray:
+    """Identify vertices with odd degree in the MST."""
+    n = len(mst_mask)
+    degrees = np.sum(mst_mask, axis=1)
+    odd_mask = (degrees % 2 == 1)
+    return odd_mask
+
+def _minimum_weight_perfect_matching(distance_matrix: np.ndarray,
+                                    odd_degree_mask: np.ndarray) -> np.ndarray:
+    """Greedy minimum weight perfect matching on odd-degree vertices."""
+    n = len(distance_matrix)
+    matching_mask = np.zeros((n, n), dtype=bool)
+    
+    # Get list of odd-degree vertices
+    odd_vertices = np.where(odd_degree_mask)[0]
+    
+    if len(odd_vertices) % 2 != 0:
+        # Shouldn't happen for MST, but handle gracefully
+        return matching_mask
+    
+    # Sort odd vertices by their average distance to other odd vertices
+    avg_dists = []
+    for v in odd_vertices:
+        other_odds = odd_vertices[odd_vertices != v]
+        if len(other_odds) > 0:
+            avg_dist = np.mean(distance_matrix[v, other_odds])
+            avg_dists.append(avg_dist)
+        else:
+            avg_dists.append(0)
+    
+    # Pair vertices greedily starting from most isolated
+    sorted_indices = np.argsort(avg_dists)[::-1]
+    paired = set()
+    
+    for i in range(0, len(odd_vertices), 2):
+        if i + 1 >= len(odd_vertices):
+            break
+            
+        idx1 = sorted_indices[i]
+        v1 = odd_vertices[idx1]
+        
+        # Find closest unpaired odd vertex
+        min_dist = np.inf
+        best_v2 = -1
+        
+        for j in range(i + 1, len(odd_vertices)):
+            idx2 = sorted_indices[j]
+            v2 = odd_vertices[idx2]
+            
+            if v2 not in paired:
+                dist = distance_matrix[v1, v2]
+                if dist < min_dist:
+                    min_dist = dist
+                    best_v2 = v2
+        
+        if best_v2 != -1:
+            matching_mask[v1, best_v2] = matching_mask[best_v2, v1] = True
+            paired.update([v1, best_v2])
+    
+    return matching_mask
+
+def _fuse_with_sparsity_control(regret_scores: np.ndarray,
+                                two_opt_scores: np.ndarray,
+                                christofides_scores: np.ndarray,
+                                adjacency_mask: np.ndarray,
+                                distance_matrix: np.ndarray,
+                                n: int) -> np.ndarray:
+    """Dynamically fuse components with sparsity control."""
+    heuristics = np.zeros_like(regret_scores, dtype=float)
+    
+    # Measure problem characteristics for adaptive weighting
+    avg_distance = np.mean(distance_matrix)
+    std_distance = np.std(distance_matrix)
+    uniformity = std_distance / (avg_distance + 1e-10)
+    
+    # Dynamic weighting based on problem characteristics
+    if uniformity < 0.3:  # Very uniform distances
+        w_regret, w_2opt, w_christofides = 0.4, 0.3, 0.3
+    elif uniformity < 0.6:  # Moderately varied
+        w_regret, w_2opt, w_christofides = 0.5, 0.25, 0.25
+    else:  # Highly varied distances
+        w_regret, w_2opt, w_christofides = 0.6, 0.2, 0.2
+    
+    # Normalize christofides scores to [0, 1]
+    christofides_norm = np.clip(christofides_scores / 2.0, 0, 1)
+    
+    # Combine scores with sparsity control
+    edge_indices = np.where(adjacency_mask)
+    
+    if len(edge_indices[0]) > 0:
+        i_list, j_list = edge_indices
+        
+        for idx in range(len(i_list)):
+            i, j = i_list[idx], j_list[idx]
+            
+            combined = (w_regret * regret_scores[i, j] +
+                       w_2opt * two_opt_scores[i, j] +
+                       w_christofides * christofides_norm[i, j])
+            
+            # Add small deterministic noise for tie-breaking
+            noise = 1e-6 * ((i * 131 + j * 241) % 1000) / 1000.0
+            heuristics[i, j] = heuristics[j, i] = combined + noise
+    
+    # Row-wise softmax normalization with temperature annealing
+    for i in range(n):
+        row = heuristics[i]
+        if np.any(row > 0):
+            # Adaptive temperature based on row statistics
+            non_zero = row[row > 0]
+            if len(non_zero) > 1:
+                row_max = np.max(non_zero)
+                row_min = np.min(non_zero)
+                if row_max - row_min > 1e-10:
+                    # Higher contrast → lower temperature (sharper distribution)
+                    temperature = 0.5 + 0.5 * np.exp(-(row_max - row_min))
+                else:
+                    temperature = 1.0
+            else:
+                temperature = 1.0
+            
+            # Softmax with temperature
+            exp_row = np.exp(row / (temperature + 1e-10))
+            heuristics[i] = exp_row / np.sum(exp_row)
+    
+    # Final symmetrization and sparsity enforcement
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    heuristics = heuristics * adjacency_mask  # Enforce sparsity
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

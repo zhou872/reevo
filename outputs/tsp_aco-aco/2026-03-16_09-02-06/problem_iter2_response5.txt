@@ -1,0 +1,414 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "2-opt Regret Heuristic", "Dynamic Sparsification", "Degree-Aware MST Bias"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple, Dict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced adaptive heuristic function for TSP edge scoring.
+    
+    Key innovations:
+    1. Dynamic weight adjustment based on instance characteristics
+    2. 2-opt regret heuristic for path-aware scoring
+    3. Adaptive sparsification with instance-specific thresholds
+    4. Degree-aware MST scoring that considers node connectivity constraints
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between nodes
+        
+    Returns:
+        Priority matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Trivial cases
+        result = np.zeros_like(distance_matrix)
+        if n == 2:
+            result[0, 1] = result[1, 0] = 1.0
+        return result
+    
+    # ==================== PHASE 1: INSTANCE ANALYSIS ====================
+    instance_stats = _analyze_instance(distance_matrix)
+    
+    # ==================== PHASE 2: CORE HEURISTIC COMPONENTS ====================
+    
+    # 1. Base inverse distance (adaptive normalization)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Use instance-specific normalization
+        if instance_stats['is_metric']:
+            # For metric instances, use relative scaling
+            normalized_dist = distance_matrix / instance_stats['median_distance']
+            inv_dist = 1 / (normalized_dist + np.eye(n) * 1e-12)
+        else:
+            # For non-metric, use absolute values
+            inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    
+    inv_dist[np.eye(n, dtype=bool)] = 0
+    
+    # 2. 2-opt regret heuristic
+    regret_scores = _compute_2opt_regret(distance_matrix, instance_stats)
+    
+    # 3. Enhanced MST bias with degree awareness
+    mst_scores = _compute_degree_aware_mst_bias(distance_matrix)
+    
+    # 4. Local concentration score (improved sparsity measure)
+    concentration_scores = _compute_local_concentration(distance_matrix, instance_stats)
+    
+    # 5. Edge competitiveness (improved competition penalty)
+    competitiveness_scores = _compute_edge_competitiveness(distance_matrix)
+    
+    # ==================== PHASE 3: ADAPTIVE WEIGHT COMBINATION ====================
+    
+    # Dynamic weights based on instance characteristics
+    weights = _compute_adaptive_weights(instance_stats)
+    
+    # Combine scores with adaptive weights
+    combined_scores = (
+        weights['w_inv'] * inv_dist +
+        weights['w_regret'] * regret_scores +
+        weights['w_mst'] * mst_scores +
+        weights['w_conc'] * concentration_scores +
+        weights['w_comp'] * competitiveness_scores
+    )
+    
+    # ==================== PHASE 4: ADAPTIVE SPARSIFICATION ====================
+    
+    # Dynamic sparsification thresholds
+    sparsity_mask = _adaptive_sparsification(
+        combined_scores, 
+        distance_matrix, 
+        instance_stats
+    )
+    
+    # Apply sparsification
+    final_scores = np.zeros_like(distance_matrix)
+    final_scores[sparsity_mask] = combined_scores[sparsity_mask]
+    
+    # Ensure symmetry
+    final_scores = np.maximum(final_scores, final_scores.T)
+    
+    # Final normalization for stability
+    mask = final_scores > 0
+    if np.any(mask):
+        max_val = np.max(final_scores[mask])
+        if max_val > 0:
+            final_scores[mask] = final_scores[mask] / max_val
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+
+
+def _analyze_instance(distance_matrix: np.ndarray) -> Dict:
+    """Analyze instance characteristics for adaptive parameter tuning."""
+    n = distance_matrix.shape[0]
+    
+    # Extract upper triangular values (excluding diagonal)
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    
+    stats = {}
+    
+    # Basic statistics
+    stats['n'] = n
+    stats['mean_distance'] = np.mean(distances)
+    stats['median_distance'] = np.median(distances)
+    stats['std_distance'] = np.std(distances)
+    stats['cv'] = stats['std_distance'] / (stats['mean_distance'] + 1e-12)
+    
+    # Distribution shape
+    q25, q75 = np.percentile(distances, [25, 75])
+    stats['iqr'] = q75 - q25
+    stats['skewness'] = (stats['mean_distance'] - stats['median_distance']) / (stats['std_distance'] + 1e-12)
+    
+    # Metric properties (check triangle inequality for a sample)
+    sample_size = min(100, n)
+    if n >= 3:
+        samples = np.random.choice(n, size=(sample_size, 3), replace=True)
+        violations = 0
+        for i, j, k in samples:
+            if distance_matrix[i, j] > distance_matrix[i, k] + distance_matrix[k, j]:
+                violations += 1
+        stats['is_metric'] = violations / sample_size < 0.1
+    else:
+        stats['is_metric'] = True
+    
+    # Concentration measure
+    nearest_ratios = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        sorted_dists = np.sort(dists)[:3]  # 3 nearest neighbors
+        if len(sorted_dists) >= 2:
+            nearest_ratios.append(sorted_dists[1] / sorted_dists[0])
+    
+    stats['neighbor_concentration'] = np.mean(nearest_ratios) if nearest_ratios else 1.0
+    
+    return stats
+
+
+def _compute_2opt_regret(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+    """Compute 2-opt regret heuristic scores."""
+    n = distance_matrix.shape[0]
+    regret = np.zeros((n, n))
+    
+    # For each node, find two best connections
+    for i in range(n):
+        # Get distances from node i
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find two smallest distances
+        idx_sorted = np.argsort(dists_i)
+        best_idx = idx_sorted[0]
+        second_best_idx = idx_sorted[1]
+        
+        best_dist = dists_i[best_idx]
+        second_best_dist = dists_i[second_best_idx]
+        
+        # Regret if we don't take the best edge
+        base_regret = second_best_dist - best_dist
+        
+        # Distribute regret to potential edges
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Regret for edge (i,j) is how much worse it is than alternatives
+            if j == best_idx:
+                regret[i, j] += base_regret
+            else:
+                # Penalty based on how much worse than second best
+                penalty = max(0, distance_matrix[i, j] - second_best_dist)
+                regret[i, j] -= penalty / (stats['mean_distance'] + 1e-12)
+    
+    # Symmetrize and normalize
+    regret = (regret + regret.T) / 2
+    max_val = np.max(np.abs(regret))
+    if max_val > 0:
+        regret = regret / max_val
+    
+    return np.maximum(regret, 0)
+
+
+def _compute_degree_aware_mst_bias(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute MST bias considering node degree constraints."""
+    n = distance_matrix.shape[0]
+    mst_bias = np.zeros((n, n))
+    
+    try:
+        # Compute MST
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_array = mst.toarray()
+        mst_mask = mst_array != 0
+        
+        # Compute degrees in MST
+        mst_degrees = np.sum(mst_mask, axis=1)
+        
+        # Assign bias scores
+        for i in range(n):
+            for j in range(i + 1, n):
+                if mst_mask[i, j]:
+                    # Base MST bonus
+                    bonus = 2.0
+                    
+                    # Adjust based on degrees (favor edges between low-degree nodes)
+                    degree_factor = 2.0 / (mst_degrees[i] + mst_degrees[j] + 1e-12)
+                    
+                    # Distance factor (within MST, prefer shorter edges)
+                    dist_factor = 1.0 / (distance_matrix[i, j] + 1e-12)
+                    
+                    mst_bias[i, j] = mst_bias[j, i] = bonus * degree_factor * dist_factor
+    
+    except Exception:
+        # Fallback: uniform bias
+        mst_bias = np.ones((n, n))
+        np.fill_diagonal(mst_bias, 0)
+    
+    # Normalize
+    max_val = np.max(mst_bias)
+    if max_val > 0:
+        mst_bias = mst_bias / max_val
+    
+    return mst_bias
+
+
+def _compute_local_concentration(distance_matrix: np.ndarray, stats: Dict) -> np.ndarray:
+    """Compute local concentration scores."""
+    n = distance_matrix.shape[0]
+    concentration = np.zeros((n, n))
+    
+    k = max(2, n // 10)  # Number of nearest neighbors to consider
+    
+    for i in range(n):
+        # Get distances and sort
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        idx_sorted = np.argsort(dists)
+        
+        # Get k nearest neighbors
+        nn_indices = idx_sorted[:k]
+        nn_dists = dists[nn_indices]
+        
+        # Compute concentration metric
+        if len(nn_dists) >= 2:
+            # Variance of nearest neighbor distances
+            dist_variance = np.var(nn_dists) if len(nn_dists) > 1 else 0
+            mean_dist = np.mean(nn_dists)
+            
+            # Concentration score: lower variance means more concentrated
+            conc_score = 1.0 / (dist_variance + 1e-12)
+            
+            # Scale by instance statistics
+            scale_factor = 1.0 / (stats['cv'] + 1e-12) if stats['cv'] > 0 else 1.0
+            
+            for idx, j in enumerate(nn_indices):
+                # Higher score for edges in concentrated regions
+                dist_ratio = nn_dists[idx] / (mean_dist + 1e-12)
+                concentration[i, j] = conc_score * scale_factor / (dist_ratio + 1e-12)
+    
+    # Normalize
+    max_val = np.max(concentration)
+    if max_val > 0:
+        concentration = concentration / max_val
+    
+    return concentration
+
+
+def _compute_edge_competitiveness(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute edge competitiveness scores."""
+    n = distance_matrix.shape[0]
+    competitiveness = np.zeros((n, n))
+    
+    # Precompute nearest competitors for each node
+    nearest_dists = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest_dists[i] = np.min(dists)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Competition from other nodes to i and j
+            competitors_i = 0
+            competitors_j = 0
+            
+            # Count nodes that are close competitors
+            threshold_i = 1.5 * nearest_dists[i]
+            threshold_j = 1.5 * nearest_dists[j]
+            
+            for k in range(n):
+                if k != i and k != j:
+                    if distance_matrix[k, i] <= threshold_i:
+                        competitors_i += 1
+                    if distance_matrix[k, j] <= threshold_j:
+                        competitors_j += 1
+            
+            # Competitiveness score: lower competition is better
+            total_competitors = competitors_i + competitors_j
+            competitiveness[i, j] = competitiveness[j, i] = 1.0 / (1.0 + total_competitors)
+    
+    return competitiveness
+
+
+def _compute_adaptive_weights(stats: Dict) -> Dict:
+    """Compute adaptive weights based on instance characteristics."""
+    weights = {}
+    
+    # Base weights
+    base_weights = {
+        'w_inv': 1.0,
+        'w_regret': 0.8,
+        'w_mst': 0.7,
+        'w_conc': 0.6,
+        'w_comp': 0.4
+    }
+    
+    # Adjust based on instance characteristics
+    
+    # For highly variable distances, emphasize regret and concentration
+    if stats['cv'] > 1.0:
+        base_weights['w_regret'] *= 1.5
+        base_weights['w_conc'] *= 1.3
+    elif stats['cv'] < 0.3:
+        # For uniform distances, emphasize MST and inverse distance
+        base_weights['w_mst'] *= 1.4
+        base_weights['w_inv'] *= 1.2
+    
+    # For metric instances, trust MST more
+    if stats['is_metric']:
+        base_weights['w_mst'] *= 1.3
+    
+    # For concentrated neighborhoods, emphasize local measures
+    if stats['neighbor_concentration'] < 1.2:
+        base_weights['w_conc'] *= 1.4
+        base_weights['w_regret'] *= 1.2
+    
+    # Normalize weights
+    total = sum(base_weights.values())
+    for key in base_weights:
+        weights[key] = base_weights[key] / total
+    
+    return weights
+
+
+def _adaptive_sparsification(scores: np.ndarray, 
+                           distance_matrix: np.ndarray,
+                           stats: Dict) -> np.ndarray:
+    """Apply adaptive sparsification based on instance characteristics."""
+    n = scores.shape[0]
+    mask = np.zeros((n, n), dtype=bool)
+    
+    # Dynamic parameters based on instance size and characteristics
+    if n < 20:
+        # Small instances: keep more edges
+        node_keep = max(3, n // 3)
+        global_keep = 0.4
+    elif n < 100:
+        # Medium instances
+        node_keep = max(3, n // 8)
+        global_keep = 0.3
+    else:
+        # Large instances: aggressive sparsification
+        node_keep = max(3, n // 15)
+        global_keep = 0.2
+    
+    # Adjust for instance characteristics
+    if stats['cv'] > 1.0:
+        # High variability: keep more edges
+        node_keep = int(node_keep * 1.5)
+        global_keep = min(global_keep * 1.3, 0.5)
+    
+    # Node-specific top edges
+    for i in range(n):
+        row_scores = scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Get top node_keep edges from this node
+        if node_keep < n:
+            top_indices = np.argpartition(-row_scores, node_keep)[:node_keep]
+            mask[i, top_indices] = True
+    
+    # Global top edges
+    if global_keep < 1.0:
+        flat_scores = scores[np.triu_indices(n, k=1)]
+        if len(flat_scores) > 0:
+            threshold = np.percentile(flat_scores, 100 * (1 - global_keep))
+            global_mask = scores >= threshold
+            mask = mask | global_mask
+    
+    # Ensure symmetry
+    mask = mask | mask.T
+    
+    # Force diagonal to False
+    np.fill_diagonal(mask, False)
+    
+    return mask
+```

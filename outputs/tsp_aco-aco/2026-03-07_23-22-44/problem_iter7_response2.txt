@@ -1,0 +1,202 @@
+```json
+{
+    "algorithm_features": ["Exponential Regret Penalization", "Dynamic Ensemble Weighting", "MST Connectivity Bonus", "Distance-Inverse Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Efficient TSP heuristic with exponential regret penalization, dynamic ensemble weighting,
+    MST connectivity bonus, and intelligent sparsification.
+    
+    Core Innovations:
+    1. Exponential Regret Penalization: Smooth penalty based on opportunity cost relative to alternatives
+    2. Dynamic Ensemble Weighting: Adaptive weights based on problem characteristics
+    3. MST Connectivity Bonus: Prioritize edges that form the minimum spanning tree
+    4. Distance-Inverse Sparsification: Remove unpromising edges while preserving connectivity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. CORE COMPONENTS ====================
+    # Inverse distance (basic proximity measure)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Minimum Spanning Tree for connectivity bonus
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = (mst > 0) | (mst.T > 0)
+    
+    # ==================== 2. EXPONENTIAL REGRET PENALIZATION ====================
+    def compute_regret_scores() -> np.ndarray:
+        """Compute regret scores with exponential penalization"""
+        regret_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            # Get distances from node i
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            
+            # For each potential edge from i
+            for j in range(n):
+                if i == j:
+                    continue
+                
+                direct_cost = distance_matrix[i, j]
+                
+                # Find best alternative path of length 2 (i -> k -> j)
+                best_alternative = np.inf
+                for k in range(n):
+                    if k == i or k == j:
+                        continue
+                    alt_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                    if alt_cost < best_alternative:
+                        best_alternative = alt_cost
+                
+                # Calculate regret and apply exponential penalization
+                if best_alternative < np.inf:
+                    regret = max(0, best_alternative - direct_cost)
+                    # Exponential decay: exp(-regret / best_alternative)
+                    if best_alternative > 0:
+                        regret_matrix[i, j] = np.exp(-regret / best_alternative)
+                    else:
+                        regret_matrix[i, j] = 1.0
+        
+        # Symmetrize
+        return (regret_matrix + regret_matrix.T) / 2
+    
+    regret_scores = compute_regret_scores()
+    
+    # ==================== 3. DYNAMIC ENSEMBLE WEIGHTING ====================
+    def compute_dynamic_weights() -> tuple:
+        """Compute adaptive weights based on problem characteristics"""
+        # Problem statistics
+        triu_indices = np.triu_indices(n, 1)
+        distances_upper = distance_matrix[triu_indices]
+        
+        # 1. Sparsity measure (distance distribution)
+        if len(distances_upper) > 0:
+            dist_std = np.std(distances_upper)
+            dist_mean = np.mean(distances_upper)
+            coeff_var = dist_std / (dist_mean + 1e-8)
+        else:
+            coeff_var = 1.0
+        
+        # 2. Size-based adjustments
+        size_factor = min(1.0, np.log1p(n) / 10)
+        
+        # Base weights
+        w_regret = 0.4 * (1.0 + 0.5 * min(1.0, coeff_var))
+        w_inv = 0.3 * (1.0 - 0.3 * min(1.0, coeff_var))
+        w_mst = 0.3 * (1.0 + 0.5 * size_factor)
+        
+        # Normalize to sum to 1
+        total = w_regret + w_inv + w_mst
+        w_regret /= total
+        w_inv /= total
+        w_mst /= total
+        
+        return w_regret, w_inv, w_mst
+    
+    w_regret, w_inv, w_mst = compute_dynamic_weights()
+    
+    # ==================== 4. COMPOSITE SCORE ====================
+    # Normalize components to comparable scales
+    def normalize_matrix(mat: np.ndarray) -> np.ndarray:
+        """Normalize matrix to [0, 1] range"""
+        mat_min = np.min(mat)
+        mat_max = np.max(mat)
+        if mat_max - mat_min > 1e-8:
+            return (mat - mat_min) / (mat_max - mat_min)
+        return np.zeros_like(mat)
+    
+    inv_dist_norm = normalize_matrix(inv_dist)
+    regret_norm = normalize_matrix(regret_scores)
+    
+    # Weighted combination
+    composite = (
+        w_regret * regret_norm +
+        w_inv * inv_dist_norm
+    )
+    
+    # Apply MST connectivity bonus (multiplicative)
+    mst_bonus = np.where(mst_edges, 1.5, 1.0)
+    composite *= mst_bonus
+    
+    # ==================== 5. INTELLIGENT SPARSIFICATION ====================
+    def sparsify_scores(scores: np.ndarray) -> np.ndarray:
+        """Retain only promising edges while preserving connectivity"""
+        sparsified = np.zeros_like(scores)
+        
+        # Always keep MST edges
+        sparsified[mst_edges] = scores[mst_edges]
+        
+        # Determine adaptive sparsification threshold
+        upper_scores = scores[np.triu_indices(n, 1)]
+        if len(upper_scores) > 0:
+            # Keep top percentile based on problem size
+            percentile = max(25, min(75, 100 - n))  # More aggressive for larger problems
+            threshold = np.percentile(upper_scores, percentile)
+        else:
+            threshold = 0
+        
+        # Add promising edges above threshold
+        promising = scores > threshold
+        sparsified[promising] = scores[promising]
+        
+        # Ensure each node has at least 2 connections (for TSP cycle)
+        for i in range(n):
+            node_edges = sparsified[i]
+            non_zero = np.sum(node_edges > 0)
+            if non_zero < 2:
+                # Add the best missing edges for this node
+                sorted_indices = np.argsort(scores[i])[::-1]
+                added = 0
+                for j in sorted_indices:
+                    if j != i and sparsified[i, j] == 0:
+                        sparsified[i, j] = scores[i, j]
+                        sparsified[j, i] = scores[j, i]
+                        added += 1
+                        if added + non_zero >= 2:
+                            break
+        
+        return sparsified
+    
+    sparsified = sparsify_scores(composite)
+    
+    # ==================== 6. FINAL PROCESSING ====================
+    # Symmetrize
+    symmetric_scores = (sparsified + sparsified.T) / 2
+    
+    # Apply final distance-based attenuation
+    max_dist = np.max(distance_matrix)
+    if max_dist > 0:
+        dist_decay = np.exp(-distance_matrix / (0.5 * max_dist + 1e-8))
+        symmetric_scores *= dist_decay
+    
+    # Normalize to [0, 1]
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

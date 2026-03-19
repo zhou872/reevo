@@ -1,0 +1,253 @@
+```json
+{
+    "algorithm_features": ["Dynamic Neighborhood Topology", "Multi-Perspective Edge Efficiency Scoring", "Lightweight Spectral Partitioning", "Ensemble Weighting with Symmetry Validation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with ensemble scoring and symmetry-aware validation.
+    
+    Combines multiple complementary perspectives on edge quality:
+    1. Dynamic neighborhood topology based on local density
+    2. Multi-step path efficiency analysis
+    3. Lightweight spectral partitioning for global structure
+    4. Symmetry-validated ensemble weighting
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    epsilon = 1e-12
+    np.fill_diagonal(distance_matrix, np.inf)
+    
+    # === 1. DYNAMIC NEIGHBORHOOD TOPOLOGY ===
+    # Compute local density characteristics
+    first_nn = np.min(distance_matrix, axis=1)
+    avg_nn = np.mean(first_nn)
+    
+    # Adaptive neighborhood size based on local density
+    density_factor = first_nn / (avg_nn + epsilon)
+    base_k = int(np.clip(np.sqrt(n), 4, 12))
+    k_per_node = np.clip(
+        base_k * (1.6 - 0.6 * np.tanh(1.5 * (density_factor - 1))),
+        3, n - 1
+    ).astype(int)
+    
+    # Sort neighbors for each node
+    sorted_idx = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.take_along_axis(distance_matrix, sorted_idx, axis=1)
+    
+    # === 2. CORE HEURISTIC COMPONENTS ===
+    
+    # A) Local Efficiency Score
+    local_scores = np.ones((n, n))
+    for i in range(n):
+        k_i = k_per_node[i]
+        if k_i > 0:
+            # Harmonic centrality within neighborhood
+            nn_dists = sorted_dists[i, :k_i]
+            if np.any(nn_dists > 0):
+                harmonic_mean = k_i / np.sum(1 / (nn_dists + epsilon))
+                # Exponential decay with distance
+                decay = np.exp(-distance_matrix[i] / (2 * harmonic_mean + epsilon))
+                local_scores[i] *= decay
+    np.fill_diagonal(local_scores, 0)
+    
+    # B) Path Competition Score
+    path_scores = np.ones((n, n))
+    
+    # Compute best alternatives for 1-step and 2-step paths
+    best_1step = sorted_dists[:, 0]
+    second_best = sorted_dists[:, 1]
+    regret_1step = (second_best - best_1step) / (best_1step + epsilon)
+    
+    # Estimate 2-step alternatives
+    for i in range(n):
+        k_i = min(k_per_node[i] * 2, n - 2)
+        if k_i > 0:
+            intermediates = sorted_idx[i, 1:k_i+1]
+            for j in range(n):
+                if i != j and j not in intermediates[:2]:
+                    # Find best 2-step path through intermediates
+                    best_2step = np.inf
+                    for k in intermediates:
+                        if k != j:
+                            cost = distance_matrix[i, k] + distance_matrix[k, j]
+                            if cost < best_2step:
+                                best_2step = cost
+                    
+                    if best_2step < np.inf:
+                        ratio = distance_matrix[i, j] / (best_2step + epsilon)
+                        # Penalize edges with much better alternatives
+                        penalty = np.exp(-max(0, ratio - 0.9))
+                        path_scores[i, j] = penalty
+    
+    # C) Mutual Affinity Boost
+    mutual_boost = np.zeros((n, n))
+    for i in range(n):
+        k_i = k_per_node[i]
+        if k_i > 0:
+            nn_i = set(sorted_idx[i, :k_i])
+            for j in nn_i:
+                if j < n and i != j:
+                    k_j = k_per_node[j]
+                    if k_j > 0:
+                        nn_j = set(sorted_idx[j, :k_j])
+                        if i in nn_j:
+                            # Strong mutual attraction
+                            closeness = 1.0 / (distance_matrix[i, j] + epsilon)
+                            mutual_boost[i, j] = 1.8 * closeness
+    
+    # D) MST Connectivity Priority
+    mst_priority = np.ones((n, n))
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_edges = (mst_dense > 0) | (mst_dense.T > 0)
+            # MST edges get priority based on local regret
+            regret_matrix = 0.5 * (regret_1step[:, np.newaxis] + regret_1step[np.newaxis, :])
+            mst_priority[mst_edges] = 1.5 + 0.5 * np.tanh(regret_matrix[mst_edges])
+        except:
+            pass
+    
+    # E) Lightweight Spectral Partitioning
+    partition_penalty = np.ones((n, n))
+    if n >= 8:
+        try:
+            # Create normalized similarity matrix
+            gamma = np.percentile(distance_matrix[np.triu_indices(n, 1)], 25)
+            W = np.exp(-distance_matrix / (gamma + epsilon))
+            np.fill_diagonal(W, 0)
+            
+            # Compute normalized Laplacian
+            D = np.diag(W.sum(axis=1))
+            D_inv_sqrt = np.diag(1 / np.sqrt(np.diag(D) + epsilon))
+            L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+            
+            # Get Fiedler vector (second smallest eigenvector)
+            eigvals, eigvecs = eigh(L_norm, subset_by_index=[1, 2])
+            if eigvecs.shape[1] >= 1:
+                fiedler = eigvecs[:, 0]
+                # Soft partition assignment
+                median = np.median(fiedler)
+                partition_strength = 1 / (1 + np.exp(-8 * (fiedler - median)))
+                
+                # Penalize edges crossing partition boundary
+                diff = np.abs(partition_strength[:, None] - partition_strength[None, :])
+                partition_penalty = 1 - 0.3 * diff
+        except:
+            pass
+    
+    # === 3. ENSEMBLE WEIGHTING WITH SYMMETRY VALIDATION ===
+    
+    # Create component ensemble
+    components = {
+        'local': local_scores,
+        'path': path_scores,
+        'mutual': 1.0 + mutual_boost,
+        'mst': mst_priority,
+        'partition': partition_penalty
+    }
+    
+    # Initial weights based on problem characteristics
+    avg_dist = np.mean(distance_matrix[np.triu_indices(n, 1)])
+    std_dist = np.std(distance_matrix[np.triu_indices(n, 1)])
+    uniformity = std_dist / (avg_dist + epsilon)
+    
+    base_weights = {
+        'local': 1.0,
+        'path': 0.9 + 0.2 * uniformity,  # Higher for uniform instances
+        'mutual': 1.2 - 0.3 * uniformity,  # Higher for clustered instances
+        'mst': 0.8 + 0.1 * np.log(n) / 5,
+        'partition': 0.7 * (1 - uniformity)  # Only for non-uniform
+    }
+    
+    # Symmetry validation: adjust weights based on directional consistency
+    directional_disagreement = 0
+    for comp_name, comp_mat in components.items():
+        if comp_name != 'mutual':  # mutual is already symmetric
+            # Measure asymmetry
+            asymmetry = np.mean(np.abs(comp_mat - comp_mat.T) / (np.abs(comp_mat) + epsilon))
+            if not np.isnan(asymmetry):
+                directional_disagreement += asymmetry
+    
+    # Reduce weight on asymmetric components
+    if directional_disagreement > 0.1:
+        asymmetry_factor = 1 / (1 + 2 * directional_disagreement)
+        for comp_name in ['local', 'path']:
+            base_weights[comp_name] *= asymmetry_factor
+    
+    # Normalize weights
+    weight_sum = sum(base_weights.values())
+    weights = {k: v / weight_sum for k, v in base_weights.items()}
+    
+    # Combine components multiplicatively
+    combined = np.ones((n, n))
+    for name, weight in weights.items():
+        combined *= components[name] ** weight
+    
+    # === 4. INTELLIGENT EDGE SELECTION ===
+    
+    # Dynamic sparsification with symmetry check
+    final_scores = combined.copy()
+    
+    for i in range(n):
+        row = final_scores[i].copy()
+        
+        # Always keep mutual nearest neighbors
+        keep_mask = (mutual_boost[i] > 0)
+        
+        # Keep top edges based on combined score and symmetry
+        adaptive_k = max(3, min(10, k_per_node[i]))
+        
+        # Symmetry-adjusted score
+        symmetry_factor = np.minimum(row, final_scores[:, i]) / (np.maximum(row, final_scores[:, i]) + epsilon)
+        adjusted_score = row * (1.0 + 0.4 * symmetry_factor)
+        
+        if adaptive_k < n - 1:
+            top_k_idx = np.argpartition(adjusted_score, -adaptive_k)[-adaptive_k:]
+            keep_mask[top_k_idx] = True
+        
+        # Ensure minimum connectivity
+        if np.sum(keep_mask) < 2:
+            top2_idx = np.argsort(row)[-2:]
+            keep_mask[top2_idx] = True
+        
+        row[~keep_mask] = 0
+        final_scores[i] = row
+    
+    # === 5. FINAL PROCESSING ===
+    
+    # Ensure symmetry using geometric mean
+    sym_mask = (final_scores > 0) | (final_scores.T > 0)
+    geo_mean = np.sqrt(final_scores * final_scores.T + epsilon)
+    final_scores = geo_mean * sym_mask
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    # Row-normalize for probability interpretation
+    row_sums = final_scores.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    final_scores = final_scores / row_sums
+    
+    # Gentle smoothing
+    final_scores = 0.95 * final_scores + 0.05 * (1.0 / (n - 1))
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

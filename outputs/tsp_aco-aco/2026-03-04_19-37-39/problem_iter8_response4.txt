@@ -1,0 +1,536 @@
+```json
+{
+    "algorithm_features": ["Online Learning Weight Adaptation", "Graph Sampling for Ultra-Large Instances", "Advanced Local Search Heuristics"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with online weight learning, graph sampling,
+    and advanced local search integration.
+    
+    Key innovations over v1:
+    1. Online weight optimization via tour quality feedback loop
+    2. Graph sampling techniques for ultra-large instances (n > 1000)
+    3. Advanced k-opt local search in solution sampling phase
+    4. Multi-resolution heuristic computation
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances (n x n)
+        
+    Returns:
+        Matrix of edge promise indicators (same shape as input)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ==================== 1. ADAPTIVE PARAMETER SETUP ====================
+    
+    # Instance characteristics
+    triu_indices = np.triu_indices(n, k=1)
+    edge_lengths = distance_matrix[triu_indices]
+    cv = np.std(edge_lengths) / (np.mean(edge_lengths) + 1e-10)
+    
+    # Determine computation strategy based on size
+    if n <= 500:
+        compute_strategy = "full"
+        k_nn = max(2, min(15, n // 4))
+        n_samples = min(50, n)
+    elif n <= 2000:
+        compute_strategy = "sampling"
+        k_nn = max(2, min(10, n // 10))
+        n_samples = min(30, n // 10)
+    else:  # Ultra-large instances
+        compute_strategy = "ultra_sampling"
+        k_nn = max(2, min(5, n // 20))
+        n_samples = min(15, n // 50)
+    
+    # ==================== 2. GRAPH SAMPLING FOR ULTRA-LARGE INSTANCES ====================
+    
+    def sample_subgraph(nodes: np.ndarray) -> np.ndarray:
+        """Sample a diverse set of nodes using k-means++ inspired sampling."""
+        if len(nodes) <= n_samples:
+            return nodes
+            
+        selected = []
+        # Start with a random node
+        selected.append(np.random.choice(nodes))
+        
+        while len(selected) < n_samples:
+            # Compute minimum distance to already selected nodes
+            min_distances = np.inf * np.ones(len(nodes))
+            for i, node in enumerate(nodes):
+                if node not in selected:
+                    dist_to_selected = distance_matrix[node, selected].min()
+                    min_distances[i] = dist_to_selected
+            
+            # Select next node with probability proportional to distance^2
+            probs = min_distances ** 2
+            probs[~np.isfinite(probs)] = 0
+            if probs.sum() == 0:
+                probs = np.ones(len(probs))
+            probs = probs / probs.sum()
+            
+            next_idx = np.random.choice(len(nodes), p=probs)
+            selected.append(nodes[next_idx])
+        
+        return np.array(selected)
+    
+    # ==================== 3. ONLINE WEIGHT OPTIMIZATION SETUP ====================
+    
+    # Initialize heuristic factors with different characteristics
+    factor_names = ["inv_dist", "nn", "triangle", "mst", "christofides", "centrality"]
+    n_factors = len(factor_names)
+    
+    # Start with adaptive weights based on instance characteristics
+    if n < 30:
+        weights = np.array([0.25, 0.25, 0.20, 0.15, 0.10, 0.05])
+    elif n < 150:
+        weights = np.array([0.20, 0.20, 0.25, 0.20, 0.10, 0.05])
+    elif n < 1000:
+        weights = np.array([0.15, 0.15, 0.30, 0.25, 0.10, 0.05])
+    else:
+        weights = np.array([0.10, 0.10, 0.35, 0.30, 0.10, 0.05])
+    
+    # Adjust for coefficient of variation
+    if cv > 1.0:
+        weights[0] += 0.1  # Boost distance-based
+        weights[2] -= 0.05  # Reduce triangle
+    elif cv < 0.3:
+        weights[2] += 0.1  # Boost triangle (structural)
+        weights[0] -= 0.05  # Reduce distance-based
+    
+    weights = np.clip(weights, 0.05, 0.5)
+    weights = weights / weights.sum()
+    
+    # ==================== 4. HEURISTIC FACTOR COMPUTATION ====================
+    
+    def compute_heuristic_factors(sample_nodes: np.ndarray = None) -> List[np.ndarray]:
+        """Compute all heuristic factors, optionally on a sampled subgraph."""
+        if sample_nodes is None:
+            nodes = np.arange(n)
+            sub_n = n
+            sub_dist = distance_matrix
+        else:
+            nodes = sample_nodes
+            sub_n = len(nodes)
+            sub_dist = distance_matrix[np.ix_(nodes, nodes)]
+        
+        factors = []
+        
+        # 4a. Inverse distance factor
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_dist = 1.0 / sub_dist
+        np.fill_diagonal(inv_dist, 0)
+        row_sums = inv_dist.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        inv_dist_norm = inv_dist / row_sums
+        
+        # Map back to full matrix if sampled
+        if sample_nodes is not None:
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(nodes, nodes)
+            full_factor[idx] = inv_dist_norm
+            factors.append(full_factor)
+        else:
+            factors.append(inv_dist_norm)
+        
+        # 4b. Nearest neighbor factor
+        nn_factor = np.zeros((sub_n, sub_n))
+        k_effective = min(k_nn, sub_n-1)
+        if k_effective > 0:
+            partitioned = np.argpartition(sub_dist, k_effective+1, axis=1)[:, :k_effective+1]
+            for i in range(sub_n):
+                neighbors = partitioned[i][partitioned[i] != i][:k_effective]
+                if len(neighbors) > 0:
+                    ranks = np.arange(len(neighbors))
+                    weights = np.exp(-ranks / 2.0)
+                    nn_factor[i, neighbors] = weights
+        
+        # Symmetrize and map back
+        nn_factor = np.maximum(nn_factor, nn_factor.T)
+        if sample_nodes is not None:
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(nodes, nodes)
+            full_factor[idx] = nn_factor
+            factors.append(full_factor)
+        else:
+            factors.append(nn_factor)
+        
+        # 4c. Triangle completion factor
+        triangle_factor = np.zeros((sub_n, sub_n))
+        if sub_n >= 4:
+            threshold_percentile = max(30, min(50, 100 * (1 - 10/sub_n)))
+            percentiles = np.percentile(sub_dist, threshold_percentile, axis=1, keepdims=True)
+            short_edges = sub_dist <= percentiles
+            np.fill_diagonal(short_edges, False)
+            
+            common_short = short_edges @ short_edges.T
+            max_possible = sub_n - 2
+            if max_possible > 0:
+                triangle_factor = common_short.astype(float) / max_possible
+                triangle_factor = triangle_factor * inv_dist_norm
+        
+        # Map back
+        if sample_nodes is not None:
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(nodes, nodes)
+            full_factor[idx] = triangle_factor
+            factors.append(full_factor)
+        else:
+            factors.append(triangle_factor)
+        
+        # 4d. MST factor
+        mst_factor = np.zeros((sub_n, sub_n))
+        if sub_n <= 500 or sample_nodes is not None:
+            mst = minimum_spanning_tree(csr_matrix(sub_dist)).toarray()
+            mst_mask = (mst > 0) | (mst.T > 0)
+            mst_factor[mst_mask] = 1.0
+        else:
+            # Approximate MST for large instances
+            for i in range(sub_n):
+                sorted_idx = np.argsort(sub_dist[i])
+                neighbors = sorted_idx[1:k_nn+1]
+                mst_factor[i, neighbors] = 0.8
+                for j in neighbors:
+                    if np.sum(mst_factor[i] > 0) + np.sum(mst_factor[j] > 0) < 4:
+                        mst_factor[j, i] = 0.8
+        
+        mst_factor = np.maximum(mst_factor, mst_factor.T)
+        
+        # Map back
+        if sample_nodes is not None:
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(nodes, nodes)
+            full_factor[idx] = mst_factor
+            factors.append(full_factor)
+        else:
+            factors.append(mst_factor)
+        
+        # 4e. Christofides-inspired factor
+        christofides_factor = np.zeros((sub_n, sub_n))
+        if sub_n >= 4:
+            mst_degrees = (mst_factor > 0).sum(axis=1)
+            odd_nodes = np.where(mst_degrees % 2 == 1)[0]
+            
+            if len(odd_nodes) >= 2:
+                odd_dist = sub_dist[np.ix_(odd_nodes, odd_nodes)]
+                k_odd = min(3, len(odd_nodes)-1)
+                if k_odd > 0:
+                    for idx, i in enumerate(odd_nodes):
+                        odd_indices = np.argsort(odd_dist[idx])
+                        selected_odds = odd_indices[1:k_odd+1]
+                        original_odds = odd_nodes[selected_odds]
+                        for rank, j in enumerate(original_odds):
+                            christofides_factor[i, j] = np.exp(-rank / 2.0)
+        
+        christofides_factor = np.maximum(christofides_factor, christofides_factor.T)
+        
+        # Map back
+        if sample_nodes is not None:
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(nodes, nodes)
+            full_factor[idx] = christofides_factor
+            factors.append(full_factor)
+        else:
+            factors.append(christofides_factor)
+        
+        # 4f. Node centrality factor
+        centrality_factor = np.zeros((sub_n, sub_n))
+        row_sums = np.sum(sub_dist, axis=1) - np.diag(sub_dist)
+        node_centrality = 1 / (row_sums + 1e-10)
+        node_centrality = node_centrality / (node_centrality.sum() + 1e-10)
+        centrality_factor = np.outer(node_centrality, node_centrality)
+        
+        # Map back
+        if sample_nodes is not None:
+            full_factor = np.zeros((n, n))
+            idx = np.ix_(nodes, nodes)
+            full_factor[idx] = centrality_factor
+            factors.append(full_factor)
+        else:
+            factors.append(centrality_factor)
+        
+        return factors
+    
+    # ==================== 5. SOLUTION SAMPLING WITH ADVANCED LOCAL SEARCH ====================
+    
+    def generate_initial_tour(method: str = 'nn', start_node: int = None) -> np.ndarray:
+        """Generate initial tour using various methods."""
+        if start_node is None:
+            start_node = np.random.randint(0, n)
+        
+        if method == 'nn':
+            tour = [start_node]
+            unvisited = set(range(n)) - {start_node}
+            while unvisited:
+                current = tour[-1]
+                nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+            return np.array(tour)
+        elif method == 'random':
+            return np.random.permutation(n)
+        elif method == 'greedy':
+            # Greedy insertion
+            tour = [start_node, np.argmin(distance_matrix[start_node])]
+            unvisited = set(range(n)) - set(tour)
+            while unvisited:
+                best_node = None
+                best_position = -1
+                best_increase = np.inf
+                
+                for node in unvisited:
+                    for i in range(len(tour)):
+                        j = (i + 1) % len(tour)
+                        increase = (distance_matrix[tour[i], node] + 
+                                   distance_matrix[node, tour[j]] - 
+                                   distance_matrix[tour[i], tour[j]])
+                        if increase < best_increase:
+                            best_increase = increase
+                            best_node = node
+                            best_position = i + 1
+                
+                tour.insert(best_position, best_node)
+                unvisited.remove(best_node)
+            
+            return np.array(tour)
+        else:
+            return np.random.permutation(n)
+    
+    def tour_length(tour: np.ndarray) -> float:
+        """Calculate length of a tour."""
+        return sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n))
+    
+    def k_opt_improve(tour: np.ndarray, k: int = 3, max_iter: int = 20) -> np.ndarray:
+        """Apply k-opt local search."""
+        if k < 2 or n < 4:
+            return tour
+        
+        best_tour = tour.copy()
+        best_len = tour_length(best_tour)
+        
+        for _ in range(max_iter):
+            improved = False
+            
+            if k >= 3 and n >= 6:
+                # Try 3-opt moves
+                for i in range(n-4):
+                    for j in range(i+2, n-2):
+                        for l in range(j+2, n):
+                            if l == n-1 and i == 0:
+                                continue
+                            
+                            # Current edges
+                            a, b = best_tour[i], best_tour[(i+1)%n]
+                            c, d = best_tour[j], best_tour[(j+1)%n]
+                            e, f = best_tour[l], best_tour[(l+1)%n]
+                            
+                            current = (distance_matrix[a, b] + 
+                                      distance_matrix[c, d] + 
+                                      distance_matrix[e, f])
+                            
+                            # Try different 3-opt reconnections
+                            # Type 1
+                            new1 = (distance_matrix[a, c] + 
+                                   distance_matrix[b, e] + 
+                                   distance_matrix[d, f])
+                            
+                            if new1 < current:
+                                # Perform the swap
+                                new_tour = best_tour.copy()
+                                new_tour[i+1:j+1] = new_tour[i+1:j+1][::-1]
+                                new_tour[j+1:l+1] = new_tour[j+1:l+1][::-1]
+                                new_len = best_len - current + new1
+                                if new_len < best_len:
+                                    best_tour = new_tour
+                                    best_len = new_len
+                                    improved = True
+                                    break
+                    
+                    if improved:
+                        break
+            
+            # Fall back to 2-opt if no 3-opt improvement
+            if not improved and n >= 4:
+                for i in range(n-1):
+                    for j in range(i+2, n):
+                        if j == n-1 and i == 0:
+                            continue
+                        
+                        a, b = best_tour[i], best_tour[(i+1)%n]
+                        c, d = best_tour[j], best_tour[(j+1)%n]
+                        
+                        current = distance_matrix[a, b] + distance_matrix[c, d]
+                        new = distance_matrix[a, c] + distance_matrix[b, d]
+                        
+                        if new < current:
+                            new_tour = best_tour.copy()
+                            new_tour[i+1:j+1] = new_tour[i+1:j+1][::-1]
+                            new_len = best_len - current + new
+                            if new_len < best_len:
+                                best_tour = new_tour
+                                best_len = new_len
+                                improved = True
+                                break
+                    if improved:
+                        break
+            
+            if not improved:
+                break
+        
+        return best_tour
+    
+    # Generate diverse tours for weight learning
+    n_tours = min(30, max(10, n // 10))
+    tours = []
+    tour_lengths = []
+    
+    for _ in range(n_tours):
+        # Mix different generation methods
+        method = np.random.choice(['nn', 'random', 'greedy'], p=[0.5, 0.3, 0.2])
+        start = np.random.randint(0, n) if n > 1 else 0
+        tour = generate_initial_tour(method, start)
+        
+        # Apply local search based on instance size
+        if n <= 100:
+            tour = k_opt_improve(tour, k=3, max_iter=15)
+        elif n <= 500:
+            tour = k_opt_improve(tour, k=2, max_iter=10)
+        else:
+            tour = k_opt_improve(tour, k=2, max_iter=5)
+        
+        tours.append(tour)
+        tour_lengths.append(tour_length(tour))
+    
+    # ==================== 6. ONLINE WEIGHT LEARNING ====================
+    
+    # Compute factors based on strategy
+    if compute_strategy == "full":
+        factors = compute_heuristic_factors()
+    else:
+        # Sample nodes for computation
+        sample_nodes = sample_subgraph(np.arange(n))
+        factors = compute_heuristic_factors(sample_nodes)
+    
+    # Normalize factors
+    normalized_factors = []
+    for factor in factors:
+        f_max = factor.max()
+        if f_max > 0:
+            normalized_factors.append(factor / f_max)
+        else:
+            normalized_factors.append(factor)
+    
+    # Update weights based on tour quality
+    if len(tours) > 0:
+        # Select top 30% tours
+        sorted_indices = np.argsort(tour_lengths)
+        top_k = max(3, len(tours) // 3)
+        top_tours = [tours[i] for i in sorted_indices[:top_k]]
+        
+        # Compute edge frequency in top tours
+        edge_mask = np.zeros((n, n), dtype=bool)
+        for tour in top_tours:
+            for i in range(n):
+                j = (i + 1) % n
+                u, v = tour[i], tour[j]
+                edge_mask[u, v] = True
+                edge_mask[v, u] = True
+        
+        # Evaluate how well each factor predicts top tour edges
+        factor_scores = np.zeros(n_factors)
+        for i, factor in enumerate(normalized_factors):
+            factor_scores[i] = factor[edge_mask].mean() if edge_mask.any() else 0
+        
+        # Update weights using exponential moving average
+        if factor_scores.sum() > 0:
+            normalized_scores = factor_scores / factor_scores.sum()
+            learning_rate = 0.3
+            weights = (1 - learning_rate) * weights + learning_rate * normalized_scores
+            weights = np.clip(weights, 0.05, 0.5)
+            weights = weights / weights.sum()
+    
+    # ==================== 7. COMBINE FACTORS WITH LEARNED WEIGHTS ====================
+    
+    combined = np.zeros((n, n))
+    for w, factor in zip(weights, normalized_factors):
+        combined += w * factor
+    
+    # ==================== 8. ADAPTIVE SPARSIFICATION ====================
+    
+    # Determine target edges per node
+    if n <= 50:
+        target_edges = max(3, min(8, n-1))
+    elif n <= 200:
+        target_edges = max(3, min(6, n//4))
+    elif n <= 1000:
+        target_edges = max(3, min(5, n//10))
+    else:
+        target_edges = max(3, min(4, n//20))
+    
+    sparsity_mask = np.zeros_like(combined, dtype=bool)
+    
+    for i in range(n):
+        node_scores = combined[i].copy()
+        node_scores[i] = -np.inf
+        
+        n_select = min(target_edges, n-1)
+        top_indices = np.argsort(node_scores)[-n_select:]
+        sparsity_mask[i, top_indices] = True
+    
+    # Ensure MST connectivity
+    if compute_strategy == "full":
+        mst = minimum_spanning_tree(csr_matrix(distance_matrix)).toarray()
+        mst_mask = (mst > 0) | (mst.T > 0)
+        sparsity_mask = sparsity_mask | mst_mask
+    
+    # Ensure symmetry and minimum degree
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    for i in range(n):
+        connections = np.sum(sparsity_mask[i])
+        if connections < 2:
+            candidate_scores = combined[i].copy()
+            candidate_scores[i] = -np.inf
+            candidate_scores[sparsity_mask[i]] = -np.inf
+            
+            needed = 2 - connections
+            if needed > 0:
+                best_indices = np.argsort(candidate_scores)[-needed:]
+                for idx in best_indices:
+                    if candidate_scores[idx] > -np.inf:
+                        sparsity_mask[i, idx] = True
+                        sparsity_mask[idx, i] = True
+    
+    # Apply sparsification
+    result = np.zeros_like(combined)
+    result[sparsity_mask] = combined[sparsity_mask]
+    
+    # ==================== 9. POST-PROCESSING ====================
+    
+    # Final symmetrization
+    result = (result + result.T) / 2
+    np.fill_diagonal(result, 0)
+    
+    # Apply sigmoid scaling for better contrast
+    max_val = result.max()
+    if max_val > 0:
+        scaled = result / max_val
+        # Gentle sigmoid to emphasize promising edges
+        result = 1 / (1 + np.exp(-5 * (scaled - 0.5)))
+    
+    # Normalize to [0, 1]
+    result_min, result_max = result.min(), result.max()
+    if result_max - result_min > 1e-10:
+        result = (result - result_min) / (result_max - result_min)
+    
+    return result
+```

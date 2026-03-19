@@ -1,0 +1,130 @@
+```json
+{
+    "algorithm_features": ["MST Edge Bonus", "Shared Neighbor Clustering", "Regret-based Penalty", "Lookahead Spatial Averaging"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection incorporating structural insights
+    with regret-based penalization and lookahead spatial averaging.
+    
+    Features:
+    1. MST Edge Bonus: Edges in minimum spanning tree receive boosted scores
+    2. Shared Neighbor Clustering: Favors edges connecting nodes with overlapping neighborhoods
+    3. Regret-based Penalty: Discounts edges that are the only good option for a node
+    4. Lookahead Spatial Averaging: Adjusts scores based on average future connection costs
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Base inverse distance matrix
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.where(distance_matrix > 0, distance_matrix, np.inf)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 1. Minimum Spanning Tree bonus
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = np.where(mst + mst.T > 0, 1.8, 0)  # Increased from 1.5
+    
+    # 2. Local clustering via shared neighbors
+    k = max(2, int(np.sqrt(n)))
+    nearest_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        indices = np.argsort(distance_matrix[i])[1:k+1]
+        nearest_mask[i, indices] = True
+    
+    # Shared neighbor ratio
+    shared_neighbors = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            shared = np.intersect1d(
+                np.where(nearest_mask[i])[0],
+                np.where(nearest_mask[j])[0]
+            ).size
+            shared_neighbors[i, j] = shared_neighbors[j, i] = shared / k
+    
+    # 3. Regret-based penalization
+    # Compute regret for each node (difference between best and second-best options)
+    regret_penalty = np.ones_like(distance_matrix)
+    for i in range(n):
+        row_mask = distance_matrix[i] > 0
+        if np.sum(row_mask) >= 2:
+            valid_indices = np.where(row_mask)[0]
+            row_dist = distance_matrix[i, valid_indices]
+            sorted_idx = np.argsort(row_dist)[:2]  # Two smallest distances
+            best_dist = row_dist[sorted_idx[0]]
+            second_best_dist = row_dist[sorted_idx[1]]
+            
+            # Regret factor: higher when best edge is much better than alternatives
+            regret_factor = (second_best_dist - best_dist) / (second_best_dist + 1e-10)
+            
+            # Apply penalty proportional to regret factor
+            # Higher regret means this edge is critical, so we reduce its score
+            # to avoid overcommitment during stochastic sampling
+            penalty_factor = 1.0 - 0.3 * regret_factor  # Max 30% reduction
+            
+            # Find the best edge index in original matrix
+            best_j = valid_indices[sorted_idx[0]]
+            regret_penalty[i, best_j] = penalty_factor
+    
+    # 4. Lookahead spatial averaging
+    lookahead_factor = np.zeros_like(distance_matrix)
+    for i in range(n):
+        for j in range(n):
+            if i != j and distance_matrix[i, j] > 0:
+                # Consider all possible next steps from node j
+                # Average of distances from j to other nodes (excluding i and j)
+                mask = np.ones(n, dtype=bool)
+                mask[[i, j]] = False
+                avg_future_dist = np.mean(distance_matrix[j, mask])
+                
+                # Normalize by overall average distance for scaling
+                overall_avg = np.mean(distance_matrix[distance_matrix > 0])
+                if overall_avg > 0:
+                    lookahead_factor[i, j] = 1.0 / (1.0 + 0.2 * (avg_future_dist / overall_avg - 1.0))
+                else:
+                    lookahead_factor[i, j] = 1.0
+    
+    # 5. Directional connectivity correction (from v1)
+    out_density = np.sum(nearest_mask, axis=1, keepdims=True) / (n - 1)
+    in_density = np.sum(nearest_mask, axis=0, keepdims=True) / (n - 1)
+    directional_correction = 1 + 0.25 * (out_density - in_density.T)  # Reduced from 0.3
+    directional_correction = np.clip(directional_correction, 0.75, 1.25)
+    
+    # 6. Combine all components multiplicatively
+    base_heuristic = inv_dist * directional_correction
+    base_heuristic *= (1 + 0.4 * shared_neighbors)  # Density bonus
+    base_heuristic *= regret_penalty                # Regret adjustment
+    base_heuristic *= lookahead_factor              # Lookahead scaling
+    base_heuristic += mst_bonus                     # MST edge boost
+    
+    # 7. Adaptive sparsification using median distances
+    row_medians = np.median(distance_matrix, axis=1, keepdims=True)
+    col_medians = np.median(distance_matrix, axis=0, keepdims=True)
+    median_threshold = (row_medians + col_medians.T) / 2
+    sparsity_mask = distance_matrix < median_threshold
+    
+    # Apply sparsification
+    heuristics = base_heuristic * sparsity_mask
+    
+    # 8. Enhanced symmetry preservation with weighted average
+    # Give more weight to the smaller value to avoid overestimation
+    heuristics_sym = np.minimum(heuristics, heuristics.T) * 0.3 + \
+                     np.maximum(heuristics, heuristics.T) * 0.7
+    heuristics = 0.5 * (heuristics + heuristics_sym)
+    
+    # Ensure zero diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    # 9. Normalize to maintain consistent scale
+    if np.max(heuristics) > 0:
+        heuristics = heuristics / np.max(heuristics)
+    
+    return heuristics
+```

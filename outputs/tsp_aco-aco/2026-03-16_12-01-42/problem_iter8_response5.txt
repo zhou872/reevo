@@ -1,0 +1,289 @@
+```json
+{
+    "algorithm_features": ["Adaptive Regret Thresholding", "Lightweight Three-Step Path Efficiency", "Harmonic Density Scoring", "Weighted Multiplicative Fusion"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge prioritization with adaptive regret thresholds,
+    lightweight path lookahead, and dynamically weighted fusion.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix with non-negative entries
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance with stability epsilon ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Global distance statistics for adaptive thresholds
+    if n > 1:
+        # Extract off-diagonal distances
+        off_diag_mask = ~np.eye(n, dtype=bool)
+        global_distances = distance_matrix[off_diag_mask]
+        global_mean = np.mean(global_distances)
+        global_std = np.std(global_distances) + epsilon
+    else:
+        global_mean = 1.0
+        global_std = 1.0
+    
+    # === 2. Adaptive Regret with Global Statistics ===
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= 2:
+            # Find two best distances
+            indices = np.argpartition(dists, 2)[:2]
+            first_idx, second_idx = indices[0], indices[1]
+            
+            # Ensure ordering
+            if dists[second_idx] < dists[first_idx]:
+                first_idx, second_idx = second_idx, first_idx
+            
+            first_best = dists[first_idx]
+            second_best = dists[second_idx]
+            
+            # Adaptive regret threshold based on global statistics
+            # Higher threshold when distances are more variable
+            regret_threshold = 0.1 * (global_std / (global_mean + epsilon))
+            
+            # Compute base regret for best edge
+            if first_best > 0:
+                base_regret = (second_best - first_best) / (first_best + epsilon)
+                # Apply adaptive threshold: only significant regrets get full boost
+                regret_matrix[i, first_idx] = 1.0 + np.tanh(base_regret / (regret_threshold + epsilon))
+            
+            # For other edges, compute relative regret
+            for j in range(n):
+                if i == j or j == first_idx:
+                    continue
+                
+                d_ij = distance_matrix[i, j]
+                best_alt = second_best if j == first_idx else first_best
+                
+                if d_ij > 0:
+                    edge_regret = (best_alt - d_ij) / (d_ij + epsilon)
+                    # Apply adaptive scaling
+                    scaled_regret = edge_regret / (regret_threshold + epsilon)
+                    regret_matrix[i, j] = 1.0 + 0.3 * np.tanh(scaled_regret)
+    
+    # === 3. Harmonic Density Scoring with Adaptive Neighborhood ===
+    cluster_scores = np.zeros_like(distance_matrix)
+    
+    # Adaptive neighborhood size based on problem characteristics
+    k_cluster = max(3, min(15, int(np.sqrt(n) * 1.5)))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        if len(dists) >= k_cluster:
+            # Get k_cluster nearest neighbors
+            nearest_idx = np.argpartition(dists, k_cluster)[:k_cluster]
+            nearest_dists = dists[nearest_idx]
+            
+            # Harmonic mean for local density
+            if np.any(nearest_dists > 0):
+                harmonic_mean = k_cluster / np.sum(1 / (nearest_dists + epsilon))
+                
+                # Score based on relative distance to local density
+                for idx, j in enumerate(nearest_idx):
+                    if i == j:
+                        continue
+                    
+                    d_ij = distance_matrix[i, j]
+                    # Edge gets higher score if much closer than local average
+                    density_ratio = harmonic_mean / (d_ij + epsilon)
+                    cluster_scores[i, j] = 1.0 + 0.4 * np.tanh(density_ratio - 1.0)
+    
+    # === 4. Lightweight Three-Step Path Efficiency ===
+    path_efficiency = np.ones_like(distance_matrix)
+    
+    if n > 3:
+        # Use limited neighborhood for path exploration
+        k_path = max(2, min(6, n // 4))
+        
+        for i in range(n):
+            # Get i's nearest neighbors (excluding self)
+            dists_i = distance_matrix[i].copy()
+            dists_i[i] = np.inf
+            if len(dists_i) >= k_path:
+                neighbors_i = np.argpartition(dists_i, k_path)[:k_path]
+                
+                for j in range(n):
+                    if i == j:
+                        continue
+                    
+                    # Get j's nearest neighbors
+                    dists_j = distance_matrix[j].copy()
+                    dists_j[j] = np.inf
+                    if len(dists_j) >= k_path:
+                        neighbors_j = np.argpartition(dists_j, k_path)[:k_path]
+                        
+                        # Explore two-step paths: i -> k -> j
+                        best_two_step = np.inf
+                        for k in neighbors_i:
+                            if k != j:
+                                two_step = distance_matrix[i, k] + distance_matrix[k, j]
+                                if two_step < best_two_step:
+                                    best_two_step = two_step
+                        
+                        # Explore three-step paths: i -> k -> l -> j
+                        best_three_step = np.inf
+                        for k in neighbors_i:
+                            for l in neighbors_j:
+                                if k != l and k != j and l != i:
+                                    three_step = (distance_matrix[i, k] + 
+                                                 distance_matrix[k, l] + 
+                                                 distance_matrix[l, j])
+                                    if three_step < best_three_step:
+                                        best_three_step = three_step
+                        
+                        # Take the better of two-step and three-step
+                        best_alt = min(best_two_step, best_three_step)
+                        
+                        if best_alt < np.inf:
+                            # Efficiency ratio: direct / alternative
+                            efficiency_ratio = distance_matrix[i, j] / (best_alt + epsilon)
+                            # Boost edges with no efficient alternatives
+                            path_efficiency[i, j] = 1.0 + 0.5 * np.exp(-max(0, efficiency_ratio - 1.0))
+    
+    # === 5. Node Centrality with Dynamic Balancing ===
+    centrality_penalty = np.ones_like(distance_matrix)
+    
+    # Compute popularity based on nearest neighbor appearances
+    popularity = np.zeros(n)
+    k_pop = max(3, min(10, n // 3))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if len(dists) >= k_pop:
+            nearest = set(np.argpartition(dists, k_pop)[:k_pop])
+            for j in nearest:
+                popularity[j] += 1
+    
+    # Normalize and apply penalty
+    if np.max(popularity) > 0:
+        norm_pop = popularity / np.max(popularity)
+        
+        # Dynamic penalty strength based on popularity distribution
+        pop_std = np.std(norm_pop)
+        penalty_strength = min(0.6, 0.3 + 0.3 * pop_std)
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    # Penalize connections to popular nodes
+                    penalty = 1.0 - penalty_strength * norm_pop[j]
+                    centrality_penalty[i, j] = max(0.4, penalty)
+    
+    np.fill_diagonal(centrality_penalty, 0)
+    
+    # === 6. Dynamic Weighted Fusion ===
+    # Weight components based on problem characteristics
+    if n <= 10:
+        # Small problems: emphasize distance and regret
+        w_inv = 1.2
+        w_regret = 1.0
+        w_cluster = 0.8
+        w_path = 0.7
+    elif n <= 50:
+        # Medium problems: balanced approach
+        w_inv = 1.0
+        w_regret = 1.1
+        w_cluster = 1.0
+        w_path = 0.9
+    else:
+        # Large problems: emphasize clustering and path efficiency
+        w_inv = 0.9
+        w_regret = 1.0
+        w_cluster = 1.2
+        w_path = 1.1
+    
+    # Apply weights via exponentiation
+    heuristics = (inv_dist ** w_inv) * \
+                 (regret_matrix ** w_regret) * \
+                 (cluster_scores ** w_cluster) * \
+                 (path_efficiency ** w_path) * \
+                 centrality_penalty
+    
+    # === 7. MST Reinforcement ===
+    if n > 2:
+        try:
+            mst = minimum_spanning_tree(distance_matrix)
+            mst_dense = mst.toarray()
+            mst_present = (mst_dense > 0) | (mst_dense.T > 0)
+            
+            # Boost MST edges moderately
+            heuristics[mst_present] *= 1.5
+        except:
+            pass  # Fallback if MST computation fails
+    
+    # === 8. Adaptive Sparsification ===
+    for i in range(n):
+        row = heuristics[i].copy()
+        
+        # Determine keep threshold based on row statistics
+        non_zero = row[row > 0]
+        if len(non_zero) > 3:
+            # Keep edges above adaptive percentile
+            keep_pct = max(30, min(70, 50 - n/10))  # More selective for larger n
+            threshold = np.percentile(non_zero, keep_pct)
+            
+            # Also keep MST edges if they exist
+            mst_mask = np.zeros(n, dtype=bool)
+            if n > 2:
+                try:
+                    mst_i = minimum_spanning_tree(distance_matrix).toarray()[i] > 0
+                    mst_mask = mst_i | mst_mask
+                except:
+                    pass
+            
+            mask = (row >= threshold) | mst_mask
+            
+            # Ensure minimum connectivity
+            if np.sum(mask) < 2:
+                top2_idx = np.argsort(row)[-2:]
+                mask[top2_idx] = True
+            
+            row[~mask] = 0
+            heuristics[i] = row
+    
+    # === 9. Symmetrization and Final Normalization ===
+    # Use arithmetic mean for symmetry
+    heuristics_sym = (heuristics + heuristics.T) / 2
+    
+    # Additional boost for mutually high scores
+    mutual_min = np.minimum(heuristics, heuristics.T)
+    heuristics_sym += 0.2 * mutual_min
+    
+    # Final cleanup
+    np.fill_diagonal(heuristics_sym, 0)
+    heuristics_sym = np.maximum(heuristics_sym, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics_sym)
+    if max_val > 0:
+        heuristics_sym = heuristics_sym / max_val
+    
+    return heuristics_sym
+```

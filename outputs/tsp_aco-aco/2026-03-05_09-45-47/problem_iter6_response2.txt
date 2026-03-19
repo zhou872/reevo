@@ -1,0 +1,382 @@
+```json
+{
+    "algorithm_features": ["Adaptive Landmark Approximation", "Multi-Factor Weight Learning", "Graph Sparsification", "Triangle Boosting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.manifold import MDS
+from sklearn.neighbors import KDTree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with adaptive multi-factor learning,
+    efficient landmark-based spatial analysis, and intelligent sparsification.
+    
+    Key improvements:
+    1. Dynamic weight learning for factor combination based on instance characteristics
+    2. Efficient landmark approximation with adaptive sampling for scalability
+    3. Graph sparsification with degree-aware edge selection
+    4. Saturated triangle boosting for cluster reinforcement
+    
+    Args:
+        distance_matrix: Square symmetric distance matrix (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+        return result
+    
+    # 1. Base heuristic: reciprocal of distances
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal_weights, 0)
+    
+    # 2. Compute spatial clustering using adaptive landmark method
+    spatial_promising = _compute_spatial_clustering_v3(distance_matrix, n)
+    
+    # 3. Compute MST-based promises
+    mst_promising = _compute_mst_promises_v3(distance_matrix, n)
+    
+    # 4. Compute local connectivity factors
+    local_factors = _compute_local_factors_v3(distance_matrix, n)
+    
+    # 5. Learn adaptive weights for factor combination
+    weights = _learn_adaptive_weights(
+        reciprocal_weights, spatial_promising, mst_promising, 
+        local_factors, distance_matrix, n
+    )
+    
+    # 6. Combine factors with learned weights
+    heuristics_matrix = _combine_factors_v3(
+        reciprocal_weights, spatial_promising, mst_promising, 
+        local_factors, weights, distance_matrix
+    )
+    
+    # 7. Degree-aware adaptive sparsification
+    sparsified = _degree_aware_sparsification(heuristics_matrix, distance_matrix, n)
+    
+    # 8. Saturated triangle boosting
+    final_heuristics = _saturated_triangle_boosting(sparsified, n)
+    
+    # 9. Final normalization
+    np.fill_diagonal(final_heuristics, 0)
+    max_val = np.max(final_heuristics)
+    if max_val > 0:
+        final_heuristics = final_heuristics / max_val
+    
+    return final_heuristics
+
+
+def _compute_spatial_clustering_v3(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute spatial clustering using adaptive landmark sampling."""
+    spatial_promising = np.zeros((n, n))
+    
+    # Adaptive number of landmarks based on instance size
+    n_landmarks = min(max(10, int(np.sqrt(n))), 100)
+    
+    if n <= 500:
+        # Use MDS for accurate coordinates for moderate-sized instances
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=min(3, n-1),
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=1,
+                max_iter=50
+            )
+            coords = mds.fit_transform(distance_matrix)
+    else:
+        # Landmark-based approximation for large instances
+        # Select landmarks using farthest-point sampling for better coverage
+        landmarks = _farthest_point_sampling(distance_matrix, n_landmarks)
+        
+        # Approximate coordinates using distances to landmarks
+        coords = np.zeros((n, n_landmarks))
+        for i in range(n):
+            coords[i] = distance_matrix[i, landmarks]
+    
+    # Build KD-tree for efficient neighbor queries
+    tree = KDTree(coords)
+    
+    # Adaptive k: logarithmic in n, with bounds
+    k = max(3, min(int(np.log2(n)) * 2, min(30, n - 1)))
+    
+    # Find nearest neighbors for each node
+    for i in range(n):
+        distances, indices = tree.query(coords[i].reshape(1, -1), k=k+1)
+        indices = indices[0]
+        
+        # Exclude self if present
+        if indices[0] == i:
+            indices = indices[1:k+1]
+        else:
+            indices = indices[:k]
+        
+        spatial_promising[i, indices] = 1.0
+    
+    return spatial_promising
+
+
+def _farthest_point_sampling(distance_matrix: np.ndarray, n_samples: int) -> np.ndarray:
+    """Select landmarks using farthest-point sampling."""
+    n = distance_matrix.shape[0]
+    selected = []
+    
+    # Start with a random point
+    selected.append(np.random.randint(n))
+    
+    # Select remaining points as farthest from current set
+    for _ in range(1, n_samples):
+        min_distances = np.min(distance_matrix[:, selected], axis=1)
+        next_point = np.argmax(min_distances)
+        selected.append(next_point)
+    
+    return np.array(selected)
+
+
+def _compute_mst_promises_v3(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute promises based on MST and near-MST edges."""
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    mst_promising = mst_edges + mst_edges.T  # Make symmetric
+    
+    # Also consider edges that are "almost" in MST (k-nearest neighbors)
+    k_near = min(5, n - 1)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        closest = np.argsort(dists)[:k_near]
+        for j in closest:
+            if mst_promising[i, j] == 0:
+                mst_promising[i, j] = 0.5
+    
+    return mst_promising
+
+
+def _compute_local_factors_v3(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute local connectivity factors based on neighborhood statistics."""
+    m = min(10, n - 1)
+    local_factors = np.ones((n, n))
+    
+    if m == 0:
+        return local_factors
+    
+    # Precompute local statistics for all nodes
+    local_means = np.zeros(n)
+    local_stds = np.zeros(n)
+    
+    for i in range(n):
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        sorted_dists_i = np.sort(dists_i)[:m]
+        local_means[i] = np.mean(sorted_dists_i)
+        local_stds[i] = np.std(sorted_dists_i) + 1e-12
+    
+    # Compute pairwise factors efficiently
+    for i in range(n):
+        mean_i = local_means[i]
+        std_i = local_stds[i]
+        
+        for j in range(i+1, n):
+            mean_j = local_means[j]
+            std_j = local_stds[j]
+            
+            # Nodes with similar local statistics are more likely to connect
+            stat_similarity = np.exp(-np.abs(mean_i - mean_j) / (std_i + std_j))
+            
+            # Distance relative to local means
+            mean_dist = (mean_i + mean_j) / 2
+            dist_ratio = distance_matrix[i, j] / (mean_dist + 1e-12)
+            
+            # Combined factor
+            local_factors[i, j] = local_factors[j, i] = (
+                stat_similarity * np.exp(-0.5 * dist_ratio**2)
+            )
+    
+    return local_factors
+
+
+def _learn_adaptive_weights(reciprocal_weights: np.ndarray,
+                           spatial_promising: np.ndarray,
+                           mst_promising: np.ndarray,
+                           local_factors: np.ndarray,
+                           distance_matrix: np.ndarray,
+                           n: int) -> dict:
+    """Learn adaptive weights for factor combination based on instance characteristics."""
+    weights = {}
+    
+    # Analyze instance characteristics
+    avg_distance = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    distance_std = np.std(distance_matrix[np.triu_indices(n, k=1)])
+    cv = distance_std / (avg_distance + 1e-12)  # Coefficient of variation
+    
+    # Base weights with instance-specific adjustments
+    weights['reciprocal'] = 1.0  # Base weight
+    
+    # Spatial weight: higher for instances with clear structure
+    spatial_weight = 0.7 + 0.3 * (1 - cv)  # Higher for lower variability
+    weights['spatial'] = np.clip(spatial_weight, 0.5, 1.2)
+    
+    # MST weight: always important, adjust based on n
+    mst_weight = 2.0 - 0.5 * np.log10(n) / np.log10(100)
+    weights['mst'] = np.clip(mst_weight, 1.5, 2.5)
+    
+    # Local factor weight: higher for instances with local patterns
+    local_weight = 0.5 + 0.3 * cv  # Higher for higher variability
+    weights['local'] = np.clip(local_weight, 0.3, 0.8)
+    
+    # Logarithmic boost weight for very short edges
+    weights['log_boost'] = 0.2 + 0.1 * (1 - cv)
+    
+    return weights
+
+
+def _combine_factors_v3(reciprocal_weights: np.ndarray,
+                       spatial_promising: np.ndarray,
+                       mst_promising: np.ndarray,
+                       local_factors: np.ndarray,
+                       weights: dict,
+                       distance_matrix: np.ndarray) -> np.ndarray:
+    """Combine heuristic factors with learned adaptive weights."""
+    n = reciprocal_weights.shape[0]
+    
+    # Apply spatial factor with learned weight
+    spatial_factor = np.where(spatial_promising > 0, 
+                             weights['spatial'], 
+                             weights['spatial'] * 0.3)
+    
+    # Apply MST factor with learned weight
+    mst_strength = np.where(mst_promising == 2, 
+                           weights['mst'],  # Strong MST edges
+                           np.where(mst_promising == 1, 
+                                   weights['mst'] * 0.7,  # Weak MST edges
+                                   weights['mst'] * 0.2))  # Non-MST edges
+    
+    # Combine factors with learned weights
+    combined_scores = (weights['reciprocal'] * reciprocal_weights * 
+                      spatial_factor * mst_strength * 
+                      (weights['local'] * local_factors))
+    
+    # Logarithmic boost for very short edges with learned weight
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_boost = 1 + weights['log_boost'] * np.log(1 + 1/(reciprocal_weights + 1e-12))
+        log_boost = np.nan_to_num(log_boost, nan=1.0, posinf=1.0)
+    
+    heuristics_matrix = combined_scores * log_boost
+    
+    # Ensure symmetry
+    heuristics_matrix = (heuristics_matrix + heuristics_matrix.T) / 2
+    
+    return heuristics_matrix
+
+
+def _degree_aware_sparsification(heuristics_matrix: np.ndarray,
+                                 distance_matrix: np.ndarray,
+                                 n: int) -> np.ndarray:
+    """Sparsify heuristics while maintaining connectivity and degree balance."""
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    if n <= 10:
+        return heuristics_matrix.copy()
+    
+    # Adaptive target degree per node
+    base_degree = max(3, int(np.log2(n) * 1.8))
+    target_degree = min(base_degree, n - 1)
+    
+    # Preserve MST edges to guarantee connectivity
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf  # Ignore diagonal
+        
+        # Identify MST neighbors that must be kept
+        mst_neighbors = np.where(mst_edges[i])[0]
+        
+        # Calculate remaining slots for non-MST edges
+        remaining_slots = max(0, target_degree - len(mst_neighbors))
+        
+        if remaining_slots > 0:
+            # Get non-MST edges sorted by heuristic value
+            non_mst_mask = ~np.isin(np.arange(n), mst_neighbors)
+            non_mst_indices = np.where(non_mst_mask)[0]
+            
+            if len(non_mst_indices) > remaining_slots:
+                # Keep top remaining_slots non-MST edges
+                non_mst_scores = row[non_mst_indices]
+                threshold_idx = np.argpartition(-non_mst_scores, remaining_slots-1)[remaining_slots-1]
+                threshold = non_mst_scores[threshold_idx]
+                keep_non_mst = non_mst_indices[non_mst_scores >= threshold]
+            else:
+                keep_non_mst = non_mst_indices[row[non_mst_indices] > 0]
+        else:
+            keep_non_mst = []
+        
+        # Combine MST and selected non-MST edges
+        keep_indices = np.concatenate([mst_neighbors, keep_non_mst])
+        keep_indices = np.unique(keep_indices[keep_indices != i])
+        
+        # Apply the selection
+        sparsified[i, keep_indices] = heuristics_matrix[i, keep_indices]
+    
+    # Ensure symmetry and connectivity
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Check for isolated nodes and connect to nearest neighbor
+    for i in range(n):
+        if np.count_nonzero(sparsified[i]) == 0:
+            nearest = np.argsort(distance_matrix[i])[1]
+            sparsified[i, nearest] = sparsified[nearest, i] = 1.0
+    
+    return sparsified
+
+
+def _saturated_triangle_boosting(heuristics_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Boost scores for edges that form triangles, with saturation effect."""
+    boosted = heuristics_matrix.copy()
+    
+    if n > 1000:
+        # Approximate triangle counting for very large graphs
+        sample_size = min(300, n)
+        sampled_nodes = np.random.choice(n, sample_size, replace=False)
+        
+        for i in sampled_nodes:
+            neighbors_i = set(np.where(heuristics_matrix[i] > 0)[0])
+            for j in neighbors_i:
+                if j <= i:
+                    continue
+                neighbors_j = set(np.where(heuristics_matrix[j] > 0)[0])
+                common = len(neighbors_i & neighbors_j)
+                if common > 0:
+                    # Saturating boost: diminishing returns
+                    boost = 1 + 0.1 * min(common, 8)
+                    boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    else:
+        # Efficient triangle counting for moderate-sized graphs
+        binary_mask = (heuristics_matrix > 0).astype(float)
+        common_neighbors = binary_mask @ binary_mask.T
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if heuristics_matrix[i, j] > 0:
+                    common = int(common_neighbors[i, j])
+                    if common > 0:
+                        # Saturating boost with diminishing returns
+                        boost = 1 + 0.15 * min(common, 6)
+                        boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    return boosted
+```

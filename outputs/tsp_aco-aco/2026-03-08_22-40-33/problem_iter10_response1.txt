@@ -1,0 +1,289 @@
+```json
+{
+    "algorithm_features": ["Reciprocal Distance Ratio Weighting", "Lightweight Two-Hop Efficiency Analysis", "Adaptive Parameter Selection via Instance Characterization", "Connectivity-Aware Edge Retention"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization.
+    
+    Improvements over previous versions:
+    1. Distance-aware reciprocal weighting using actual distance ratios
+    2. Lightweight two-hop path efficiency analysis
+    3. Instance-aware parameter adaptation via clustering coefficient
+    4. Optimized edge retention preserving connectivity
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. INSTANCE CHARACTERIZATION FOR ADAPTIVE PARAMETERS ===
+    # Extract distance statistics
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    if len(distances) > 0:
+        dist_median = np.median(distances)
+        dist_cv = np.std(distances) / (np.mean(distances) + 1e-12)
+    else:
+        dist_median = 1.0
+        dist_cv = 0.0
+    
+    # Estimate clustering tendency
+    k_cluster = min(5, n - 1)
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_cluster + 1]
+    
+    # Count common neighbors between nearest neighbors
+    cluster_score = 0.0
+    for i in range(n):
+        neighbors_i = set(nearest_indices[i])
+        for j in range(min(3, len(neighbors_i))):
+            if j < len(neighbors_i):
+                k = nearest_indices[i, j]
+                neighbors_k = set(nearest_indices[k])
+                cluster_score += len(neighbors_i & neighbors_k) / k_cluster
+    
+    cluster_norm = cluster_score / (3 * n + 1e-12)
+    
+    # Adaptive parameters based on instance characteristics
+    k = max(3, min(8, int(4 + 2 * cluster_norm - dist_cv)))
+    alpha = 0.6 + 0.2 * cluster_norm  # Regret parameter
+    beta = 0.8 - 0.3 * dist_cv  # Efficiency sensitivity
+    
+    # === 2. DISTANCE-AWARE RECIPROCAL WEIGHTING ===
+    # Compute distance ratios relative to nearest neighbors
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    nearest_dists = sorted_dists[:, 1]  # Distance to nearest neighbor
+    
+    reciprocal_weight = np.ones((n, n))
+    positions = np.argsort(np.argsort(distance_matrix, axis=1), axis=1)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Distance ratio component
+            dist_ratio_i = distance_matrix[i, j] / (nearest_dists[i] + 1e-12)
+            dist_ratio_j = distance_matrix[i, j] / (nearest_dists[j] + 1e-12)
+            
+            # Mutual ranking component
+            rank_i_j = positions[i, j]
+            rank_j_i = positions[j, i]
+            
+            # Combine distance ratio and mutual ranking
+            if rank_i_j < k and rank_j_i < k:
+                # Strong mutual preference: both in top-k
+                ratio_penalty = min(dist_ratio_i, dist_ratio_j)
+                rank_boost = (2 * k) / (k + rank_i_j + rank_j_i + 1e-12)
+                score = rank_boost * (2.0 - ratio_penalty)
+            elif rank_i_j < k or rank_j_i < k:
+                # One-way preference
+                better_rank = min(rank_i_j, rank_j_i)
+                ratio_penalty = max(dist_ratio_i, dist_ratio_j)
+                score = 1.0 + (k - better_rank) / (2 * k) * (2.0 - ratio_penalty)
+            else:
+                # Base case with distance penalty
+                avg_ratio = (dist_ratio_i + dist_ratio_j) / 2
+                score = max(0.2, 2.0 - avg_ratio)
+            
+            reciprocal_weight[i, j] = reciprocal_weight[j, i] = score
+    
+    # === 3. LIGHTWEIGHT TWO-HOP EFFICIENCY ===
+    efficiency = np.ones((n, n))
+    if n >= 4:
+        # Precompute k-nearest for efficiency check (reuse from earlier)
+        k_eff = min(5, n - 2)
+        nearest_eff = np.argsort(distance_matrix, axis=1)[:, 1:k_eff + 1]
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct = distance_matrix[i, j]
+                if direct <= 0:
+                    continue
+                
+                # Find best two-hop path through common neighbors
+                best_alt = np.inf
+                # Check intersection of nearest neighbors
+                common = set(nearest_eff[i]) & set(nearest_eff[j])
+                for k in common:
+                    if k != i and k != j:
+                        alt = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alt = min(best_alt, alt)
+                
+                # Calculate efficiency score
+                if best_alt < np.inf:
+                    ratio = best_alt / direct
+                    # Sigmoid transformation centered at 1.0
+                    efficiency[i, j] = 1.0 / (1.0 + np.exp(beta * (ratio - 1.1)))
+                else:
+                    # No alternative found, assume efficient
+                    efficiency[i, j] = 0.9
+    
+    # === 4. ADAPTIVE REGRET MODEL ===
+    regret = np.ones((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            rank_i_j = positions[i, j]
+            rank_j_i = positions[j, i]
+            avg_rank = (rank_i_j + rank_j_i) / 2
+            
+            # Distance-aware regret: combine rank and distance ratio
+            dist_ratio = distance_matrix[i, j] / (nearest_dists[i] + nearest_dists[j]) * 2
+            rank_term = 1.0 / (1.0 + alpha * avg_rank)
+            dist_term = 1.0 / (1.0 + 0.5 * dist_ratio)
+            
+            regret[i, j] = regret[j, i] = (rank_term + dist_term) / 2
+    
+    # === 5. BASE DISTANCE SCALING ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        eps = dist_median * 0.01 if dist_median > 0 else 1e-12
+        scaled_dist = distance_matrix / (dist_median + 1e-12)
+        inv_dist = 1.0 / (scaled_dist + eps * np.eye(n))
+    
+    np.fill_diagonal(inv_dist, 0)
+    max_inv = np.max(inv_dist[~np.eye(n, dtype=bool)], initial=0)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # === 6. COMBINE FACTORS ===
+    heuristics = inv_dist * reciprocal_weight * efficiency * regret
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 7. CONNECTIVITY-AWARE EDGE RETENTION ===
+    # Preserve MST edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Mutual K-NN edges (adaptive K)
+    k_mutual = min(k, n - 1)
+    knn_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_mutual + 1]
+    knn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        knn_mask[i, knn_indices[i]] = True
+    mutual_knn = knn_mask & knn_mask.T
+    
+    # Boost structurally important edges
+    heuristics[mst_mask] *= 1.4
+    heuristics[mutual_knn] *= 1.2
+    
+    # === 8. ADAPTIVE EDGE PRUNING ===
+    heuristics_final = heuristics.copy()
+    
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = -np.inf
+        
+        # Preserve important edges
+        preserve_mask = mst_mask[i] | mutual_knn[i]
+        
+        # Determine target edges per node
+        non_zero = row[row > 0]
+        if len(non_zero) > 0:
+            # Nodes in dense regions get fewer edges
+            density = len(non_zero) / (n - 1)
+            target_edges = max(k, int((0.5 - 0.2 * density) * n))
+        else:
+            target_edges = max(k, n // 3)
+        
+        # Apply pruning if needed
+        current_edges = np.sum(row > 0)
+        if current_edges > target_edges:
+            # Separate preserved and non-preserved
+            non_preserved = row.copy()
+            non_preserved[preserve_mask] = -np.inf
+            
+            # Calculate how many non-preserved edges to keep
+            preserved_count = np.sum(preserve_mask)
+            additional_needed = max(0, target_edges - preserved_count)
+            
+            if additional_needed > 0 and np.any(non_preserved > -np.inf):
+                # Keep top additional_needed non-preserved edges
+                sorted_vals = np.sort(non_preserved[non_preserved > -np.inf])
+                if len(sorted_vals) >= additional_needed:
+                    threshold = sorted_vals[-additional_needed]
+                    zero_mask = (row < threshold) & (~preserve_mask)
+                    heuristics_final[i, zero_mask] = 0
+        
+        # Ensure minimum connectivity
+        kept = np.sum(heuristics_final[i] > 0)
+        if kept < k:
+            # Add top edges from original scores
+            row_copy = heuristics[i].copy()
+            row_copy[i] = -np.inf
+            row_copy[heuristics_final[i] > 0] = -np.inf
+            
+            if np.any(row_copy > -np.inf):
+                needed = k - kept
+                top_idx = np.argsort(row_copy)[-needed:]
+                heuristics_final[i, top_idx] = heuristics[i, top_idx]
+    
+    # === 9. FINAL SYMMETRIZATION AND NORMALIZATION ===
+    # Ensure symmetry using maximum
+    symmetric_heuristics = np.maximum(heuristics_final, heuristics_final.T)
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    # Normalize to [0, 1]
+    non_zero = symmetric_heuristics[symmetric_heuristics > 0]
+    if len(non_zero) > 0:
+        max_val = np.max(non_zero)
+        if max_val > 0:
+            symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with different instance types
+    for instance_type in ["cluster", "uniform", "mixed"]:
+        if instance_type == "cluster":
+            n = 40
+            coords = np.random.randn(n, 2) * 5
+            coords[:25] += np.array([30, 30])
+            coords[25:] += np.array([70, 70])
+        elif instance_type == "uniform":
+            n = 40
+            coords = np.random.rand(n, 2) * 100
+        else:  # mixed
+            n = 40
+            coords = np.zeros((n, 2))
+            coords[:15] = np.random.randn(15, 2) * 5 + [20, 20]
+            coords[15:30] = np.random.rand(15, 2) * 60 + [40, 40]
+            coords[30:] = np.random.rand(10, 2) * 100
+        
+        dist_matrix = squareform(pdist(coords))
+        heuristics = heuristics_v2(dist_matrix.copy())
+        
+        print(f"\n=== {instance_type.upper()} Instance (n={n}) ===")
+        print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+        
+        edges_per_node = np.sum(heuristics > 0, axis=1)
+        print(f"Edges per node: min={edges_per_node.min()}, "
+              f"max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+        
+        is_symmetric = np.allclose(heuristics, heuristics.T)
+        print(f"Matrix symmetric: {is_symmetric}")
+        
+        # Sample scores
+        print("Sample edge scores (i, j, distance, heuristic):")
+        for i, j in [(0, 1), (0, 10), (5, 15), (10, 25), (15, 35)]:
+            if i < n and j < n:
+                print(f"({i:2d}, {j:2d}): dist={dist_matrix[i, j]:6.2f}, "
+                      f"score={heuristics[i, j]:.4f}")
+```

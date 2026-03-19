@@ -1,0 +1,249 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsification", "Triangle-Based Boosting", "Reciprocal-Distance Weighting", "Clustering Enhancement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining multiple factors
+    with improved efficiency and clustering awareness.
+    
+    Returns a matrix of edge promises with the same shape as distance_matrix,
+    where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+            return result
+    
+    # Base heuristic: reciprocal of distances (closer nodes are more promising)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal_weights, 0)
+    
+    # Factor 1: MST-based connectivity (fundamental graph structure)
+    mst_promising = _compute_mst_promises_v2(distance_matrix, n)
+    
+    # Factor 2: Local density-based clustering
+    density_factor = _compute_density_factor(distance_matrix, n)
+    
+    # Factor 3: Adaptive k-nearest neighbors
+    knn_factor = _compute_knn_factor(distance_matrix, n)
+    
+    # Combine factors with learned weighting
+    base_heuristics = _combine_factors_v2(
+        reciprocal_weights, mst_promising, density_factor, knn_factor
+    )
+    
+    # Adaptive sparsification: keep most promising edges per node
+    sparsified = _adaptive_sparsification_v2(base_heuristics, n)
+    
+    # Triangle-based boosting: enhance edges within dense clusters
+    boosted = _triangle_boosting_v2(sparsified, n)
+    
+    # Final normalization
+    max_val = np.max(boosted)
+    if max_val > 0:
+        boosted = boosted / max_val
+    
+    np.fill_diagonal(boosted, 0)
+    return boosted
+
+
+def _compute_mst_promises_v2(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute MST-based promise scores with enhanced neighborhood awareness."""
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    # Make symmetric and add bonus for MST edges
+    mst_promising = mst_edges + mst_edges.T
+    
+    # Enhanced neighborhood: consider extended neighborhood beyond MST
+    for i in range(n):
+        # Get distances to other nodes
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Adaptive neighborhood size based on log2(n)
+        k = min(5, max(2, int(np.log2(n))))
+        
+        # Get k nearest neighbors
+        nearest = np.argpartition(dists, k)[:k]
+        
+        # Boost edges to nearest neighbors, with diminishing returns
+        for j_idx, j in enumerate(nearest):
+            if mst_promising[i, j] == 0:
+                # Boost decreases with rank (closer neighbors get higher boost)
+                boost = 0.7 * (1.0 - j_idx / (k + 1))
+                mst_promising[i, j] = boost
+                mst_promising[j, i] = boost
+    
+    return mst_promising
+
+
+def _compute_density_factor(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute density-based factor favoring edges in dense regions."""
+    density_factor = np.ones((n, n))
+    
+    # For each node, compute average distance to its k nearest neighbors
+    k = min(10, n - 1)
+    
+    for i in range(n):
+        # Get distances to other nodes
+        dists_i = distance_matrix[i].copy()
+        dists_i[i] = np.inf
+        
+        # Find k nearest neighbors
+        nearest_i = np.argpartition(dists_i, k)[:k]
+        avg_dist_i = np.mean(dists_i[nearest_i])
+        
+        for j in range(i + 1, n):
+            # Get distances from j
+            dists_j = distance_matrix[j].copy()
+            dists_j[j] = np.inf
+            
+            # Find k nearest neighbors for j
+            nearest_j = np.argpartition(dists_j, k)[:k]
+            avg_dist_j = np.mean(dists_j[nearest_j])
+            
+            # Edge weight based on relative density
+            local_avg = (avg_dist_i + avg_dist_j) / 2
+            dist = distance_matrix[i, j]
+            
+            # Prefer edges that are shorter than local average
+            if dist < local_avg:
+                # Boost inversely proportional to distance ratio
+                density_factor[i, j] = density_factor[j, i] = 1.0 + (local_avg - dist) / (local_avg + 1e-12)
+            else:
+                # Penalize edges longer than local average
+                density_factor[i, j] = density_factor[j, i] = max(0.5, local_avg / (dist + 1e-12))
+    
+    return density_factor
+
+
+def _compute_knn_factor(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute k-nearest neighbor factor with adaptive k."""
+    knn_factor = np.zeros((n, n))
+    
+    # Adaptive k based on log2(n)
+    k = max(3, min(n - 1, int(np.log2(n)) + 2))
+    
+    for i in range(n):
+        # Get distances to other nodes
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Find k nearest neighbors
+        nearest = np.argpartition(dists, k)[:k]
+        
+        # Assign weights based on rank (inverse distance weighting)
+        for rank, j in enumerate(nearest):
+            # Weight decreases with rank
+            weight = 1.0 / (1.0 + rank * 0.3)
+            knn_factor[i, j] = weight
+    
+    # Make symmetric by taking maximum
+    knn_factor = np.maximum(knn_factor, knn_factor.T)
+    
+    return knn_factor
+
+
+def _combine_factors_v2(reciprocal_weights: np.ndarray,
+                       mst_promising: np.ndarray,
+                       density_factor: np.ndarray,
+                       knn_factor: np.ndarray) -> np.ndarray:
+    """Combine all factors using multiplicative weighting."""
+    n = reciprocal_weights.shape[0]
+    
+    # Base score from reciprocal distances
+    base_score = reciprocal_weights.copy()
+    
+    # Apply MST factor (strong boost for MST edges)
+    mst_weighted = base_score * np.where(mst_promising > 0, 
+                                         np.where(mst_promising >= 1, 2.5, 1.0 + mst_promising),
+                                         0.8)
+    
+    # Apply density factor
+    density_weighted = mst_weighted * density_factor
+    
+    # Apply KNN factor with smoothing
+    knn_smoothed = np.where(knn_factor > 0, 
+                           knn_factor * 1.5 + 0.5,  # Boost for KNN edges
+                           1.0)  # Neutral for non-KNN edges
+    
+    combined = density_weighted * knn_smoothed
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+
+def _adaptive_sparsification_v2(heuristics_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Adaptively sparsify the heuristic matrix, keeping most promising edges."""
+    if n <= 10:
+        # Keep all edges for very small graphs
+        return heuristics_matrix.copy()
+    
+    sparsified = np.zeros_like(heuristics_matrix)
+    
+    # Adaptive sparsity: keep more edges for smaller graphs
+    # Using p = min(0.5, max(0.15, log2(n)/10)) as suggested
+    base_keep_ratio = min(0.5, max(0.15, np.log2(n) / 10))
+    
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = -np.inf  # Ignore diagonal
+        
+        # Determine number of edges to keep
+        num_to_keep = max(3, int(base_keep_ratio * n))
+        num_to_keep = min(num_to_keep, n - 1)
+        
+        if np.any(row > 0):
+            # Get indices of top edges
+            top_indices = np.argpartition(-row, num_to_keep)[:num_to_keep]
+            threshold = np.min(row[top_indices])
+            
+            # Keep edges above threshold
+            mask = row >= threshold
+            sparsified[i] = heuristics_matrix[i] * mask
+    
+    # Ensure symmetry by taking maximum
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    return sparsified
+
+
+def _triangle_boosting_v2(heuristics_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Boost scores for edges that form triangles (common neighbors)."""
+    boosted = heuristics_matrix.copy()
+    
+    if n > 3:
+        # Create binary adjacency from non-zero heuristic values
+        binary_adj = (heuristics_matrix > 0).astype(float)
+        
+        # Count common neighbors efficiently using matrix multiplication
+        common_neighbors = binary_adj @ binary_adj.T
+        
+        # For each edge (i,j) with non-zero heuristic, apply triangle boost
+        for i in range(n):
+            for j in range(i + 1, n):
+                if heuristics_matrix[i, j] > 0:
+                    common = common_neighbors[i, j]
+                    if common > 0:
+                        # Boost factor increases with number of common neighbors
+                        # but with diminishing returns (logarithmic scaling)
+                        boost = 1.0 + 0.25 * np.log1p(common)
+                        boosted[i, j] = boosted[j, i] = heuristics_matrix[i, j] * boost
+    
+    return boosted
+```

@@ -1,0 +1,184 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsification", "Distance Variance Weighting", "Two-Hop Regret Ratio", "Mutual Nearest Neighbor Bonus"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic function for TSP edge selection balancing computational
+    efficiency with adaptive edge quality assessment.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Adaptive Sparsification ====================
+    # Use distance variance to determine neighborhood size adaptively
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Compute distance statistics for each node
+    distances_no_self = distance_matrix.copy()
+    np.fill_diagonal(distances_no_self, np.inf)
+    distance_variance = np.var(distances_no_self, axis=1, ddof=1)
+    
+    for i in range(n):
+        # Base k on log2(n) with variance adjustment
+        # Higher variance -> fewer neighbors (more selective)
+        variance_factor = 1.0 / (1.0 + np.sqrt(distance_variance[i]))
+        k = max(3, int(np.log2(n) * variance_factor))
+        
+        # Get k nearest neighbors using argpartition for efficiency
+        distances = distances_no_self[i].copy()
+        nn_indices = np.argpartition(distances, k)[:k]
+        adjacency_mask[i, nn_indices] = True
+        
+        # Ensure reciprocal connections for graph connectivity
+        for j in nn_indices:
+            j_distances = distances_no_self[j].copy()
+            j_k = max(3, int(np.log2(n) * (1.0 / (1.0 + np.sqrt(distance_variance[j])))))
+            j_nn = np.argpartition(j_distances, j_k)[:j_k]
+            if i in j_nn:
+                adjacency_mask[j, i] = True
+    
+    # Ensure symmetry and no self-loops
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Distance Variance Weighting ====================
+    # Score edges based on normalized inverse distance with variance awareness
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Precompute median distances for normalization
+    median_dists = np.median(distances_no_self, axis=1)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Get distances to neighbors
+            valid_dists = distance_matrix[i, valid_mask]
+            neighbor_indices = np.where(valid_mask)[0]
+            
+            # Normalize distances by local median for variance awareness
+            norm_dists = valid_dists / median_dists[i]
+            
+            # Compute inverse with exponential decay for variance adjustment
+            # Higher variance -> stronger preference for very short edges
+            var_factor = np.exp(-distance_variance[i])
+            inv_vals = np.exp(-norm_dists * (1.0 + 0.5 * var_factor))
+            
+            # Normalize by number of neighbors and row sum
+            neighbor_count = len(neighbor_indices)
+            row_total = np.sum(inv_vals)
+            if row_total > 1e-10:
+                inv_dist[i, neighbor_indices] = inv_vals / (row_total * neighbor_count)
+    
+    # Symmetrize by geometric mean (preserves relative magnitudes)
+    inv_dist_sym = np.sqrt(np.maximum(inv_dist * inv_dist.T, 1e-12))
+    
+    # ==================== 3. Efficient Two-Hop Regret Analysis ====================
+    # Compute penalty based on two-hop alternatives ratio
+    regret_penalty = np.ones_like(distance_matrix)
+    
+    # Precompute nearest neighbors for each node
+    k_check = max(4, int(np.sqrt(n)))
+    nearest_indices = np.argsort(distances_no_self, axis=1)[:, :k_check]
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        valid_indices = np.where(valid_mask)[0]
+        
+        for j in valid_indices:
+            if i >= j:
+                continue
+                
+            # Consider common nearest neighbors as intermediate candidates
+            i_neighbors = nearest_indices[i]
+            j_neighbors = nearest_indices[j]
+            
+            # Find intersection (nodes near both i and j)
+            candidate_mask = np.isin(i_neighbors, j_neighbors)
+            candidate_nodes = i_neighbors[candidate_mask]
+            candidate_nodes = candidate_nodes[candidate_nodes != i]
+            candidate_nodes = candidate_nodes[candidate_nodes != j]
+            
+            if len(candidate_nodes) > 0:
+                # Compute best two-hop alternative
+                two_hop_dists = distance_matrix[i, candidate_nodes] + distance_matrix[candidate_nodes, j]
+                min_two_hop = np.min(two_hop_dists) if len(two_hop_dists) > 0 else np.inf
+                direct_dist = distance_matrix[i, j]
+                
+                if direct_dist > 1e-10 and min_two_hop < np.inf:
+                    # Compute simple ratio penalty
+                    ratio = min_two_hop / direct_dist
+                    # Map ratio to [0.3, 1.0] penalty range
+                    penalty = 0.3 + 0.7 * np.clip(ratio, 0.5, 2.0) / 2.0
+                    regret_penalty[i, j] = regret_penalty[j, i] = penalty
+    
+    # ==================== 4. Lightweight Mutual Neighbor Bonus ====================
+    # Boost edges where nodes are mutual nearest neighbors
+    mutual_bonus = np.ones_like(distance_matrix)
+    
+    # Find nearest neighbor for each node
+    nearest_neighbor = nearest_indices[:, 0]
+    
+    for i in range(n):
+        j = nearest_neighbor[i]
+        if j < i and nearest_neighbor[j] == i:
+            # Mutual nearest neighbors: strong bonus
+            mutual_bonus[i, j] = mutual_bonus[j, i] = 1.5
+        elif adjacency_mask[i, j]:
+            # One-way nearest neighbor: moderate bonus
+            mutual_bonus[i, j] = mutual_bonus[j, i] = 1.2
+    
+    # ==================== 5. Combine Components ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Only compute for edges in sparse graph
+    i_indices, j_indices = np.where(adjacency_mask)
+    mask_upper = i_indices < j_indices
+    i_indices = i_indices[mask_upper]
+    j_indices = j_indices[mask_upper]
+    
+    for idx in range(len(i_indices)):
+        i, j = i_indices[idx], j_indices[idx]
+        
+        # Base score from distance weighting
+        score = inv_dist_sym[i, j]
+        
+        # Apply regret penalty and mutual bonus
+        score *= regret_penalty[i, j] * mutual_bonus[i, j]
+        
+        # Add minimal random tie-breaking
+        score += 1e-12 * np.random.random()
+        
+        heuristics[i, j] = heuristics[j, i] = score
+    
+    # ==================== 6. Final Processing ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Ensure symmetry with arithmetic mean
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

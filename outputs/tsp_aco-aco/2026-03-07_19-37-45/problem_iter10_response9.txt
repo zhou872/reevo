@@ -1,0 +1,700 @@
+```json
+{
+    "algorithm_features": ["Adaptive Multi-hop Regret Analysis", "Spectral Clustering Density Estimation", "Approximate Edge Betweenness Centrality", "Meta-Weighted Factor Combination"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.linalg import eigsh
+from scipy.sparse import csr_matrix
+import networkx as nx
+from typing import Dict, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with adaptive multi-hop regret, spectral clustering,
+    approximate betweenness centrality, and meta-weighted factor combination.
+    
+    Returns a heuristic matrix where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return 1 / (distance_matrix + np.eye(n) * 1e-8)
+    
+    # Step 1: Enhanced instance analysis
+    stats = _analyze_instance_v4(distance_matrix)
+    
+    # Step 2: Compute core heuristic factors
+    factors = _compute_factors_v4(distance_matrix, stats)
+    
+    # Step 3: Adaptive regret analysis (1-hop to 3-hop based on instance)
+    regret_scores = _compute_adaptive_regret(distance_matrix, stats, factors)
+    
+    # Step 4: Approximate edge betweenness centrality
+    betweenness_scores = _compute_approx_betweenness(distance_matrix, stats)
+    
+    # Step 5: Meta-weighted factor combination
+    weights = _compute_meta_weights(stats, factors, regret_scores, betweenness_scores)
+    
+    # Step 6: Optimized candidate selection
+    candidate_mask = _build_candidate_mask_v4(distance_matrix, stats, factors, 
+                                             regret_scores, betweenness_scores)
+    
+    # Step 7: Combine all factors with meta-weights
+    H = _combine_factors_v4(distance_matrix, stats, factors, regret_scores,
+                           betweenness_scores, weights, candidate_mask)
+    
+    # Step 8: Intelligent post-processing
+    H = _post_process_v4(H, distance_matrix, stats, weights)
+    
+    return H
+
+
+def _analyze_instance_v4(distance_matrix: np.ndarray) -> Dict:
+    """Comprehensive instance analysis with graph-theoretic properties."""
+    n = distance_matrix.shape[0]
+    
+    # Basic distance statistics
+    dist_no_diag = distance_matrix[~np.eye(n, dtype=bool)].reshape(n, n-1)
+    mean_dist = np.mean(dist_no_diag)
+    std_dist = np.std(dist_no_diag)
+    cv_dist = std_dist / (mean_dist + 1e-8)
+    
+    # Percentile analysis
+    p25, p50, p75 = np.percentile(dist_no_diag, [25, 50, 75])
+    iqr = p75 - p25
+    skewness = (p75 - p50) / (p50 - p25 + 1e-8)
+    
+    # Regularity measure from nearest neighbor ratios
+    nn_ratios = []
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if len(dists) >= 3:
+            sorted_dists = np.sort(dists)
+            nn_ratios.append(sorted_dists[1] / (sorted_dists[0] + 1e-8))
+    regularity = np.mean(nn_ratios) if nn_ratios else 1.0
+    
+    # Estimate clustering coefficient (binary graph with threshold)
+    threshold = np.median(dist_no_diag)
+    adj = (distance_matrix <= threshold).astype(float)
+    np.fill_diagonal(adj, 0)
+    clustering_coeffs = []
+    for i in range(n):
+        neighbors = np.where(adj[i] > 0)[0]
+        if len(neighbors) >= 2:
+            subgraph = adj[neighbors][:, neighbors]
+            triangles = np.sum(subgraph) / 2
+            possible = len(neighbors) * (len(neighbors) - 1) / 2
+            clustering_coeffs.append(triangles / possible if possible > 0 else 0)
+    avg_clustering = np.mean(clustering_coeffs) if clustering_coeffs else 0.0
+    
+    # Spectral properties (for larger instances)
+    spectral_gap = 0.1
+    if 10 <= n <= 500:
+        try:
+            D = np.diag(np.sum(distance_matrix, axis=1))
+            L = D - distance_matrix
+            D_inv_sqrt = np.diag(1 / np.sqrt(np.diag(D) + 1e-8))
+            L_norm = D_inv_sqrt @ L @ D_inv_sqrt
+            eigvals = eigsh(L_norm, k=2, which='SM', return_eigenvectors=False)
+            spectral_gap = eigvals[1] if len(eigvals) > 1 else 0.1
+        except:
+            pass
+    
+    return {
+        'n': n,
+        'mean_dist': mean_dist,
+        'std_dist': std_dist,
+        'cv_dist': cv_dist,
+        'regularity': regularity,
+        'skewness': skewness,
+        'clustering': avg_clustering,
+        'spectral_gap': spectral_gap,
+        'iqr': iqr,
+        'p50': p50
+    }
+
+
+def _compute_factors_v4(distance_matrix: np.ndarray, 
+                       stats: Dict) -> Dict:
+    """Compute base heuristic factors."""
+    n = stats['n']
+    factors = {}
+    
+    # 1. Inverse distance (normalized)
+    inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-8)
+    np.fill_diagonal(inv_dist, 0)
+    max_inv = np.max(inv_dist)
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    factors['inv_dist'] = inv_dist
+    
+    # 2. Local density via spectral embedding
+    factors['spectral_density'] = _compute_spectral_density_v2(distance_matrix, stats)
+    
+    # 3. MST-based scoring with edge criticality
+    factors['mst'] = _compute_mst_scores_v4(distance_matrix, stats)
+    
+    # 4. Graph centrality approximation
+    factors['centrality'] = _compute_node_centrality(distance_matrix, stats)
+    
+    return factors
+
+
+def _compute_spectral_density_v2(distance_matrix: np.ndarray,
+                                stats: Dict) -> np.ndarray:
+    """Density estimation using spectral embedding with multiple dimensions."""
+    n = stats['n']
+    spectral_scores = np.ones((n, n))
+    
+    if n < 8:
+        # Fallback for small instances
+        return _compute_simple_density_v2(distance_matrix, stats)
+    
+    try:
+        # Create normalized similarity matrix
+        similarity = np.exp(-distance_matrix / stats['p50'])
+        np.fill_diagonal(similarity, 0)
+        
+        # Use up to 3 dimensions based on instance size
+        k = min(3, n - 1)
+        eigvals, eigvecs = eigsh(similarity, k=k, which='LA')
+        
+        if k >= 2:
+            # Embed nodes in k-dimensional space
+            embedding = eigvecs[:, :k]
+            
+            # Compute Mahalanobis-like distances in embedding space
+            cov_inv = np.linalg.pinv(np.cov(embedding.T))
+            density_scores = np.zeros((n, n))
+            
+            for i in range(n):
+                for j in range(i+1, n):
+                    diff = embedding[i] - embedding[j]
+                    # Distance in embedded space (Mahalanobis)
+                    dist_emb = np.sqrt(diff @ cov_inv @ diff.T)
+                    # Convert to similarity: closer in embedded space = higher score
+                    spectral_scores[i, j] = spectral_scores[j, i] = np.exp(-dist_emb)
+    
+    except Exception:
+        spectral_scores = _compute_simple_density_v2(distance_matrix, stats)
+    
+    # Normalize
+    max_score = np.max(spectral_scores)
+    if max_score > 0:
+        spectral_scores = spectral_scores / max_score
+    
+    return spectral_scores
+
+
+def _compute_simple_density_v2(distance_matrix: np.ndarray,
+                              stats: Dict) -> np.ndarray:
+    """Fallback density scoring with adaptive neighborhood."""
+    n = stats['n']
+    density_scores = np.ones((n, n))
+    
+    # Adaptive k based on instance size and clustering
+    k = max(2, min(6, int(n ** 0.5)))
+    
+    # Local density using k-nearest neighbors
+    local_density = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if len(dists) >= k:
+            k_nearest = np.partition(dists, k)[:k]
+            local_density[i] = np.mean(k_nearest)
+        else:
+            local_density[i] = np.mean(dists)
+    
+    # Normalize using robust statistics
+    median_density = np.median(local_density)
+    mad_density = np.median(np.abs(local_density - median_density))
+    if mad_density > 1e-8:
+        local_density_z = (local_density - median_density) / (1.4826 * mad_density)
+    else:
+        local_density_z = np.zeros(n)
+    
+    # Score edges: favor connections between sparse regions
+    for i in range(n):
+        for j in range(i+1, n):
+            # Combined z-score (lower density = more sparse)
+            combined_z = (local_density_z[i] + local_density_z[j]) / 2.0
+            # Invert: higher score for sparse-sparse connections
+            density_scores[i, j] = density_scores[j, i] = np.exp(-abs(combined_z))
+    
+    return density_scores
+
+
+def _compute_mst_scores_v4(distance_matrix: np.ndarray,
+                          stats: Dict) -> np.ndarray:
+    """MST scoring with edge criticality and redundancy analysis."""
+    n = stats['n']
+    mst_scores = np.ones((n, n))
+    
+    if n <= 2:
+        return mst_scores
+    
+    try:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_array = mst.toarray()
+        mst_present = (mst_array + mst_array.T) > 0
+        
+        # Base boost for MST edges
+        mst_scores[mst_present] = 1.6
+        
+        # Node degrees in MST
+        node_degrees = np.sum(mst_present, axis=1)
+        
+        # Edge criticality analysis
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_present[i, j]:
+                    # Critical if removing disconnects large components
+                    if node_degrees[i] == 1 or node_degrees[j] == 1:
+                        mst_scores[i, j] = 2.4  # Leaf edges are critical
+                    elif node_degrees[i] == 2 and node_degrees[j] == 2:
+                        mst_scores[i, j] = 2.0  # Chain edges
+                    else:
+                        # Check redundancy: if there's a nearly as good alternative
+                        min_alt = float('inf')
+                        for k in range(n):
+                            if k != i and k != j:
+                                alt = distance_matrix[i, k] + distance_matrix[k, j]
+                                min_alt = min(min_alt, alt)
+                        
+                        redundancy = min_alt / distance_matrix[i, j]
+                        if redundancy > 1.5:  # No good alternative
+                            mst_scores[i, j] = 2.2
+    except Exception:
+        pass
+    
+    np.fill_diagonal(mst_scores, 0)
+    return mst_scores
+
+
+def _compute_node_centrality(distance_matrix: np.ndarray,
+                            stats: Dict) -> np.ndarray:
+    """Approximate node centrality scores using inverse distance sums."""
+    n = stats['n']
+    centrality = np.zeros(n)
+    
+    # Use inverse distance as centrality measure
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        centrality[i] = np.sum(1 / (dists + 1e-8))
+    
+    # Normalize
+    max_c = np.max(centrality)
+    if max_c > 0:
+        centrality = centrality / max_c
+    
+    # Convert to edge scores: favor edges connecting central nodes
+    centrality_scores = np.ones((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            centrality_scores[i, j] = centrality_scores[j, i] = \
+                (centrality[i] + centrality[j]) / 2.0
+    
+    return centrality_scores
+
+
+def _compute_adaptive_regret(distance_matrix: np.ndarray,
+                            stats: Dict,
+                            factors: Dict) -> np.ndarray:
+    """Adaptive multi-hop regret analysis (1-3 hops based on instance)."""
+    n = stats['n']
+    regret_scores = np.ones((n, n))
+    
+    if n < 4:
+        return regret_scores
+    
+    # Determine regret horizon based on instance characteristics
+    horizon = 2  # Default
+    if n >= 20 and stats['clustering'] < 0.3:
+        horizon = 3  # Use 3-hop for larger, less clustered instances
+    elif n >= 10:
+        horizon = 2
+    else:
+        horizon = 1
+    
+    # Precompute nearest neighbors for efficiency
+    k_nn = min(15, n - 1)
+    nearest = {}
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if k_nn < len(dists):
+            nearest[i] = np.argpartition(dists, k_nn)[:k_nn]
+        else:
+            nearest[i] = [j for j in range(n) if j != i]
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            direct_cost = distance_matrix[i, j]
+            
+            # Skip obviously bad edges
+            if direct_cost > 5 * stats['mean_dist']:
+                regret_scores[i, j] = 0.1
+                continue
+            
+            best_alternative = float('inf')
+            
+            if horizon == 1:
+                # 1-hop regret: best alternative through one intermediate
+                for k in nearest[i]:
+                    if k != j:
+                        alt = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternative = min(best_alternative, alt)
+            
+            elif horizon == 2:
+                # 2-hop regret: i -> u -> v -> j
+                candidates_i = nearest[i]
+                candidates_j = nearest[j]
+                for u in candidates_i:
+                    if u == j:
+                        continue
+                    for v in candidates_j:
+                        if v == i or v == u:
+                            continue
+                        if distance_matrix[u, v] < 3 * stats['mean_dist']:
+                            alt = (distance_matrix[i, u] + 
+                                  distance_matrix[u, v] + 
+                                  distance_matrix[v, j])
+                            best_alternative = min(best_alternative, alt)
+            
+            else:  # horizon == 3
+                # 3-hop regret: i -> u -> v -> w -> j
+                candidates_i = nearest[i][:10]
+                candidates_j = nearest[j][:10]
+                # Sample middle nodes
+                middle_candidates = np.random.choice(range(n), 
+                                                    min(10, n), 
+                                                    replace=False)
+                
+                for u in candidates_i:
+                    for v in middle_candidates:
+                        if v in [i, j, u]:
+                            continue
+                        for w in candidates_j:
+                            if w in [i, j, u, v]:
+                                continue
+                            # Check reasonable connections
+                            if (distance_matrix[u, v] < 3 * stats['mean_dist'] and
+                                distance_matrix[v, w] < 3 * stats['mean_dist']):
+                                alt = (distance_matrix[i, u] +
+                                      distance_matrix[u, v] +
+                                      distance_matrix[v, w] +
+                                      distance_matrix[w, j])
+                                best_alternative = min(best_alternative, alt)
+            
+            # Compute regret score
+            if direct_cost > 0 and best_alternative < float('inf'):
+                regret_ratio = best_alternative / direct_cost
+                
+                # Convert to score: higher when no good alternative exists
+                if regret_ratio > 2.0:
+                    score = 0.1  # Very poor edge
+                elif regret_ratio > 1.5:
+                    score = 0.3
+                elif regret_ratio > 1.2:
+                    score = 0.6
+                elif regret_ratio > 1.0:
+                    score = 0.8 + (1.2 - regret_ratio) * 0.5
+                else:
+                    score = 1.2  # Bonus for edges better than alternatives
+                
+                regret_scores[i, j] = score
+    
+    # Symmetrize and normalize
+    regret_scores = (regret_scores + regret_scores.T) / 2
+    np.fill_diagonal(regret_scores, 0)
+    
+    max_val = np.max(regret_scores)
+    if max_val > 0:
+        regret_scores = regret_scores / max_val
+    
+    return regret_scores
+
+
+def _compute_approx_betweenness(distance_matrix: np.ndarray,
+                               stats: Dict) -> np.ndarray:
+    """Approximate edge betweenness centrality using sampling."""
+    n = stats['n']
+    betweenness = np.zeros((n, n))
+    
+    if n < 4:
+        return betweenness
+    
+    # Create thresholded graph for betweenness approximation
+    threshold = stats['p50'] * 1.5
+    adj = (distance_matrix <= threshold).astype(float)
+    np.fill_diagonal(adj, 0)
+    
+    # Sample nodes for betweenness computation
+    sample_size = min(20, n)
+    if sample_size < 3:
+        return betweenness
+    
+    sampled_nodes = np.random.choice(range(n), sample_size, replace=False)
+    
+    # Compute shortest paths between sampled nodes
+    try:
+        # Use Floyd-Warshall for small n, otherwise approximate
+        if n <= 100:
+            # Exact betweenness on thresholded graph for all pairs
+            G = nx.from_numpy_array(adj)
+            edge_betweenness = nx.edge_betweenness_centrality(G, normalized=True)
+            for (i, j), val in edge_betweenness.items():
+                betweenness[i, j] = betweenness[j, i] = val
+        else:
+            # Approximate using sampled node pairs
+            for s in sampled_nodes:
+                for t in sampled_nodes:
+                    if s >= t:
+                        continue
+                    # Find all shortest paths between s and t
+                    try:
+                        paths = list(nx.all_shortest_paths(nx.Graph(adj), s, t))
+                        for path in paths:
+                            for k in range(len(path)-1):
+                                i, j = path[k], path[k+1]
+                                betweenness[i, j] += 1 / len(paths)
+                                betweenness[j, i] += 1 / len(paths)
+                    except:
+                        continue
+    except Exception:
+        # Fallback: use inverse distance as proxy
+        for i in range(n):
+            for j in range(i+1, n):
+                if adj[i, j] > 0:
+                    betweenness[i, j] = betweenness[j, i] = 1 / (distance_matrix[i, j] + 1e-8)
+    
+    # Normalize
+    max_bet = np.max(betweenness)
+    if max_bet > 0:
+        betweenness = betweenness / max_bet
+    
+    return betweenness
+
+
+def _compute_meta_weights(stats: Dict,
+                         factors: Dict,
+                         regret_scores: np.ndarray,
+                         betweenness_scores: np.ndarray) -> Dict:
+    """Compute factor weights using instance meta-features."""
+    n = stats['n']
+    cv = stats['cv_dist']
+    clustering = stats['clustering']
+    regularity = stats['regularity']
+    spectral_gap = stats['spectral_gap']
+    
+    # Base weights
+    weights = {
+        'w_inv': 1.0,  # Inverse distance always relevant
+        
+        # Regret weight: higher for regular, low-clustering instances
+        'w_regret': 0.5 + 0.3 * regularity - 0.2 * clustering,
+        
+        # Spectral density weight: higher when spectral gap indicates structure
+        'w_spectral': 0.3 + 0.5 * spectral_gap + 0.2 * clustering,
+        
+        # MST weight: decreases with size, increases with structure
+        'w_mst': max(0.2, 0.8 - 0.02 * n) * (1.0 + spectral_gap),
+        
+        # Centrality weight: higher for clustered instances
+        'w_centrality': 0.2 + 0.6 * clustering,
+        
+        # Betweenness weight: higher for instances with clear bottlenecks
+        'w_betweenness': 0.1 + 0.4 * (1.0 - regularity)
+    }
+    
+    # Adjust based on coefficient of variation
+    if cv < 0.2:  # Very uniform
+        weights['w_regret'] *= 1.4
+        weights['w_spectral'] *= 0.6
+    elif cv > 0.8:  # Highly variable
+        weights['w_regret'] *= 0.7
+        weights['w_betweenness'] *= 1.3
+        weights['w_centrality'] *= 1.2
+    
+    # Ensure non-negative and normalize for geometric mean
+    for key in weights:
+        weights[key] = max(0.1, weights[key])
+    
+    # Normalize sum to ~number of factors (6) for balanced influence
+    total = sum(weights.values())
+    scale = 6.0 / total if total > 0 else 1.0
+    for key in weights:
+        weights[key] *= scale
+    
+    return weights
+
+
+def _build_candidate_mask_v4(distance_matrix: np.ndarray,
+                            stats: Dict,
+                            factors: Dict,
+                            regret_scores: np.ndarray,
+                            betweenness_scores: np.ndarray) -> np.ndarray:
+    """Build candidate mask using multiple heuristic signals."""
+    n = stats['n']
+    
+    # Base candidate size
+    base_k = min(15, max(5, int(np.log2(n) * 2)))
+    
+    # Adjust based on instance characteristics
+    k = int(base_k * (1.0 + 0.4 * stats['clustering'] - 0.2 * stats['regularity']))
+    k = max(3, min(k, n - 1))
+    
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    # Phase 1: Nearest neighbors and high-regret edges
+    for i in range(n):
+        # k-nearest neighbors
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        if k < len(dists):
+            nearest = np.argpartition(dists, k)[:k]
+        else:
+            nearest = [j for j in range(n) if j != i]
+        candidate_mask[i, nearest] = True
+        
+        # Top regret edges
+        regret_row = regret_scores[i].copy()
+        regret_row[i] = -np.inf
+        top_regret = np.argpartition(regret_row, -min(3, n-1))[-min(3, n-1):]
+        candidate_mask[i, top_regret] = True
+        
+        # High betweenness edges
+        betweenness_row = betweenness_scores[i].copy()
+        betweenness_row[i] = -np.inf
+        top_betweenness = np.argpartition(betweenness_row, -min(2, n-1))[-min(2, n-1):]
+        candidate_mask[i, top_betweenness] = True
+    
+    # Ensure symmetry
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Phase 2: Ensure minimum connectivity
+    min_edges = max(3, min(6, n // 4))
+    for i in range(n):
+        if np.sum(candidate_mask[i]) < min_edges:
+            # Add promising edges based on combined score
+            combined = np.zeros(n)
+            for j in range(n):
+                if j != i and not candidate_mask[i, j]:
+                    combined[j] = (
+                        factors['inv_dist'][i, j] *
+                        regret_scores[i, j] *
+                        factors['spectral_density'][i, j]
+                    )
+            
+            needed = min_edges - np.sum(candidate_mask[i])
+            top_candidates = np.argpartition(combined, -needed)[-needed:]
+            for j in top_candidates:
+                if j != i:
+                    candidate_mask[i, j] = candidate_mask[j, i] = True
+    
+    np.fill_diagonal(candidate_mask, False)
+    return candidate_mask
+
+
+def _combine_factors_v4(distance_matrix: np.ndarray,
+                       stats: Dict,
+                       factors: Dict,
+                       regret_scores: np.ndarray,
+                       betweenness_scores: np.ndarray,
+                       weights: Dict,
+                       candidate_mask: np.ndarray) -> np.ndarray:
+    """Combine all factors using weighted geometric mean."""
+    n = stats['n']
+    H = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                combined = (
+                    (factors['inv_dist'][i, j] ** weights['w_inv']) *
+                    (regret_scores[i, j] ** weights['w_regret']) *
+                    (factors['spectral_density'][i, j] ** weights['w_spectral']) *
+                    (factors['mst'][i, j] ** weights['w_mst']) *
+                    (factors['centrality'][i, j] ** weights['w_centrality']) *
+                    (betweenness_scores[i, j] ** weights['w_betweenness'])
+                )
+                H[i, j] = H[j, i] = combined
+    
+    return H
+
+
+def _post_process_v4(H: np.ndarray,
+                    distance_matrix: np.ndarray,
+                    stats: Dict,
+                    weights: Dict) -> np.ndarray:
+    """Final post-processing with adaptive sparsification."""
+    n = stats['n']
+    
+    # Ensure symmetry and zero diagonal
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    # Adaptive sparsification based on instance size
+    if n > 10:
+        # Keep top edges per node
+        k_keep = max(3, min(8, int(n ** 0.7)))
+        H_filtered = np.zeros_like(H)
+        
+        for i in range(n):
+            row = H[i].copy()
+            row[i] = -np.inf
+            if np.sum(row > 0) > k_keep:
+                threshold = np.partition(row, -k_keep)[-k_keep]
+                indices = np.where(row >= threshold)[0]
+                H_filtered[i, indices] = row[indices]
+                H_filtered[indices, i] = row[indices]
+            else:
+                H_filtered[i] = H[i]
+                H_filtered[:, i] = H[:, i]
+        
+        H = H_filtered
+    
+    # Ensure connectivity
+    min_connections = max(2, min(4, n // 6))
+    for i in range(n):
+        non_zero = np.where(H[i] > 0)[0]
+        if len(non_zero) < min_connections:
+            # Score potential edges
+            edge_scores = []
+            for j in range(n):
+                if j != i and H[i, j] == 0:
+                    # Simple heuristic: inverse distance with regret
+                    inv_dist = 1 / (distance_matrix[i, j] + 1e-8)
+                    
+                    # Simple regret estimate
+                    dists_i = distance_matrix[i].copy()
+                    dists_i[i] = dists_i[j] = np.inf
+                    best_i = np.min(dists_i)
+                    regret = (distance_matrix[i, j] - best_i) / (best_i + 1e-8)
+                    
+                    score = inv_dist * np.exp(-regret)
+                    edge_scores.append((j, score))
+            
+            # Add best edges
+            edge_scores.sort(key=lambda x: x[1], reverse=True)
+            to_add = min_connections - len(non_zero)
+            for j, score in edge_scores[:to_add]:
+                H[i, j] = H[j, i] = score
+    
+    # Final normalization with power transformation
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    # Emphasize strong candidates based on instance regularity
+    power_exp = 0.9 - 0.3 * stats['regularity']  # More emphasis for regular instances
+    H = np.power(H, np.clip(power_exp, 0.5, 1.2))
+    
+    return H
+```

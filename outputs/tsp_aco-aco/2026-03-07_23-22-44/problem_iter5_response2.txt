@@ -1,0 +1,172 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Bonus", "Exponential Regret Penalization", "Adaptive Graph Sparsification", "Node-Based Edge Selection"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic scoring for TSP edges with MST-preserving sparsification.
+    
+    Key improvements over v1:
+    1. Regret calculation using exponential decay relative to best alternative
+    2. Distance normalization using robust statistics (percentile-based)
+    3. MST edges receive multiplicative bonus (not just preservation)
+    4. Adaptive sparsification based on problem size and edge distribution
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix of shape (n, n)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base inverse distance (avoid division by zero)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Exponential regret penalization
+    # Compute regret as: distance(i,j) - best_alternative_distance(i,j)
+    regret_matrix = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get distances from node i to all others
+        row_dists = distance_matrix[i].copy()
+        row_dists[i] = np.inf
+        
+        # Find best alternative for each j (minimum distance excluding j itself)
+        for j in range(n):
+            if i == j:
+                continue
+            # Exclude edge (i,j) when finding best alternative
+            alternative_dists = row_dists.copy()
+            alternative_dists[j] = np.inf
+            best_alt = np.min(alternative_dists)
+            
+            if best_alt > 0 and not np.isinf(best_alt):
+                regret = distance_matrix[i, j] - best_alt
+                # Apply exponential decay: exp(-regret / best_alt)
+                # Higher regret gets stronger penalty
+                regret_matrix[i, j] = np.exp(-regret / (best_alt + 1e-8))
+            else:
+                regret_matrix[i, j] = 1.0  # No penalty if no good alternative
+    
+    # Make regret symmetric
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    np.fill_diagonal(regret_matrix, 0)
+    
+    # 3. Distance normalization using robust percentile
+    triu_indices = np.triu_indices(n, k=1)
+    if len(triu_indices[0]) > 0:
+        non_zero_dists = distance_matrix[triu_indices]
+        if len(non_zero_dists) > 0:
+            # Use 25th percentile for more stable normalization
+            norm_factor = np.percentile(non_zero_dists, 25)
+        else:
+            norm_factor = 1.0
+    else:
+        norm_factor = 1.0
+    
+    # Distance penalty using normalized exponential decay
+    if norm_factor > 0:
+        dist_penalty = np.exp(-distance_matrix / (0.7 * norm_factor))
+    else:
+        dist_penalty = np.ones_like(distance_matrix)
+    np.fill_diagonal(dist_penalty, 0)
+    
+    # 4. MST connectivity with bonus factor
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    mst_bonus = np.ones_like(distance_matrix)
+    mst_bonus[mst_mask] = 1.5  # 50% bonus for MST edges
+    
+    # 5. Combine components
+    base_scores = inv_dist * regret_matrix * dist_penalty * mst_bonus
+    
+    # 6. Adaptive sparsification with MST preservation
+    sparsified = np.zeros_like(base_scores)
+    
+    # Determine base connectivity based on problem size
+    if n <= 10:
+        base_edges = min(5, n-1)
+    elif n <= 50:
+        base_edges = int(np.sqrt(n)) + 2
+    else:
+        base_edges = int(np.log2(n) * 3)
+    
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Always preserve MST edges for this node
+        node_mst_mask = mst_mask[i]
+        
+        # Determine number of edges to keep for this node
+        mst_count = np.sum(node_mst_mask)
+        target_edges = max(base_edges, mst_count + 1)
+        target_edges = min(target_edges, n-1)
+        
+        # Calculate score thresholds
+        if np.sum(row_scores > -np.inf) > 0:
+            # Keep MST edges plus top scoring non-MST edges
+            non_mst_scores = row_scores.copy()
+            non_mst_scores[node_mst_mask] = -np.inf
+            
+            if np.sum(non_mst_scores > -np.inf) > 0:
+                # Determine how many non-MST edges we need
+                needed_non_mst = target_edges - mst_count
+                if needed_non_mst > 0:
+                    # Get threshold for top non-MST edges
+                    valid_non_mst = non_mst_scores[non_mst_scores > -np.inf]
+                    if len(valid_non_mst) > 0:
+                        if needed_non_mst < len(valid_non_mst):
+                            threshold = np.partition(
+                                valid_non_mst, 
+                                -needed_non_mst
+                            )[-needed_non_mst]
+                        else:
+                            threshold = np.min(valid_non_mst)
+                        
+                        top_non_mst = (non_mst_scores >= threshold) & (non_mst_scores > -np.inf)
+                        keep_mask = node_mst_mask | top_non_mst
+                    else:
+                        keep_mask = node_mst_mask
+                else:
+                    keep_mask = node_mst_mask
+            else:
+                keep_mask = node_mst_mask
+        else:
+            keep_mask = node_mst_mask
+        
+        # Apply selection
+        sparsified[i][keep_mask] = base_scores[i][keep_mask]
+    
+    # 7. Symmetrize: keep edge if selected by either endpoint
+    symmetric_scores = np.maximum(sparsified, sparsified.T)
+    
+    # 8. Ensure MST edges have minimum viable score
+    if np.max(symmetric_scores) > 0:
+        min_nonzero = np.min(symmetric_scores[symmetric_scores > 0])
+        symmetric_scores[mst_mask] = np.maximum(symmetric_scores[mst_mask], min_nonzero * 0.5)
+    
+    # 9. Final normalization
+    max_score = np.max(symmetric_scores)
+    if max_score > 0:
+        symmetric_scores = symmetric_scores / max_score
+    
+    np.fill_diagonal(symmetric_scores, 0)
+    
+    return symmetric_scores
+```

@@ -1,0 +1,157 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Improved heuristic for TSP edge selection focusing on three key principles:
+    1. Prioritize MST edges (most important)
+    2. Penalize triangle inequality violations
+    3. Control node degrees to avoid overly connected nodes
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Matrix of same shape where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Ensure diagonal is infinity to avoid self-connections
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # 1. Base heuristic: inverse distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1 / safe_dist
+    base_heuristic[np.isinf(base_heuristic)] = 0
+    
+    # 2. Prioritize MST edges (most important factor)
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Get MST using Prim's algorithm (more robust than simple implementation)
+    mst_tree = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = mst_tree > 0
+    mst_mask = mst_mask | mst_mask.T  # Make symmetric
+    
+    # MST edges get high bonus, non-MST edges get penalty
+    mst_bonus = np.ones_like(distance_matrix)
+    mst_bonus[mst_mask] = 2.0  # Strong bonus for MST edges
+    mst_bonus[~mst_mask] = 0.5  # Penalty for non-MST edges
+    
+    # 3. Penalize triangle inequality violations
+    triangle_penalty = np.ones_like(distance_matrix)
+    
+    if n >= 3:
+        # Vectorized triangle inequality check
+        for i in range(n):
+            for j in range(i + 1, n):
+                if safe_dist[i, j] < np.inf:
+                    # Find minimum detour through any third node
+                    # Exclude i and j from potential intermediates
+                    mask = np.ones(n, dtype=bool)
+                    mask[i] = mask[j] = False
+                    
+                    if np.any(mask):
+                        detours = safe_dist[i, mask] + safe_dist[mask, j]
+                        if len(detours) > 0:
+                            min_detour = np.min(detours)
+                            
+                            # Apply penalty based on violation severity
+                            if safe_dist[i, j] > 2.0 * min_detour:
+                                penalty = 0.1  # Severe violation
+                            elif safe_dist[i, j] > 1.5 * min_detour:
+                                penalty = 0.3  # Moderate violation
+                            elif safe_dist[i, j] > 1.2 * min_detour:
+                                penalty = 0.7  # Mild violation
+                            else:
+                                penalty = 1.0  # No significant violation
+                            
+                            triangle_penalty[i, j] = triangle_penalty[j, i] = penalty
+    
+    # 4. Control node degrees (limit promising edges per node)
+    degree_adjustment = np.ones_like(distance_matrix)
+    
+    # Compute initial scores to determine which edges are most promising for each node
+    initial_scores = base_heuristic * triangle_penalty * mst_bonus
+    
+    # For each node, keep top k edges
+    # k scales with problem size but is conservative
+    k = max(2, min(5, n // 3))
+    
+    for i in range(n):
+        if n > k:
+            # Get scores for edges from node i (excluding diagonal)
+            node_scores = initial_scores[i].copy()
+            node_scores[i] = -np.inf  # Ignore self
+            
+            # Find threshold for top k edges
+            top_indices = np.argpartition(-node_scores, k)[:k]
+            threshold = np.min(node_scores[top_indices])
+            
+            # Apply degree control: boost top edges, penalize others
+            for j in range(n):
+                if i != j:
+                    if node_scores[j] >= threshold:
+                        # Top edges get boost, but MST edges get extra boost
+                        if mst_mask[i, j]:
+                            degree_adjustment[i, j] = 1.5
+                        else:
+                            degree_adjustment[i, j] = 1.2
+                    else:
+                        # Non-top edges get penalized
+                        degree_adjustment[i, j] = 0.2
+    
+    # 5. Combine all factors with clear priorities
+    combined = base_heuristic * triangle_penalty * mst_bonus * degree_adjustment
+    
+    # 6. Ensure MST edges are always included (set minimum score if they were penalized too much)
+    min_mst_score = 0.01  # Minimum score for MST edges
+    mst_scores = combined[mst_mask]
+    if len(mst_scores) > 0:
+        current_min = np.min(mst_scores)
+        if current_min < min_mst_score:
+            # Boost underperforming MST edges
+            boost_factor = min_mst_score / current_min
+            combined[mst_mask] = np.maximum(combined[mst_mask] * boost_factor, min_mst_score)
+    
+    # 7. Apply sparsification: keep only edges above threshold
+    if n > 2:
+        # Flatten non-diagonal, non-zero scores
+        mask = ~np.eye(n, dtype=bool)
+        flat_scores = combined[mask]
+        
+        if len(flat_scores[flat_scores > 0]) > 0:
+            # Keep top edges: MST edges plus top 30% of remaining
+            mst_threshold = 0  # MST edges already handled
+            non_mst_scores = flat_scores[~mst_mask[mask]]
+            
+            if len(non_mst_scores[non_mst_scores > 0]) > 0:
+                # Higher threshold for non-MST edges
+                non_mst_threshold = np.percentile(non_mst_scores[non_mst_scores > 0], 70)
+                
+                # Apply thresholds
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        if not mst_mask[i, j] and combined[i, j] < non_mst_threshold:
+                            combined[i, j] = combined[j, i] = 0
+    
+    # 8. Normalize for consistent scale
+    non_zero = combined[combined > 0]
+    if len(non_zero) > 0:
+        max_val = np.max(non_zero)
+        if max_val > 0:
+            combined = combined / max_val
+    
+    # Ensure diagonal is zero and matrix is symmetric
+    np.fill_diagonal(combined, 0)
+    combined = np.maximum(combined, combined.T)
+    
+    return combined
+```

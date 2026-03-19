@@ -1,0 +1,246 @@
+```json
+{
+    "algorithm_features": ["Sampled Edge Frequency", "Adaptive Betweenness", "Dynamic Graph Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with optimized sampling, adaptive betweenness,
+    and intelligent sparsification for improved performance and accuracy.
+    
+    Key Improvements over v1:
+    1. More efficient approximate betweenness via random path sampling.
+    2. Refined adaptive weighting based on instance statistics.
+    3. Dynamic sparsification with size-aware edge retention.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, where higher values indicate
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    distances_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    log_n = np.log(n + 1)
+    density_factor = min(1.0, n / 50.0)
+    
+    # ===== 2. SOLUTION SAMPLING FOR EDGE FREQUENCY =====
+    def generate_tour(method: str = 'nn') -> np.ndarray:
+        """Generate initial tour using specified heuristic."""
+        if method == 'nn':
+            start = np.random.randint(0, n)
+            tour = [start]
+            unvisited = set(range(n)) - {start}
+            while unvisited:
+                current = tour[-1]
+                nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+            return np.array(tour)
+        elif method == 'greedy':
+            if n <= 3:
+                return np.random.permutation(n)
+            # Cheapest insertion
+            indices = np.random.choice(n, 3, replace=False)
+            tour = list(indices[:3])
+            tour.append(tour[0])
+            remaining = set(range(n)) - set(tour[:-1])
+            while remaining:
+                best_cost = float('inf')
+                best_node = best_pos = -1
+                for node in remaining:
+                    for i in range(len(tour)-1):
+                        cost_inc = (distance_matrix[tour[i], node] +
+                                   distance_matrix[node, tour[i+1]] -
+                                   distance_matrix[tour[i], tour[i+1]])
+                        if cost_inc < best_cost:
+                            best_cost = cost_inc
+                            best_node = node
+                            best_pos = i + 1
+                tour.insert(best_pos, best_node)
+                remaining.remove(best_node)
+            return np.array(tour[:-1])
+        else:  # random
+            return np.random.permutation(n)
+    
+    def two_opt_improve(tour: np.ndarray, max_iter: int = 30) -> np.ndarray:
+        """Apply 2-opt local search with limited iterations for speed."""
+        improved = True
+        it = 0
+        current = tour.copy()
+        while improved and it < max_iter:
+            improved = False
+            for i in range(n-1):
+                for j in range(i+2, n):
+                    if j == n-1 and i == 0:
+                        continue
+                    a, b = current[i], current[(i+1)%n]
+                    c, d = current[j], current[(j+1)%n]
+                    old = distance_matrix[a, b] + distance_matrix[c, d]
+                    new = distance_matrix[a, c] + distance_matrix[b, d]
+                    if new < old:
+                        current[(i+1)%n:j+1] = current[(i+1)%n:j+1][::-1]
+                        improved = True
+                        break
+                if improved:
+                    break
+            it += 1
+        return current
+    
+    # Adaptive number of tours
+    num_tours = max(5, min(20, n // 2))
+    tours = []
+    for _ in range(num_tours):
+        method = np.random.choice(['nn', 'greedy', 'random'], p=[0.5, 0.3, 0.2])
+        tour = generate_tour(method)
+        tour = two_opt_improve(tour, max_iter=int(15 * density_factor))
+        tours.append(tour)
+    
+    # Edge frequency matrix
+    edge_freq = np.zeros_like(distance_matrix)
+    for tour in tours:
+        for i in range(n):
+            u, v = tour[i], tour[(i+1)%n]
+            edge_freq[u, v] += 1
+            edge_freq[v, u] += 1
+    if edge_freq.max() > 0:
+        edge_freq /= edge_freq.max()
+    
+    # ===== 3. FAST SAMPLED EDGE BETWEENNESS =====
+    # Approximate betweenness using random path sampling
+    num_samples = max(10, min(50, n // 3))
+    betweenness = np.zeros_like(distance_matrix)
+    
+    for _ in range(num_samples):
+        # Sample a random path via greedy construction between two nodes
+        start, end = np.random.choice(n, 2, replace=False)
+        path = [start]
+        visited = {start}
+        current = start
+        while current != end and len(visited) < n:
+            # Greedy move towards end (minimize distance to end, but allow exploration)
+            candidates = [j for j in range(n) if j not in visited]
+            if not candidates:
+                break
+            # Heuristic: prefer edges that are short and move closer to end
+            scores = [distance_matrix[current, j] + 0.5 * distance_matrix[j, end] for j in candidates]
+            next_node = candidates[np.argmin(scores)]
+            path.append(next_node)
+            visited.add(next_node)
+            current = next_node
+        
+        # Count edges in the path
+        for i in range(len(path)-1):
+            u, v = path[i], path[i+1]
+            betweenness[u, v] += 1
+            betweenness[v, u] += 1
+    
+    if betweenness.max() > 0:
+        betweenness /= betweenness.max()
+    
+    # Closeness centrality (simplified)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    row_sums = np.sum(distance_matrix, axis=1) - np.diag(distance_matrix)
+    closeness = (n - 1) / (row_sums + 1e-10)
+    closeness = closeness / closeness.sum()
+    
+    # Combined centrality score
+    centrality = 0.6 * betweenness + 0.4 * np.outer(closeness, closeness)
+    
+    # ===== 4. ADAPTIVE HYBRID WEIGHTING =====
+    edge_freq_std = np.std(edge_freq[np.triu_indices(n, k=1)])
+    # Weights adjust based on instance variability
+    w_freq = 0.4 + 0.3 * min(1.0, edge_freq_std * 3)
+    w_dist = 0.3 + 0.2 * (1 - min(1.0, cv))
+    w_cent = 0.2 + 0.1 * min(1.0, cv)
+    w_mst = 0.1 + 0.1 * density_factor
+    total = w_freq + w_dist + w_cent + w_mst
+    w_freq, w_dist, w_cent, w_mst = w_freq/total, w_dist/total, w_cent/total, w_mst/total
+    
+    # ===== 5. COMPONENT COMPUTATION =====
+    # Distance component
+    inv_dist_norm = inv_dist / (inv_dist.max() + 1e-10)
+    
+    # MST component
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    mst_scores = np.zeros_like(distance_matrix)
+    mst_scores[mst_mask] = 1.0 / (distance_matrix[mst_mask] + 1e-10)
+    if mst_scores.max() > 0:
+        mst_scores /= mst_scores.max()
+    
+    # Nearest neighbor mask for initial boosting
+    k_nn = max(2, min(5, int(np.sqrt(n))))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        nn_indices = np.argsort(distance_matrix[i])[1:k_nn+1]
+        nn_mask[i, nn_indices] = True
+    nn_mask = nn_mask | nn_mask.T
+    
+    # ===== 6. COMBINE COMPONENTS =====
+    heuristics_mat = (
+        w_freq * edge_freq +
+        w_dist * inv_dist_norm +
+        w_cent * centrality +
+        w_mst * mst_scores
+    )
+    
+    # Boost edges that are in MST and have high frequency
+    overlap = mst_mask & (edge_freq > np.percentile(edge_freq, 70))
+    heuristics_mat[overlap] *= 1.4
+    
+    # ===== 7. DYNAMIC GRAPH SPARSIFICATION =====
+    # Adaptive edge retention per node
+    min_edges = max(2, int(1.5 * log_n))
+    max_edges = min(n-1, int(4 * log_n))
+    sparsity_mask = np.zeros_like(heuristics_mat, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_mat[i].copy()
+        scores[i] = -np.inf
+        # Determine edges to keep: base on size and density
+        keep = int(np.clip((n-1) * (0.15 + 0.25 * density_factor), min_edges, max_edges))
+        top_idx = np.argsort(scores)[-keep:]
+        sparsity_mask[i, top_idx] = True
+    
+    # Ensure connectivity via MST and symmetry
+    sparsity_mask = sparsity_mask | mst_mask
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Apply sparsification
+    heuristics_mat *= sparsity_mask
+    heuristics_mat[nn_mask & sparsity_mask] *= 1.3  # Boost nearest neighbors
+    
+    # ===== 8. FINAL PROCESSING =====
+    heuristics_mat = 0.5 * (heuristics_mat + heuristics_mat.T)
+    np.fill_diagonal(heuristics_mat, 0)
+    
+    # Normalize non-zero values
+    non_zero = heuristics_mat[heuristics_mat > 0]
+    if len(non_zero) > 0:
+        q_low, q_high = np.percentile(non_zero, [5, 95])
+        heuristics_mat = np.clip(heuristics_mat, q_low, q_high)
+        if heuristics_mat.max() > 0:
+            heuristics_mat /= heuristics_mat.max()
+    
+    return heuristics_mat
+```

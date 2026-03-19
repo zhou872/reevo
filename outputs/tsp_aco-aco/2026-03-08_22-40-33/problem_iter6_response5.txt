@@ -1,0 +1,318 @@
+```json
+{
+    "algorithm_features": ["Christofides Approximation Fusion", "Distance-Adaptive Mutual K-NN", "Two-step Lookahead Path Efficiency", "Connectivity-Aware Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray,
+                  lookahead_hops: int = 3,
+                  adaptive_regret: bool = True,
+                  adaptive_sparsity: bool = True) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization combining Christofides
+    approximation with adaptive local optimization principles.
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (shape n x n)
+        lookahead_hops: Maximum depth for multi-hop lookahead (2-3 recommended)
+        adaptive_regret: Whether to adapt regret penalty based on distance distribution
+        adaptive_sparsity: Whether to adaptively sparsify unpromising edges
+        
+    Returns:
+        Heuristic matrix of same shape as input, with scores in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # Suppress warnings for clean output
+    warnings.filterwarnings('ignore')
+    
+    # ===== 1. INSTANCE CHARACTERIZATION =====
+    # Extract statistical features for adaptive parameters
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / (dist_mean + 1e-12)  # Coefficient of variation
+    
+    # Adaptive parameter tuning based on instance characteristics
+    if adaptive_regret:
+        regret_power = 1.5 + 0.8 * np.tanh(2 * dist_cv)  # 1.5-2.3 range
+    else:
+        regret_power = 1.5
+        
+    mst_weight = 2.0 + 0.5 * np.tanh(dist_cv - 1.0)  # 2.0-2.5 range
+    
+    # ===== 2. CHRISTOFIDES APPROXIMATION EDGES =====
+    def _compute_christofides_edges(dist_mat: np.ndarray) -> np.ndarray:
+        """Compute Christofides approximation edges (MST + min-weight matching)."""
+        n_nodes = dist_mat.shape[0]
+        christofides_mask = np.zeros((n_nodes, n_nodes), dtype=bool)
+        
+        # Minimum Spanning Tree (Prim's algorithm)
+        visited = np.zeros(n_nodes, dtype=bool)
+        min_edge = np.full(n_nodes, np.inf)
+        parent = np.full(n_nodes, -1, dtype=int)
+        min_edge[0] = 0
+        
+        for _ in range(n_nodes):
+            # Find unvisited node with minimum edge
+            u = -1
+            min_val = np.inf
+            for i in range(n_nodes):
+                if not visited[i] and min_edge[i] < min_val:
+                    min_val = min_edge[i]
+                    u = i
+            if u == -1:
+                break
+            visited[u] = True
+            if parent[u] != -1:
+                christofides_mask[u, parent[u]] = christofides_mask[parent[u], u] = True
+            
+            # Update distances to unvisited neighbors
+            for v in range(n_nodes):
+                if not visited[v] and dist_mat[u, v] < min_edge[v]:
+                    min_edge[v] = dist_mat[u, v]
+                    parent[v] = u
+        
+        # Identify odd-degree vertices in MST
+        mst_degrees = np.sum(christofides_mask, axis=1)
+        odd_vertices = np.where(mst_degrees % 2 == 1)[0]
+        
+        # Greedy minimum-weight matching for odd-degree vertices
+        if len(odd_vertices) >= 2:
+            # Create distance submatrix for odd vertices
+            odd_distances = dist_mat[np.ix_(odd_vertices, odd_vertices)]
+            np.fill_diagonal(odd_distances, np.inf)
+            
+            matched = np.zeros(len(odd_vertices), dtype=bool)
+            for i in range(len(odd_vertices)):
+                if not matched[i]:
+                    u = odd_vertices[i]
+                    # Find closest unmatched odd vertex
+                    best_dist = np.inf
+                    best_j = -1
+                    for j in range(i + 1, len(odd_vertices)):
+                        if not matched[j]:
+                            v = odd_vertices[j]
+                            dist = dist_mat[u, v]
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_j = j
+                    if best_j != -1:
+                        v = odd_vertices[best_j]
+                        christofides_mask[u, v] = christofides_mask[v, u] = True
+                        matched[i] = matched[best_j] = True
+        
+        return christofides_mask
+    
+    christofides_mask = _compute_christofides_edges(distance_matrix)
+    
+    # ===== 3. BASE INVERSE DISTANCE WITH ADAPTIVE SCALING =====
+    scale = dist_mean if dist_mean > 0 else 1.0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = scale / (distance_matrix + 0.15 * scale * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ===== 4. ADAPTIVE REGRET-BASED PENALIZATION =====
+    regret_penalty = np.ones((n, n))
+    for i in range(n):
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        candidates = np.where(mask)[0]
+        if len(candidates) >= 2:
+            dists = distance_matrix[i, candidates]
+            sorted_idx = np.argsort(dists)
+            best_dist = dists[sorted_idx[0]]
+            
+            for rank, pos in enumerate(sorted_idx):
+                j = candidates[pos]
+                if rank == 0:
+                    regret_penalty[i, j] = 1.0  # Best edge gets no penalty
+                else:
+                    # Combine rank and distance ratio
+                    norm_rank = rank / (len(candidates) - 1)
+                    dist_ratio = dists[pos] / (best_dist + 1e-12)
+                    # Sigmoid-like penalty: harsh for mid-range, softer for extremes
+                    penalty = 1 / (1 + regret_power * norm_rank * np.sqrt(dist_ratio))
+                    regret_penalty[i, j] = penalty
+    
+    # Symmetrize using geometric mean
+    regret_penalty = np.sqrt(regret_penalty * regret_penalty.T)
+    
+    # ===== 5. MUTUAL K-NN PROXIMITY BONUS =====
+    # Adaptive K based on problem size
+    k_nn = min(max(3, int(np.sqrt(n))), n - 1)
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_nn + 1]
+    mutual_nn_bonus = np.ones((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if j in nearest_indices[i] and i in nearest_indices[j]:
+                # Both are in each other's K-NN
+                rank_i = np.where(nearest_indices[i] == j)[0][0]
+                rank_j = np.where(nearest_indices[j] == i)[0][0]
+                avg_rank = (rank_i + rank_j) / (2 * (k_nn - 1))
+                # Bonus decreases with rank distance
+                bonus = 1.0 + 0.6 * (1.0 - avg_rank)  # 1.0 to 1.6 range
+                mutual_nn_bonus[i, j] = mutual_nn_bonus[j, i] = bonus
+    
+    # ===== 6. TWO-STEP LOOKAHEAD PATH EFFICIENCY =====
+    lookahead_score = np.ones((n, n))
+    if n >= 4 and lookahead_hops >= 2:
+        # Use slightly more neighbors for lookahead
+        lookahead_k = min(max(4, int(1.5 * np.sqrt(n))), n - 1)
+        nearest_indices_lookahead = np.argsort(distance_matrix, axis=1)[:, 1:lookahead_k + 1]
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                direct_dist = distance_matrix[i, j]
+                if direct_dist <= 0:
+                    continue
+                    
+                best_alternative = np.inf
+                
+                # 2-hop paths through common neighbors
+                i_neighbors = set(nearest_indices_lookahead[i].tolist())
+                j_neighbors = set(nearest_indices_lookahead[j].tolist())
+                common_neighbors = i_neighbors.intersection(j_neighbors)
+                
+                for k in common_neighbors:
+                    if k != i and k != j:
+                        alt_path = distance_matrix[i, k] + distance_matrix[k, j]
+                        best_alternative = min(best_alternative, alt_path)
+                
+                # 3-hop paths if enabled and no good 2-hop found
+                if lookahead_hops >= 3 and (best_alternative / direct_dist > 1.3):
+                    for k in list(i_neighbors)[:min(3, len(i_neighbors))]:
+                        if k == j:
+                            continue
+                        for l in list(j_neighbors)[:min(3, len(j_neighbors))]:
+                            if l == i or l == k:
+                                continue
+                            # Check if k and l are connected or share neighbor
+                            if k in nearest_indices_lookahead[l] or l in nearest_indices_lookahead[k]:
+                                alt_path = (distance_matrix[i, k] + 
+                                           distance_matrix[k, l] + 
+                                           distance_matrix[l, j])
+                                best_alternative = min(best_alternative, alt_path)
+                
+                # Calculate efficiency score
+                if best_alternative < np.inf:
+                    efficiency = best_alternative / direct_dist
+                    # Transform to scoring function: higher score = direct edge is better
+                    score = 0.5 + 1.5 / (1.0 + np.exp(-2.0 * (efficiency - 1.0)))
+                    lookahead_score[i, j] = lookahead_score[j, i] = score
+    
+    # ===== 7. COMBINE ALL COMPONENTS =====
+    heuristics = inv_dist.copy()
+    heuristics *= regret_penalty
+    heuristics *= lookahead_score
+    heuristics *= mutual_nn_bonus
+    
+    # Boost edges from Christofides approximation
+    heuristics[christofides_mask] *= 1.8
+    
+    # Ensure symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # ===== 8. CONNECTIVITY-AWARE SPARSIFICATION =====
+    if adaptive_sparsity and n > 3:
+        # Estimate local connectivity per node
+        connectivity = np.zeros(n)
+        for i in range(n):
+            row_vals = heuristics[i].copy()
+            row_vals[i] = -np.inf
+            # Look at top 4-6 edges per node
+            top_k = min(6, n - 1)
+            if np.sum(row_vals > 0) >= top_k:
+                top_values = np.partition(row_vals, -top_k)[-top_k:]
+                connectivity[i] = np.mean(top_values[top_values > -np.inf])
+        
+        # Normalize connectivity scores
+        max_conn = np.max(connectivity)
+        if max_conn > 0:
+            connectivity = connectivity / max_conn
+        
+        # Apply adaptive thresholding
+        for i in range(n):
+            row = heuristics[i].copy()
+            row[i] = 0  # Zero diagonal
+            
+            # Always keep Christofides edges
+            keep_mask = christofides_mask[i].copy()
+            
+            # Determine number of edges to keep based on connectivity
+            if connectivity[i] > 0.7:  # Well-connected node
+                keep_count = min(int(1.5 * np.sqrt(n)), n - 1)
+            elif connectivity[i] < 0.3:  # Poorly-connected node
+                keep_count = min(int(0.8 * np.sqrt(n)), n - 1)
+            else:
+                keep_count = min(int(1.2 * np.sqrt(n)), n - 1)
+            
+            # Ensure we keep at least some edges beyond Christofides
+            keep_count = max(keep_count, np.sum(keep_mask) + 1)
+            
+            # Keep top edges based on heuristic score
+            if np.sum(row > 0) > keep_count:
+                # Sort non-zero values
+                non_zero = row[row > 0]
+                if len(non_zero) > 0:
+                    threshold = np.sort(non_zero)[-keep_count]
+                    # Zero out edges below threshold (except Christofides edges)
+                    low_score_mask = (row < threshold) & (~keep_mask)
+                    row[low_score_mask] = 0
+            
+            heuristics[i] = row
+        
+        # Re-symmetrize
+        heuristics = (heuristics + heuristics.T) / 2
+    
+    # ===== 9. FINAL NORMALIZATION =====
+    np.fill_diagonal(heuristics, 0)
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Ensure exact symmetry and zero diagonal
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+
+
+# Example usage and test
+if __name__ == "__main__":
+    np.random.seed(42)
+    n_nodes = 20
+    
+    # Create symmetric distance matrix
+    coords = np.random.rand(n_nodes, 2) * 100
+    from scipy.spatial.distance import pdist, squareform
+    dist_matrix = squareform(pdist(coords))
+    
+    heuristics = heuristics_v2(dist_matrix, lookahead_hops=3)
+    
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity (zero entries): {(heuristics == 0).sum() / heuristics.size:.1%}")
+    
+    non_zero_edges = np.sum(heuristics > 0, axis=1)
+    print(f"Non-zero edges per node: min={non_zero_edges.min()}, "
+          f"max={non_zero_edges.max()}, mean={non_zero_edges.mean():.1f}")
+    
+    print(f"Matrix symmetric? {np.allclose(heuristics, heuristics.T)}")
+    
+    print("\nSample edge scores (i, j, distance, heuristic):")
+    for i, j in [(0, 1), (0, 5), (2, 8), (3, 7), (10, 15)]:
+        if i < n_nodes and j < n_nodes:
+            print(f"({i}, {j}): dist={dist_matrix[i, j]:.2f}, "
+                  f"heuristic={heuristics[i, j]:.4f}")
+```

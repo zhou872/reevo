@@ -1,0 +1,334 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Regret", "Spectral Clustering Reinforcement", "Adaptive Sparsification", "Competitive Borda Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.linalg import eigh
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristic with two-step lookahead regret, spectral clustering,
+    and adaptive sparsification for stochastic solution sampling.
+    
+    Key Innovations:
+    1. Two-step lookahead regret modeling that anticipates future path costs
+    2. Spectral graph analysis for identifying natural clusters and structural patterns
+    3. Reinforcement learning-inspired adaptive sparsification thresholds
+    4. Competitive Borda scoring with global tournament weighting
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores (0-1 range)
+    """
+    n = distance_matrix.shape[0]
+    if n < 4:
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix with self-distances masked
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # ------------------------------------------------------------
+    # 1. DYNAMIC CANDIDATE SELECTION WITH TWO-STEP LOOKAHEAD
+    # ------------------------------------------------------------
+    
+    # Adaptive candidate count based on instance size
+    base_k = max(4, min(15, int(np.log2(n) * 3)))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Precompute two-step minimum paths for all pairs
+    # This gives us lookahead information for candidate selection
+    two_step_min = np.full_like(distance_matrix, np.inf)
+    for i in range(n):
+        for k in range(n):
+            if i != k:
+                two_step_min[i] = np.minimum(two_step_min[i], 
+                                           safe_dist[i, k] + safe_dist[k])
+    
+    for i in range(n):
+        # Multiple criteria for candidate selection
+        distances = safe_dist[i]
+        
+        # Criterion 1: Direct distance (closest neighbors)
+        top_by_distance = np.argsort(distances)[:base_k]
+        
+        # Criterion 2: Two-step advantage (how much better is direct vs two-step)
+        two_step_advantage = two_step_min[i] - distances
+        top_by_advantage = np.argsort(two_step_advantage)[-base_k:]
+        
+        # Criterion 3: Lookahead regret (anticipate future constraints)
+        # Nodes that serve as good bridges between other nodes
+        bridge_scores = np.zeros(n)
+        for j in range(n):
+            if i != j:
+                # How many alternative paths go through this edge
+                alternative_gap = two_step_min[i, j] - distances[j]
+                bridge_scores[j] = max(0, alternative_gap) / (distances[j] + eps)
+        top_by_bridge = np.argsort(bridge_scores)[-base_k//2:]
+        
+        # Combine criteria
+        candidates = np.union1d(top_by_distance, top_by_advantage)
+        candidates = np.union1d(candidates, top_by_bridge)
+        candidate_mask[i, candidates] = True
+    
+    # Ensure symmetry in candidate selection
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # ------------------------------------------------------------
+    # 2. ENHANCED SPECTRAL CLUSTERING WITH MULTIPLE EIGENVECTORS
+    # ------------------------------------------------------------
+    
+    spectral_bonus = np.zeros_like(distance_matrix)
+    
+    # Use spectral analysis only for moderate-sized instances
+    if n <= 1000 and n >= 10:
+        try:
+            # Normalized similarity matrix (Gaussian kernel)
+            mean_dist = np.mean(safe_dist[safe_dist < np.inf])
+            W = np.exp(-safe_dist / (mean_dist + eps))
+            np.fill_diagonal(W, 0)
+            
+            # Degree matrix
+            D = np.diag(np.sum(W, axis=1))
+            D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + eps))
+            
+            # Normalized Laplacian
+            L_norm = np.eye(n) - D_inv_sqrt @ W @ D_inv_sqrt
+            
+            # Compute multiple eigenvectors for richer clustering
+            k_eigen = min(5, n - 2)
+            eigvals, eigvecs = eigh(L_norm, subset_by_index=[1, k_eigen])
+            
+            # Use the eigenvectors for spectral embedding
+            embedding = eigvecs[:, :3] if eigvecs.shape[1] >= 3 else eigvecs
+            
+            # Compute pairwise distances in spectral space
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if candidate_mask[i, j]:
+                        # Euclidean distance in spectral space
+                        spectral_dist = np.linalg.norm(embedding[i] - embedding[j])
+                        # Bonus for being close in spectral space
+                        spectral_bonus[i, j] = np.exp(-spectral_dist * 2.0)
+                        spectral_bonus[j, i] = spectral_bonus[i, j]
+                        
+        except:
+            # Fallback: use simple inverse distance
+            pass
+    
+    # ------------------------------------------------------------
+    # 3. TWO-STEP LOOKAHEAD REGRET WITH FUTURE ANTICIPATION
+    # ------------------------------------------------------------
+    
+    regret_matrix = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i]
+        valid_dists = dists[dists < np.inf]
+        
+        if len(valid_dists) >= 3:
+            # Sort distances
+            sorted_idx = np.argsort(dists)
+            sorted_dists = dists[sorted_idx]
+            
+            # Compute two-step lookahead for each potential edge
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    dist_ij = dists[j]
+                    
+                    # Base rank penalty
+                    rank = np.searchsorted(sorted_dists, dist_ij)
+                    rank_penalty = rank / (len(valid_dists) - 1 + eps)
+                    
+                    # Two-step lookahead penalty
+                    # Consider the cost if we don't take edge (i,j)
+                    lookahead_penalty = 0
+                    
+                    # Find best alternative two-step path excluding j
+                    mask = np.ones(n, dtype=bool)
+                    mask[i] = mask[j] = False
+                    if np.any(mask):
+                        alternative_costs = safe_dist[i, mask] + safe_dist[mask, j]
+                        best_alternative = np.min(alternative_costs)
+                        
+                        # Penalize edges that have good alternatives
+                        if best_alternative < dist_ij * 1.2:  # Within 20%
+                            lookahead_penalty = (dist_ij - best_alternative) / (dist_ij + eps)
+                    
+                    # Combine penalties with weights
+                    combined_penalty = 0.7 * rank_penalty + 0.3 * lookahead_penalty
+                    
+                    # Apply sigmoid transformation for smooth penalty
+                    regret_matrix[i, j] = 1.0 / (1.0 + np.exp(5.0 * (combined_penalty - 0.5)))
+    
+    # ------------------------------------------------------------
+    # 4. COMPETITIVE BORDA WEIGHTING WITH GLOBAL TOURNAMENT
+    # ------------------------------------------------------------
+    
+    borda_weights = np.zeros_like(distance_matrix)
+    
+    # Global tournament: for each node, rank all others by distance
+    for i in range(n):
+        dists_i = safe_dist[i]
+        # Count how many nodes are closer than each candidate
+        for j in range(n):
+            if i != j:
+                tournament_score = np.sum(dists_i < dists_i[j])
+                # Normalize and apply sigmoid for smooth weighting
+                normalized_score = tournament_score / (n - 2 + eps)
+                borda_weights[i, j] = 1.0 / (1.0 + np.exp(3.0 * (normalized_score - 0.7)))
+    
+    # ------------------------------------------------------------
+    # 5. MST-BASED STRUCTURAL REINFORCEMENT
+    # ------------------------------------------------------------
+    
+    mst_bonus = np.zeros_like(distance_matrix)
+    
+    try:
+        mst = minimum_spanning_tree(distance_matrix).toarray()
+        mst_edges = (mst + mst.T) > 0
+        
+        # Strong bonus for MST edges (they form the backbone)
+        mst_bonus[mst_edges] = 0.3
+        
+        # Additional bonus for edges that complete small cycles with MST edges
+        for i in range(n):
+            mst_neighbors = np.where(mst_edges[i])[0]
+            for j in range(i + 1, n):
+                if candidate_mask[i, j] and not mst_edges[i, j]:
+                    # Check if this edge creates a triangle with MST edges
+                    common_neighbors = set(mst_neighbors) & set(np.where(mst_edges[j])[0])
+                    if len(common_neighbors) > 0:
+                        mst_bonus[i, j] = 0.15
+                        mst_bonus[j, i] = 0.15
+                        
+    except:
+        pass
+    
+    # ------------------------------------------------------------
+    # 6. ADAPTIVE COMBINATION WITH INSTANCE-AWARE WEIGHTS
+    # ------------------------------------------------------------
+    
+    # Analyze instance characteristics for weight adaptation
+    triu_indices = np.triu_indices(n, k=1)
+    distances = distance_matrix[triu_indices]
+    dist_cv = np.std(distances) / (np.mean(distances) + eps)
+    
+    # Adaptive weights based on instance characteristics
+    if dist_cv < 0.3:  # Uniform instances
+        reg_weight = 0.4
+        spec_weight = 0.4
+        borda_weight = 0.2
+    elif n < 20:  # Small instances
+        reg_weight = 0.5
+        spec_weight = 0.3
+        borda_weight = 0.2
+    else:  # General case
+        reg_weight = 0.45
+        spec_weight = 0.35
+        borda_weight = 0.2
+    
+    # Base score: inverse distance
+    inv_dist = 1.0 / safe_dist
+    inv_dist_max = np.max(inv_dist[inv_dist < np.inf])
+    if inv_dist_max > 0:
+        inv_dist = inv_dist / inv_dist_max
+    
+    # Combine components
+    heuristics = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if candidate_mask[i, j]:
+                # Individual components
+                comp_inv = inv_dist[i, j]
+                comp_reg = regret_matrix[i, j]
+                comp_spec = 1.0 + spectral_bonus[i, j]
+                comp_borda = borda_weights[i, j]
+                comp_mst = 1.0 + mst_bonus[i, j]
+                
+                # Geometric mean with adaptive weights
+                score = (comp_inv ** 0.3 * 
+                        comp_reg ** reg_weight *
+                        comp_spec ** spec_weight *
+                        comp_borda ** borda_weight *
+                        comp_mst ** 0.1)
+                
+                heuristics[i, j] = score
+                heuristics[j, i] = score
+    
+    # ------------------------------------------------------------
+    # 7. REINFORCEMENT-LEARNING INSPIRED ADAPTIVE SPARSIFICATION
+    # ------------------------------------------------------------
+    
+    # Adaptive sparsity based on instance hardness
+    # Harder instances (more variance) get more connections
+    sparsity_factor = min(0.7, 0.3 + 0.4 * dist_cv)
+    
+    for i in range(n):
+        row = heuristics[i]
+        non_zero = row[row > 0]
+        
+        if len(non_zero) > 0:
+            # Adaptive threshold based on distribution
+            mean_val = np.mean(non_zero)
+            std_val = np.std(non_zero)
+            
+            # Dynamic threshold: mean + alpha*std
+            # Higher alpha = more sparse
+            alpha = 1.5 - sparsity_factor  # Ranges from 0.8 to 1.2
+            
+            threshold = mean_val + alpha * std_val
+            heuristics[i, row < threshold] = 0
+    
+    # Ensure minimum connectivity
+    for i in range(n):
+        non_zero = np.nonzero(heuristics[i])[0]
+        if len(non_zero) < 2:
+            # Find promising edges to add
+            potential = np.argsort(inv_dist[i])[-4:]
+            needed = 2 - len(non_zero)
+            added = 0
+            
+            for j in potential:
+                if i != j and added < needed:
+                    boost = np.max(heuristics[i]) * 1.5 if np.max(heuristics[i]) > 0 else 0.5
+                    heuristics[i, j] = boost
+                    heuristics[j, i] = max(heuristics[j, i], boost)
+                    added += 1
+    
+    # Final symmetrization and normalization
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Row-wise softmax with adaptive temperature
+    for i in range(n):
+        row = heuristics[i]
+        if np.sum(row) > 0:
+            # Temperature based on row variance
+            row_nonzero = row[row > 0]
+            if len(row_nonzero) > 1:
+                temperature = max(0.1, np.std(row_nonzero) * 2.0)
+                exp_row = np.exp(row / temperature)
+                row_sum = np.sum(exp_row)
+                if row_sum > eps:
+                    heuristics[i] = exp_row / row_sum
+    
+    # Final zeroing of diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

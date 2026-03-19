@@ -1,0 +1,214 @@
+```json
+{
+    "algorithm_features": ["Local-Regret Normalized Penalty", "Geometric Rank-Weighted Scoring", "Spatial Density Bonus", "Multi-Factor Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge evaluation with improved regret modeling,
+    adaptive rank weighting, and refined spatial analysis.
+    
+    Features:
+    1. Local-Regret Normalized Penalty: Considers local vs global alternatives
+    2. Geometric Rank-Weighted Scoring: Adaptive exponential rank weighting
+    3. Spatial Density Bonus: Kernel-based density estimation with adaptive bandwidth
+    4. Multi-Factor Sparsification: Dynamic candidate lists with connectivity preservation
+    
+    Returns: Heuristic matrix of same shape as input, with values in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Trivial case: fully connected
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix (avoid self-loops and division by zero)
+    safe_dist = distance_matrix.copy()
+    np.fill_diagonal(safe_dist, np.inf)
+    eps = 1e-12
+    
+    # 1. Base inverse distance (normalized by median distance for robustness)
+    median_dist = np.median(safe_dist[safe_dist < np.inf])
+    inv_dist = median_dist / (safe_dist + eps)
+    
+    # 2. Adaptive candidate list with symmetry enforcement
+    # Use O(sqrt(n)) candidates per node, but at least 4
+    k_candidate = max(4, int(np.sqrt(n) * 1.5))
+    candidate_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        # Get top k candidates by distance (nearest neighbors)
+        neighbors = np.argsort(safe_dist[i])[:k_candidate]
+        candidate_mask[i, neighbors] = True
+    
+    # Ensure candidate list is symmetric
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # 3. Local-Regret Normalized Penalty with smooth transition
+    regret_matrix = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        dists = safe_dist[i].copy()
+        if len(dists) < 2:
+            continue
+            
+        # Sort distances
+        sorted_dists = np.sort(dists)
+        
+        # Best distance (closest neighbor)
+        best_dist = sorted_dists[0]
+        
+        # Alternative distance: median of top k/2 alternatives
+        alt_idx = max(1, min(k_candidate//2, len(sorted_dists)-1))
+        alt_dist = sorted_dists[alt_idx]
+        
+        # Maximum distance for normalization
+        max_dist = sorted_dists[-1]
+        
+        for j in range(n):
+            if i == j:
+                continue
+                
+            edge_dist = dists[j]
+            
+            if edge_dist <= alt_dist:
+                # Smooth transition for near-best edges
+                if edge_dist <= best_dist + eps:
+                    regret = 0.0
+                else:
+                    # Quadratic penalty for moderate edges
+                    t = (edge_dist - best_dist) / (alt_dist - best_dist + eps)
+                    regret = 0.2 * (t ** 2)
+            else:
+                # Progressive penalty for worse edges
+                t = (edge_dist - alt_dist) / (max_dist - alt_dist + eps)
+                regret = 0.2 + 0.8 * t
+            
+            regret_matrix[i, j] = regret
+    
+    # 4. Geometric Rank-Weighted Scoring with adaptive decay
+    rank_weights = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        # Get sorted indices by distance
+        sorted_idx = np.argsort(safe_dist[i])
+        valid_idx = sorted_idx[sorted_idx != i]  # Exclude self
+        
+        if len(valid_idx) == 0:
+            continue
+            
+        # Adaptive decay based on distance distribution of nearest neighbors
+        k_samples = min(10, len(valid_idx))
+        sample_distances = safe_dist[i, valid_idx[:k_samples]]
+        
+        if len(sample_distances) > 1 and np.max(sample_distances) > eps:
+            # Normalized standard deviation as decay factor
+            rel_std = np.std(sample_distances) / np.mean(sample_distances)
+            decay_rate = 0.4 + 0.4 * np.tanh(rel_std)  # Smooth mapping to [0.4, 0.8]
+        else:
+            decay_rate = 0.6
+        
+        # Assign weights with exponential decay
+        for rank, j in enumerate(valid_idx):
+            rank_weights[i, j] = decay_rate ** rank
+    
+    # 5. Spatial Density Bonus with geometric mean of endpoint densities
+    density_bonus = np.zeros_like(distance_matrix)
+    
+    if n >= 3:
+        # Compute node densities
+        node_densities = np.zeros(n)
+        
+        # Adaptive threshold: median of all non-zero distances
+        median_all = np.median(safe_dist[safe_dist < np.inf])
+        density_threshold = median_all * 0.8
+        
+        for i in range(n):
+            # Count nodes within threshold distance
+            close_nodes = np.sum(safe_dist[i] <= density_threshold) - 1  # Exclude self
+            # Normalize by sqrt(n) for scale invariance
+            node_densities[i] = close_nodes / np.sqrt(n)
+        
+        # Apply logarithmic scaling to densities
+        node_densities = np.log1p(node_densities)
+        
+        # Compute density bonus for candidate edges
+        for i in range(n):
+            for j in range(i+1, n):
+                if candidate_mask[i, j]:
+                    # Geometric mean of endpoint densities
+                    geo_mean = np.sqrt(node_densities[i] * node_densities[j] + eps)
+                    # Bonus scales with geometric mean
+                    density_bonus[i, j] = 0.2 * geo_mean
+                    density_bonus[j, i] = density_bonus[i, j]
+    
+    # 6. Minimum Spanning Tree structural bias (for moderate-sized instances)
+    if n <= 2000 and n >= 3:  # Practical limit for MST computation
+        try:
+            mst = minimum_spanning_tree(distance_matrix).toarray()
+            mst_bias = (mst + mst.T) > 0
+            mst_bonus = mst_bias * 0.25
+        except:
+            mst_bonus = np.zeros_like(distance_matrix)
+    else:
+        mst_bonus = np.zeros_like(distance_matrix)
+    
+    # 7. Combine all factors with weighted composition
+    heuristics_matrix = np.zeros_like(distance_matrix)
+    
+    # Base score: inverse distance weighted by rank
+    base_score = inv_dist * rank_weights
+    
+    # Apply regret penalty with exponential decay
+    regret_penalty = np.exp(-1.5 * regret_matrix)
+    score_with_regret = base_score * regret_penalty
+    
+    # Add bonuses multiplicatively
+    heuristics_matrix = score_with_regret * (1.0 + density_bonus) * (1.0 + mst_bonus)
+    
+    # 8. Enhanced sparsification with connectivity preservation
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # Ensure minimum connectivity: each node must have at least 2 non-zero edges
+    min_connections = min(2, n-1)
+    for i in range(n):
+        row = heuristics_matrix[i]
+        nonzero_indices = np.nonzero(row)[0]
+        
+        if len(nonzero_indices) < min_connections:
+            # Find closest nodes not already connected
+            distances = safe_dist[i].copy()
+            distances[nonzero_indices] = np.inf  # Exclude already connected
+            
+            # Select required number of additional connections
+            additional = min_connections - len(nonzero_indices)
+            if additional > 0:
+                closest = np.argsort(distances)[:additional]
+                for j in closest:
+                    if distances[j] < np.inf:
+                        # Boost these edges moderately
+                        boost_factor = 0.8 * np.max(heuristics_matrix)
+                        heuristics_matrix[i, j] = boost_factor
+                        heuristics_matrix[j, i] = boost_factor
+    
+    # 9. Final processing: symmetrize, zero diagonal, and normalize
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(heuristics_matrix)
+    if max_val > eps:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    # Ensure numerical stability
+    heuristics_matrix = np.clip(heuristics_matrix, 0.0, 1.0)
+    
+    return heuristics_matrix
+```

@@ -1,0 +1,377 @@
+```json
+{
+    "algorithm_features": ["Spectral Embedding Clustering", "Adaptive Multi-step Regret", "Graph Centrality Fusion", "Connectivity-Preserving Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics leveraging spectral embedding for cluster-aware
+    scoring, adaptive multi-step regret minimization, and graph centrality fusion.
+    
+    Key innovations:
+    1. Spectral embedding clustering using multiple eigenvectors for nuanced structural insights
+    2. Adaptive multi-step regret with instance-aware normalization and pruning
+    3. Fusion of multiple graph centrality measures (MST, k-NN, spectral)
+    4. Multi-stage sparsification guaranteeing connectivity while preserving critical edges
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # ============================================
+    # 1. INSTANCE CHARACTERIZATION
+    # ============================================
+    flat_dists = distance_matrix[np.triu_indices(n, 1)]
+    mean_dist = np.mean(flat_dists)
+    std_dist = np.std(flat_dists)
+    sparsity = min(1.0, std_dist / (mean_dist + 1e-8))
+    
+    # Compute local density variation
+    k_local = max(3, n // 20)
+    local_density = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest = np.partition(dists, k_local)[:k_local]
+        local_density[i] = np.mean(nearest)
+    density_cv = np.std(local_density) / (np.mean(local_density) + 1e-8)
+    
+    # ============================================
+    # 2. ADAPTIVE MULTI-STEP REGRET
+    # ============================================
+    regret_matrix = np.ones((n, n))
+    
+    # Determine regret depth based on instance size and sparsity
+    if n < 50:
+        regret_depth = 2
+    elif n < 200:
+        regret_depth = 3
+    else:
+        regret_depth = 4 if sparsity > 0.7 else 3
+    
+    # Precompute sorted distances for efficiency
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Get alternative paths
+        for j in range(n):
+            if i == j:
+                continue
+                
+            dist_ij = distance_matrix[i, j]
+            base_regret = 0.0
+            
+            # Multi-step regret calculation
+            for step in range(1, regret_depth + 1):
+                # Prune search for efficiency
+                if step == 1:
+                    candidates = sorted_indices[i, 1:min(6, n)]
+                elif step == 2:
+                    candidates = sorted_indices[i, 1:min(4, n)]
+                else:
+                    candidates = sorted_indices[i, 1:min(3, n)]
+                
+                step_regrets = []
+                for alt in candidates:
+                    if alt == j:
+                        continue
+                    
+                    # Compute alternative path cost
+                    if step == 1:
+                        alt_cost = distance_matrix[i, alt]
+                    else:
+                        # Recursively estimate multi-step alternative cost
+                        remaining = [k for k in range(n) if k not in [i, j, alt]]
+                        if not remaining:
+                            alt_cost = distance_matrix[i, alt]
+                        else:
+                            # Estimate continuation from alternative node
+                            alt_dists = distance_matrix[alt, remaining]
+                            best_cont = np.min(alt_dists) if len(alt_dists) > 0 else 0
+                            alt_cost = distance_matrix[i, alt] + 0.7 * best_cont
+                    
+                    regret = dist_ij - alt_cost
+                    step_regrets.append(max(0, regret))
+                
+                if step_regrets:
+                    # Weight later steps less
+                    weight = 0.6 ** (step - 1)
+                    base_regret += weight * np.mean(step_regrets)
+            
+            # Normalize regret by distance and sparsity
+            norm_regret = base_regret / (dist_ij + 1e-8)
+            regret_penalty = np.exp(-norm_regret * (1.0 + sparsity))
+            regret_matrix[i, j] = regret_penalty
+    
+    regret_matrix = (regret_matrix + regret_matrix.T) / 2
+    
+    # ============================================
+    # 3. SPECTRAL EMBEDDING CLUSTERING
+    # ============================================
+    cluster_matrix = np.ones((n, n))
+    
+    try:
+        # Build similarity matrix
+        with np.errstate(divide='ignore', invalid='ignore'):
+            similarity = 1.0 / (distance_matrix + np.eye(n) * 1e-8)
+        np.fill_diagonal(similarity, 0)
+        
+        # Compute normalized Laplacian
+        degree = np.sum(similarity, axis=1)
+        degree_sqrt_inv = 1.0 / np.sqrt(degree + 1e-8)
+        L_norm = np.eye(n) - np.outer(degree_sqrt_inv, degree_sqrt_inv) * similarity
+        
+        # Determine number of eigenvectors based on instance size
+        if n <= 100:
+            n_eigen = min(10, max(3, int(np.sqrt(n))))
+        else:
+            n_eigen = min(15, max(5, int(np.cbrt(n))))
+        
+        # Compute eigenvectors
+        eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+        idx = np.argsort(eigenvalues)
+        eigenvectors = eigenvectors[:, idx]
+        
+        # Take first n_eigen non-trivial eigenvectors (skip the first constant one)
+        embedding = eigenvectors[:, 1:n_eigen+1]
+        
+        # Normalize embedding
+        embedding_norm = embedding / (np.linalg.norm(embedding, axis=1, keepdims=True) + 1e-8)
+        
+        # Compute pairwise cosine similarity
+        cluster_sim = embedding_norm @ embedding_norm.T
+        cluster_sim = (cluster_sim + 1.0) / 2.0  # Map from [-1,1] to [0,1]
+        
+        # Adjust based on density variation
+        cluster_matrix = 0.5 + 0.5 * cluster_sim * (1.0 + 0.3 * density_cv)
+        
+    except np.linalg.LinAlgError:
+        # Fallback to distance-based clustering
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                # Simple inverse distance fallback
+                cluster_matrix[i, j] = 1.0 / (1.0 + 0.1 * distance_matrix[i, j])
+    
+    # ============================================
+    # 4. GRAPH CENTRALITY FUSION
+    # ============================================
+    centrality_matrix = np.ones((n, n))
+    
+    # Minimum Spanning Tree
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # k-Nearest Neighbor graph
+    k_nn = max(2, min(10, n // 10))
+    knn_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        sorted_idx = np.argsort(distance_matrix[i])[1:k_nn+1]
+        knn_mask[i, sorted_idx] = True
+        knn_mask[sorted_idx, i] = True
+    
+    # Betweenness approximation using random walks
+    if n <= 100:
+        n_walks = min(100, n * 10)
+        edge_counts = np.zeros((n, n))
+        
+        for _ in range(n_walks):
+            start = np.random.randint(0, n)
+            path = [start]
+            visited = np.zeros(n, dtype=bool)
+            visited[start] = True
+            
+            while len(path) < min(10, n):
+                current = path[-1]
+                # Transition probability inversely proportional to distance
+                dists = distance_matrix[current].copy()
+                dists[visited] = np.inf
+                probs = 1.0 / (dists + 1e-8)
+                probs[current] = 0
+                if probs.sum() == 0:
+                    break
+                probs /= probs.sum()
+                
+                next_node = np.random.choice(n, p=probs)
+                path.append(next_node)
+                visited[next_node] = True
+            
+            # Count edges in path
+            for a, b in zip(path[:-1], path[1:]):
+                edge_counts[a, b] += 1
+                edge_counts[b, a] += 1
+        
+        if edge_counts.max() > 0:
+            edge_counts = edge_counts / edge_counts.max()
+    
+    # Combine centrality measures
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            
+            mst_val = 1.5 if mst_mask[i, j] else 1.0
+            knn_val = 1.2 if knn_mask[i, j] else 1.0
+            
+            if n <= 100:
+                centrality_val = 0.5 + 0.5 * edge_counts[i, j]
+                centrality_matrix[i, j] = mst_val * knn_val * centrality_val
+            else:
+                centrality_matrix[i, j] = mst_val * knn_val
+    
+    # ============================================
+    # 5. ADAPTIVE COMPONENT FUSION
+    # ============================================
+    # Compute inverse distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / (distance_matrix + 0.05 * mean_dist)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize all components to [0,1] range
+    def normalize(mat):
+        mask = ~np.eye(n, dtype=bool)
+        valid = mat[mask]
+        if valid.size > 0 and np.max(valid) > np.min(valid):
+            mat_norm = (mat - np.min(valid)) / (np.max(valid) - np.min(valid))
+            mat_norm[np.diag_indices(n)] = 0
+            return mat_norm
+        return mat
+    
+    regret_norm = normalize(regret_matrix)
+    cluster_norm = normalize(cluster_matrix)
+    centrality_norm = normalize(centrality_matrix)
+    inv_dist_norm = normalize(inv_dist)
+    
+    # Adaptive weighting based on instance characteristics
+    if n < 30:
+        weights = [0.35, 0.25, 0.25, 0.15]  # regret, cluster, centrality, distance
+    elif sparsity > 0.7:
+        weights = [0.45, 0.20, 0.25, 0.10]  # emphasize regret for sparse instances
+    elif density_cv > 0.5:
+        weights = [0.30, 0.35, 0.20, 0.15]  # emphasize clustering for varied density
+    else:
+        weights = [0.40, 0.30, 0.20, 0.10]
+    
+    # Weighted combination
+    heuristic = (weights[0] * regret_norm + 
+                 weights[1] * cluster_norm + 
+                 weights[2] * centrality_norm + 
+                 weights[3] * inv_dist_norm)
+    
+    # ============================================
+    # 6. CONNECTIVITY-PRESERVING SPARSIFICATION
+    # ============================================
+    # Start with MST as backbone
+    final_mask = mst_mask.copy()
+    
+    # Adaptive per-node edge selection
+    for i in range(n):
+        scores = heuristic[i].copy()
+        scores[i] = -np.inf
+        
+        # Determine number of edges to keep
+        if n < 50:
+            n_keep = max(3, n // 5)
+        else:
+            n_keep = max(4, int(np.log2(n) * (1.5 if sparsity > 0.5 else 1.0)))
+        
+        # Keep top edges
+        if n_keep < n - 1:
+            threshold = np.partition(scores, -n_keep)[-n_keep]
+            keep_mask = scores >= threshold
+        else:
+            keep_mask = np.ones(n, dtype=bool)
+            keep_mask[i] = False
+        
+        # Ensure connectivity to nearest neighbors
+        nearest = np.argsort(distance_matrix[i])[1:3]
+        keep_mask[nearest] = True
+        
+        final_mask[i] = final_mask[i] | keep_mask
+        final_mask[:, i] = final_mask[:, i] | keep_mask
+    
+    # Connectivity verification and repair
+    visited = np.zeros(n, dtype=bool)
+    stack = [0]
+    visited[0] = True
+    
+    while stack:
+        current = stack.pop()
+        neighbors = np.where(final_mask[current])[0]
+        for nb in neighbors:
+            if not visited[nb]:
+                visited[nb] = True
+                stack.append(nb)
+    
+    if not np.all(visited):
+        # Connect disconnected components
+        components = []
+        unvisited = np.where(~visited)[0].tolist()
+        
+        while unvisited:
+            start = unvisited[0]
+            comp = []
+            stack = [start]
+            local_visited = np.zeros(n, dtype=bool)
+            local_visited[start] = True
+            
+            while stack:
+                node = stack.pop()
+                comp.append(node)
+                neighbors = np.where(final_mask[node])[0]
+                for nb in neighbors:
+                    if not local_visited[nb]:
+                        local_visited[nb] = True
+                        stack.append(nb)
+            
+            components.append(comp)
+            unvisited = [u for u in unvisited if not local_visited[u]]
+        
+        # Connect components with best heuristic edges
+        main_comp = np.where(visited)[0].tolist()
+        for comp in components:
+            best_score = -np.inf
+            best_edge = None
+            
+            for node1 in comp:
+                for node2 in main_comp:
+                    score = heuristic[node1, node2]
+                    if score > best_score:
+                        best_score = score
+                        best_edge = (node1, node2)
+            
+            if best_edge:
+                final_mask[best_edge] = True
+                final_mask[best_edge[::-1]] = True
+    
+    # Apply final mask
+    heuristic = heuristic * final_mask
+    
+    # Row-wise softmax normalization
+    for i in range(n):
+        row = heuristic[i]
+        mask = row > 0
+        if np.sum(mask) > 1:
+            exp_row = np.exp(row[mask] - np.max(row[mask]))
+            heuristic[i, mask] = exp_row / exp_row.sum()
+    
+    # Final symmetry and zero diagonal
+    heuristic = (heuristic + heuristic.T) / 2
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

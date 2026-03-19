@@ -1,0 +1,316 @@
+```json
+{
+    "algorithm_features": ["Tour Sampling with LK Heuristic", "Adaptive Edge Frequency", "Meta-Parameter Learning", "Multi-Stage Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List, Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with meta-learning parameter adaptation,
+    LK-inspired local search, and intelligent multi-stage edge filtering.
+    
+    Core Innovations:
+    1. LK-inspired edge exchange patterns in tour generation
+    2. Meta-learning to adapt parameters based on instance features
+    3. Multi-stage edge filtering: candidate generation → refinement → sparsification
+    4. Edge promise estimation via ensemble of diverse heuristics
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ===== 1. META-LEARNING: ADAPTIVE PARAMETER SETTING =====
+    # Extract instance features for parameter adaptation
+    triu_distances = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(triu_distances)
+    dist_std = np.std(triu_distances)
+    dist_cv = dist_std / (dist_mean + 1e-10)
+    n_log = np.log(n + 1)
+    
+    # Meta-parameters adapted to instance characteristics
+    base_samples = int(np.clip(8 + n_log * 2, 10, 30))  # Number of tours to sample
+    lk_iterations = int(np.clip(5 + n_log * 1.5, 5, 20))  # LK improvement iterations
+    candidate_ratio = np.clip(0.08 + 0.12 * min(1.0, n_log / 5), 0.05, 0.25)  # Candidate edges per node
+    
+    # ===== 2. DIVERSIFIED TOUR GENERATION WITH LK IMPROVEMENT =====
+    def generate_tour(method: str) -> np.ndarray:
+        """Generate initial tour using various construction methods."""
+        if method == 'nn':  # Nearest neighbor
+            start = np.random.randint(0, n)
+            tour = [start]
+            unvisited = set(range(n)) - {start}
+            while unvisited:
+                current = tour[-1]
+                nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+            return np.array(tour)
+        
+        elif method == 'greedy':  # Greedy insertion
+            if n <= 3:
+                return np.random.permutation(n)
+            # Start with a triangle
+            nodes = list(np.random.choice(n, min(3, n), replace=False))
+            tour = nodes + [nodes[0]]
+            
+            remaining = set(range(n)) - set(nodes)
+            while remaining:
+                best_gain = float('inf')
+                best_node = None
+                best_pos = -1
+                
+                for node in remaining:
+                    for i in range(len(tour)-1):
+                        gain = (distance_matrix[tour[i], node] + 
+                               distance_matrix[node, tour[i+1]] - 
+                               distance_matrix[tour[i], tour[i+1]])
+                        if gain < best_gain:
+                            best_gain = gain
+                            best_node = node
+                            best_pos = i + 1
+                
+                tour.insert(best_pos, best_node)
+                remaining.remove(best_node)
+            
+            return np.array(tour[:-1])
+        
+        elif method == 'random':  # Random permutation
+            return np.random.permutation(n)
+        
+        else:  # Christofides-like (simplified for speed)
+            tour = list(range(n))
+            np.random.shuffle(tour)
+            return np.array(tour)
+    
+    def lin_kernighan_improve(tour: np.ndarray, max_iter: int = lk_iterations) -> np.ndarray:
+        """
+        Simplified LK heuristic focusing on promising edge exchanges.
+        This captures the essence of LK without full implementation complexity.
+        """
+        best_tour = tour.copy()
+        best_length = sum(distance_matrix[best_tour[i], best_tour[(i+1)%n]] 
+                         for i in range(n))
+        
+        improved = True
+        iteration = 0
+        
+        while improved and iteration < max_iter:
+            improved = False
+            
+            # Try to break and reconnect edges in promising patterns
+            for i in range(n):
+                if improved:
+                    break
+                    
+                # Current edge (i, i+1)
+                a, b = tour[i], tour[(i+1)%n]
+                
+                # Look for promising alternative connections
+                # Sort potential reconnection nodes by distance to a
+                candidates = list(range(n))
+                candidates.remove(a)
+                candidates.remove(b)
+                
+                # Prioritize nodes that are close to a
+                candidates.sort(key=lambda x: distance_matrix[a, x])
+                
+                # Try top k candidates (adaptive based on n)
+                k = min(5, max(2, n // 20))
+                for c in candidates[:k]:
+                    # c cannot be adjacent to a in current tour
+                    c_idx = np.where(tour == c)[0][0]
+                    c_next = tour[(c_idx+1)%n]
+                    
+                    if c_next == a or c_next == b:
+                        continue
+                    
+                    # Potential gain from swapping edges (a,b)+(c,c_next) to (a,c)+(b,c_next)
+                    gain = (distance_matrix[a, b] + distance_matrix[c, c_next] -
+                           distance_matrix[a, c] - distance_matrix[b, c_next])
+                    
+                    if gain > 0:  # Improvement found
+                        # Perform the 2-opt swap
+                        i_idx = i
+                        j_idx = c_idx
+                        if j_idx < i_idx:
+                            i_idx, j_idx = j_idx, i_idx
+                        
+                        # Reverse segment between i+1 and j
+                        tour = np.concatenate([
+                            tour[:i_idx+1],
+                            tour[i_idx+1:j_idx+1][::-1],
+                            tour[j_idx+1:]
+                        ])
+                        
+                        improved = True
+                        break
+            
+            iteration += 1
+            
+        # Return best tour found
+        current_length = sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n))
+        return tour if current_length < best_length else best_tour
+    
+    # Generate diverse tours with LK improvement
+    tours = []
+    methods = ['nn', 'greedy', 'random']
+    method_counts = [base_samples//2, base_samples//3, base_samples - base_samples//2 - base_samples//3]
+    
+    for method, count in zip(methods, method_counts):
+        for _ in range(count):
+            tour = generate_tour(method)
+            tour = lin_kernighan_improve(tour)
+            tours.append(tour)
+    
+    # ===== 3. EDGE FREQUENCY AND QUALITY WEIGHTING =====
+    edge_freq = np.zeros_like(distance_matrix, dtype=float)
+    edge_quality = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Compute tour lengths for weighting
+    tour_lengths = []
+    for tour in tours:
+        length = sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n))
+        tour_lengths.append(length)
+    
+    min_length = min(tour_lengths)
+    max_length = max(tour_lengths)
+    length_range = max_length - min_length + 1e-10
+    
+    # Weight edges by both frequency and tour quality
+    for tour, length in zip(tours, tour_lengths):
+        # Tour weight: better tours get higher weight
+        tour_weight = 1.0 - (length - min_length) / length_range
+        
+        for i in range(n):
+            u, v = tour[i], tour[(i+1)%n]
+            edge_freq[u, v] += 1
+            edge_freq[v, u] += 1
+            edge_quality[u, v] += tour_weight
+            edge_quality[v, u] += tour_weight
+    
+    # Normalize
+    if edge_freq.max() > 0:
+        edge_freq = edge_freq / edge_freq.max()
+    if edge_quality.max() > 0:
+        edge_quality = edge_quality / edge_quality.max()
+    
+    # Combined edge promise from tours
+    tour_component = 0.6 * edge_freq + 0.4 * edge_quality
+    
+    # ===== 4. STRUCTURAL COMPONENTS =====
+    # Inverse distance (adaptive transformation)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Apply power transform based on instance characteristics
+    power = 0.7 + 0.6 * np.tanh(dist_cv - 0.5)
+    inv_dist = np.power(inv_dist, power)
+    if inv_dist.max() > 0:
+        inv_dist = inv_dist / inv_dist.max()
+    
+    # MST component
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    mst_component = np.zeros_like(distance_matrix)
+    mst_component[mst_mask] = 1.0 / (distance_matrix[mst_mask] + 1e-10)
+    if mst_component.max() > 0:
+        mst_component = mst_component / mst_component.max()
+    
+    # ===== 5. ADAPTIVE COMPONENT FUSION =====
+    # Determine weights based on instance features
+    tour_variance = np.var([edge_freq[i,j] for i in range(n) for j in range(i+1, n)])
+    
+    # Meta-learning: adjust weights based on instance characteristics
+    if n < 20:
+        weights = [0.5, 0.3, 0.2]  # tour, inv_dist, mst
+    elif dist_cv < 0.3:
+        weights = [0.4, 0.4, 0.2]  # uniform distances: emphasize structure
+    elif tour_variance > 0.1:
+        weights = [0.6, 0.2, 0.2]  # strong tour patterns: trust them more
+    else:
+        weights = [0.45, 0.35, 0.2]  # balanced
+    
+    # Adjust based on n
+    size_factor = min(1.0, n_log / 6)
+    weights[0] *= (0.9 + 0.2 * size_factor)  # More weight to tours for larger instances
+    weights[1] *= (1.1 - 0.2 * size_factor)
+    weights = np.array(weights) / np.sum(weights)
+    
+    # Combine components
+    heuristic_matrix = (
+        weights[0] * tour_component +
+        weights[1] * inv_dist +
+        weights[2] * mst_component
+    )
+    
+    # ===== 6. MULTI-STAGE EDGE FILTERING =====
+    # Stage 1: Candidate generation - keep promising edges
+    candidate_edges = np.zeros_like(heuristic_matrix, dtype=bool)
+    
+    # Adaptive number of candidate edges per node
+    edges_per_node = max(3, int(n * candidate_ratio))
+    
+    for i in range(n):
+        scores = heuristic_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        # Keep top edges
+        threshold = np.partition(scores, -edges_per_node)[-edges_per_node]
+        candidate_edges[i, scores >= threshold] = True
+    
+    # Stage 2: Refinement - ensure MST edges are included
+    candidate_edges = candidate_edges | mst_mask
+    
+    # Stage 3: Symmetry
+    candidate_edges = candidate_edges | candidate_edges.T
+    
+    # Apply filtering
+    heuristic_matrix = heuristic_matrix * candidate_edges
+    
+    # ===== 7. FINAL ENHANCEMENTS =====
+    # Ensure symmetry and zero diagonal
+    heuristic_matrix = 0.5 * (heuristic_matrix + heuristic_matrix.T)
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    # Soft normalization: preserve relative ordering
+    non_zero = heuristic_matrix[heuristic_matrix > 0]
+    if len(non_zero) > 1:
+        # Min-max scaling for non-zero values
+        min_val, max_val = non_zero.min(), non_zero.max()
+        if max_val > min_val:
+            heuristic_matrix[heuristic_matrix > 0] = (
+                (non_zero - min_val) / (max_val - min_val)
+            )
+    
+    # Boost edges that appear in multiple components
+    multi_support = ((tour_component > 0.3) & (inv_dist > 0.3)).astype(float)
+    heuristic_matrix = heuristic_matrix * (1.0 + 0.2 * multi_support)
+    
+    # Final sparsification: remove very weak edges
+    threshold = np.percentile(heuristic_matrix[heuristic_matrix > 0], 10) if np.any(heuristic_matrix > 0) else 0
+    heuristic_matrix[heuristic_matrix < threshold] = 0
+    
+    # Final normalization to [0, 1]
+    max_val = heuristic_matrix.max()
+    if max_val > 0:
+        heuristic_matrix = heuristic_matrix / max_val
+    
+    return heuristic_matrix
+```

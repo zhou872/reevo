@@ -1,0 +1,455 @@
+```json
+{
+    "algorithm_features": ["Two-step Lookahead Edge Gain", "Adaptive Modularity-based Clustering", "Multi-Objective Geometric Fusion", "Reinforcement Learning-inspired Weight Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.cluster import SpectralClustering
+from typing import Tuple, Optional
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  temperature: float = 1.0,
+                  exploration_factor: float = 0.3) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with lookahead strategies, adaptive clustering,
+    and reinforcement learning-inspired weight adaptation.
+    
+    Args:
+        distance_matrix: Square symmetric matrix of pairwise distances
+        temperature: Controls exploration vs exploitation in weight adaptation (higher = more exploration)
+        exploration_factor: How much to explore alternative weight configurations
+        
+    Returns:
+        Heuristic matrix with higher values for more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristic = np.zeros_like(distance_matrix)
+        if n == 2:
+            heuristic[0, 1] = heuristic[1, 0] = 1.0
+        return heuristic
+    
+    # ==================== 1. ADAPTIVE WEIGHT INITIALIZATION ====================
+    # RL-inspired: weights adapt based on instance characteristics
+    weights = _adaptive_weight_tuning(distance_matrix, temperature, exploration_factor)
+    
+    # ==================== 2. COMPUTE BASE COMPONENTS ====================
+    # Base reciprocal distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    np.fill_diagonal(inv_dist, 0)
+    
+    # MST-based connectivity (Prim's algorithm for efficiency)
+    mst_mask = _compute_mst_mask_fast(distance_matrix)
+    mst_degrees = mst_mask.sum(axis=1)
+    
+    # Centrality metrics for hub identification
+    centrality = _compute_multi_scale_centrality(distance_matrix)
+    
+    # ==================== 3. LOOKAHEAD EDGE GAIN ====================
+    # Two-step lookahead: estimate gain from including edge (i,j)
+    lookahead_gain = _compute_lookahead_gain(distance_matrix)
+    
+    # ==================== 4. MODULARITY-BASED CLUSTERING ====================
+    # Spectral clustering for better community detection
+    cluster_factor = _compute_modularity_bonus(distance_matrix, n_clusters=min(8, max(2, n//10)))
+    
+    # ==================== 5. REGRET WITH ADAPTIVE K ====================
+    # Dynamic k-regret based on instance size
+    k_regret = min(5, max(2, n//20))
+    regret_matrix = _compute_adaptive_regret(distance_matrix, k=k_regret)
+    
+    # ==================== 6. DENSITY-AWARE NORMALIZATION ====================
+    density_factor = _compute_kernel_density(distance_matrix, bandwidth='scott')
+    
+    # ==================== 7. MULTI-OBJECTIVE FUSION ====================
+    # Combine components using weighted geometric mean with adaptive exponents
+    heuristic = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if distance_matrix[i, j] == 0:
+                continue
+                
+            # Collect all components
+            components = {
+                'inv_dist': np.power(inv_dist[i, j], 0.8),
+                'mst': 2.0 if mst_mask[i, j] else 1.0 - 0.1 * (mst_degrees[i] + mst_degrees[j]) / 2,
+                'centrality': _fuse_centrality(centrality[i], centrality[j]),
+                'lookahead': lookahead_gain[i, j],
+                'cluster': cluster_factor[i, j],
+                'regret': 1.0 - 0.3 * regret_matrix[i, j],
+                'density': density_factor[i, j]
+            }
+            
+            # Adaptive exponents based on component importance
+            exponents = {
+                'inv_dist': 1.2,
+                'mst': 0.9,
+                'centrality': 0.7,
+                'lookahead': 1.1,
+                'cluster': 0.8,
+                'regret': 0.6,
+                'density': 0.5
+            }
+            
+            # Multi-objective geometric mean
+            log_score = 0.0
+            total_weight = 0.0
+            
+            for key in components:
+                w = weights.get(key, 1.0) * exponents[key]
+                value = max(components[key], 1e-10)
+                log_score += w * np.log(value)
+                total_weight += w
+            
+            score = np.exp(log_score / total_weight) if total_weight > 0 else 0
+            
+            # Scale by problem size (logarithmic adjustment)
+            score *= (1.0 + np.log1p(n) / 15)
+            
+            heuristic[i, j] = heuristic[j, i] = score
+    
+    # ==================== 8. ENHANCED SPARSIFICATION ====================
+    # Community-aware sparsification
+    heuristic = _community_aware_sparsify(heuristic, distance_matrix, mst_mask)
+    
+    # Final normalization
+    max_val = heuristic.max()
+    if max_val > 0:
+        heuristic /= max_val
+    
+    np.fill_diagonal(heuristic, 0)
+    return heuristic
+
+def _adaptive_weight_tuning(distance_matrix: np.ndarray, 
+                           temperature: float, 
+                           exploration_factor: float) -> dict:
+    """RL-inspired adaptive weight tuning based on instance characteristics."""
+    n = distance_matrix.shape[0]
+    
+    # Extract instance features
+    distances = distance_matrix[np.triu_indices(n, k=1)]
+    cv = np.std(distances) / (np.mean(distances) + 1e-10)  # Coefficient of variation
+    skewness = np.mean((distances - np.mean(distances))**3) / (np.std(distances)**3 + 1e-10)
+    
+    # Base weights from problem characteristics
+    if n < 20:
+        # Small instances: emphasize lookahead and MST
+        base_weights = {
+            'inv_dist': 0.15, 'mst': 0.25, 'centrality': 0.1,
+            'lookahead': 0.25, 'cluster': 0.05, 'regret': 0.1, 'density': 0.1
+        }
+    elif n < 100:
+        # Medium instances: balanced approach
+        base_weights = {
+            'inv_dist': 0.18, 'mst': 0.2, 'centrality': 0.12,
+            'lookahead': 0.2, 'cluster': 0.1, 'regret': 0.12, 'density': 0.08
+        }
+    else:
+        # Large instances: emphasize clustering and regret
+        base_weights = {
+            'inv_dist': 0.2, 'mst': 0.15, 'centrality': 0.1,
+            'lookahead': 0.15, 'cluster': 0.15, 'regret': 0.15, 'density': 0.1
+        }
+    
+    # Adjust based on distance distribution characteristics
+    if cv > 1.5:  # Highly variable distances
+        base_weights['lookahead'] *= 1.2
+        base_weights['regret'] *= 0.8
+    if skewness > 1:  # Right-skewed (many short, few long distances)
+        base_weights['cluster'] *= 1.3
+        base_weights['density'] *= 0.7
+    
+    # Add exploration noise (RL-inspired)
+    if exploration_factor > 0:
+        noise = np.random.randn(7) * exploration_factor * temperature
+        keys = list(base_weights.keys())
+        for idx, key in enumerate(keys):
+            base_weights[key] = max(0.05, base_weights[key] * (1 + noise[idx]))
+    
+    # Normalize to sum to 1
+    total = sum(base_weights.values())
+    return {k: v/total for k, v in base_weights.items()}
+
+def _compute_mst_mask_fast(distance_matrix: np.ndarray) -> np.ndarray:
+    """Fast MST computation using Prim's algorithm with vectorization."""
+    n = distance_matrix.shape[0]
+    mst_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    if n <= 1:
+        return mst_mask
+    
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    distances = distance_matrix[0].copy()
+    parent = np.zeros(n, dtype=int)
+    
+    for _ in range(n - 1):
+        # Find minimum distance to unvisited nodes
+        unvisited = ~visited
+        if not np.any(unvisited):
+            break
+        
+        # Set visited nodes' distances to infinity
+        masked_dist = distances.copy()
+        masked_dist[visited] = np.inf
+        
+        # Find closest unvisited node
+        v = np.argmin(masked_dist)
+        
+        # Add edge to MST
+        if v > 0:
+            mst_mask[parent[v], v] = True
+            mst_mask[v, parent[v]] = True
+        
+        visited[v] = True
+        
+        # Update distances
+        new_distances = distance_matrix[v]
+        update_mask = new_distances < distances
+        update_mask &= ~visited
+        distances[update_mask] = new_distances[update_mask]
+        parent[update_mask] = v
+    
+    return mst_mask
+
+def _compute_multi_scale_centrality(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute centrality at multiple scales (local and global)."""
+    n = distance_matrix.shape[0]
+    
+    # Local centrality (k-nearest neighbor graph)
+    k_local = max(2, n // 10)
+    local_centrality = np.zeros(n)
+    for i in range(n):
+        neighbors = np.argsort(distance_matrix[i])[1:k_local+1]
+        local_centrality[i] = np.mean(distance_matrix[i, neighbors])
+    
+    # Global centrality (closeness)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        closeness = (n - 1) / (distance_matrix.sum(axis=1) + 1e-10)
+    
+    # Combine scales
+    if np.max(local_centrality) > 0:
+        local_centrality = 1.0 / (local_centrality + 1e-10)
+        local_centrality /= np.max(local_centrality)
+    
+    if np.max(closeness) > 0:
+        closeness /= np.max(closeness)
+    
+    # Multi-scale combination
+    centrality = 0.4 * local_centrality + 0.6 * closeness
+    
+    # Normalize to [0.5, 1.5]
+    c_min, c_max = centrality.min(), centrality.max()
+    if c_max - c_min > 1e-10:
+        centrality = 0.5 + (centrality - c_min) / (c_max - c_min)
+    
+    return centrality
+
+def _compute_lookahead_gain(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute two-step lookahead gain for each edge."""
+    n = distance_matrix.shape[0]
+    gain_matrix = np.ones((n, n))
+    
+    # Precompute nearest neighbors for each node
+    nearest = np.argsort(distance_matrix, axis=1)[:, 1:4]  # Top 3 neighbors
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Find best alternative connections for i and j
+            alt_i = nearest[i][nearest[i] != j][0] if np.any(nearest[i] != j) else -1
+            alt_j = nearest[j][nearest[j] != i][0] if np.any(nearest[j] != i) else -1
+            
+            if alt_i >= 0 and alt_j >= 0 and alt_i != alt_j:
+                # Calculate gain from choosing (i,j) vs alternatives
+                current_cost = distance_matrix[i, alt_i] + distance_matrix[j, alt_j]
+                new_cost = distance_matrix[i, j] + distance_matrix[alt_i, alt_j]
+                gain = current_cost - new_cost
+                
+                # Convert gain to multiplicative factor
+                avg_dist = np.mean([distance_matrix[i, alt_i], distance_matrix[j, alt_j]])
+                gain_matrix[i, j] = gain_matrix[j, i] = np.exp(gain / (avg_dist + 1e-10))
+            else:
+                gain_matrix[i, j] = gain_matrix[j, i] = 1.0
+    
+    # Normalize gains
+    max_gain = gain_matrix.max()
+    if max_gain > 0:
+        gain_matrix /= max_gain
+    
+    np.fill_diagonal(gain_matrix, 0)
+    return gain_matrix
+
+def _compute_modularity_bonus(distance_matrix: np.ndarray, 
+                             n_clusters: int) -> np.ndarray:
+    """Compute community-based bonuses using spectral clustering."""
+    n = distance_matrix.shape[0]
+    bonus_matrix = np.ones((n, n))
+    
+    if n_clusters < 2 or n < 10:
+        return bonus_matrix
+    
+    try:
+        # Convert distances to similarities
+        max_dist = distance_matrix.max()
+        similarities = 1.0 - distance_matrix / (max_dist + 1e-10)
+        
+        # Spectral clustering
+        clustering = SpectralClustering(
+            n_clusters=n_clusters,
+            affinity='precomputed',
+            assign_labels='kmeans',
+            random_state=42
+        )
+        labels = clustering.fit_predict(similarities)
+        
+        # Assign bonuses based on community membership
+        for i in range(n):
+            for j in range(i + 1, n):
+                if labels[i] == labels[j]:
+                    # Same community: bonus inversely proportional to community size
+                    community_size = np.sum(labels == labels[i])
+                    bonus = 1.0 + 1.0 / np.sqrt(community_size)
+                    bonus_matrix[i, j] = bonus_matrix[j, i] = bonus
+                else:
+                    # Different communities: small penalty
+                    bonus_matrix[i, j] = bonus_matrix[j, i] = 0.8
+    except:
+        # Fallback to distance-based approximation
+        pass
+    
+    return bonus_matrix
+
+def _compute_adaptive_regret(distance_matrix: np.ndarray, k: int = 3) -> np.ndarray:
+    """Compute regret relative to k best alternatives."""
+    n = distance_matrix.shape[0]
+    regret = np.zeros_like(distance_matrix)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Find k+1 nearest neighbors
+        k_nearest = min(k + 1, n - 1)
+        nearest_indices = np.argsort(distances)[:k_nearest]
+        nearest_dists = distances[nearest_indices]
+        
+        if len(nearest_dists) == 0:
+            continue
+        
+        # Compute regret for all edges from i
+        for j in range(n):
+            if i == j:
+                continue
+            
+            if j in nearest_indices[:k]:
+                # Among top k: regret relative to best alternative
+                alt_dist = nearest_dists[0] if j != nearest_indices[0] else nearest_dists[1]
+                regret[i, j] = (distance_matrix[i, j] - alt_dist) / (alt_dist + 1e-10)
+            else:
+                # Not in top k: larger regret
+                avg_topk = np.mean(nearest_dists[:k])
+                regret[i, j] = (distance_matrix[i, j] - avg_topk) / (avg_topk + 1e-10)
+    
+    # Symmetrize and normalize
+    regret = (regret + regret.T) / 2
+    regret = np.clip(regret, 0, 2)
+    
+    max_regret = regret.max()
+    if max_regret > 0:
+        regret /= max_regret
+    
+    return regret
+
+def _compute_kernel_density(distance_matrix: np.ndarray, 
+                           bandwidth: str = 'scott') -> np.ndarray:
+    """Compute kernel density estimates for each node."""
+    n = distance_matrix.shape[0]
+    density_factors = np.ones((n, n))
+    
+    if n <= 3:
+        return density_factors
+    
+    # Estimate local density using k-nearest neighbor distances
+    k = max(2, n // 5)
+    densities = np.zeros(n)
+    
+    for i in range(n):
+        # Use median distance to k nearest neighbors
+        distances = np.partition(distance_matrix[i], k+1)[:k+1]
+        distances = distances[distances > 0]
+        if len(distances) > 0:
+            densities[i] = np.median(distances)
+        else:
+            densities[i] = 1.0
+    
+    # Normalize densities
+    density_mean = densities.mean()
+    if density_mean > 0:
+        relative_density = densities / density_mean
+    
+    # Create adjustment factors
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                # Adjust based on relative densities
+                dens_i, dens_j = relative_density[i], relative_density[j]
+                if dens_i < 0.7 and dens_j < 0.7:
+                    # Both in sparse regions: slight bonus
+                    density_factors[i, j] = 1.2
+                elif dens_i > 1.3 and dens_j > 1.3:
+                    # Both in dense regions: slight penalty
+                    density_factors[i, j] = 0.9
+                elif abs(dens_i - dens_j) > 0.8:
+                    # Connecting very different density regions: moderate bonus
+                    density_factors[i, j] = 1.1
+    
+    return density_factors
+
+def _fuse_centrality(ci: float, cj: float) -> float:
+    """Fuse centrality scores of two nodes."""
+    # Harmonic mean favors balanced centrality
+    if ci + cj > 0:
+        return 2 * ci * cj / (ci + cj + 1e-10)
+    return 1.0
+
+def _community_aware_sparsify(heuristic: np.ndarray, 
+                             distance_matrix: np.ndarray,
+                             mst_mask: np.ndarray) -> np.ndarray:
+    """Sparsify heuristic matrix while preserving community structure."""
+    n = heuristic.shape[0]
+    result = heuristic.copy()
+    
+    # Always keep MST edges
+    result[mst_mask] = heuristic[mst_mask]
+    
+    # Determine number of edges to keep per node
+    edges_per_node = max(3, min(10, n // 5))
+    
+    # For each node, keep top edges within and between communities
+    for i in range(n):
+        # Get all edges from node i
+        row = result[i].copy()
+        row[i] = -np.inf
+        
+        # Sort edges by heuristic value
+        sorted_indices = np.argsort(row)[::-1]
+        
+        # Keep top edges
+        keep_indices = sorted_indices[:edges_per_node]
+        
+        # Zero out non-kept edges (except MST edges)
+        for j in range(n):
+            if j != i and j not in keep_indices and not mst_mask[i, j]:
+                result[i, j] = result[j, i] = 0
+    
+    # Ensure symmetry
+    result = np.maximum(result, result.T)
+    
+    return result
+```

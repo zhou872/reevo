@@ -1,0 +1,239 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Lookahead Penalty", "Degree-aware Adaptive Sparsification", "Rank-weighted Inverse Distance Scoring", "Symmetric Neighborhood Propagation"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with improved sparsification
+    and multi-hop analysis based on the given suggestions.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Degree-aware Adaptive Sparsification ====================
+    # Determine neighbor count based on edges within 1.5x of minimum distance
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Find minimum distance from node i (excluding self)
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        min_dist = np.min(distances)
+        
+        # Count edges within 1.5x of minimum distance
+        threshold = 1.5 * min_dist
+        count_within_threshold = np.sum(distances <= threshold)
+        
+        # Determine number of neighbors to keep (dynamic based on local connectivity)
+        # Ensure at least 3 neighbors and cap at reasonable number
+        k_i = max(3, min(count_within_threshold, int(np.sqrt(n)) + 2))
+        
+        # Get k_i nearest neighbors
+        nn_indices = np.argpartition(distances, k_i)[:k_i]
+        adjacency_mask[i, nn_indices] = True
+    
+    # Ensure symmetry and connectivity
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    
+    # Add minimal connectivity: ensure each node has at least 2 neighbors
+    for i in range(n):
+        if np.sum(adjacency_mask[i]) < 2:
+            # Add the 2 closest nodes not already connected
+            distances = distance_matrix[i].copy()
+            distances[i] = np.inf
+            # Mask already connected neighbors to avoid duplicates
+            distances[adjacency_mask[i]] = np.inf
+            additional_indices = np.argsort(distances)[:2]
+            adjacency_mask[i, additional_indices] = True
+            adjacency_mask[additional_indices, i] = True
+    
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Rank-weighted Inverse Distance Scoring ====================
+    # Compute enhanced inverse distance scores with rank-based weighting
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Get distances to neighbors
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Compute rank-based weights with exponential decay
+            ranks = np.argsort(np.argsort(valid_dists)) + 1  # Closest gets rank 1
+            # Exponential decay: higher weight for closer ranks
+            weights = np.exp(-0.5 * (ranks - 1))
+            weights = weights / np.sum(weights)  # Normalize
+            
+            # Apply weighted inverse distance with distance normalization
+            # Add small epsilon to avoid division by zero
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            # Normalize by average distance to all neighbors
+            avg_dist = np.mean(valid_dists)
+            inv_dist[i, valid_mask] = (inv_vals * weights) / avg_dist
+    
+    # Symmetrize by taking maximum (preserve the stronger connection)
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    
+    # ==================== 3. Enhanced Multi-hop Lookahead Analysis ====================
+    # Compute penalties considering two-hop and three-hop alternatives
+    multi_hop_penalty = np.ones_like(distance_matrix)
+    
+    # Pre-compute sorted distances for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        valid_indices = np.where(valid_mask)[0]
+        
+        for j in valid_indices:
+            if i >= j:
+                continue
+                
+            direct_dist = distance_matrix[i, j]
+            if direct_dist < 1e-10:
+                continue
+                
+            # Find candidate intermediate nodes among top neighbors
+            # Use adaptive number based on local density
+            i_degree = np.sum(adjacency_mask[i])
+            j_degree = np.sum(adjacency_mask[j])
+            check_limit = max(3, int(np.sqrt(min(i_degree, j_degree))) + 2)
+            
+            i_neighbors = sorted_indices[i, 1:check_limit+1]
+            j_neighbors = sorted_indices[j, 1:check_limit+1]
+            candidate_nodes = np.unique(np.concatenate([i_neighbors, j_neighbors]))
+            # Exclude i and j
+            candidate_nodes = candidate_nodes[(candidate_nodes != i) & (candidate_nodes != j)]
+            
+            # Compute two-hop alternatives
+            two_hop_min = np.inf
+            if len(candidate_nodes) > 0:
+                two_hop_dists = distance_matrix[i, candidate_nodes] + distance_matrix[candidate_nodes, j]
+                two_hop_min = np.min(two_hop_dists) if len(two_hop_dists) > 0 else np.inf
+            
+            # Compute three-hop alternatives (limited search for efficiency)
+            three_hop_min = np.inf
+            if len(candidate_nodes) > 1:
+                # Sample a subset of candidate pairs for three-hop
+                max_three_hop_samples = min(20, len(candidate_nodes) * 2)
+                if len(candidate_nodes) > 2:
+                    # Randomly sample pairs for three-hop analysis
+                    rng = np.random.default_rng(seed=42)  # Deterministic for reproducibility
+                    sampled_pairs = rng.choice(candidate_nodes, size=(min(max_three_hop_samples, len(candidate_nodes)), 2), replace=True)
+                    
+                    three_hop_dists = []
+                    for k, l in sampled_pairs:
+                        if k != l and k != i and k != j and l != i and l != j:
+                            three_hop = distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                            three_hop_dists.append(three_hop)
+                    
+                    if three_hop_dists:
+                        three_hop_min = np.min(three_hop_dists)
+            
+            # Compute penalty based on best alternative ratio
+            best_alternative = min(two_hop_min, three_hop_min)
+            
+            if best_alternative < np.inf:
+                ratio = best_alternative / direct_dist
+                
+                # Piecewise penalty function based on ratio
+                if ratio < 0.9:
+                    # Much better alternative exists - heavily penalize
+                    penalty = 0.2
+                elif ratio < 1.1:
+                    # Competitive alternative - moderate penalty
+                    penalty = 0.4 + 0.3 * (ratio - 0.9) / 0.2
+                elif ratio < 1.5:
+                    # Somewhat competitive - light penalty
+                    penalty = 0.7 + 0.2 * (ratio - 1.1) / 0.4
+                else:
+                    # No competitive alternative - minimal penalty
+                    penalty = 0.9 + 0.1 * min(1.0, (ratio - 1.5) / 2.0)
+                
+                multi_hop_penalty[i, j] = multi_hop_penalty[j, i] = penalty
+    
+    # ==================== 4. Symmetric Neighborhood Propagation ====================
+    # Enhance scores based on shared neighborhood structure
+    neighborhood_bonus = np.ones_like(distance_matrix)
+    
+    # Compute Jaccard similarity of neighborhoods (excluding self)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Get neighbors of i and j (excluding i and j themselves)
+                neighbors_i = set(np.where(adjacency_mask[i])[0])
+                neighbors_i.discard(j)
+                neighbors_j = set(np.where(adjacency_mask[j])[0])
+                neighbors_j.discard(i)
+                
+                if neighbors_i and neighbors_j:
+                    intersection = len(neighbors_i & neighbors_j)
+                    union = len(neighbors_i | neighbors_j)
+                    if union > 0:
+                        jaccard = intersection / union
+                        # Apply bonus for shared neighbors (higher connectivity)
+                        neighborhood_bonus[i, j] = neighborhood_bonus[j, i] = 0.8 + 0.4 * jaccard
+    
+    # ==================== 5. Combine All Components ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Combine scores with multiplicative factors
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Base score from enhanced inverse distance
+                base_score = inv_dist[i, j]
+                
+                # Apply multi-hop penalty
+                base_score *= multi_hop_penalty[i, j]
+                
+                # Apply neighborhood bonus
+                base_score *= neighborhood_bonus[i, j]
+                
+                # Additional factor: prefer edges connecting to nodes with higher degree
+                # (helps balance the tour)
+                i_degree = np.sum(adjacency_mask[i])
+                j_degree = np.sum(adjacency_mask[j])
+                degree_factor = 0.5 + 0.5 * (min(i_degree, j_degree) / max(i_degree, j_degree))
+                base_score *= degree_factor
+                
+                heuristics[i, j] = heuristics[j, i] = base_score
+    
+    # ==================== 6. Final Processing ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small constant to all valid edges to avoid zeros
+    heuristics[adjacency_mask] += 1e-8
+    
+    # Row-normalize to create probability distributions
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure all values are non-negative
+    heuristics = np.maximum(heuristics, 0)
+    
+    return heuristics
+```

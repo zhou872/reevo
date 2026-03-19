@@ -1,0 +1,295 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Fusion", "MST-Based Centrality", "Stochastic Sparsification", "Euclidean-Aware Design"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial
+from typing import Tuple, Optional
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic matrix for TSP edge selection with enhanced performance.
+    
+    Key improvements over v1:
+    1. Euclidean-aware design with fast triangle inequality checks
+    2. Efficient MST centrality computation using sparse operations
+    3. Adaptive stochastic sparsification with problem-size scaling
+    4. Robust numerical stability and edge case handling
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape, row-normalized for stochastic sampling
+    """
+    n = distance_matrix.shape[0]
+    np.random.seed(42)  # For reproducibility
+    
+    # ===== 1. TRIVIAL CASES =====
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / np.maximum(distance_matrix, 1e-12)
+        np.fill_diagonal(result, 0)
+        row_sums = result.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return result / row_sums
+    
+    # ===== 2. FAST GRAPH ANALYSIS =====
+    # Extract upper triangle distances efficiently
+    triu_indices = np.triu_indices(n, k=1)
+    if len(triu_indices[0]) > 0:
+        distances = distance_matrix[triu_indices]
+        med_dist = np.median(distances)
+        std_dist = np.std(distances)
+        cv_dist = std_dist / (med_dist + 1e-12) if med_dist > 0 else 1.0
+        # Cap CV for stability
+        cv_dist = np.clip(cv_dist, 0.1, 5.0)
+    else:
+        cv_dist = 1.0
+        med_dist = 1.0
+    
+    # Fast Euclidean-ness test using triangle inequality on sample
+    euclidean_score = 0.5  # Default neutral
+    if n >= 3:
+        sample_size = min(100, n)
+        sample_indices = np.random.choice(n, sample_size, replace=False)
+        violations = 0
+        checks = 0
+        
+        # Vectorized triangle inequality check
+        for i in sample_indices:
+            others = sample_indices[sample_indices != i]
+            if len(others) >= 2:
+                # Compare direct vs two-step paths
+                direct = distance_matrix[i, others]
+                # Use median other as intermediate
+                for j in others:
+                    intermediates = others[others != j]
+                    if len(intermediates) > 0:
+                        # Check triangle inequality: d(i,j) ≤ d(i,k) + d(k,j)
+                        k = intermediates[0]  # Just check one intermediate for speed
+                        two_step = distance_matrix[i, k] + distance_matrix[k, j]
+                        if direct[np.where(others == j)[0][0]] > two_step * 1.01:  # 1% tolerance
+                            violations += 1
+                        checks += 1
+        
+        if checks > 0:
+            euclidean_score = 1.0 - (violations / checks)
+    
+    # ===== 3. BASE COMPONENTS =====
+    # 3.1 Inverse distance (handling zeros)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 3.2 MST computation (sparse for efficiency)
+    mst_mask = np.zeros((n, n), dtype=bool)
+    mst_adj = None
+    
+    try:
+        # Convert to sparse matrix for efficient MST
+        csr_dist = sparse.csr_matrix(distance_matrix)
+        mst = sparse.csgraph.minimum_spanning_tree(csr_dist)
+        mst_mask = (mst + mst.T) > 0  # Symmetrize
+        mst_adj = mst_mask.astype(float)
+    except Exception as e:
+        warnings.warn(f"MST computation failed: {e}")
+        # Fallback: use nearest neighbor connectivity
+        for i in range(n):
+            row = distance_matrix[i].copy()
+            row[i] = np.inf
+            nearest = np.argmin(row)
+            mst_mask[i, nearest] = True
+            mst_mask[nearest, i] = True
+        mst_adj = mst_mask.astype(float)
+    
+    # ===== 4. ENHANCED CENTRALITY MEASURES =====
+    # 4.1 MST-based closeness centrality (efficient computation)
+    mst_closeness = np.ones(n)  # Default uniform
+    
+    if mst_adj is not None:
+        try:
+            # Compute distances in MST (tree distances)
+            mst_dist = sparse.csgraph.shortest_path(mst_adj, directed=False, unweighted=True)
+            # Avoid infinite distances
+            mst_dist[mst_dist == np.inf] = n  # Large penalty
+            mst_dist[mst_dist == 0] = 1  # Avoid division by zero for self
+            
+            # Closeness = 1 / sum of distances
+            mst_closeness = 1 / np.sum(mst_dist, axis=1)
+            # Normalize
+            max_val = mst_closeness.max()
+            if max_val > 0:
+                mst_closeness = mst_closeness / max_val
+        except:
+            # Fallback: degree centrality in MST
+            mst_degree = mst_mask.sum(axis=1)
+            max_deg = mst_degree.max()
+            if max_deg > 0:
+                mst_closeness = mst_degree / max_deg
+    
+    # 4.2 Distance-based centrality (inverse of average distance)
+    row_sums = np.sum(distance_matrix, axis=1)
+    dist_centrality = 1 / (row_sums + 1e-12)
+    max_val = dist_centrality.max()
+    if max_val > 0:
+        dist_centrality = dist_centrality / max_val
+    
+    # 4.3 Combined centrality with Euclidean adaptation
+    if euclidean_score > 0.7:
+        # For Euclidean graphs, weight MST centrality more
+        centrality = 0.7 * mst_closeness + 0.3 * dist_centrality
+    else:
+        # For non-Euclidean, balance both
+        centrality = 0.5 * mst_closeness + 0.5 * dist_centrality
+    
+    # Create centrality matrix (outer product with geometric mean)
+    centrality_mat = np.outer(centrality, centrality)
+    
+    # ===== 5. ADAPTIVE FUSION =====
+    # Dynamic weights based on problem characteristics
+    size_factor = min(1.0, n / 500.0)  # Scale with problem size
+    
+    # Base weights
+    w_inv = 0.4 + 0.1 * euclidean_score  # Higher for Euclidean
+    w_mst = 0.3 + 0.1 * (1.0 - euclidean_score)  # Higher for non-Euclidean
+    w_cent = 0.3 + 0.1 * size_factor  # Higher for larger problems
+    
+    # Normalize
+    total = w_inv + w_mst + w_cent + 1e-12
+    w_inv /= total
+    w_mst /= total
+    w_cent /= total
+    
+    # MST edges get extra boost based on CV
+    mst_boost = 1.0 + 0.5 * cv_dist  # Higher boost for diverse distances
+    
+    # Combine components
+    combined = (w_inv * inv_dist + 
+                w_mst * mst_boost * mst_adj + 
+                w_cent * centrality_mat)
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    # ===== 6. INTELLIGENT SPARSIFICATION =====
+    result = np.zeros_like(combined)
+    
+    # Adaptive k based on problem size and CV
+    base_k = int(np.clip(np.sqrt(n) * (1.0 + 0.5 * cv_dist), 5, min(50, n-1)))
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Find positive candidates
+        pos_mask = row > 0
+        if not np.any(pos_mask):
+            # Fallback: use inverse distance
+            fallback_row = inv_dist[i].copy()
+            fallback_row[i] = -np.inf
+            pos_mask = fallback_row > 0
+            if np.any(pos_mask):
+                row = fallback_row
+            else:
+                # Last resort: nearest neighbors
+                dist_row = distance_matrix[i].copy()
+                dist_row[i] = np.inf
+                nearest = np.argsort(dist_row)[:base_k]
+                result[i, nearest] = 1.0
+                continue
+        
+        # Calculate statistics for adaptive decision
+        pos_values = row[pos_mask]
+        if len(pos_values) == 0:
+            continue
+            
+        mean_val = np.mean(pos_values)
+        std_val = np.std(pos_values)
+        local_cv = std_val / (mean_val + 1e-12)
+        
+        # Adaptive k for this row
+        k = int(np.clip(base_k * (1.0 + 0.3 * local_cv), 3, len(pos_values)))
+        
+        # Get candidate indices
+        candidates = np.where(pos_mask)[0]
+        candidate_values = pos_values
+        
+        # Adaptive temperature for softmax
+        if len(candidate_values) > 1:
+            # Normalize for entropy calculation
+            norm_vals = candidate_values / (candidate_values.sum() + 1e-12)
+            entropy = -np.sum(norm_vals * np.log(norm_vals + 1e-12))
+            max_entropy = np.log(len(candidate_values))
+            norm_entropy = entropy / (max_entropy + 1e-12)
+            temperature = 0.3 + 0.7 * norm_entropy  # Higher temp for uniform distributions
+        else:
+            temperature = 1.0
+        
+        # Softmax selection with adaptive temperature
+        exp_vals = np.exp(candidate_values / (temperature + 1e-12))
+        probs = exp_vals / (exp_vals.sum() + 1e-12)
+        
+        # Stochastic selection: choose top k with probability proportional to softmax
+        if k < len(probs):
+            # Sample without replacement using probabilities
+            try:
+                selected_idx = np.random.choice(
+                    len(probs), 
+                    size=k, 
+                    replace=False, 
+                    p=probs
+                )
+            except:
+                # Fallback to deterministic top-k
+                selected_idx = np.argsort(candidate_values)[-k:]
+        else:
+            selected_idx = np.arange(len(probs))
+        
+        selected = candidates[selected_idx]
+        selected_vals = candidate_values[selected_idx]
+        
+        # Apply rank-based decay
+        sorted_order = np.argsort(selected_vals)[::-1]
+        for rank, idx in enumerate(sorted_order):
+            j = selected[idx]
+            decay = np.exp(-rank / (1.0 + 0.5 * local_cv))
+            result[i, j] = selected_vals[idx] * decay
+    
+    # ===== 7. POST-PROCESSING =====
+    # Symmetrize
+    result = (result + result.T) / 2
+    
+    # Add minimal exploration noise (scaled by mean value)
+    mean_val = result[result > 0].mean() if np.any(result > 0) else 1.0
+    noise_scale = 0.02 * (1.0 + 0.5 * cv_dist)
+    noise = noise_scale * mean_val * np.random.rand(n, n)
+    np.fill_diagonal(noise, 0)
+    result = np.maximum(result + noise, 0)
+    
+    # Ensure zero diagonal
+    np.fill_diagonal(result, 0)
+    
+    # Row normalization with fallback
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Use inverse distance as fallback for disconnected rows
+        result[zero_rows] = inv_dist[zero_rows]
+        row_sums = result.sum(axis=1, keepdims=True)
+    
+    # Normalize with stability
+    row_sums = np.maximum(row_sums, 1e-12)
+    result = result / row_sums
+    
+    # Final symmetrization
+    result = (result + result.T) / 2
+    
+    return result
+```

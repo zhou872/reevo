@@ -1,0 +1,561 @@
+```json
+{
+    "algorithm_features": ["Adaptive Weight Tuning", "Multi-hop Path Potential", "Graph Centrality Bonus", "Sparse Matrix Optimization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix, lil_matrix
+from collections import defaultdict
+import heapq
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection with adaptive weight tuning,
+    multi-hop lookahead, and sparse optimization.
+    
+    Key improvements over v1:
+    1. Adaptive weight tuning based on problem structure analysis
+    2. Multi-hop path potential (up to 3 hops) with beam search
+    3. Graph centrality measures using approximated betweenness
+    4. Sparse matrix operations for scalability
+    5. Phase-aware scoring with iterative refinement
+    
+    Returns: Heuristic matrix of same shape as input (higher = more promising)
+    """
+    n = distance_matrix.shape[0]
+    if n <= 3:
+        # Simple case for very small instances
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-8)
+        np.fill_diagonal(inv_dist, 0)
+        return inv_dist
+    
+    # Phase 1: Analyze problem structure for adaptive weight tuning
+    problem_stats = _analyze_problem_structure(distance_matrix)
+    
+    # Phase 2: Build candidate graph with adaptive sparsity
+    candidate_mask, k = _build_candidate_graph(distance_matrix, problem_stats)
+    
+    # Phase 3: Compute multi-factorial scores using sparse operations
+    H = _compute_heuristic_scores(distance_matrix, candidate_mask, k, problem_stats)
+    
+    # Phase 4: Iterative refinement with feedback
+    H = _refine_scores(H, distance_matrix, candidate_mask, problem_stats)
+    
+    return H
+
+
+def _analyze_problem_structure(dist_mat: np.ndarray) -> dict:
+    """Analyze distance matrix to determine problem characteristics."""
+    n = dist_mat.shape[0]
+    
+    # Remove diagonal for analysis
+    mask = ~np.eye(n, dtype=bool)
+    valid_dists = dist_mat[mask].flatten()
+    
+    stats = {
+        'size': n,
+        'mean_dist': np.mean(valid_dists),
+        'std_dist': np.std(valid_dists),
+        'sparsity_pattern': None
+    }
+    
+    # Analyze distance distribution
+    percentiles = np.percentile(valid_dists, [25, 50, 75])
+    stats['dist_q1'] = percentiles[0]
+    stats['dist_q3'] = percentiles[2]
+    stats['dist_iqr'] = percentiles[2] - percentiles[0]
+    
+    # Determine if problem is clustered or uniform
+    if stats['std_dist'] < 0.3 * stats['mean_dist']:
+        stats['structure_type'] = 'uniform'
+    else:
+        stats['structure_type'] = 'clustered'
+    
+    # Estimate optimal sparsity level
+    if n <= 50:
+        stats['target_density'] = 0.4
+    elif n <= 200:
+        stats['target_density'] = 0.3
+    else:
+        stats['target_density'] = 0.2
+    
+    return stats
+
+
+def _build_candidate_graph(dist_mat: np.ndarray, stats: dict) -> tuple:
+    """Build sparse candidate graph with adaptive connectivity."""
+    n = stats['size']
+    
+    # Adaptive k-nearest neighbors
+    if stats['structure_type'] == 'clustered':
+        k_base = max(3, int(np.log2(n)))
+        k_extra = int(0.2 * n)
+    else:
+        k_base = max(2, int(np.log1p(n)))
+        k_extra = int(0.1 * n)
+    
+    k = min(k_base + k_extra, n - 1)
+    
+    # Build candidate mask using sparse operations
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Get k+1 smallest distances
+        indices = np.argpartition(dist_mat[i], k + 1)[:k + 1]
+        # Remove self and filter by distance threshold
+        indices = indices[indices != i]
+        threshold = stats['dist_q3'] * 1.5
+        indices = indices[dist_mat[i, indices] <= threshold]
+        candidate_mask[i, indices] = True
+    
+    # Make symmetric (edge is candidate if either endpoint considers it)
+    candidate_mask = candidate_mask | candidate_mask.T
+    
+    # Further sparsify to target density
+    current_density = np.sum(candidate_mask) / (n * n - n)
+    if current_density > stats['target_density']:
+        # Keep only top connections by distance
+        for i in range(n):
+            candidate_indices = np.where(candidate_mask[i])[0]
+            if len(candidate_indices) > 0:
+                distances = dist_mat[i, candidate_indices]
+                # Keep only closest connections to achieve target density
+                keep_count = int(stats['target_density'] * n)
+                if len(candidate_indices) > keep_count:
+                    top_indices = np.argsort(distances)[:keep_count]
+                    new_mask = np.zeros(n, dtype=bool)
+                    new_mask[candidate_indices[top_indices]] = True
+                    candidate_mask[i] = new_mask
+    
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    
+    return candidate_mask, k
+
+
+def _compute_heuristic_scores(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                             k: int, stats: dict) -> np.ndarray:
+    """Compute heuristic scores using multiple adaptive factors."""
+    n = stats['size']
+    H = np.zeros((n, n))
+    
+    # 1. Base inverse distance with adaptive scaling
+    inv_dist = 1 / (dist_mat + np.eye(n) * 1e-8)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Scale based on problem characteristics
+    if stats['structure_type'] == 'clustered':
+        inv_dist = np.power(inv_dist, 0.8)
+    
+    # 2. Multi-hop path potential with beam search
+    multi_hop_scores = _compute_multi_hop_potential(dist_mat, candidate_mask, k)
+    
+    # 3. Regret-based scoring with adaptive depth
+    regret_scores = _compute_regret_scores(dist_mat, candidate_mask, k, stats)
+    
+    # 4. Graph centrality bonus
+    centrality_scores = _compute_centrality_bonus(dist_mat, candidate_mask)
+    
+    # 5. MST bias (exact computation using Prim's algorithm)
+    mst_bias = _compute_mst_bias(dist_mat, candidate_mask)
+    
+    # 6. Local density factor
+    density_scores = _compute_density_scores(dist_mat, candidate_mask, k)
+    
+    # Adaptive weight combination based on problem phase
+    if n < 100:
+        # Smaller problems: more balanced weights
+        weights = {
+            'inv_dist': 0.4,
+            'multi_hop': 0.25,
+            'regret': 0.15,
+            'centrality': 0.1,
+            'mst': 0.05,
+            'density': 0.05
+        }
+    elif stats['structure_type'] == 'clustered':
+        # Clustered problems: emphasize connectivity
+        weights = {
+            'inv_dist': 0.3,
+            'multi_hop': 0.3,
+            'regret': 0.15,
+            'centrality': 0.15,
+            'mst': 0.05,
+            'density': 0.05
+        }
+    else:
+        # Uniform problems: emphasize local structure
+        weights = {
+            'inv_dist': 0.5,
+            'multi_hop': 0.2,
+            'regret': 0.15,
+            'centrality': 0.05,
+            'mst': 0.05,
+            'density': 0.05
+        }
+    
+    # Combine factors with weighted geometric mean
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                factors = []
+                
+                if weights['inv_dist'] > 0:
+                    factors.append(inv_dist[i, j] ** weights['inv_dist'])
+                
+                if weights['multi_hop'] > 0 and multi_hop_scores[i, j] > 0:
+                    factors.append(multi_hop_scores[i, j] ** weights['multi_hop'])
+                
+                if weights['regret'] > 0 and regret_scores[i, j] > 0:
+                    factors.append(regret_scores[i, j] ** weights['regret'])
+                
+                if weights['centrality'] > 0 and centrality_scores[i, j] > 0:
+                    factors.append(centrality_scores[i, j] ** weights['centrality'])
+                
+                if weights['mst'] > 0:
+                    factors.append(mst_bias[i, j] ** weights['mst'])
+                
+                if weights['density'] > 0 and density_scores[i, j] > 0:
+                    factors.append(density_scores[i, j] ** weights['density'])
+                
+                if factors:
+                    H[i, j] = np.prod(factors)
+    
+    # Normalize
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    # Ensure symmetry
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    return H
+
+
+def _compute_multi_hop_potential(dist_mat: np.ndarray, 
+                                candidate_mask: np.ndarray,
+                                k: int) -> np.ndarray:
+    """Compute multi-hop path potential using beam search."""
+    n = dist_mat.shape[0]
+    scores = np.zeros((n, n))
+    
+    # Beam width adapts to problem size
+    beam_width = min(10, max(3, n // 20))
+    
+    for i in range(n):
+        # Get candidate neighbors
+        neighbors = np.where(candidate_mask[i])[0]
+        if len(neighbors) == 0:
+            continue
+        
+        for j in neighbors:
+            if i == j:
+                continue
+            
+            # Consider 2-hop and 3-hop paths
+            best_alternative = float('inf')
+            
+            # 2-hop paths: i -> k -> j
+            for k_node in neighbors:
+                if k_node != j and candidate_mask[k_node, j]:
+                    alt_path = dist_mat[i, k_node] + dist_mat[k_node, j]
+                    best_alternative = min(best_alternative, alt_path)
+            
+            # 3-hop paths with beam search
+            beam = [(dist_mat[i, mid1], mid1, [mid1]) 
+                   for mid1 in neighbors if mid1 != j]
+            heapq.heapify(beam)
+            
+            # Expand beam
+            for _ in range(min(beam_width, len(beam))):
+                if not beam:
+                    break
+                
+                current_dist, current_node, path = heapq.heappop(beam)
+                
+                # Try to reach j in next hop
+                if candidate_mask[current_node, j]:
+                    alt_path = current_dist + dist_mat[current_node, j]
+                    best_alternative = min(best_alternative, alt_path)
+                
+                # Add third hop
+                for next_node in np.where(candidate_mask[current_node])[0]:
+                    if next_node not in path and next_node != j:
+                        new_dist = current_dist + dist_mat[current_node, next_node]
+                        if len(beam) < beam_width or new_dist < beam[0][0]:
+                            heapq.heappush(beam, (new_dist, next_node, path + [next_node]))
+            
+            # Score based on how much better direct edge is than alternatives
+            if best_alternative < float('inf'):
+                ratio = dist_mat[i, j] / (best_alternative + 1e-8)
+                # Sigmoid transformation for smooth scoring
+                scores[i, j] = 1 / (1 + np.exp(5 * (ratio - 1)))
+    
+    return scores
+
+
+def _compute_regret_scores(dist_mat: np.ndarray, 
+                          candidate_mask: np.ndarray,
+                          k: int, stats: dict) -> np.ndarray:
+    """Compute regret scores with adaptive depth."""
+    n = stats['size']
+    scores = np.zeros((n, n))
+    
+    regret_depth = min(3, k)
+    
+    for i in range(n):
+        # Get distances to candidate neighbors
+        candidates = np.where(candidate_mask[i])[0]
+        if len(candidates) == 0:
+            continue
+        
+        distances = dist_mat[i, candidates]
+        sorted_indices = np.argsort(distances)
+        
+        if len(sorted_indices) >= regret_depth + 1:
+            for idx, j_idx in enumerate(sorted_indices[:regret_depth+1]):
+                j = candidates[j_idx]
+                if i == j:
+                    continue
+                
+                # Look for alternative among next best candidates
+                alt_candidates = []
+                for alt_idx in sorted_indices[:regret_depth+1]:
+                    if alt_idx != idx:
+                        alt_candidates.append(candidates[alt_idx])
+                
+                if alt_candidates:
+                    # Best alternative distance
+                    alt_dists = dist_mat[i, alt_candidates]
+                    best_alt = np.min(alt_dists)
+                    
+                    # Regret calculation
+                    regret = max(0, best_alt - dist_mat[i, j])
+                    if dist_mat[i, j] > 0:
+                        normalized_regret = regret / dist_mat[i, j]
+                        scores[i, j] = 1 / (1 + np.exp(-5 * normalized_regret))
+    
+    # Make symmetric
+    scores = (scores + scores.T) / 2
+    return scores
+
+
+def _compute_centrality_bonus(dist_mat: np.ndarray,
+                             candidate_mask: np.ndarray) -> np.ndarray:
+    """Compute betweenness centrality approximation for edges."""
+    n = dist_mat.shape[0]
+    scores = np.zeros((n, n))
+    
+    if n > 100:
+        # For large graphs, use sampling
+        sample_size = min(50, n // 2)
+        sources = np.random.choice(n, sample_size, replace=False)
+    else:
+        # For small graphs, use all nodes
+        sources = range(n)
+    
+    for s in sources:
+        # Dijkstra's algorithm from source s
+        dist = np.full(n, float('inf'))
+        dist[s] = 0
+        prev = [set() for _ in range(n)]
+        
+        pq = [(0, s)]
+        
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d > dist[u]:
+                continue
+            
+            # Only consider candidate edges
+            neighbors = np.where(candidate_mask[u])[0]
+            
+            for v in neighbors:
+                new_dist = d + dist_mat[u, v]
+                if new_dist < dist[v]:
+                    dist[v] = new_dist
+                    prev[v] = {u}
+                    heapq.heappush(pq, (new_dist, v))
+                elif abs(new_dist - dist[v]) < 1e-8:
+                    prev[v].add(u)
+        
+        # Backward pass to count paths
+        path_counts = np.zeros(n)
+        # Process nodes in reverse distance order
+        sorted_nodes = np.argsort(dist)[::-1]
+        
+        for v in sorted_nodes:
+            if v == s:
+                path_counts[v] = 1
+                continue
+            
+            total = 0
+            for u in prev[v]:
+                total += path_counts[u]
+            path_counts[v] = total
+            
+            # Add to edge scores
+            for u in prev[v]:
+                scores[u, v] += path_counts[u] / total if total > 0 else 0
+    
+    # Normalize and make symmetric
+    max_score = np.max(scores)
+    if max_score > 0:
+        scores = scores / max_score
+    
+    scores = (scores + scores.T) / 2
+    return scores
+
+
+def _compute_mst_bias(dist_mat: np.ndarray,
+                     candidate_mask: np.ndarray) -> np.ndarray:
+    """Compute MST bias using Prim's algorithm on candidate graph."""
+    n = dist_mat.shape[0]
+    bias = np.ones((n, n))
+    
+    if n > 1000:
+        # For very large instances, approximate
+        return bias
+    
+    # Prim's algorithm
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    # Create a masked distance matrix (inf for non-candidates)
+    masked_dist = dist_mat.copy()
+    masked_dist[~candidate_mask] = float('inf')
+    np.fill_diagonal(masked_dist, float('inf'))
+    
+    for _ in range(n - 1):
+        # Find minimum edge from visited to unvisited
+        visited_indices = np.where(visited)[0]
+        unvisited_indices = np.where(~visited)[0]
+        
+        if len(visited_indices) == 0 or len(unvisited_indices) == 0:
+            break
+        
+        # Get all edges between visited and unvisited
+        min_val = float('inf')
+        min_i, min_j = -1, -1
+        
+        # Vectorized search (memory efficient for large n)
+        for i in visited_indices:
+            row = masked_dist[i, unvisited_indices]
+            if len(row) > 0:
+                min_idx = np.argmin(row)
+                if row[min_idx] < min_val:
+                    min_val = row[min_idx]
+                    min_i = i
+                    min_j = unvisited_indices[min_idx]
+        
+        if min_i != -1 and min_j != -1:
+            bias[min_i, min_j] = 2.0
+            bias[min_j, min_i] = 2.0
+            visited[min_j] = True
+    
+    return bias
+
+
+def _compute_density_scores(dist_mat: np.ndarray,
+                           candidate_mask: np.ndarray,
+                           k: int) -> np.ndarray:
+    """Compute local density scores favoring edges in sparse regions."""
+    n = dist_mat.shape[0]
+    scores = np.zeros((n, n))
+    
+    # Compute local density for each node
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        candidates = np.where(candidate_mask[i])[0]
+        if len(candidates) > 0:
+            # Average distance to nearest candidates
+            if len(candidates) >= k:
+                nearest = np.partition(dist_mat[i, candidates], k)[:k]
+                local_density[i] = np.mean(nearest)
+            else:
+                local_density[i] = np.mean(dist_mat[i, candidates])
+    
+    # Normalize densities
+    if np.std(local_density) > 1e-8:
+        local_density = (local_density - np.mean(local_density)) / np.std(local_density)
+    
+    # Score edges: favor connecting sparse regions
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                # Combined sparsity (higher = more sparse)
+                combined_sparsity = abs(local_density[i]) + abs(local_density[j])
+                # Sigmoid to map to [0, 1]
+                scores[i, j] = 1 / (1 + np.exp(-combined_sparsity))
+    
+    return scores
+
+
+def _refine_scores(H: np.ndarray,
+                  dist_mat: np.ndarray,
+                  candidate_mask: np.ndarray,
+                  stats: dict) -> np.ndarray:
+    """Refine scores through iterative feedback and consistency checks."""
+    n = stats['size']
+    
+    # 1. Ensure triangle inequality consistency
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                # Check if there exists a node k that makes a better triangle
+                for k in range(n):
+                    if k != i and k != j and candidate_mask[i, k] and candidate_mask[k, j]:
+                        triangle_quality = (dist_mat[i, k] + dist_mat[k, j]) / dist_mat[i, j]
+                        if triangle_quality < 1.2:  # Good triangle exists
+                            # Slightly penalize direct edge
+                            H[i, j] *= 0.9
+                            break
+    
+    # 2. Boost edges that form promising cycles
+    if n <= 200:  # Only for reasonably sized instances
+        for i in range(n):
+            candidates_i = np.where(candidate_mask[i])[0]
+            for j in candidates_i:
+                if j <= i:
+                    continue
+                
+                # Look for nodes that connect to both i and j
+                common = np.where(candidate_mask[i] & candidate_mask[j])[0]
+                common = common[(common != i) & (common != j)]
+                
+                if len(common) >= 2:
+                    # This edge participates in promising 3-cycles
+                    cycle_potential = 0
+                    for k in common[:3]:  # Check first few
+                        cycle_length = dist_mat[i, j] + dist_mat[j, k] + dist_mat[k, i]
+                        avg_edge = cycle_length / 3
+                        if avg_edge < stats['dist_q3']:
+                            cycle_potential += 1
+                    
+                    if cycle_potential > 0:
+                        boost = 1 + 0.1 * cycle_potential
+                        H[i, j] *= boost
+                        H[j, i] *= boost
+    
+    # 3. Final normalization
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    # 4. Apply final sparsification
+    flat_scores = H[candidate_mask]
+    if len(flat_scores) > 0:
+        threshold = np.percentile(flat_scores, 20)  # Keep top 80%
+        H[~candidate_mask] = 0
+        H[H < threshold] = 0
+    
+    # Ensure symmetry and zero diagonal
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    return H
+```

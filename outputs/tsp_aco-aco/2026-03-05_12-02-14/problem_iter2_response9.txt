@@ -1,0 +1,282 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree", "Dynamic Weighting", "Betweenness Centrality", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import Tuple
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection combining multiple strategies:
+    1. Minimum Spanning Tree (MST) edges as structural backbone
+    2. Dynamic weighting based on problem characteristics
+    3. Edge betweenness centrality in MST for critical edges
+    4. Adaptive sparsification with connectivity guarantees
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape as input, with higher values
+        indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        inv_dist = 1.0 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(inv_dist, 0)
+        return inv_dist
+    
+    # Prepare distance matrix (avoid division by zero)
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    inv_dist = 1.0 / dist
+    
+    # 1. MST-based heuristic (structural backbone)
+    dist_for_mst = distance_matrix.copy()
+    np.fill_diagonal(dist_for_mst, 0)
+    mst = minimum_spanning_tree(dist_for_mst).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # 2. Dynamic parameter calculation based on problem characteristics
+    problem_char = analyze_problem_characteristics(distance_matrix)
+    dynamic_weights = compute_dynamic_weights(problem_char)
+    
+    # 3. Enhanced betweenness centrality in MST
+    betweenness = compute_mst_betweenness(mst_mask, n)
+    if betweenness.max() > 0:
+        betweenness = betweenness / betweenness.max()
+    
+    # 4. Nearest neighbor heuristic with adaptive k
+    k_nn = max(2, int(np.sqrt(n)))  # More conservative than linear scaling
+    nn_mask = compute_adaptive_nn_mask(dist, k_nn, problem_char['density'])
+    
+    # 5. Combine heuristics with dynamic weights
+    heuristics_matrix = combine_heuristics(
+        inv_dist, mst_mask, nn_mask, betweenness, dynamic_weights
+    )
+    
+    # 6. Adaptive sparsification
+    heuristics_matrix = adaptive_sparsification(
+        heuristics_matrix, mst_mask, dist, n, problem_char
+    )
+    
+    # 7. Final processing
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    max_val = heuristics_matrix.max()
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    return heuristics_matrix
+
+
+def analyze_problem_characteristics(distance_matrix: np.ndarray) -> dict:
+    """Analyze problem characteristics for dynamic parameter adjustment"""
+    n = distance_matrix.shape[0]
+    
+    # Calculate distance statistics
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    mean_dist = np.mean(flat_dists)
+    std_dist = np.std(flat_dists)
+    
+    # Estimate problem density (relative spread of distances)
+    cv = std_dist / mean_dist if mean_dist > 0 else 0
+    density = 1.0 / (1.0 + cv)  # Higher density = more uniform distances
+    
+    # Node degree variability
+    nearest_counts = []
+    for i in range(n):
+        row = distance_matrix[i]
+        threshold = np.percentile(row[row > 0], 25)
+        nearest_counts.append(np.sum(row <= threshold))
+    
+    degree_var = np.std(nearest_counts) / np.mean(nearest_counts) if np.mean(nearest_counts) > 0 else 0
+    
+    return {
+        'n': n,
+        'density': density,
+        'degree_variability': degree_var,
+        'mean_distance': mean_dist,
+        'std_distance': std_dist
+    }
+
+
+def compute_dynamic_weights(problem_char: dict) -> dict:
+    """Compute dynamic weights based on problem characteristics"""
+    n = problem_char['n']
+    density = problem_char['density']
+    degree_var = problem_char['degree_variability']
+    
+    # Base weights with dynamic adjustments
+    mst_base = 3.0
+    nn_base = 2.0
+    betweenness_base = 1.5
+    
+    # Adjust MST weight based on problem size and density
+    # Larger problems and denser graphs benefit more from MST
+    mst_weight = mst_base * (1.0 + np.log10(n) / 10) * (0.8 + 0.4 * density)
+    
+    # Adjust NN weight based on degree variability
+    # More variable degrees suggest some nodes are clear hubs
+    nn_weight = nn_base * (0.9 + 0.2 * degree_var)
+    
+    # Adjust betweenness weight based on problem size
+    # Larger problems benefit more from centrality information
+    betweenness_weight = betweenness_base * (1.0 + np.log10(n) / 20)
+    
+    return {
+        'mst': mst_weight,
+        'nn': nn_weight,
+        'betweenness': betweenness_weight
+    }
+
+
+def compute_mst_betweenness(mst_mask: np.ndarray, n: int) -> np.ndarray:
+    """Compute betweenness centrality for edges in MST"""
+    betweenness = np.zeros((n, n))
+    
+    # Build adjacency list from MST mask
+    adj_list = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_mask[i, j]:
+                adj_list[i].append(j)
+                adj_list[j].append(i)
+    
+    # For each node as root, compute component sizes
+    for root in range(n):
+        # BFS to get tree structure
+        parent = [-1] * n
+        children = [[] for _ in range(n)]
+        visited = [False] * n
+        stack = [root]
+        visited[root] = True
+        order = []
+        
+        while stack:
+            node = stack.pop()
+            order.append(node)
+            for neighbor in adj_list[node]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    parent[neighbor] = node
+                    children[node].append(neighbor)
+                    stack.append(neighbor)
+        
+        # Compute subtree sizes in reverse order
+        subtree_size = [1] * n
+        for node in reversed(order):
+            for child in children[node]:
+                subtree_size[node] += subtree_size[child]
+        
+        # Calculate betweenness for edges
+        for node in range(n):
+            if parent[node] != -1:
+                size_subtree = subtree_size[node]
+                size_rest = n - size_subtree
+                edge_btw = size_subtree * size_rest
+                betweenness[node, parent[node]] += edge_btw
+                betweenness[parent[node], node] += edge_btw
+    
+    # Normalize by number of roots considered
+    betweenness = betweenness / n
+    return betweenness
+
+
+def compute_adaptive_nn_mask(dist: np.ndarray, base_k: int, density: float) -> np.ndarray:
+    """Compute nearest neighbor mask with density-adaptive thresholding"""
+    n = dist.shape[0]
+    nn_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        # Adaptive k based on local density
+        local_dists = dist[i].copy()
+        local_dists[i] = np.inf
+        median_dist = np.median(local_dists[local_dists < np.inf])
+        
+        # More neighbors in dense regions, fewer in sparse
+        density_factor = 0.5 + density  # [0.5, 1.5]
+        adaptive_k = max(2, int(base_k * density_factor))
+        
+        # Get nearest neighbors
+        nearest = np.argsort(dist[i])[:adaptive_k]
+        nn_mask[i, nearest] = True
+        nn_mask[nearest, i] = True
+    
+    return nn_mask
+
+
+def combine_heuristics(inv_dist: np.ndarray, mst_mask: np.ndarray,
+                      nn_mask: np.ndarray, betweenness: np.ndarray,
+                      weights: dict) -> np.ndarray:
+    """Combine multiple heuristics with dynamic weights"""
+    heuristics = inv_dist.copy()
+    
+    # Apply MST boost
+    mst_boost = weights['mst'] * mst_mask
+    heuristics = heuristics * (1.0 + mst_boost)
+    
+    # Apply NN boost
+    nn_boost = weights['nn'] * nn_mask
+    heuristics = heuristics * (1.0 + nn_boost)
+    
+    # Add betweenness component
+    betweenness_component = weights['betweenness'] * betweenness * inv_dist
+    heuristics = heuristics + betweenness_component
+    
+    return heuristics
+
+
+def adaptive_sparsification(heuristics: np.ndarray, mst_mask: np.ndarray,
+                           dist: np.ndarray, n: int,
+                           problem_char: dict) -> np.ndarray:
+    """Adaptively sparsify the heuristic matrix"""
+    sparsified = heuristics.copy()
+    
+    # Always keep MST edges
+    sparsity_mask = mst_mask.copy()
+    
+    # Adaptive number of edges to keep per node
+    base_top_k = max(3, n // 6)  # More conservative than v1
+    density_factor = 0.8 + 0.4 * problem_char['density']  # [0.8, 1.2]
+    top_k = int(base_top_k * density_factor)
+    
+    # Keep top edges per node
+    for i in range(n):
+        row = sparsified[i].copy()
+        row[i] = -np.inf
+        
+        # Get top_k promising edges
+        threshold = np.partition(row, -top_k)[-top_k]
+        top_mask = row >= threshold
+        
+        sparsity_mask[i, top_mask] = True
+        sparsity_mask[top_mask, i] = True
+    
+    # Apply sparsification
+    sparsified[~sparsity_mask] = 0
+    
+    # Ensure each node has at least 2 connections
+    for i in range(n):
+        non_zero = np.count_nonzero(sparsified[i])
+        if non_zero < 2:
+            # Add nearest neighbors if missing
+            nearest = np.argsort(dist[i])[1:3]  # Skip self
+            for j in nearest:
+                if sparsified[i, j] == 0:
+                    sparsified[i, j] = heuristics[i, j] * 0.3  # Reduced weight
+                    sparsified[j, i] = heuristics[j, i] * 0.3
+    
+    return sparsified
+```

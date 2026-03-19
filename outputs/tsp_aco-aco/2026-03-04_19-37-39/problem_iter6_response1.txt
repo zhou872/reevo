@@ -1,0 +1,266 @@
+```json
+{
+    "algorithm_features": ["Heuristic Tour Sampling", "Geometric Feature Adaptation", "KNN Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with geometric feature adaptation
+    and online learning from sampled heuristic tours.
+    
+    Key improvements:
+    1. Online learning via multiple heuristic tour sampling (nearest neighbor, greedy insertion)
+    2. Geometric feature detection (clustering, convex hull, distribution skewness)
+    3. KNN-based sparsification with connectivity preservation
+    4. Adaptive component weighting based on instance characteristics
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # ========== 1. GEOMETRIC FEATURE DETECTION ==========
+    # Compute geometric features for adaptive parameter tuning
+    distances_no_diag = distance_matrix[~np.eye(n, dtype=bool)].flatten()
+    mean_dist = np.mean(distances_no_diag)
+    std_dist = np.std(distances_no_diag)
+    
+    # Coefficient of variation
+    cv = std_dist / mean_dist if mean_dist > 0 else 0.5
+    
+    # Skewness of distance distribution (indicates clustering)
+    skewness = 0
+    if len(distances_no_diag) > 2:
+        skewness = np.mean(((distances_no_diag - mean_dist) / std_dist) ** 3) if std_dist > 0 else 0
+    
+    # Estimate cluster tendency via kurtosis
+    kurtosis = 0
+    if len(distances_no_diag) > 3:
+        kurtosis = np.mean(((distances_no_diag - mean_dist) / std_dist) ** 4) if std_dist > 0 else 0
+    
+    # ========== 2. ONLINE LEARNING VIA SAMPLED TOURS ==========
+    # Generate multiple heuristic tours for learning edge importance
+    tour_usage = np.zeros_like(distance_matrix, dtype=np.float32)
+    num_tours = min(10, max(3, n // 5))
+    
+    # Helper function for nearest neighbor tour
+    def nearest_neighbor_tour(start_idx: int) -> np.ndarray:
+        tour = [start_idx]
+        unvisited = set(range(n))
+        unvisited.remove(start_idx)
+        current = start_idx
+        
+        while unvisited:
+            # Find nearest unvisited node
+            distances_to_current = distance_matrix[current].copy()
+            distances_to_current[list(tour)] = np.inf
+            next_node = np.argmin(distances_to_current)
+            tour.append(next_node)
+            unvisited.remove(next_node)
+            current = next_node
+        
+        return np.array(tour)
+    
+    # Helper function for greedy insertion tour
+    def greedy_insertion_tour(start_idx: int) -> np.ndarray:
+        # Start with triangle
+        distances_copy = distance_matrix.copy()
+        np.fill_diagonal(distances_copy, np.inf)
+        
+        # Pick two farthest from start to create initial triangle
+        farthest = np.argsort(distances_copy[start_idx])[-2:]
+        tour = [start_idx, farthest[0], farthest[1]]
+        
+        remaining = set(range(n))
+        remaining.difference_update(tour)
+        
+        while remaining:
+            best_node = -1
+            best_position = -1
+            best_increase = np.inf
+            
+            for node in remaining:
+                for i in range(len(tour)):
+                    j = (i + 1) % len(tour)
+                    increase = (distance_matrix[tour[i], node] + 
+                               distance_matrix[node, tour[j]] - 
+                               distance_matrix[tour[i], tour[j]])
+                    
+                    if increase < best_increase:
+                        best_increase = increase
+                        best_node = node
+                        best_position = i + 1
+            
+            tour.insert(best_position, best_node)
+            remaining.remove(best_node)
+        
+        return np.array(tour)
+    
+    # Sample tours with different strategies and starting points
+    for tour_idx in range(num_tours):
+        # Alternate between strategies
+        if tour_idx % 2 == 0:
+            start = tour_idx % n
+            tour = nearest_neighbor_tour(start)
+        else:
+            start = (tour_idx * 7) % n  # Different starting point
+            tour = greedy_insertion_tour(start)
+        
+        # Record edge usage (undirected)
+        for i in range(n):
+            j = (i + 1) % n
+            tour_usage[tour[i], tour[j]] += 1
+            tour_usage[tour[j], tour[i]] += 1
+    
+    # Normalize tour usage
+    if np.max(tour_usage) > 0:
+        tour_usage = tour_usage / np.max(tour_usage)
+    
+    # ========== 3. ADAPTIVE PARAMETER TUNING ==========
+    # Weights based on geometric features
+    if cv > 1.2 or abs(skewness) > 1.5:
+        # Irregular or clustered instance: emphasize sampled tours and MST
+        tour_weight = 0.6
+        inv_dist_weight = 0.2
+        centrality_weight = 0.2
+        mst_boost = 2.5
+        k = max(2, min(4, n // 6))  # Fewer neighbors for clustered instances
+    elif cv < 0.3 and abs(skewness) < 0.5:
+        # Regular, uniform instance: balanced approach
+        tour_weight = 0.4
+        inv_dist_weight = 0.3
+        centrality_weight = 0.3
+        mst_boost = 2.0
+        k = max(3, min(6, n // 4))
+    else:
+        # Moderate instance
+        tour_weight = 0.5
+        inv_dist_weight = 0.25
+        centrality_weight = 0.25
+        mst_boost = 2.2
+        k = max(2, min(5, n // 5))
+    
+    # Adjust for problem size
+    size_factor = np.log10(max(n, 10))
+    if n < 20:
+        tour_weight *= 1.3
+    elif n > 100:
+        inv_dist_weight *= 1.2
+        centrality_weight *= 0.8
+    
+    # ========== 4. BASE COMPONENTS ==========
+    # Inverse distance with regularization
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # K-nearest neighbors mask
+    knn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        knn_mask[i, nn_indices] = True
+    knn_mask = knn_mask | knn_mask.T
+    
+    # Minimum spanning tree
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    
+    # Geometric centrality measure
+    row_sums = np.sum(distance_matrix, axis=1) - np.diag(distance_matrix)
+    avg_dist = row_sums / (n - 1)
+    
+    # Adjust centrality based on distance distribution
+    if abs(skewness) > 1.0:
+        # For skewed distributions, use median for robustness
+        robust_avg = np.median(avg_dist)
+        centrality = 1 / (np.abs(avg_dist - robust_avg) + 1e-10)
+    else:
+        # For symmetric distributions, use mean
+        robust_avg = np.mean(avg_dist)
+        centrality = 1 / (avg_dist + 1e-10)
+    
+    centrality = np.exp(centrality - np.max(centrality))
+    centrality = centrality / (np.sum(centrality) + 1e-10)
+    
+    edge_potential = np.outer(centrality, centrality)
+    np.fill_diagonal(edge_potential, 0)
+    
+    # ========== 5. MULTI-COMPONENT COMBINATION ==========
+    base_component = (inv_dist_weight * inv_dist + 
+                     centrality_weight * edge_potential)
+    
+    # Add tour-based learning component
+    heuristic_scores = tour_weight * tour_usage + (1 - tour_weight) * base_component
+    
+    # Boost important structural edges
+    heuristic_scores[knn_mask] *= 1.3
+    heuristic_scores[mst_mask] *= mst_boost
+    
+    # Penalize very long edges (beyond 3x median)
+    median_dist = np.median(distances_no_diag)
+    long_edge_penalty = distance_matrix > (3 * median_dist)
+    heuristic_scores[long_edge_penalty] *= 0.3
+    
+    # ========== 6. KNN-BASED SPARSIFICATION ==========
+    # Ensure each node has at least k connections
+    sparsity_mask = knn_mask.copy()
+    
+    # Always include MST edges for connectivity
+    sparsity_mask = sparsity_mask | mst_mask
+    
+    # Include top additional edges based on heuristic scores
+    additional_edges_per_node = max(1, n // 10)
+    for i in range(n):
+        scores_i = heuristic_scores[i].copy()
+        scores_i[i] = -np.inf  # Exclude self
+        scores_i[sparsity_mask[i]] = -np.inf  # Exclude already selected
+        
+        # Select top additional edges
+        top_indices = np.argpartition(scores_i, -additional_edges_per_node)[-additional_edges_per_node:]
+        sparsity_mask[i, top_indices] = True
+    
+    # Ensure symmetry
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Apply sparsification
+    heuristic_scores = heuristic_scores * sparsity_mask
+    
+    # ========== 7. FINAL PROCESSING ==========
+    # Handle edge cases with very few non-zero values
+    non_zero = heuristic_scores[heuristic_scores > 0]
+    if len(non_zero) > 0:
+        # Statistical normalization
+        mean_val = np.mean(non_zero)
+        std_val = np.std(non_zero)
+        heuristic_scores = np.clip(heuristic_scores, 
+                                   max(0, mean_val - 2 * std_val), 
+                                   mean_val + 2 * std_val)
+    
+    # Final normalization
+    max_val = np.max(heuristic_scores)
+    if max_val > 0:
+        heuristic_scores = heuristic_scores / max_val
+    
+    # Zero diagonal
+    np.fill_diagonal(heuristic_scores, 0)
+    
+    return heuristic_scores
+```

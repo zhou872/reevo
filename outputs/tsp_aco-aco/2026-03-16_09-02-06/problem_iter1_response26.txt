@@ -1,0 +1,114 @@
+```json
+{
+    "algorithm_features": ["Degree-constrained centrality", "Symmetric regret weighting", "Cluster-aware pruning", "Inverse distance with sparsity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import distance_matrix as scipy_distance_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics combining multiple factors:
+    1. Inverse distance (baseline)
+    2. Node centrality based on minimum spanning tree degree
+    3. Regret weighting (difference between best and second-best connections)
+    4. Cluster detection and intra-cluster boosting
+    5. Sparsification of unpromising edges
+    """
+    n = distance_matrix.shape[0]
+    heuristics = np.zeros_like(distance_matrix)
+    np.fill_diagonal(heuristics, 0)
+    
+    # 1. Baseline: inverse distance (avoid division by zero)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        inv_dist = np.nan_to_num(inv_dist, posinf=0, neginf=0)
+    
+    # 2. Node centrality via Minimum Spanning Tree degree approximation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_deg = np.zeros(n)
+    for i in range(n):
+        mst_deg[i] = np.count_nonzero(mst[i, :]) + np.count_nonzero(mst[:, i])
+    
+    # Normalize and create centrality matrix
+    if mst_deg.max() > 0:
+        centrality = mst_deg / mst_deg.max()
+    else:
+        centrality = np.ones(n)
+    centrality_mat = np.outer(centrality, centrality)
+    
+    # 3. Regret weighting: importance of each edge relative to alternatives
+    regret = np.zeros_like(distance_matrix)
+    for i in range(n):
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        sorted_idx = np.argsort(row)
+        if len(sorted_idx) >= 2:
+            best, second_best = row[sorted_idx[0]], row[sorted_idx[1]]
+            regret[i, sorted_idx[0]] = (second_best - best) / (second_best + 1e-10)
+    
+    # Symmetric regret (average of both directions)
+    regret_sym = (regret + regret.T) / 2
+    
+    # 4. Cluster detection and intra-cluster boosting
+    # Simple clustering: partition based on MST connectivity
+    cluster_mask = np.zeros((n, n), dtype=bool)
+    if n > 10:
+        # Use approximate clustering via k-means on 2D MDS projection
+        from sklearn.manifold import MDS
+        from sklearn.cluster import KMeans
+        
+        # Approximate 2D embedding
+        mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+        coords = mds.fit_transform(distance_matrix)
+        
+        # Determine number of clusters (max 4 for computational efficiency)
+        n_clusters = min(4, max(2, n // 10))
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(coords)
+        labels = kmeans.labels_
+        
+        # Boost edges within same cluster
+        for i in range(n):
+            for j in range(i + 1, n):
+                if labels[i] == labels[j]:
+                    cluster_mask[i, j] = cluster_mask[j, i] = True
+    
+    # 5. Combine factors with weights
+    base_heuristics = inv_dist * centrality_mat * (1 + regret_sym)
+    
+    # Apply cluster boosting
+    if cluster_mask.any():
+        cluster_boost = 2.0  # Boost factor for intra-cluster edges
+        base_heuristics[cluster_mask] *= cluster_boost
+    
+    # 6. Sparsification: keep only promising edges
+    # Strategy: For each node, keep top k connections plus intra-cluster edges
+    k = min(8, n - 1)  # Keep at most 8 best connections per node
+    
+    sparsity_mask = np.zeros_like(base_heuristics, dtype=bool)
+    for i in range(n):
+        # Get indices of top k edges (excluding diagonal)
+        row = base_heuristics[i].copy()
+        row[i] = -np.inf
+        top_k_idx = np.argpartition(row, -k)[-k:]
+        sparsity_mask[i, top_k_idx] = True
+        
+        # Always keep intra-cluster edges
+        if cluster_mask.any():
+            sparsity_mask[i] = sparsity_mask[i] | cluster_mask[i]
+        
+        # Keep symmetric connections
+        sparsity_mask[:, i] = sparsity_mask[:, i] | sparsity_mask[i, :]
+    
+    # Apply sparsity mask
+    heuristics = base_heuristics * sparsity_mask
+    
+    # Normalize to similar scale as input
+    if heuristics.max() > 0:
+        heuristics = heuristics / heuristics.max()
+    
+    return heuristics
+```

@@ -1,0 +1,466 @@
+```json
+{
+    "algorithm_features": ["Multi-Factor Integration", "Community-Aware Boosting", "Dynamic Weight Adaptation", "Sparsity Optimization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import KDTree
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristic with optimized community detection,
+    learned weight adaptation, and efficient factor combination.
+    
+    Key improvements:
+    1. Fast approximate community detection using spectral clustering
+    2. Instance-adaptive weight tuning via distance distribution analysis
+    3. Efficient matrix operations replacing loops where possible
+    4. Balanced trade-off between exploration and exploitation
+    
+    Args:
+        distance_matrix: Symmetric n x n distance matrix with zero diagonal
+        
+    Returns:
+        Heuristic matrix with higher values indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # 1. Base reciprocal distances with stability
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(reciprocal, 0)
+    reciprocal = np.clip(reciprocal, 0, 1e6)  # Prevent extreme values
+    
+    # 2. Compute structural factors in parallel
+    mst_factor = _fast_mst_factor(distance_matrix, n)
+    knn_factor = _fast_knn_factor(distance_matrix, n)
+    density_factor = _compute_density_ratio(distance_matrix, n)
+    
+    # 3. Fast community detection using spectral approximation
+    communities = _spectral_community_detection(distance_matrix, n)
+    community_factor = _community_aware_factor(communities, distance_matrix, n)
+    
+    # 4. Dynamic weight computation based on instance analysis
+    instance_features = _analyze_instance(distance_matrix, n)
+    weights = _compute_adaptive_weights_v2(instance_features)
+    
+    # 5. Efficient factor combination with weighted geometric mean
+    combined = _efficient_geometric_combination(
+        reciprocal, mst_factor, knn_factor, 
+        density_factor, community_factor, weights, n
+    )
+    
+    # 6. Adaptive sparsification with connectivity preservation
+    sparsified = _smart_sparsification(combined, distance_matrix, n)
+    
+    # 7. Enhanced pattern recognition using triangle closure
+    boosted = _triangle_closure_boost(sparsified, communities, n)
+    
+    # 8. Final normalization and symmetry enforcement
+    np.fill_diagonal(boosted, 0)
+    boosted = (boosted + boosted.T) / 2  # Ensure symmetry
+    
+    max_val = np.max(boosted)
+    if max_val > 0:
+        boosted = boosted / max_val
+    
+    return boosted
+
+def _fast_mst_factor(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute MST-based factor with neighborhood awareness."""
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_binary = (mst.toarray() > 0).astype(float)
+    
+    # Direct MST edges get highest weight
+    mst_factor = mst_binary + mst_binary.T
+    
+    # Extend to nearest neighbors of MST vertices
+    for i in range(n):
+        if np.any(mst_binary[i]):  # Only for MST vertices
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            
+            # Connect to k nearest non-MST neighbors
+            k = min(3, n - 1)
+            nearest = np.argpartition(dists, k)[:k]
+            
+            for j in nearest:
+                if mst_factor[i, j] == 0:
+                    # Decaying weight based on rank
+                    rank = np.where(nearest == j)[0][0]
+                    weight = 0.5 * (1.0 - 0.2 * rank)
+                    mst_factor[i, j] = mst_factor[j, i] = weight
+    
+    return mst_factor
+
+def _fast_knn_factor(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute k-nearest neighbor factor using vectorized operations."""
+    knn_factor = np.zeros((n, n))
+    
+    # Adaptive k based on problem size
+    k = min(max(3, int(np.log2(n)) + 2), n - 1)
+    
+    # Get k-nearest neighbors for each node
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        indices = np.argpartition(dists, k)[:k]
+        
+        # Assign weights inversely proportional to rank
+        for rank, j in enumerate(indices):
+            knn_factor[i, j] = 1.0 / (1.0 + 0.3 * rank)
+    
+    # Symmetrize (take maximum to preserve strongest connections)
+    knn_factor = np.maximum(knn_factor, knn_factor.T)
+    return knn_factor
+
+def _compute_density_ratio(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute density-based factor comparing edge length to local density."""
+    density_factor = np.ones((n, n))
+    
+    # Precompute local density for each node
+    local_density = np.zeros(n)
+    k_density = min(5, n - 1)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nearest_dists = np.partition(dists, k_density)[:k_density]
+        local_density[i] = np.mean(nearest_dists)
+    
+    # Compute density ratio for each edge
+    for i in range(n):
+        for j in range(i + 1, n):
+            local_avg = (local_density[i] + local_density[j]) / 2
+            dist = distance_matrix[i, j]
+            
+            if dist < local_avg:
+                # Edge is shorter than local average - boost
+                ratio = local_avg / (dist + 1e-12)
+                density_factor[i, j] = density_factor[j, i] = min(2.0, 1.0 + 0.5 * np.log1p(ratio))
+            else:
+                # Edge is longer - penalize
+                ratio = dist / (local_avg + 1e-12)
+                density_factor[i, j] = density_factor[j, i] = max(0.3, 1.0 / np.sqrt(ratio))
+    
+    return density_factor
+
+def _spectral_community_detection(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """
+    Fast approximate community detection using spectral clustering.
+    
+    Uses the Fiedler vector (second eigenvector of Laplacian) for bipartition,
+    then recursively splits if beneficial.
+    """
+    if n <= 10:
+        return np.zeros(n, dtype=int)  # Single community for small instances
+    
+    # Convert distances to similarities
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarities = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    np.fill_diagonal(similarities, 0)
+    
+    # Degree matrix
+    degrees = np.sum(similarities, axis=1)
+    D = np.diag(degrees)
+    
+    # Normalized Laplacian
+    D_sqrt_inv = np.diag(1.0 / np.sqrt(degrees + 1e-12))
+    L_norm = np.eye(n) - D_sqrt_inv @ similarities @ D_sqrt_inv
+    
+    # Compute eigenvectors (we only need the second smallest)
+    try:
+        # Use eigsh for sparse matrices or eig for small n
+        if n > 50:
+            from scipy.sparse.linalg import eigsh
+            _, eigenvectors = eigsh(L_norm, k=2, which='SM')
+            fiedler = eigenvectors[:, 1]
+        else:
+            eigenvalues, eigenvectors = np.linalg.eigh(L_norm)
+            idx = np.argsort(eigenvalues)
+            fiedler = eigenvectors[:, idx[1]]
+    except:
+        # Fallback: use degree-based clustering
+        return _degree_based_clustering(similarities, n)
+    
+    # Partition based on sign of Fiedler vector
+    labels = np.zeros(n, dtype=int)
+    labels[fiedler >= np.median(fiedler)] = 1
+    
+    # Recursively split if large enough and beneficial
+    if n > 20:
+        # Check if split improves modularity
+        if _compute_modularity(similarities, labels) > 0.1:
+            # Recursively split each community
+            final_labels = np.zeros(n, dtype=int)
+            label_counter = 0
+            
+            for comm_id in [0, 1]:
+                indices = np.where(labels == comm_id)[0]
+                if len(indices) > 5:
+                    sub_matrix = distance_matrix[np.ix_(indices, indices)]
+                    sub_labels = _spectral_community_detection(sub_matrix, len(indices))
+                    final_labels[indices] = sub_labels + label_counter
+                    label_counter += np.max(sub_labels) + 1
+                else:
+                    final_labels[indices] = label_counter
+                    label_counter += 1
+            
+            return final_labels
+    
+    return labels
+
+def _degree_based_clustering(similarities: np.ndarray, n: int) -> np.ndarray:
+    """Fallback clustering method based on node degrees."""
+    degrees = np.sum(similarities, axis=1)
+    sorted_idx = np.argsort(degrees)
+    
+    # Split into two communities by degree
+    labels = np.zeros(n, dtype=int)
+    labels[sorted_idx[n//2:]] = 1
+    
+    return labels
+
+def _compute_modularity(similarities: np.ndarray, labels: np.ndarray) -> float:
+    """Compute modularity of a partition."""
+    m = np.sum(similarities) / 2  # Total weight
+    if m == 0:
+        return 0.0
+    
+    communities = np.unique(labels)
+    modularity = 0.0
+    
+    for comm in communities:
+        indices = np.where(labels == comm)[0]
+        sub_sim = similarities[np.ix_(indices, indices)]
+        intra_weight = np.sum(sub_sim) / 2
+        total_degree = np.sum(similarities[indices, :])
+        
+        modularity += intra_weight/m - (total_degree/(2*m))**2
+    
+    return modularity
+
+def _community_aware_factor(communities: np.ndarray, distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute factor based on community structure with distance awareness."""
+    community_factor = np.ones((n, n))
+    
+    # Intra-community boosting
+    for i in range(n):
+        for j in range(i + 1, n):
+            if communities[i] == communities[j]:
+                # Boost inversely proportional to intra-community distance rank
+                comm_indices = np.where(communities == communities[i])[0]
+                if len(comm_indices) > 1:
+                    # Compute distance percentile within community
+                    intra_dists = []
+                    for k in comm_indices:
+                        if k != i:
+                            intra_dists.append(distance_matrix[i, k])
+                    
+                    if intra_dists:
+                        dist_ij = distance_matrix[i, j]
+                        percentile = np.sum(np.array(intra_dists) < dist_ij) / len(intra_dists)
+                        
+                        # Stronger boost for shorter intra-community edges
+                        boost = 1.5 + 0.5 * (1.0 - percentile)
+                        community_factor[i, j] = community_factor[j, i] = boost
+    
+    return community_factor
+
+def _analyze_instance(distance_matrix: np.ndarray, n: int) -> dict:
+    """Extract key features from the instance for adaptive weighting."""
+    # Upper triangle distances
+    triu_indices = np.triu_indices(n, 1)
+    distances = distance_matrix[triu_indices]
+    
+    features = {
+        'n': n,
+        'mean_dist': np.mean(distances),
+        'std_dist': np.std(distances),
+        'cv_dist': np.std(distances) / (np.mean(distances) + 1e-12),
+        'skewness': 0.0,
+        'mst_ratio': 0.0,
+        'spatial_clustering': 0.0
+    }
+    
+    # Distance skewness
+    if len(distances) > 1:
+        features['skewness'] = 3 * (features['mean_dist'] - np.median(distances)) / (features['std_dist'] + 1e-12)
+    
+    # MST characteristics
+    if n > 1:
+        mst = minimum_spanning_tree(distance_matrix)
+        mst_length = mst.sum()
+        avg_mst_edge = mst_length / (n - 1)
+        features['mst_ratio'] = avg_mst_edge / (features['mean_dist'] + 1e-12)
+    
+    # Spatial clustering tendency (using nearest neighbor distances)
+    if n >= 10:
+        nn_dists = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nn_dists.append(np.min(dists))
+        features['spatial_clustering'] = np.mean(nn_dists) / (features['mean_dist'] + 1e-12)
+    
+    return features
+
+def _compute_adaptive_weights_v2(features: dict) -> dict:
+    """Compute adaptive weights based on instance features."""
+    n = features['n']
+    cv = features['cv_dist']
+    skewness = abs(features['skewness'])
+    mst_ratio = features['mst_ratio']
+    
+    # Base weights reflecting general TSP knowledge
+    weights = {
+        'reciprocal': 0.35,
+        'mst': 0.25,
+        'knn': 0.15,
+        'density': 0.15,
+        'community': 0.10
+    }
+    
+    # Adjust based on distance variability
+    if cv > 1.0:  # High variability
+        weights['reciprocal'] += 0.08
+        weights['density'] += 0.04
+        weights['mst'] -= 0.06
+        weights['knn'] -= 0.06
+    
+    # Adjust based on skewness
+    if skewness > 0.5:  # Skewed distribution
+        weights['community'] += 0.05
+        weights['density'] -= 0.03
+        weights['knn'] -= 0.02
+    
+    # Adjust based on MST characteristics
+    if mst_ratio < 0.7:  # MST edges much shorter than average
+        weights['mst'] += 0.06
+        weights['reciprocal'] -= 0.04
+    
+    # Adjust based on problem size
+    size_factor = min(1.0, n / 100)
+    weights['community'] *= (0.8 + 0.4 * size_factor)
+    weights['knn'] *= (0.9 + 0.2 * size_factor)
+    
+    # Normalize to sum to 1
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    return weights
+
+def _efficient_geometric_combination(
+    reciprocal: np.ndarray,
+    mst: np.ndarray,
+    knn: np.ndarray,
+    density: np.ndarray,
+    community: np.ndarray,
+    weights: dict,
+    n: int
+) -> np.ndarray:
+    """Combine factors using weighted geometric mean with numerical stability."""
+    # Ensure all factors are positive with small epsilon
+    eps = 1e-12
+    reciprocal = np.maximum(reciprocal, eps)
+    mst = np.maximum(mst, eps)
+    knn = np.maximum(knn, eps)
+    density = np.maximum(density, eps)
+    community = np.maximum(community, eps)
+    
+    # Compute weighted geometric mean using logarithms for numerical stability
+    log_combined = np.zeros((n, n))
+    log_combined += weights['reciprocal'] * np.log(reciprocal)
+    log_combined += weights['mst'] * np.log(mst)
+    log_combined += weights['knn'] * np.log(knn)
+    log_combined += weights['density'] * np.log(density)
+    log_combined += weights['community'] * np.log(community)
+    
+    # Convert back from log space
+    combined = np.exp(log_combined)
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+def _smart_sparsification(heuristics: np.ndarray, distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Adaptively sparsify while preserving connectivity and promising edges."""
+    if n <= 15:
+        return heuristics.copy()
+    
+    sparsified = np.zeros_like(heuristics)
+    
+    # Determine number of edges to keep per node adaptively
+    base_edges = max(4, int(np.log2(n)) * 2)
+    edges_per_node = min(base_edges, n - 1)
+    
+    # First pass: keep top edges for each node
+    for i in range(n):
+        row = heuristics[i].copy()
+        row[i] = -np.inf
+        
+        if edges_per_node < n - 1:
+            threshold = np.partition(row, -edges_per_node)[-edges_per_node]
+        else:
+            threshold = 0
+        
+        mask = row >= threshold
+        sparsified[i] = heuristics[i] * mask
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    
+    # Second pass: ensure MST edges are preserved
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mst_edges[i, j] and sparsified[i, j] == 0:
+                # Restore MST edge with original heuristic value
+                sparsified[i, j] = sparsified[j, i] = heuristics[i, j]
+    
+    return sparsified
+
+def _triangle_closure_boost(heuristics: np.ndarray, communities: np.ndarray, n: int) -> np.ndarray:
+    """Boost edges that complete triangles, especially within communities."""
+    if n < 3:
+        return heuristics
+    
+    boosted = heuristics.copy()
+    
+    # Binary adjacency for triangle detection
+    binary_adj = (heuristics > 0).astype(float)
+    
+    # Count common neighbors (potential triangles)
+    common_neighbors = binary_adj @ binary_adj.T
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if heuristics[i, j] > 0:
+                cn = common_neighbors[i, j]
+                if cn > 0:
+                    # Base triangle boost
+                    boost = 1.0 + 0.2 * np.log1p(cn)
+                    
+                    # Extra boost for intra-community triangles
+                    if communities[i] == communities[j]:
+                        boost *= 1.3
+                    
+                    boosted[i, j] = boosted[j, i] = heuristics[i, j] * min(boost, 2.0)
+    
+    return boosted
+```

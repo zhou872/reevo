@@ -1,0 +1,180 @@
+```json
+{
+    "algorithm_features": ["Regret-Weighted Inverse Distance", "Adaptive MST Sparsification", "1-Tree Connectivity Priors", "Exponential Edge Length Penalty"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges with regret-based adjustments and adaptive sparsity.
+    
+    Key innovations:
+    1. Regret-weighted distance scoring using k-nearest neighbor differentials
+    2. Adaptive sparsity based on local solution entropy estimates
+    3. 1-tree connectivity priors (extending MST with second-best edges)
+    4. Exponential penalty with distance-adaptive decay parameter
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric distance matrix of shape (n, n)
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic scores matrix of same shape, higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # 1. Base inverse distance with zero handling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Adaptive local density estimation using variable k
+    k_min = min(3, n - 1)
+    k_max = min(8, n - 1)
+    
+    # Calculate entropy-based k for each node
+    local_entropies = np.zeros(n)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        sorted_dists = np.sort(dists)
+        
+        # Normalize distances for entropy calculation
+        if len(sorted_dists) > 1:
+            normalized = sorted_dists / (np.sum(sorted_dists) + 1e-8)
+            entropy = -np.sum(normalized * np.log(normalized + 1e-8))
+            local_entropies[i] = entropy
+    
+    # Determine k for each node based on entropy
+    if np.max(local_entropies) > np.min(local_entropies):
+        normalized_entropy = (local_entropies - np.min(local_entropies)) / (np.max(local_entropies) - np.min(local_entropies))
+        k_values = k_min + (k_max - k_min) * normalized_entropy
+        k_values = np.round(k_values).astype(int)
+    else:
+        k_values = np.full(n, k_min)
+    
+    # Calculate density using adaptive k
+    local_density = np.zeros(n)
+    for i in range(n):
+        k = k_values[i]
+        if k > 0:
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            k_nearest = np.partition(dists, k)[:k]
+            local_density[i] = 1.0 / (np.mean(k_nearest) + 1e-8)
+    
+    # 3. Regret-based scoring: compare best vs second-best options
+    regret_scores = np.ones_like(distance_matrix)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Find two smallest distances for each node
+        if len(dists) >= 2:
+            indices = np.argpartition(dists, 2)[:2]
+            d1, d2 = dists[indices[0]], dists[indices[1]]
+            
+            # Calculate regret: how much worse is second-best?
+            if d1 > 0:
+                regret = (d2 - d1) / d1
+                
+                # Apply regret bonus to the best edge
+                best_idx = indices[0]
+                regret_scores[i, best_idx] += 0.3 * np.tanh(regret)  # Tanh for bounded scaling
+    
+    # 4. Enhanced connectivity priors: 1-tree approximation
+    # Minimum Spanning Tree
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    
+    # For each node, find second-best edge not in MST
+    second_best_mask = np.zeros_like(distance_matrix, dtype=bool)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        mst_edges = mst[i] > 0
+        
+        # Find smallest non-MST edge
+        non_mst_dists = dists.copy()
+        non_mst_dists[mst_edges] = np.inf
+        if np.any(non_mst_dists < np.inf):
+            second_best_idx = np.argmin(non_mst_dists)
+            second_best_mask[i, second_best_idx] = True
+    
+    # Connectivity bonus: higher for MST, moderate for second-best edges
+    connectivity_bonus = np.ones_like(distance_matrix)
+    connectivity_bonus[mst > 0] = 1.8  # MST edges
+    connectivity_bonus[second_best_mask] = 1.4  # Second-best edges
+    
+    # 5. Combine components with adaptive weights
+    density_weights = np.sqrt(np.outer(local_density, local_density))
+    base_scores = inv_dist * density_weights * regret_scores * connectivity_bonus
+    
+    # 6. Adaptive sparsification based on score distribution
+    sparsified = np.zeros_like(base_scores)
+    
+    for i in range(n):
+        row_scores = base_scores[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Calculate adaptive sparsity based on score entropy
+        if n > 2:
+            valid_scores = row_scores[row_scores > 0]
+            if len(valid_scores) > 1:
+                normalized = valid_scores / (np.sum(valid_scores) + 1e-8)
+                row_entropy = -np.sum(normalized * np.log(normalized + 1e-8))
+                max_entropy = np.log(len(valid_scores))
+                
+                # Higher entropy -> keep more edges
+                if max_entropy > 0:
+                    entropy_ratio = row_entropy / max_entropy
+                    keep_ratio = 0.2 + 0.3 * entropy_ratio  # 20-50% of edges
+                else:
+                    keep_ratio = 0.3
+            else:
+                keep_ratio = 0.3
+        else:
+            keep_ratio = 0.5
+        
+        k_keep = max(2, int(keep_ratio * (n - 1)))
+        
+        # Select top edges
+        if k_keep < len(row_scores):
+            threshold = np.partition(row_scores, -k_keep)[-k_keep]
+            mask = row_scores >= threshold
+        else:
+            mask = np.ones_like(row_scores, dtype=bool)
+            mask[i] = False
+        
+        sparsified[i][mask] = base_scores[i][mask]
+    
+    # Symmetrize: keep edge if either endpoint considers it promising
+    symmetric_scores = np.maximum(sparsified, sparsified.T)
+    
+    # 7. Adaptive exponential penalty
+    median_dist = np.median(distance_matrix[distance_matrix > 0])
+    scale = 0.7 * median_dist + 1e-8
+    
+    # Stronger penalty for very long edges
+    length_penalty = np.exp(-distance_matrix / scale)
+    final_scores = symmetric_scores * length_penalty
+    
+    # 8. Final normalization with stability checks
+    max_score = np.max(final_scores)
+    if max_score > 0:
+        final_scores = final_scores / max_score
+    
+    np.fill_diagonal(final_scores, 0)
+    
+    return final_scores
+```

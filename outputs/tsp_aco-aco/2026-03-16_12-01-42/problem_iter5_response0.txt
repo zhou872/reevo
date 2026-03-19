@@ -1,0 +1,177 @@
+```json
+{
+    "algorithm_features": ["Second-Neighbor Regret Penalization", "Spatial Harmonic Averaging", "Adaptive Top-k Sparsification"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge selection with simplified regret calculation
+    and vectorized operations for improved performance.
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        n x n symmetric distance matrix
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix of same shape, where higher values indicate
+        more promising edges for inclusion in solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    epsilon = 1e-12
+    
+    # === 1. Base inverse distance ===
+    inv_dist = 1 / (distance_matrix + epsilon)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 2. Regret-based penalization using second nearest neighbor ===
+    dist_with_inf = distance_matrix.copy()
+    np.fill_diagonal(dist_with_inf, np.inf)
+    
+    # Sort distances for each node
+    sorted_indices = np.argsort(dist_with_inf, axis=1)
+    sorted_distances = np.take_along_axis(dist_with_inf, sorted_indices, axis=1)
+    
+    # First and second nearest distances
+    first_nn_dist = sorted_distances[:, 0]
+    second_nn_dist = sorted_distances[:, 1]
+    
+    # Regret per node: (second_best - best) / best
+    regret_i = (second_nn_dist - first_nn_dist) / (first_nn_dist + epsilon)
+    
+    # Symmetric regret boost for edges
+    regret_boost = 1.0 + 0.5 * (regret_i[:, np.newaxis] + regret_i[np.newaxis, :])
+    np.fill_diagonal(regret_boost, 0)
+    
+    # === 3. Spatial harmonic averaging ===
+    k_spatial = min(7, n - 1)
+    nearest_dists = sorted_distances[:, :k_spatial]
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        node_spatial = k_spatial / np.sum(1 / (nearest_dists + epsilon), axis=1)
+    
+    # Harmonic mean of endpoint spatial scores
+    spatial_scores = 2 / (1/(node_spatial[:, np.newaxis] + epsilon) + 
+                         1/(node_spatial[np.newaxis, :] + epsilon))
+    np.fill_diagonal(spatial_scores, 0)
+    
+    # Normalize spatial scores to [0.5, 1.5] range
+    non_zero_mask = spatial_scores > 0
+    if np.any(non_zero_mask):
+        spatial_min = np.min(spatial_scores[non_zero_mask])
+        spatial_max = np.max(spatial_scores[non_zero_mask])
+        if spatial_max > spatial_min:
+            spatial_scores = 0.5 + (spatial_scores - spatial_min) / (spatial_max - spatial_min)
+    
+    # === 4. Mutual nearest neighbor boost ===
+    k_mutual = max(3, int(np.sqrt(n)))
+    if k_mutual > n - 1:
+        k_mutual = n - 1
+    
+    nn_indices = sorted_indices[:, :k_mutual]
+    mutual_nn_boost = np.zeros_like(distance_matrix)
+    
+    # Vectorized check for mutual nearest neighbors
+    for i in range(n):
+        for j in nn_indices[i]:
+            if j < n and np.any(nn_indices[j] == i):
+                mutual_nn_boost[i, j] = 1.8 * regret_boost[i, j]
+    
+    # === 5. Efficient MST factor (Prim's algorithm) ===
+    mst_boost = np.zeros_like(distance_matrix)
+    if n > 1:
+        visited = np.zeros(n, dtype=bool)
+        visited[0] = True
+        min_edge_to_tree = distance_matrix[0].copy()
+        source_node = np.zeros(n, dtype=int)
+        
+        for _ in range(n - 1):
+            unvisited = ~visited
+            if not np.any(unvisited):
+                break
+                
+            candidates = np.where(unvisited)[0]
+            min_idx = np.argmin(min_edge_to_tree[candidates])
+            best_j = candidates[min_idx]
+            i = source_node[best_j]
+            
+            mst_boost[i, best_j] = 2.0 * spatial_scores[i, best_j]
+            mst_boost[best_j, i] = 2.0 * spatial_scores[best_j, i]
+            visited[best_j] = True
+            
+            # Update distances to tree
+            for v in range(n):
+                if not visited[v] and distance_matrix[best_j, v] < min_edge_to_tree[v]:
+                    min_edge_to_tree[v] = distance_matrix[best_j, v]
+                    source_node[v] = best_j
+    
+    # === 6. Degree balancing penalty ===
+    popularity = np.zeros(n, dtype=int)
+    for j in range(n):
+        for idx in nn_indices[j]:
+            if idx < n:
+                popularity[idx] += 1
+    
+    norm_pop = np.minimum(1.0, popularity / (k_mutual * 2))
+    penalty_vals = 1.0 - 0.3 * norm_pop
+    degree_penalty = np.outer(penalty_vals, np.ones(n))
+    np.fill_diagonal(degree_penalty, 0)
+    
+    # === 7. Multiplicative fusion ===
+    heuristics = inv_dist.copy()
+    heuristics *= (1.0 + mutual_nn_boost)
+    heuristics *= (1.0 + mst_boost)
+    heuristics *= regret_boost
+    heuristics *= spatial_scores
+    heuristics *= degree_penalty
+    
+    # === 8. Adaptive sparsification ===
+    adaptive_k = min(12, max(3, n // 4))
+    
+    for i in range(n):
+        if adaptive_k >= n - 1:
+            continue
+            
+        row = heuristics[i].copy()
+        
+        # Regret-adjusted scores
+        regret_adjusted = row * (1.0 + 0.5 * (regret_boost[i] - 1.0))
+        
+        # Always keep mutual nearest neighbors
+        keep_mask = np.zeros(n, dtype=bool)
+        for j in nn_indices[i]:
+            if j < n and mutual_nn_boost[i, j] > 0:
+                keep_mask[j] = True
+        
+        # Keep top adaptive_k edges by regret-adjusted score
+        top_k_indices = np.argsort(regret_adjusted)[-adaptive_k:]
+        keep_mask[top_k_indices] = True
+        
+        # Ensure at least 2 edges are kept
+        if np.sum(keep_mask) < 2:
+            top2_indices = np.argsort(row)[-2:]
+            keep_mask[top2_indices] = True
+        
+        row[~keep_mask] = 0
+        heuristics[i] = row
+    
+    # === 9. Symmetrization and normalization ===
+    symmetric_heuristics = np.maximum(heuristics, heuristics.T * 0.8)
+    np.fill_diagonal(symmetric_heuristics, 0)
+    
+    symmetric_heuristics = np.maximum(symmetric_heuristics, 0)
+    max_val = np.max(symmetric_heuristics)
+    if max_val > 0:
+        symmetric_heuristics = symmetric_heuristics / max_val
+    
+    return symmetric_heuristics
+```

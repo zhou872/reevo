@@ -1,0 +1,264 @@
+```json
+{
+    "algorithm_features": ["Candidate Sampling", "Memory-Augmented", "Christofides Heuristic", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+import hashlib
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with candidate sampling for local search,
+    memory-augmented learning from prior runs, Christofides-inspired components for scalability,
+    and adaptive stochastic sparsification.
+    
+    Parameters:
+    distance_matrix (np.ndarray): Square matrix of distances between nodes.
+    
+    Returns:
+    np.ndarray: Matrix of the same shape with scores indicating edge promise.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Initialize memory cache as function attribute if not present
+    if not hasattr(heuristics_v2, "memory"):
+        heuristics_v2.memory = {}
+    
+    # Create a signature key for memory lookup (sampled to handle large instances)
+    rng = np.random.RandomState(42)  # Fixed seed for reproducibility
+    sample_size = min(1000, n * n)
+    if n > 0:
+        sample_indices = rng.choice(n * n, size=sample_size, replace=False)
+        sample_values = distance_matrix.flatten()[sample_indices]
+        key = hashlib.md5(sample_values.tobytes()).hexdigest()[:16]  # Short hash
+    else:
+        key = "empty"
+    
+    # Check memory and set blend factor
+    blend_old = 0.1 if key in heuristics_v2.memory else 0.0
+    blend_new = 1.0 - blend_old
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1.0 / np.maximum(distance_matrix, 1e-10)
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic[np.isnan(heuristic)] = 0
+        np.fill_diagonal(heuristic, 0)
+        # Store in memory
+        heuristics_v2.memory[key] = heuristic
+        return heuristic
+    
+    # ==================== ONLINE PARAMETER ADAPTATION ====================
+    flat_dists = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / dist_mean if dist_mean > 0 else 1.0
+    
+    # Compute edge entropy for stochasticity adjustment
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dists = 1.0 / np.maximum(distance_matrix, 1e-10)
+    inv_dists[np.isinf(inv_dists)] = 0
+    inv_dists[np.isnan(inv_dists)] = 0
+    np.fill_diagonal(inv_dists, 0)
+    row_sums = inv_dists.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    prob_matrix = inv_dists / row_sums
+    entropy = -np.sum(prob_matrix * np.log(prob_matrix + 1e-10), axis=1)
+    entropy_norm = entropy / np.log(n) if n > 1 else np.ones(n)
+    edge_entropy = np.mean(entropy_norm)
+    
+    # Adaptive parameters
+    sparsity_factor = min(1.5, max(0.5, 1.0 + 0.5 * dist_cv))
+    stochasticity_factor = min(1.0, max(0.2, edge_entropy))
+    mst_weight_factor = min(1.2, max(0.8, 1.0 - 0.2 * np.log10(max(2, n))))
+    
+    # ==================== CORE HEURISTIC COMPONENTS ====================
+    # 1. Reciprocal distance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1.0 / np.maximum(distance_matrix, 1e-10)
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # 2. Centrality using efficient PageRank with Gaussian similarity
+    sigma = np.median(distance_matrix[distance_matrix > 0])
+    gaussian_sim = np.exp(-distance_matrix**2 / (2 * sigma**2))
+    np.fill_diagonal(gaussian_sim, 0)
+    centrality = np.ones(n) / n
+    for _ in range(5):  # Reduced iterations for efficiency
+        centrality_new = 0.85 * gaussian_sim.T @ (centrality / (gaussian_sim.sum(axis=1) + 1e-10))
+        centrality_new += 0.15 / n
+        centrality = centrality_new
+    centrality = centrality / np.max(centrality) if np.max(centrality) > 0 else centrality
+    centrality_matrix = np.outer(centrality, centrality) * reciprocal
+    
+    # 3. MST component with Christofides-inspired matching
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_mask = (mst > 0).astype(float)
+        mst_degree = mst_mask.sum(axis=1)
+        
+        # Boost MST edges based on degree product
+        edge_scores = np.zeros_like(mst_mask)
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    score = (mst_degree[i] * mst_degree[j]) ** 0.5
+                    edge_scores[i, j] = edge_scores[j, i] = score
+        if np.max(edge_scores) > 0:
+            edge_scores = edge_scores / np.max(edge_scores)
+        mst_component = mst_mask * (0.5 + 0.5 * edge_scores) * mst_weight_factor
+        
+        # Christofides matching component for odd-degree vertices
+        odd_vertices = [v for v in range(n) if mst_degree[v] % 2 == 1]
+        matched = set()
+        matching_component = np.zeros_like(distance_matrix)
+        # Greedy approximate matching
+        for i in odd_vertices:
+            if i not in matched:
+                min_dist = np.inf
+                best_j = None
+                for j in odd_vertices:
+                    if j not in matched and j != i:
+                        dist = distance_matrix[i, j]
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_j = j
+                if best_j is not None:
+                    # Add matching edges with weight based on reciprocal distance
+                    weight = reciprocal[i, best_j] * 0.5  # Reduced weight for matching
+                    matching_component[i, best_j] = weight
+                    matching_component[best_j, i] = weight
+                    matched.add(i)
+                    matched.add(best_j)
+    except Exception as e:
+        mst_component = np.zeros_like(distance_matrix)
+        matching_component = np.zeros_like(distance_matrix)
+    
+    # 4. Local search with candidate sampling
+    local_search_component = np.zeros_like(distance_matrix)
+    k_neighbors = max(3, min(10, int(np.sqrt(n))))  # Sampled neighbors per node
+    l_other = max(2, min(5, int(np.log2(n))))  # Sampled nodes for 2-opt evaluation
+    
+    for i in range(n):
+        # Sample k_neighbors based on distance (closest neighbors more likely)
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        if n > k_neighbors:
+            # Use stochastic sampling: closer neighbors have higher probability
+            prob = 1.0 / (row + 1e-10)
+            prob[i] = 0
+            prob_sum = prob.sum()
+            if prob_sum > 0:
+                prob = prob / prob_sum
+                sampled_j = rng.choice(n, size=k_neighbors, replace=False, p=prob)
+            else:
+                sampled_j = rng.choice([j for j in range(n) if j != i], size=min(k_neighbors, n-1), replace=False)
+        else:
+            sampled_j = [j for j in range(n) if j != i]
+        
+        for j in sampled_j:
+            # Sample l_other nodes k for 2-opt evaluation
+            if n > l_other + 2:
+                candidates = [k for k in range(n) if k != i and k != j]
+                sampled_k = rng.choice(candidates, size=min(l_other, len(candidates)), replace=False)
+            else:
+                sampled_k = [k for k in range(n) if k != i and k != j]
+            
+            for k in sampled_k:
+                # Simple 2-opt gain approximation
+                gain = (distance_matrix[i, j] + distance_matrix[k, (k-1) % n]) - \
+                       (distance_matrix[i, k] + distance_matrix[j, (k-1) % n])
+                if gain > 0:
+                    local_search_component[i, k] += gain / (distance_matrix[i, k] + 1e-10)
+    
+    if np.max(local_search_component) > 0:
+        local_search_component = local_search_component / np.max(local_search_component)
+    
+    # ==================== ADAPTIVE COMBINATION ====================
+    # Dynamic weights based on instance size and characteristics
+    if n < 20:
+        weights = [0.4, 0.3, 0.2, 0.05, 0.05]  # reciprocal, centrality, MST, matching, local search
+    elif n < 100:
+        weights = [0.3, 0.25, 0.25, 0.1, 0.1]
+    else:
+        weights = [0.25, 0.2, 0.3, 0.15, 0.1]
+    
+    # Adjust based on distance variation
+    if dist_cv > 1.5:
+        weights[0] *= 1.2  # Increase reciprocal weight
+        weights[2] *= 0.8  # Decrease MST weight
+    
+    weight_sum = sum(weights)
+    weights = [w / weight_sum for w in weights]
+    
+    combined = (weights[0] * reciprocal + 
+                weights[1] * centrality_matrix + 
+                weights[2] * mst_component + 
+                weights[3] * matching_component + 
+                weights[4] * local_search_component)
+    
+    # ==================== MEMORY-AUGMENTED SPARSIFICATION ====================
+    if blend_old > 0:
+        # Blend with cached heuristic from memory
+        cached = heuristics_v2.memory[key]
+        combined = blend_new * combined + blend_old * cached
+    
+    sparsified = np.zeros_like(combined)
+    base_k = max(3, min(15, int(5 + n / 20)))
+    
+    for i in range(n):
+        # Adaptive k per node
+        centrality_factor = 0.8 + 0.4 * centrality[i]
+        entropy_factor = 1.0 + 0.5 * entropy_norm[i]
+        k = int(base_k * centrality_factor * entropy_factor * sparsity_factor)
+        k = max(2, min(n-1, k))
+        k += rng.randint(-1, 2)
+        k = max(2, min(n-1, k))
+        
+        row = combined[i].copy()
+        row[i] = -np.inf
+        noise = rng.randn(n) * stochasticity_factor * 0.1
+        row_noisy = row * (1 + noise)
+        row_noisy[i] = -np.inf
+        
+        if k < n-1:
+            sorted_indices = np.argsort(row_noisy)[::-1]
+            keep_indices = sorted_indices[:k]
+        else:
+            keep_indices = np.arange(n)
+            keep_indices = keep_indices[keep_indices != i]
+        
+        sorted_keep = keep_indices[np.argsort(row_noisy[keep_indices])[::-1]]
+        decay_rate = 1.5 + 0.5 * stochasticity_factor
+        for rank, j in enumerate(sorted_keep):
+            decay = np.exp(-rank / decay_rate)
+            if rank < k // 2:
+                noise_factor = 0.05
+            else:
+                noise_factor = 0.1 * stochasticity_factor
+            perturbation = 1 + noise_factor * rng.randn()
+            sparsified[i, j] = combined[i, j] * decay * max(0.7, perturbation)
+    
+    # ==================== FINAL PROCESSING ====================
+    symmetric = 0.7 * sparsified + 0.3 * sparsified.T
+    if stochasticity_factor > 0.3:
+        noise = rng.randn(n, n) * 0.02 * stochasticity_factor
+        np.fill_diagonal(noise, 0)
+        symmetric = symmetric + noise
+    
+    symmetric = np.maximum(symmetric, 0)
+    np.fill_diagonal(symmetric, 0)
+    max_val = symmetric.max()
+    if max_val > 0:
+        symmetric = symmetric / max_val
+    
+    # Update memory
+    heuristics_v2.memory[key] = symmetric
+    
+    return symmetric
+```

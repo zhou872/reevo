@@ -1,0 +1,281 @@
+```json
+{
+    "algorithm_features": ["Meta-Learned Parameter Adaptation", "Graph Neural Embedding Features", "K-OPT Move Potential Scoring", "Multi-Scale Spatial Decomposition"]
+}
+```
+
+```python
+import numpy as np
+from typing import Optional, Tuple
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with meta-learned adaptation and structural embeddings.
+    
+    Key innovations:
+    1. Meta-learned parameter adaptation based on instance statistics
+    2. Graph neural embedding features capturing higher-order connectivity
+    3. Generalized k-OPT move potential estimation
+    4. Multi-scale spatial decomposition with spectral features
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges for inclusion in optimal tours.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. META-LEARNED PARAMETER ADAPTATION ===
+    # Compute comprehensive instance statistics
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(upper_tri)
+    dist_std = np.std(upper_tri)
+    dist_skew = np.mean((upper_tri - dist_mean)**3) / (dist_std**3 + 1e-12)
+    dist_kurtosis = np.mean((upper_tri - dist_mean)**4) / (dist_std**4 + 1e-12)
+    
+    # Meta-learned parameter mapping based on instance characteristics
+    def meta_parameter(param_type: str) -> float:
+        """Parameter adaptation based on instance statistics."""
+        if param_type == 'mst_weight':
+            # Higher kurtosis (peaked distribution) favors MST
+            return 1.7 + 0.5 * np.tanh(dist_kurtosis / 5)
+        elif param_type == 'regret_factor':
+            # Higher skewness (asymmetric distances) requires stronger regret
+            return 1.4 + 0.3 * np.tanh(np.abs(dist_skew))
+        elif param_type == 'centrality_mix':
+            # CV indicates distance heterogeneity, affects centrality balance
+            cv = dist_std / (dist_mean + 1e-12)
+            return 0.5 + 0.2 * np.tanh(cv - 1)
+        elif param_type == 'embedding_dim':
+            # Adaptive embedding dimension based on instance size
+            return min(5, max(2, int(np.log2(n))))
+        elif param_type == 'sparsity_factor':
+            # Dynamic sparsification based on instance regularity
+            return 0.7 + 0.2 * (1 - np.exp(-dist_std / dist_mean))
+        return 1.0
+    
+    # === 2. GRAPH NEURAL EMBEDDING FEATURES ===
+    def compute_graph_embeddings(dist_mat: np.ndarray, dim: int) -> np.ndarray:
+        """Compute node embeddings using graph neural features."""
+        n_nodes = dist_mat.shape[0]
+        embeddings = np.zeros((n_nodes, dim))
+        
+        # Laplacian eigenmaps (spectral embedding)
+        if n_nodes <= 500:  # Only for moderate-sized instances
+            try:
+                # Compute normalized Laplacian
+                D = np.diag(1 / np.sqrt(np.sum(dist_mat, axis=1) + 1e-12))
+                L = np.eye(n_nodes) - D @ dist_mat @ D
+                
+                # Get smallest non-zero eigenvectors
+                eigvals, eigvecs = np.linalg.eigh(L)
+                nonzero_mask = eigvals > 1e-8
+                if np.sum(nonzero_mask) >= dim:
+                    embeddings[:, :min(dim, eigvecs.shape[1])] = eigvecs[:, 1:dim+1]
+            except:
+                pass
+        
+        # Distance-based features for remaining dimensions
+        for i in range(n_nodes):
+            # Distance distribution moments
+            distances = np.delete(dist_mat[i], i)
+            if len(distances) > 0:
+                # First moment (already captured by base features)
+                embeddings[i, -2] = np.mean(distances) / (dist_mean + 1e-12)
+                # Coefficient of variation
+                if np.mean(distances) > 0:
+                    embeddings[i, -1] = np.std(distances) / np.mean(distances)
+        
+        return embeddings
+    
+    # === 3. ADVANCED REGRET WITH K-OPT POTENTIAL ===
+    def compute_kopt_regret(dist_mat: np.ndarray, k: int = 3) -> np.ndarray:
+        """Compute regret considering k-opt move alternatives."""
+        n_nodes = dist_mat.shape[0]
+        regret = np.ones((n_nodes, n_nodes))
+        
+        # Precompute sorted neighbors for each node
+        sorted_neighbors = []
+        for i in range(n_nodes):
+            row = dist_mat[i].copy()
+            row[i] = np.inf
+            sorted_idx = np.argsort(row)
+            sorted_neighbors.append((sorted_idx, row[sorted_idx]))
+        
+        for i in range(n_nodes):
+            for j in range(n_nodes):
+                if i == j:
+                    continue
+                
+                # Base regret: rank in sorted neighbors
+                idx_i, dists_i = sorted_neighbors[i]
+                rank_i = np.where(idx_i == j)[0][0] if j in idx_i else len(idx_i)
+                
+                # Consider k-opt alternatives: best replacement involving k-1 other edges
+                best_kopt_gain = 0
+                if rank_i < k * 2:  # Only consider for moderately promising edges
+                    # Simple approximation: consider best alternative paths of length 2
+                    for m in range(min(k, n_nodes)):
+                        if m == i or m == j:
+                            continue
+                        # Path i->m + m->j as alternative to direct i->j
+                        alt_path = dist_mat[i, m] + dist_mat[m, j]
+                        gain = dist_mat[i, j] - alt_path
+                        best_kopt_gain = max(best_kopt_gain, gain)
+                
+                # Combine rank-based and k-opt-based regret
+                rank_penalty = 1 / (1 + meta_parameter('regret_factor') * rank_i)
+                kopt_bonus = 1 + 0.2 * np.tanh(best_kopt_gain / (dist_mean + 1e-12))
+                
+                regret[i, j] = rank_penalty * kopt_bonus
+        
+        # Symmetrize
+        return (regret + regret.T) / 2
+    
+    # === 4. MULTI-SCALE SPATIAL DECOMPOSITION ===
+    def compute_spatial_features(dist_mat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute multi-scale spatial decomposition features."""
+        n_nodes = dist_mat.shape[0]
+        local_features = np.zeros((n_nodes, n_nodes))
+        global_features = np.zeros((n_nodes, n_nodes))
+        
+        # Local scale: cluster density estimation
+        k_local = max(2, n // 20)
+        for i in range(n_nodes):
+            # Find k nearest neighbors
+            row = dist_mat[i].copy()
+            row[i] = np.inf
+            nearest_idx = np.argpartition(row, k_local)[:k_local]
+            local_density = 1 / (np.mean(row[nearest_idx]) + 1e-12)
+            
+            for j in range(n_nodes):
+                if i != j:
+                    # Shared neighbors ratio as local connectivity
+                    if j in nearest_idx:
+                        shared_neighbors = len(set(nearest_idx) & 
+                                              set(np.argpartition(dist_mat[j], k_local)[:k_local]))
+                        local_features[i, j] = shared_neighbors / k_local * local_density
+        
+        # Global scale: spectral partitioning features
+        if n_nodes <= 300:
+            try:
+                # Fiedler vector (second smallest eigenvector of Laplacian)
+                D = np.diag(np.sum(dist_mat, axis=1))
+                L = D - dist_mat
+                eigvals, eigvecs = np.linalg.eigh(L)
+                fiedler = eigvecs[:, 1]
+                
+                # Global feature: nodes in same spectral cluster
+                median_fiedler = np.median(fiedler)
+                for i in range(n_nodes):
+                    for j in range(n_nodes):
+                        if i != j:
+                            same_cluster = (fiedler[i] > median_fiedler) == (fiedler[j] > median_fiedler)
+                            global_features[i, j] = 0.3 if same_cluster else 0.1
+            except:
+                pass
+        
+        return local_features, global_features
+    
+    # === 5. CORE HEURISTICS COMPUTATION ===
+    
+    # Base heuristic: exponential decay for better numerical stability
+    scale = dist_mean / 2
+    base_heuristic = np.exp(-distance_matrix / (scale + 1e-12))
+    np.fill_diagonal(base_heuristic, 0)
+    
+    # MST with adaptive weighting
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # Advanced regret with k-opt consideration
+    regret_factor = compute_kopt_regret(distance_matrix, k=3)
+    
+    # Graph embeddings
+    embed_dim = int(meta_parameter('embedding_dim'))
+    embeddings = compute_graph_embeddings(distance_matrix, embed_dim)
+    embedding_similarity = np.zeros((n, n))
+    if embed_dim > 0:
+        # Use cosine similarity in embedding space
+        for i in range(n):
+            for j in range(i+1, n):
+                dot_product = np.dot(embeddings[i], embeddings[j])
+                norm_i = np.linalg.norm(embeddings[i])
+                norm_j = np.linalg.norm(embeddings[j])
+                if norm_i > 0 and norm_j > 0:
+                    similarity = dot_product / (norm_i * norm_j)
+                    embedding_similarity[i, j] = embedding_similarity[j, i] = max(0, similarity)
+    
+    # Multi-scale spatial features
+    local_features, global_features = compute_spatial_features(distance_matrix)
+    
+    # Combined centrality measure
+    closeness = 1 / (np.mean(distance_matrix + np.eye(n) * 1e-12, axis=1))
+    closeness /= np.max(closeness) + 1e-12
+    
+    mst_degree = np.sum(mst_mask, axis=1) / (n - 1)
+    
+    centrality_mix = meta_parameter('centrality_mix')
+    centrality = centrality_mix * closeness + (1 - centrality_mix) * mst_degree
+    centrality_matrix = np.outer(centrality, centrality)
+    
+    # === 6. INTELLIGENT COMBINATION ===
+    heuristics = base_heuristic.copy()
+    
+    # Multiplicative combination of core factors
+    heuristics *= regret_factor
+    heuristics *= (0.7 + 0.3 * centrality_matrix)
+    heuristics *= (0.8 + 0.2 * embedding_similarity)
+    
+    # Additive combination of spatial features
+    heuristics += 0.15 * local_features + 0.1 * global_features
+    
+    # MST boost with meta-learned weight
+    mst_weight = meta_parameter('mst_weight')
+    heuristics[mst_mask] *= mst_weight
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    
+    # === 7. ADAPTIVE SPARSIFICATION ===
+    sparsity_factor = meta_parameter('sparsity_factor')
+    
+    if sparsity_factor > 0:
+        # Separate thresholds for MST and non-MST edges
+        mst_values = heuristics[mst_mask]
+        non_mst_mask = ~mst_mask
+        np.fill_diagonal(non_mst_mask, False)
+        non_mst_values = heuristics[non_mst_mask]
+        
+        if len(mst_values) > 0 and len(non_mst_values) > 0:
+            # MST edges: keep all (already boosted)
+            # Non-MST edges: dynamic threshold
+            mst_min = np.min(mst_values) if len(mst_values) > 0 else 0
+            non_mst_median = np.median(non_mst_values)
+            
+            # Threshold adapts to gap between MST and non-MST edges
+            threshold = non_mst_median * (1 - sparsity_factor * 0.5)
+            threshold = max(threshold, mst_min * 0.8)  # Ensure some non-MST edges survive
+            
+            # Zero out low-scoring non-MST edges
+            low_score_mask = non_mst_mask & (heuristics < threshold)
+            heuristics[low_score_mask] = 0
+    
+    # === 8. FINAL ENHANCEMENTS ===
+    np.fill_diagonal(heuristics, 0)
+    
+    # Smooth normalization preserving relative differences
+    max_val = np.max(heuristics)
+    if max_val > 0:
+        # Softmax-style normalization for better contrast
+        exp_heuristics = np.exp(heuristics / max_val * 3)
+        row_sums = np.sum(exp_heuristics, axis=1, keepdims=True) + 1e-12
+        heuristics = exp_heuristics / row_sums
+    
+    return heuristics
+```

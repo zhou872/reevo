@@ -1,0 +1,273 @@
+```json
+{
+    "algorithm_features": ["DBSCAN Spatial Clustering", "Two-Step Monte Carlo Lookahead", "Adaptive Parameter Tuning", "Regret with Top-k Alternatives"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse.csgraph import connected_components
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with DBSCAN clustering
+    and enhanced multi-step lookahead.
+    
+    Features:
+    1. Inverse distance weighting with robust normalization
+    2. Minimum spanning tree structural bonus
+    3. Regret-based penalization using top-k alternatives
+    4. Two-step Monte Carlo lookahead for future path estimation
+    5. DBSCAN-based spatial clustering for intra/inter-cluster edge preferences
+    6. Adaptive parameter tuning based on problem characteristics
+    7. Guided sparsification preserving high-potential edges
+    
+    Args:
+        distance_matrix: Square symmetric matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions (rows normalized to sum to 1)
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # Trivial cases
+        heuristics = np.ones((n, n)) - np.eye(n)
+        return heuristics / heuristics.sum(axis=1, keepdims=True)
+    
+    # ---------------------------------------------------------------
+    # 1. Adaptive parameter tuning based on problem characteristics
+    # ---------------------------------------------------------------
+    # Analyze distance statistics for adaptive tuning
+    distances_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    dist_cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    
+    # Adaptive parameters
+    k_regret = min(5, max(2, int(0.1 * n)))  # Regret alternatives
+    k_lookahead = min(4, max(2, int(0.08 * n)))  # Lookahead samples
+    k_sparse = max(3, min(10, int(0.15 * n)))  # Sparsification parameter
+    
+    # Temperature for softmax normalization
+    temp = 0.2 * np.sqrt(n) * (1 + 0.5 * dist_cv)
+    
+    # ---------------------------------------------------------------
+    # 2. Base inverse distance with adaptive scaling
+    # ---------------------------------------------------------------
+    with np.errstate(divide='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distances per row
+    row_sums = inv_dist.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    inv_dist = inv_dist / row_sums
+    
+    # ---------------------------------------------------------------
+    # 3. Minimum Spanning Tree structural bonus
+    # ---------------------------------------------------------------
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_bonus = (mst + mst.T > 0).astype(float) * 2.5
+    
+    # ---------------------------------------------------------------
+    # 4. Enhanced regret-based penalization
+    # ---------------------------------------------------------------
+    regret_factor = np.ones((n, n))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Get k_regret+1 nearest neighbors (including self at inf)
+        sorted_indices = np.argsort(dists)[:k_regret+1]
+        sorted_dists = dists[sorted_indices]
+        
+        # For each potential edge from i
+        for j in range(n):
+            if i == j:
+                continue
+                
+            edge_dist = distance_matrix[i, j]
+            
+            # Find alternative edges from the k_regret nearest
+            if j in sorted_indices:
+                # If j is in top-k, use next best as alternative
+                alt_idx = 1 if sorted_indices[0] == j else 0
+                alt_dist = sorted_dists[alt_idx]
+            else:
+                # If j not in top-k, use best as alternative
+                alt_dist = sorted_dists[0]
+            
+            # Calculate regret (positive when edge is better than alternative)
+            regret = alt_dist - edge_dist
+            
+            # Transform regret to factor [0.5, 2.0]
+            # Scale by average distance in top-k for normalization
+            scale = np.mean(sorted_dists[:k_regret]) + 1e-10
+            regret_factor[i, j] = 1.0 + np.tanh(regret / scale)
+    
+    # Symmetrize regret factor
+    regret_factor = (regret_factor + regret_factor.T) / 2
+    
+    # ---------------------------------------------------------------
+    # 5. Two-step Monte Carlo lookahead
+    # ---------------------------------------------------------------
+    lookahead_score = np.ones((n, n))
+    
+    # Precompute nearest neighbors for each node
+    nn_indices = np.zeros((n, k_lookahead), dtype=int)
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        nn_indices[i] = np.argsort(dists)[:k_lookahead]
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+                
+            # Sample k_lookahead possible two-step paths from i->j->k
+            # where k is from j's nearest neighbors (excluding i)
+            total_lookahead = 0.0
+            valid_samples = 0
+            
+            # Get j's nearest neighbors (excluding i)
+            j_nn = nn_indices[j]
+            for k in j_nn:
+                if k == i or k == j:
+                    continue
+                    
+                # Two-step cost: i->j + j->k + estimated completion from k
+                two_step_cost = distance_matrix[i, j] + distance_matrix[j, k]
+                
+                # Estimate remaining cost from k: average distance to nodes not visited
+                remaining_nodes = [node for node in range(n) if node not in [i, j, k]]
+                if remaining_nodes:
+                    remaining_distances = distance_matrix[k, remaining_nodes]
+                    # Weight by inverse distance: closer nodes more likely in good tours
+                    inv_rem = 1 / (remaining_distances + 1e-10)
+                    weights = inv_rem / inv_rem.sum()
+                    estimated_remaining = np.sum(weights * remaining_distances)
+                    total_cost = two_step_cost + estimated_remaining
+                else:
+                    total_cost = two_step_cost
+                
+                total_lookahead += 1 / (1 + 0.1 * total_cost / dist_mean)
+                valid_samples += 1
+            
+            if valid_samples > 0:
+                lookahead_score[i, j] = total_lookahead / valid_samples
+    
+    # Normalize lookahead scores
+    max_look = np.max(lookahead_score)
+    if max_look > 0:
+        lookahead_score = lookahead_score / max_look
+    
+    # ---------------------------------------------------------------
+    # 6. DBSCAN-based spatial clustering
+    # ---------------------------------------------------------------
+    cluster_bonus = np.ones((n, n))
+    
+    if n >= 4:
+        # Simple DBSCAN implementation
+        eps = np.percentile(distances_flat, 25)  # 25th percentile as epsilon
+        min_samples = max(2, int(0.05 * n))
+        
+        # Core points: points with at least min_samples within eps
+        core_mask = np.zeros(n, dtype=bool)
+        for i in range(n):
+            neighbors = np.sum(distance_matrix[i] <= eps) - 1  # Exclude self
+            core_mask[i] = neighbors >= min_samples
+        
+        # Build adjacency for core points
+        adjacency = np.zeros((n, n), dtype=bool)
+        for i in range(n):
+            if core_mask[i]:
+                # Connect to other core points within eps
+                for j in range(i+1, n):
+                    if core_mask[j] and distance_matrix[i, j] <= eps:
+                        adjacency[i, j] = adjacency[j, i] = True
+        
+        # Find connected components among core points
+        n_components, labels = connected_components(adjacency, directed=False)
+        
+        if n_components > 1:
+            # Assign border points (non-core) to nearest core cluster
+            final_labels = labels.copy()
+            for i in range(n):
+                if not core_mask[i]:
+                    # Find nearest core point
+                    dist_to_cores = distance_matrix[i].copy()
+                    dist_to_cores[~core_mask] = np.inf
+                    if np.any(np.isfinite(dist_to_cores)):
+                        nearest_core = np.argmin(dist_to_cores)
+                        if dist_to_cores[nearest_core] <= eps * 1.5:
+                            final_labels[i] = labels[nearest_core]
+                        else:
+                            final_labels[i] = -1  # Noise
+                    else:
+                        final_labels[i] = -1  # Noise
+            
+            # Apply cluster bonuses
+            for i in range(n):
+                for j in range(i+1, n):
+                    if final_labels[i] == final_labels[j] and final_labels[i] != -1:
+                        # Same cluster: boost
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = 1.8
+                    elif final_labels[i] != final_labels[j] and final_labels[i] != -1 and final_labels[j] != -1:
+                        # Different clusters: mild penalty
+                        cluster_bonus[i, j] = cluster_bonus[j, i] = 0.7
+    
+    # ---------------------------------------------------------------
+    # 7. Combine all factors
+    # ---------------------------------------------------------------
+    # Multiplicative combination with tuned weights
+    heuristics = inv_dist * (1.0 + 0.3 * mst_bonus) * regret_factor
+    heuristics = heuristics * (0.6 + 0.4 * lookahead_score) * cluster_bonus
+    
+    # ---------------------------------------------------------------
+    # 8. Guided sparsification
+    # ---------------------------------------------------------------
+    # Keep k_sparse nearest neighbors based on combined heuristic
+    mask = np.zeros((n, n))
+    
+    for i in range(n):
+        # Sort by heuristic value (descending)
+        sorted_idx = np.argsort(-heuristics[i])
+        # Keep top k_sparse (excluding self)
+        top_k = [idx for idx in sorted_idx if idx != i][:k_sparse]
+        mask[i, top_k] = 1
+    
+    # Ensure symmetry and zero diagonal
+    mask = np.maximum(mask, mask.T)
+    np.fill_diagonal(mask, 0)
+    
+    heuristics = heuristics * mask
+    
+    # Additional sparsification: remove very weak edges
+    for i in range(n):
+        row = heuristics[i]
+        non_zero = row[row > 0]
+        if len(non_zero) > 2:
+            threshold = np.percentile(non_zero, 80)  # Keep top 20%
+            row[row < threshold] = 0
+        heuristics[i] = row
+    
+    # Ensure final symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # ---------------------------------------------------------------
+    # 9. Final normalization with softmax
+    # ---------------------------------------------------------------
+    # Apply softmax per row with adaptive temperature
+    np.fill_diagonal(heuristics, 0)
+    heuristics_exp = np.exp(heuristics / temp)
+    row_sums = heuristics_exp.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics_exp / row_sums
+    
+    return heuristics
+```

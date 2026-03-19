@@ -1,0 +1,286 @@
+```json
+{
+    "algorithm_features": ["Stochastic Sampling", "Vectorized Sparsification", "Local Search Refinement", "Edge Frequency Memory"]
+}
+```
+
+```python
+import numpy as np
+from collections import defaultdict
+from scipy.sparse import csgraph
+import warnings
+warnings.filterwarnings('ignore')
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic matrix for TSP edge selection using stochastic solution sampling
+    and vectorized adaptive sparsification.
+    
+    Key improvements over v1:
+    1. Stochastic sampling of diverse initial solutions
+    2. Vectorized sparsification with entropy-based temperature control
+    3. Lightweight local search focusing on promising regions
+    4. Edge frequency counting without complex clustering
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape indicating edge promise (higher = better)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / distance_matrix
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic = np.nan_to_num(heuristic, nan=0)
+        np.fill_diagonal(heuristic, 0)
+        return heuristic
+    
+    # ========== Phase 1: Lightweight Structural Components ==========
+    
+    # 1A. MST edges (guaranteed to be in some optimal solutions)
+    mst = csgraph.minimum_spanning_tree(distance_matrix)
+    mst_array = mst.toarray()
+    
+    # 1B. Nearest neighbor edges (good starting point)
+    nn_edges = np.zeros_like(distance_matrix)
+    for i in range(n):
+        # Get two nearest neighbors for each node
+        row = distance_matrix[i].copy()
+        row[i] = np.inf
+        for k in range(min(3, n-1)):
+            j = np.argmin(row)
+            nn_edges[i, j] = 1.0 / distance_matrix[i, j]
+            row[j] = np.inf
+    
+    # ========== Phase 2: Stochastic Solution Sampling ==========
+    
+    # Memory for edge frequencies across sampled solutions
+    edge_frequency = np.zeros_like(distance_matrix)
+    
+    def generate_random_tour() -> list:
+        """Generate a random tour using insertion heuristic with randomness."""
+        # Start with 3 random nodes
+        nodes = list(np.random.permutation(n))
+        tour = nodes[:3]
+        remaining = nodes[3:]
+        
+        # Random insertion
+        while remaining:
+            # Select random node to insert
+            node = np.random.choice(remaining)
+            remaining.remove(node)
+            
+            # Find best insertion position with some randomness
+            best_cost = np.inf
+            best_pos = -1
+            
+            for i in range(len(tour)):
+                j = (i + 1) % len(tour)
+                cost = (distance_matrix[tour[i], node] + 
+                       distance_matrix[node, tour[j]] - 
+                       distance_matrix[tour[i], tour[j]])
+                
+                # Add random noise for exploration
+                cost *= (0.9 + 0.2 * np.random.random())
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pos = j
+            
+            tour.insert(best_pos, node)
+        
+        return tour
+    
+    def simple_2opt(tour: list, iterations: int = 20) -> list:
+        """Quick 2-opt local search."""
+        n_tour = len(tour)
+        tour = tour.copy()
+        
+        for _ in range(iterations):
+            improved = False
+            i = np.random.randint(0, n_tour)
+            for j in range((i+2) % n_tour, n_tour):
+                if j == i or (j+1) % n_tour == i:
+                    continue
+                    
+                a1, a2 = tour[i], tour[(i+1) % n_tour]
+                b1, b2 = tour[j], tour[(j+1) % n_tour]
+                
+                current = distance_matrix[a1, a2] + distance_matrix[b1, b2]
+                new = distance_matrix[a1, b1] + distance_matrix[a2, b2]
+                
+                if new < current:
+                    # Reverse segment
+                    if i < j:
+                        tour[i+1:j+1] = tour[i+1:j+1][::-1]
+                    else:
+                        segment = tour[i+1:] + tour[:j+1]
+                        segment = segment[::-1]
+                        tour[i+1:] = segment[:len(tour)-i-1]
+                        tour[:j+1] = segment[len(tour)-i-1:]
+                    improved = True
+                    break
+            
+            if not improved:
+                break
+        
+        return tour
+    
+    # Sample multiple solutions
+    num_samples = min(100, 5 * n)  # Adaptive sampling count
+    tour_lengths = []
+    
+    for _ in range(num_samples):
+        # Generate and improve tour
+        tour = generate_random_tour()
+        tour = simple_2opt(tour)
+        
+        # Calculate tour length
+        length = sum(distance_matrix[tour[i], tour[(i+1) % n]] 
+                    for i in range(n))
+        tour_lengths.append(length)
+        
+        # Record edges in this tour
+        for i in range(n):
+            u, v = tour[i], tour[(i+1) % n]
+            edge_frequency[u, v] += 1.0 / (length + 1e-10)
+            edge_frequency[v, u] += 1.0 / (length + 1e-10)
+    
+    # ========== Phase 3: Combine Components ==========
+    
+    # Normalize components
+    components = []
+    
+    # MST component
+    if np.max(mst_array) > 0:
+        mst_component = mst_array.copy()
+        mst_component[mst_component > 0] = 1
+        components.append(('mst', 0.3, mst_component))
+    
+    # NN component
+    if np.max(nn_edges) > 0:
+        nn_norm = nn_edges / np.max(nn_edges)
+        components.append(('nn', 0.2, nn_norm))
+    
+    # Frequency component
+    if np.max(edge_frequency) > 0:
+        freq_norm = edge_frequency / np.max(edge_frequency)
+        components.append(('freq', 0.4, freq_norm))
+    
+    # Reciprocal distance (baseline)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal = 1 / distance_matrix
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal = np.nan_to_num(reciprocal, nan=0)
+    
+    if np.max(reciprocal) > 0:
+        reciprocal_norm = reciprocal / np.max(reciprocal)
+        components.append(('recip', 0.1, reciprocal_norm))
+    
+    # Weighted combination
+    combined = np.zeros_like(distance_matrix)
+    total_weight = sum(weight for _, weight, _ in components)
+    
+    for name, weight, matrix in components:
+        combined += (weight / total_weight) * matrix
+    
+    # Ensure symmetry
+    combined = 0.5 * (combined + combined.T)
+    np.fill_diagonal(combined, 0)
+    
+    # ========== Phase 4: Vectorized Adaptive Sparsification ==========
+    
+    def vectorized_sparsify(matrix: np.ndarray, 
+                          temperature: float = 1.0) -> np.ndarray:
+        """
+        Vectorized sparsification with exponential decay.
+        
+        Args:
+            matrix: Input matrix to sparsify
+            temperature: Controls decay rate (higher = slower decay)
+            
+        Returns:
+            Sparsified matrix
+        """
+        n = matrix.shape[0]
+        result = np.zeros_like(matrix)
+        
+        # Always keep MST edges
+        mst_mask = mst_array > 0
+        result[mst_mask] = matrix[mst_mask]
+        
+        # For each node, select top edges with exponential decay
+        k_base = max(2, int(np.sqrt(n)))  # Base number of edges per node
+        
+        # Calculate entropy per row to adjust sparsity
+        row_entropies = []
+        for i in range(n):
+            row = matrix[i].copy()
+            row[i] = 0  # Exclude diagonal
+            row = row[row > 0]
+            if len(row) > 0:
+                row_norm = row / row.sum()
+                entropy = -np.sum(row_norm * np.log(row_norm + 1e-10))
+                row_entropies.append(entropy)
+            else:
+                row_entropies.append(0)
+        
+        # Normalize entropies to [0, 1]
+        max_entropy = max(row_entropies) if row_entropies else 1
+        if max_entropy > 0:
+            row_entropies = [e / max_entropy for e in row_entropies]
+        
+        # Apply sparsification row by row
+        for i in range(n):
+            row = matrix[i].copy()
+            row[i] = -np.inf  # Exclude self
+            
+            # Determine k for this row based on entropy
+            k = k_base + int(row_entropies[i] * k_base * 0.5)
+            k = min(k, n - 1)
+            
+            # Get top k indices
+            top_indices = np.argpartition(-row, k)[:k]
+            top_values = row[top_indices]
+            
+            # Sort top values
+            sort_idx = np.argsort(-top_values)
+            top_indices = top_indices[sort_idx]
+            top_values = top_values[sort_idx]
+            
+            # Apply exponential decay
+            ranks = np.arange(len(top_values))
+            decay_factors = np.exp(-ranks / (temperature * (1.0 + row_entropies[i])))
+            
+            # Apply to result matrix
+            for idx, j in enumerate(top_indices):
+                if not mst_mask[i, j]:  # Don't override MST edges
+                    result[i, j] = top_values[idx] * decay_factors[idx]
+        
+        # Ensure symmetry
+        result = np.maximum(result, result.T)
+        np.fill_diagonal(result, 0)
+        
+        return result
+    
+    # Determine temperature based on problem size and variance
+    dist_std = np.std(distance_matrix[np.triu_indices(n, k=1)])
+    dist_mean = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    cv = dist_std / (dist_mean + 1e-10)
+    
+    # Higher CV (more varied distances) → lower temperature (more aggressive sparsification)
+    temperature = max(0.5, 2.0 - cv)
+    
+    sparsified = vectorized_sparsify(combined, temperature)
+    
+    # Final normalization
+    max_val = sparsified.max()
+    if max_val > 0:
+        sparsified /= max_val
+    
+    return sparsified
+```

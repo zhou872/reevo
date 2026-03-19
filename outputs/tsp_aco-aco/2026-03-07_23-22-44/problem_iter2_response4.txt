@@ -1,0 +1,191 @@
+```json
+{
+    "algorithm_features": ["Regret-Weighted Neighbor Priorities", "Two-Step Lookahead Edge Efficiency", "Savings-Heuristic Centrality", "Adaptive Cluster Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge prioritization.
+    
+    Incorporates regret-based insertion costs, two-step lookahead efficiency,
+    savings heuristic centrality, and adaptive sparsification to identify
+    edges most promising for optimal TSP solutions.
+    
+    Returns: Matrix of same shape as input where higher values indicate
+             more promising edges for inclusion.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)
+    
+    # Initialize heuristic matrix with inverse distance baseline
+    eps = 1e-12
+    inv_dist = 1.0 / (distance_matrix + eps)
+    np.fill_diagonal(inv_dist, 0)
+    heuristics = inv_dist.copy()
+    
+    # ------------------------------------------------------------
+    # 1. REGRET-WEIGHTED NEIGHBOR PRIORITIES
+    # ------------------------------------------------------------
+    regret_weights = np.zeros_like(distance_matrix)
+    k_regret = min(10, n - 1)
+    
+    for i in range(n):
+        # Get sorted distances to other nodes
+        sorted_indices = np.argsort(distance_matrix[i])
+        sorted_distances = distance_matrix[i, sorted_indices]
+        
+        # Calculate insertion regret for each neighbor position
+        # Regret = cost of next best alternative - current cost
+        for rank in range(1, min(k_regret + 1, n)):
+            j = sorted_indices[rank]
+            if rank < k_regret and rank + 1 < n:
+                next_best = sorted_distances[rank + 1]
+                regret = next_best - sorted_distances[rank]
+                # Normalize regret by distance to prioritize meaningful differences
+                regret_weights[i, j] = regret / (sorted_distances[rank] + eps)
+    
+    # ------------------------------------------------------------
+    # 2. TWO-STEP LOOKAHEAD EDGE EFFICIENCY
+    # ------------------------------------------------------------
+    efficiency_bonus = np.zeros_like(distance_matrix)
+    m_lookahead = min(15, n // 3)
+    
+    for i in range(n):
+        # Consider top m neighbors for lookahead analysis
+        top_neighbors = np.argsort(distance_matrix[i])[1:m_lookahead + 1]
+        
+        for idx_j, j in enumerate(top_neighbors):
+            if i == j:
+                continue
+                
+            # Find best two-step path i -> k -> j (k != i, j)
+            valid_k = [k for k in range(n) if k not in (i, j)]
+            if valid_k:
+                # Calculate two-step costs through each intermediate k
+                two_step_costs = distance_matrix[i, valid_k] + distance_matrix[valid_k, j]
+                best_two_step = np.min(two_step_costs)
+                
+                # Efficiency ratio: direct / best indirect
+                efficiency_ratio = distance_matrix[i, j] / (best_two_step + eps)
+                
+                # Bonus for edges that are significantly more efficient
+                if efficiency_ratio < 0.7:  # Direct edge is at least 30% shorter
+                    efficiency_bonus[i, j] = 1.5 - efficiency_ratio
+    
+    # ------------------------------------------------------------
+    # 3. SAVINGS-HEURISTIC CENTRALITY
+    # ------------------------------------------------------------
+    savings_matrix = np.zeros_like(distance_matrix)
+    
+    # Use node with minimum average distance as virtual depot
+    avg_distances = np.mean(distance_matrix, axis=1)
+    depot = np.argmin(avg_distances)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            if i != depot and j != depot:
+                # Clarke-Wright savings: s(i,j) = d(depot,i) + d(depot,j) - d(i,j)
+                savings = (distance_matrix[depot, i] + 
+                          distance_matrix[depot, j] - 
+                          distance_matrix[i, j])
+                savings_matrix[i, j] = savings_matrix[j, i] = max(savings, 0)
+    
+    # Normalize savings to [0, 1]
+    max_savings = savings_matrix.max()
+    if max_savings > 0:
+        savings_matrix /= max_savings
+    
+    # ------------------------------------------------------------
+    # 4. MST-BASED STRUCTURAL PRIORITIZATION
+    # ------------------------------------------------------------
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # ------------------------------------------------------------
+    # 5. COMBINE ALL FACTORS WITH ADAPTIVE WEIGHTS
+    # ------------------------------------------------------------
+    # Dynamic weighting based on problem size
+    size_factor = min(1.0, n / 100)  # Normalize for n up to 100
+    
+    # Combine factors with weights
+    heuristics *= (1.0 + 
+                   0.8 * size_factor * regret_weights + 
+                   0.6 * size_factor * efficiency_bonus + 
+                   0.4 * savings_matrix)
+    
+    # Strong boost for MST edges (structural backbone)
+    heuristics[mst_mask] *= 2.0
+    
+    # ------------------------------------------------------------
+    # 6. ADAPTIVE CLUSTER SPARSIFICATION
+    # ------------------------------------------------------------
+    # Identify clusters of nodes based on proximity
+    cluster_mask = np.zeros_like(heuristics, dtype=bool)
+    cluster_size = max(2, min(6, n // 10))
+    
+    for i in range(n):
+        # Find cluster_size nearest neighbors
+        nearest = np.argsort(distance_matrix[i])[1:cluster_size + 1]
+        cluster_mask[i, nearest] = True
+        cluster_mask[nearest, i] = True
+        
+        # Also connect nearest neighbors among themselves
+        for a_idx, a in enumerate(nearest):
+            for b in nearest[a_idx + 1:]:
+                cluster_mask[a, b] = cluster_mask[b, a] = True
+    
+    # Only keep edges within clusters or MST edges
+    keep_mask = cluster_mask | mst_mask
+    heuristics[~keep_mask] = 0
+    
+    # ------------------------------------------------------------
+    # 7. NODE-DEGREE REGULARIZATION
+    # ------------------------------------------------------------
+    # Prevent over-concentration on hub nodes
+    node_degrees = np.sum(heuristics > 0, axis=1)
+    avg_degree = np.mean(node_degrees)
+    
+    for i in range(n):
+        if node_degrees[i] > 1.5 * avg_degree:
+            # Scale down edges from over-connected nodes
+            heuristics[i, :] *= 0.7
+            heuristics[:, i] *= 0.7
+    
+    # ------------------------------------------------------------
+    # 8. FINAL PROCESSING
+    # ------------------------------------------------------------
+    # Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Final sparsification: keep top edges per node
+    final_mask = np.zeros_like(heuristics, dtype=bool)
+    top_k = max(3, min(8, n // 5))
+    
+    for i in range(n):
+        # Get indices of non-zero edges
+        non_zero = np.where(heuristics[i] > 0)[0]
+        if len(non_zero) > 0:
+            # Select top-k by heuristic value
+            if len(non_zero) > top_k:
+                top_indices = non_zero[np.argsort(heuristics[i, non_zero])[-top_k:]]
+            else:
+                top_indices = non_zero
+            final_mask[i, top_indices] = True
+            final_mask[top_indices, i] = True
+    
+    heuristics[~final_mask] = 0
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics /= max_val
+    
+    return heuristics
+```

@@ -1,0 +1,283 @@
+```json
+{
+    "algorithm_features": ["Adaptive Meta-Weighting", "Neighborhood Density Gradient", "Edge Criticality Score", "Sigmoid Regret Normalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy import stats
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with meta-adaptive weighting and structural insights.
+    
+    Core improvements:
+    1. Meta-adaptive weighting: Instance-specific weight tuning using multiple statistics
+    2. Neighborhood density gradient: Multi-scale density measures with adaptive bandwidth
+    3. Edge criticality scoring: Quantifies structural importance in potential tours
+    4. Refined regret normalization: Sigmoid-based regret with instance-adaptive scaling
+    
+    Returns:
+        np.ndarray: Heuristic matrix with higher values for more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        heuristics = np.ones((n, n))
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # === 1. ADVANCED INSTANCE CHARACTERIZATION ===
+    
+    # Extract instance statistics for meta-weighting
+    triu_dists = distance_matrix[np.triu_indices(n, k=1)]
+    
+    # Basic statistics
+    dist_mean = np.mean(triu_dists)
+    dist_std = np.std(triu_dists)
+    dist_cv = dist_std / (dist_mean + 1e-10)  # Coefficient of variation
+    
+    # Distance distribution shape
+    dist_skew = stats.skew(triu_dists)
+    dist_kurtosis = stats.kurtosis(triu_dists)
+    
+    # Nearest neighbor statistics
+    nearest_dists = np.partition(distance_matrix, 2, axis=1)[:, 1]
+    second_nearest_dists = np.partition(distance_matrix, 3, axis=1)[:, 2]
+    mean_nearest = np.mean(nearest_dists)
+    mean_second_nearest = np.mean(second_nearest_dists)
+    neighbor_sparsity = mean_second_nearest / (mean_nearest + 1e-10)
+    
+    # Spatial uniformity measure (using MST edge length distribution)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = mst[mst > 0]
+    mst_cv = np.std(mst_edges) / (np.mean(mst_edges) + 1e-10)
+    
+    # === 2. BASE COMPONENTS WITH INSTANCE-ADAPTIVE SCALING ===
+    
+    # Normalized inverse distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-10)
+        np.fill_diagonal(inv_dist, 0)
+    
+    # Scale based on distance distribution characteristics
+    scale_factor = 1.0 + 0.3 * (1.0 - min(dist_cv, 2.0) / 2.0)
+    inv_dist = inv_dist ** (1.0 / scale_factor)
+    
+    if inv_dist.max() > 0:
+        inv_dist = inv_dist / inv_dist.max()
+    
+    # Minimum Spanning Tree indicator with edge importance weighting
+    mst_mask = (mst + mst.T) > 0
+    
+    # Compute MST edge importance based on length relative to average
+    mst_importance = np.ones((n, n))
+    mst_mean = np.mean(mst_edges) if len(mst_edges) > 0 else 1.0
+    for i in range(n):
+        for j in range(i+1, n):
+            if mst_mask[i, j]:
+                edge_length = distance_matrix[i, j]
+                # Shorter edges get higher importance, longer edges get lower
+                rel_length = edge_length / (mst_mean + 1e-10)
+                importance = np.exp(-0.5 * (rel_length - 1.0)**2)
+                mst_importance[i, j] = mst_importance[j, i] = importance
+    
+    # === 3. MULTI-SCALE DENSITY MEASUREMENT ===
+    
+    # Compute neighborhood densities at multiple scales
+    k_values = [min(3, n-1), min(5, n-1), min(8, n-1)]
+    k_values = [k for k in k_values if k > 0]
+    
+    density_vectors = []
+    for k in k_values:
+        densities = np.zeros(n)
+        for i in range(n):
+            dist_i = distance_matrix[i].copy()
+            dist_i[i] = np.inf
+            nearest_dists = np.partition(dist_i, k)[:k]
+            densities[i] = 1.0 / (np.mean(nearest_dists) + 1e-10)
+        
+        if densities.max() > 0:
+            densities = densities / densities.max()
+        density_vectors.append(densities)
+    
+    # Combine densities across scales (weighted by scale)
+    combined_density = np.zeros(n)
+    total_weight = 0
+    for idx, densities in enumerate(density_vectors):
+        weight = 1.0 / (idx + 1.0)  # Higher weight to smaller scales
+        combined_density += weight * densities
+        total_weight += weight
+    
+    combined_density = combined_density / total_weight
+    
+    # Edge density score: geometric mean of endpoint densities
+    density_matrix = np.outer(combined_density, combined_density)
+    np.fill_diagonal(density_matrix, 0)
+    
+    # === 4. REFINED REGRET-BASED PENALIZATION ===
+    
+    # Adaptive regret calculation with instance-specific scaling
+    regret_penalty = np.ones((n, n))
+    
+    # Determine regret depth based on instance size and sparsity
+    k_regret = max(2, min(5, int(np.sqrt(n))))
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Sort distances
+        sorted_dists = np.sort(dists)
+        if len(sorted_dists) > k_regret:
+            # Reference distance: weighted combination of k-th smallest
+            weights = np.exp(-0.5 * np.arange(k_regret))
+            weights = weights / weights.sum()
+            reference_dist = np.sum(weights * sorted_dists[:k_regret])
+            
+            # Compute regret penalty with sigmoid
+            for j in range(n):
+                if j != i:
+                    regret_ratio = distance_matrix[i, j] / (reference_dist + 1e-10)
+                    # Adaptive sigmoid: steeper for more uniform instances
+                    slope = 8.0 / (1.0 + dist_cv)  # Steeper for low CV
+                    regret_penalty[i, j] = 1.0 / (1.0 + np.exp(slope * (regret_ratio - 1.1)))
+    
+    # Symmetrize regret penalty using harmonic mean
+    regret_penalty = 2 * regret_penalty * regret_penalty.T / (regret_penalty + regret_penalty.T + 1e-10)
+    np.fill_diagonal(regret_penalty, 1.0)
+    
+    # === 5. EDGE CRITICALITY SCORING ===
+    
+    # Measures structural importance of edges in potential tours
+    criticality = np.zeros((n, n))
+    
+    # For each node pair, estimate how critical this edge is
+    # based on alternative path lengths
+    for i in range(n):
+        for j in range(i+1, n):
+            # Find third nodes that connect to both i and j
+            alt_paths = []
+            for k in range(n):
+                if k != i and k != j:
+                    alt_length = distance_matrix[i, k] + distance_matrix[k, j]
+                    alt_paths.append(alt_length)
+            
+            if alt_paths:
+                best_alt = min(alt_paths)
+                direct_length = distance_matrix[i, j]
+                # Criticality is high if direct edge is much shorter than alternatives
+                if best_alt > 0:
+                    criticality_ratio = best_alt / (direct_length + 1e-10)
+                    criticality[i, j] = criticality[j, i] = np.tanh(criticality_ratio - 1.0)
+    
+    # === 6. META-ADAPTIVE WEIGHT TUNING ===
+    
+    # Use instance statistics to determine optimal component weights
+    # These rules are based on empirical observations and can be refined
+    
+    # Base inverse distance weight
+    base_weight = 0.35 + 0.1 * np.tanh(1.0 - dist_cv)  # Higher for uniform distances
+    
+    # MST weight: higher for instances with uniform MST edges
+    mst_weight = 0.25 + 0.1 * np.exp(-mst_cv)  # Higher when MST edges are similar
+    
+    # Density weight: higher for clustered instances
+    density_weight = 0.15 + 0.2 * np.tanh(neighbor_sparsity - 1.0)
+    
+    # Regret weight: higher when there are clear good alternatives
+    regret_weight = 0.2 + 0.15 * np.tanh(dist_skew)  # Higher for skewed distributions
+    
+    # Criticality weight: higher for instances with clear structural edges
+    criticality_weight = 0.05 + 0.1 * np.tanh(dist_kurtosis)  # Higher for peaked distributions
+    
+    # Normalize weights
+    weights = np.array([base_weight, mst_weight, density_weight, regret_weight, criticality_weight])
+    weights = weights / weights.sum()
+    
+    # === 7. COMPONENT COMBINATION ===
+    
+    # MST bonus with importance weighting
+    mst_bonus = np.where(mst_mask, 1.0 + 0.6 * mst_importance, 1.0)
+    
+    # Combine components with meta-adaptive weights
+    heuristics = (
+        weights[0] * inv_dist +
+        weights[1] * inv_dist * mst_bonus +
+        weights[2] * density_matrix +
+        weights[3] * (1.0 - regret_penalty) * inv_dist +  # Regret as penalty on inverse distance
+        weights[4] * criticality
+    )
+    
+    # Ensure non-negativity
+    heuristics = np.maximum(heuristics, 0)
+    
+    # === 8. ADAPTIVE SPARSIFICATION ===
+    
+    promising_mask = np.zeros((n, n), dtype=bool)
+    
+    # Always include MST edges
+    promising_mask |= mst_mask
+    
+    # Include nearest neighbors based on instance characteristics
+    if n <= 10:
+        k_sparse = min(5, n-1)
+    elif n <= 30:
+        k_sparse = min(4, n-1)
+    elif n <= 100:
+        k_sparse = min(3, n-1)
+    else:
+        k_sparse = min(2, n-1)
+    
+    # Include edges to k_sparse nearest neighbors (by distance)
+    for i in range(n):
+        if n > 1:
+            # Get indices of k_sparse smallest distances (excluding self)
+            row_dists = distance_matrix[i].copy()
+            row_dists[i] = np.inf
+            nearest_indices = np.argpartition(row_dists, k_sparse)[:k_sparse]
+            promising_mask[i, nearest_indices] = True
+    
+    # Make symmetric
+    promising_mask = promising_mask | promising_mask.T
+    
+    # For medium to large instances, also include edges with high heuristic scores
+    if n > 20:
+        # Keep top edges by heuristic score (varying threshold by instance size)
+        if n <= 50:
+            percentile = 85
+        elif n <= 100:
+            percentile = 90
+        else:
+            percentile = 95
+        
+        if np.any(heuristics > 0):
+            threshold = np.percentile(heuristics[heuristics > 0], percentile)
+            promising_mask |= (heuristics > threshold)
+    
+    # Apply sparsification
+    heuristics = heuristics * promising_mask
+    
+    # === 9. STRUCTURE-AWARE NORMALIZATION ===
+    
+    # First, row-wise normalization to emphasize node-specific preferences
+    row_max = heuristics.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    heuristics = heuristics / row_max
+    
+    # Then, global normalization with MST edge preservation
+    mst_boost = 1.2  # Boost factor for MST edges
+    
+    if heuristics.max() > 0:
+        global_max = heuristics.max()
+        heuristics = heuristics / global_max
+        
+        # Apply extra boost to MST edges after normalization
+        heuristics[mst_mask] = np.minimum(heuristics[mst_mask] * mst_boost, 1.0)
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

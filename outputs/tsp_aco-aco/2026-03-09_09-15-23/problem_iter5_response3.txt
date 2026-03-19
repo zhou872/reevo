@@ -1,0 +1,177 @@
+```json
+{
+    "algorithm_features": ["Adaptive Sparsification with Symmetric Threshold", "Dynamic Two-Hop Penalty with Neighborhood Consistency", "Rank-Based Edge Weighting with Stochastic Normalization"]
+}
+```
+
+```python
+import numpy as np
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with improved adaptive
+    sparsification and two-hop analysis using symmetric thresholding and
+    neighborhood consistency checks.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Improved Adaptive Sparsification ====================
+    # Dynamic sparsification threshold based on instance size and density
+    k_sparse = max(3, int(np.sqrt(n)))  # More aggressive than log-based
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    # Pre-sort distances for efficient neighbor selection
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        # Select k_sparse nearest neighbors, excluding self
+        nearest = sorted_indices[i, 1:k_sparse+1]
+        adjacency_mask[i, nearest] = True
+        
+        # Enforce stronger symmetry: add reciprocal only if within mutual threshold
+        for j in nearest:
+            j_nearest = sorted_indices[j, 1:k_sparse+1]
+            if i in j_nearest:
+                adjacency_mask[j, i] = True
+    
+    # Final symmetry pass for connectedness
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Dynamic Inverse Distance Scoring ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Get distances to valid neighbors
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Compute exponential rank-based weights (favor closer edges more strongly)
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = 1.0 / np.sqrt(ranks)  # Square root decay for smoother gradient
+            weights = weights / np.sum(weights)
+            
+            # Inverse distance with distance-dependent scaling
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            
+            # Adaptive normalization by neighbor count with logarithmic smoothing
+            neighbor_factor = 1.0 / np.log1p(np.sum(valid_mask))
+            inv_dist[i, valid_mask] = inv_vals * weights * neighbor_factor
+    
+    # Symmetric averaging (harmonic mean for robustness)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        harmonic_means = 2.0 / (1.0/(inv_dist + 1e-10) + 1.0/(inv_dist.T + 1e-10))
+    harmonic_means[np.isnan(harmonic_means)] = 0
+    inv_dist = np.maximum(inv_dist, inv_dist.T) * 0.5 + harmonic_means * 0.5
+    
+    # ==================== 3. Enhanced Two-Hop Analysis ====================
+    two_hop_penalty = np.ones_like(distance_matrix)
+    
+    # Dynamic neighborhood size for two-hop checks
+    k_twohop = min(10, max(3, int(np.sqrt(n))))
+    
+    for i in range(n):
+        i_valid = np.where(adjacency_mask[i])[0]
+        if len(i_valid) == 0:
+            continue
+            
+        for j in i_valid:
+            if i >= j:
+                continue
+                
+            # Get top neighbors for both endpoints from sorted list (already computed)
+            i_neighbors = sorted_indices[i, 1:k_twohop+1]
+            j_neighbors = sorted_indices[j, 1:k_twohop+1]
+            
+            # Combined candidate set with intersection emphasis
+            combined = np.union1d(i_neighbors, j_neighbors)
+            combined = combined[(combined != i) & (combined != j)]
+            
+            if len(combined) > 0:
+                # Efficient vectorized two-hop computation
+                two_hop_dists = (distance_matrix[i, combined] + 
+                                 distance_matrix[combined, j])
+                
+                if len(two_hop_dists) > 0:
+                    min_two_hop = np.min(two_hop_dists)
+                    direct_dist = distance_matrix[i, j]
+                    
+                    if direct_dist > 1e-10:
+                        ratio = min_two_hop / direct_dist
+                        
+                        # Dynamic penalty based on ratio and edge density
+                        if ratio < 1.1:
+                            # Strong penalty for edges with comparable two-hop alternatives
+                            penalty = 0.2 + 0.3 * ratio
+                        elif ratio < 1.5:
+                            # Moderate penalty for somewhat competitive alternatives
+                            penalty = 0.5 + 0.3 * (ratio - 1.1) / 0.4
+                        else:
+                            # Weak penalty for non-competitive alternatives
+                            penalty = 0.8 + 0.2 * np.clip((ratio - 1.5) / 2.0, 0, 1)
+                        
+                        # Adjust penalty based on local edge density
+                        local_density = min(len(i_neighbors), len(j_neighbors)) / k_twohop
+                        penalty *= (0.7 + 0.3 * local_density)
+                        
+                        two_hop_penalty[i, j] = two_hop_penalty[j, i] = np.clip(penalty, 0.1, 1.0)
+    
+    # ==================== 4. Stochastic Edge Scoring ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Create edge list for efficient computation
+    edge_indices = np.where(np.triu(adjacency_mask, 1))
+    
+    for idx in range(len(edge_indices[0])):
+        i, j = edge_indices[0][idx], edge_indices[1][idx]
+        
+        if adjacency_mask[i, j]:
+            # Base score from inverse distance
+            base_score = inv_dist[i, j]
+            
+            # Apply two-hop penalty with non-linear combination
+            combined_score = base_score * (0.3 + 0.7 * two_hop_penalty[i, j])
+            
+            # Add small random component for exploration (stochastic element)
+            random_factor = 1.0 + 0.05 * np.random.randn()
+            combined_score *= np.clip(random_factor, 0.95, 1.05)
+            
+            heuristics[i, j] = heuristics[j, i] = combined_score
+    
+    # ==================== 5. Robust Normalization ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small epsilon only where edges exist
+    heuristics[adjacency_mask] += 1e-10
+    
+    # Row-normalize with softmax-like transformation
+    row_max = heuristics.max(axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    normalized = heuristics / row_max
+    
+    # Apply softmax with temperature
+    temperature = 0.5
+    exp_scores = np.exp(normalized / temperature)
+    row_sums = exp_scores.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = exp_scores / row_sums
+    
+    # Final symmetrization with geometric mean
+    heuristics = np.sqrt(heuristics * heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

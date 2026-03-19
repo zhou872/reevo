@@ -1,0 +1,265 @@
+```json
+{
+    "algorithm_features": ["Mutual Rank Normalization", "Adaptive K-NN Connectivity", "Two-Hop Regret Scoring", "Density-Aware Edge Pruning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization with improved rank-based scoring.
+    
+    Key improvements:
+    1. Mutual rank normalization using normalized rank scores
+    2. Adaptive K-nearest neighbor connectivity based on instance characteristics
+    3. Two-hop alternative path regret scoring
+    4. Density-aware edge pruning with cluster detection
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0,1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. INSTANCE CHARACTERIZATION ===
+    # Extract non-diagonal distances for analysis
+    distances = distance_matrix[~np.eye(n, dtype=bool)]
+    if len(distances) > 0:
+        median_dist = np.median(distances)
+        mean_dist = np.mean(distances)
+        
+        # Detect clustered instances using distance variance
+        dist_std = np.std(distances)
+        cluster_factor = dist_std / (mean_dist + 1e-12)
+        
+        # Adaptive K selection based on instance characteristics
+        base_k = max(2, int(np.sqrt(n)))
+        if cluster_factor > 1.5:  # More uniform distribution
+            k = min(base_k * 2, n // 2)
+        elif cluster_factor < 0.5:  # Highly clustered
+            k = min(base_k * 3, n // 2)
+        else:  # Moderate clustering
+            k = min(base_k, n // 2)
+        k = max(2, min(k, n - 1))
+    else:
+        k = min(8, n - 1)
+    
+    # === 2. BASE DISTANCE SCORING ===
+    # Use normalized inverse distance with softmax transformation
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Add small epsilon to avoid division by zero
+        eps = np.percentile(distances, 5) * 0.01 if len(distances) > 0 else 1e-12
+        inv_dist = 1.0 / (distance_matrix + eps)
+    
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Apply softmax normalization per row
+    for i in range(n):
+        row = inv_dist[i]
+        max_val = np.max(row)
+        if max_val > 0:
+            exp_row = np.exp(row - max_val)  # For numerical stability
+            inv_dist[i] = exp_row / np.sum(exp_row)
+    
+    # === 3. MUTUAL RANK NORMALIZATION ===
+    # Compute rank positions for each node
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    positions = np.argsort(sorted_indices, axis=1)  # position[i,j] = rank of j for i
+    
+    # Normalize ranks to [0,1] range
+    normalized_ranks = positions / (n - 1)  # n-1 possible neighbors excluding self
+    
+    # Compute mutual rank affinity
+    mutual_rank_affinity = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            rank_i_j = normalized_ranks[i, j]
+            rank_j_i = normalized_ranks[j, i]
+            
+            # Mutual rank scoring: both nodes should rank each other highly
+            if rank_i_j < 0.2 and rank_j_i < 0.2:  # Mutual top 20%
+                score = 2.0 - (rank_i_j + rank_j_i)
+            elif rank_i_j < 0.3 or rank_j_i < 0.3:  # One-way top 30%
+                score = 1.5 - min(rank_i_j, rank_j_i)
+            else:
+                score = 1.0
+            
+            mutual_rank_affinity[i, j] = mutual_rank_affinity[j, i] = score
+    
+    # === 4. ADAPTIVE K-NN CONNECTIVITY ===
+    # Build adjacency matrix for K-nearest neighbors
+    knn_adjacency = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        # Get K nearest neighbors (excluding self)
+        neighbors = sorted_indices[i, 1:k+1]
+        knn_adjacency[i, neighbors] = True
+    
+    # Symmetrize K-NN adjacency
+    knn_adjacency = knn_adjacency | knn_adjacency.T
+    
+    # === 5. TWO-HOP REGRET SCORING ===
+    # Compute alternative path scores
+    regret_scores = np.ones((n, n))
+    
+    # Precompute the K nearest distances for each node
+    k_distances = np.zeros((n, k))
+    for i in range(n):
+        k_distances[i] = distance_matrix[i, sorted_indices[i, 1:k+1]]
+    
+    # Compute regret as ratio to best alternative path
+    for i in range(n):
+        for j in range(i + 1, n):
+            direct_dist = distance_matrix[i, j]
+            
+            # Find best alternative path through common K-NN
+            best_alternative = float('inf')
+            
+            # Check common neighbors in K-NN
+            common_neighbors = np.where(knn_adjacency[i] & knn_adjacency[j])[0]
+            common_neighbors = common_neighbors[(common_neighbors != i) & (common_neighbors != j)]
+            
+            if len(common_neighbors) > 0:
+                # Try each common neighbor as intermediate
+                for m in common_neighbors[:min(5, len(common_neighbors))]:  # Limit to top 5
+                    alt_dist = distance_matrix[i, m] + distance_matrix[m, j]
+                    if alt_dist < best_alternative:
+                        best_alternative = alt_dist
+            
+            # If no common neighbors found, use nearest neighbor of each
+            if best_alternative == float('inf'):
+                # Find best 2-hop path through any node
+                for m in range(n):
+                    if m != i and m != j:
+                        alt_dist = distance_matrix[i, m] + distance_matrix[m, j]
+                        if alt_dist < best_alternative:
+                            best_alternative = alt_dist
+            
+            # Compute regret ratio
+            if direct_dist > 0 and best_alternative < float('inf'):
+                regret_ratio = best_alternative / direct_dist
+                # Transform to score: higher ratio means worse regret
+                regret_scores[i, j] = regret_scores[j, i] = 1.0 / (1.0 + np.exp(regret_ratio - 2.0))
+    
+    # === 6. DENSITY-AWARE EDGE PRUNING ===
+    # Combine factors with adaptive weights
+    base_scores = inv_dist * mutual_rank_affinity * regret_scores
+    
+    # Boost K-NN edges
+    base_scores[knn_adjacency] *= 1.3
+    
+    # Boost mutual K-NN edges (both nodes rank each other in top-K)
+    mutual_knn = knn_adjacency & knn_adjacency.T
+    base_scores[mutual_knn] *= 1.5
+    
+    # Preserve MST edges
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    base_scores[mst_mask] *= 1.4
+    
+    # === 7. ADAPTIVE EDGE SELECTION ===
+    final_heuristics = np.zeros_like(base_scores)
+    
+    # Determine edges to keep per node
+    for i in range(n):
+        # Get candidate edges for this node
+        candidate_mask = np.zeros(n, dtype=bool)
+        
+        # Always keep MST edges
+        candidate_mask |= mst_mask[i]
+        
+        # Keep mutual K-NN edges
+        candidate_mask |= mutual_knn[i]
+        
+        # Keep top scoring edges among K-NN
+        knn_mask = knn_adjacency[i].copy()
+        if np.any(knn_mask):
+            knn_scores = base_scores[i, knn_mask]
+            if len(knn_scores) > 0:
+                # Keep top 70% of K-NN edges by score
+                threshold = np.percentile(knn_scores, 30)
+                keep_knn = knn_mask.copy()
+                keep_knn[knn_mask] = base_scores[i, knn_mask] >= threshold
+                candidate_mask |= keep_knn
+        
+        # Add a few high-scoring non-KNN edges (exploration)
+        non_knn_mask = ~knn_adjacency[i] & ~np.eye(n, dtype=bool)[i]
+        if np.any(non_knn_mask):
+            non_knn_scores = base_scores[i, non_knn_mask]
+            if len(non_knn_scores) > 0:
+                # Keep top 20% of non-KNN edges
+                threshold = np.percentile(non_knn_scores, 80)
+                keep_non_knn = non_knn_mask.copy()
+                keep_non_knn[non_knn_mask] = base_scores[i, non_knn_mask] >= threshold
+                candidate_mask |= keep_non_knn
+        
+        # Apply selection
+        final_heuristics[i, candidate_mask] = base_scores[i, candidate_mask]
+    
+    # Ensure symmetry
+    final_heuristics = np.maximum(final_heuristics, final_heuristics.T)
+    
+    # Final normalization
+    np.fill_diagonal(final_heuristics, 0)
+    non_zero = final_heuristics > 0
+    if np.any(non_zero):
+        max_val = np.max(final_heuristics[non_zero])
+        if max_val > 0:
+            final_heuristics = final_heuristics / max_val
+    
+    return final_heuristics
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with different instance types
+    for instance_type in ["cluster", "uniform", "mixed"]:
+        if instance_type == "cluster":
+            n = 30
+            coords = np.random.randn(n, 2) * 5
+            coords[:20] += np.array([30, 30])
+            coords[20:] += np.array([70, 70])
+        elif instance_type == "uniform":
+            n = 30
+            coords = np.random.rand(n, 2) * 100
+        else:  # mixed
+            n = 30
+            coords = np.zeros((n, 2))
+            coords[:10] = np.random.randn(10, 2) * 5 + [20, 20]
+            coords[10:20] = np.random.rand(10, 2) * 60 + [40, 40]
+            coords[20:] = np.random.rand(10, 2) * 100
+        
+        dist_matrix = squareform(pdist(coords))
+        heuristics = heuristics_v2(dist_matrix.copy())
+        
+        print(f"\n=== {instance_type.upper()} Instance (n={n}) ===")
+        print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+        
+        edges_per_node = np.sum(heuristics > 0, axis=1)
+        print(f"Edges per node: min={edges_per_node.min()}, "
+              f"max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+        
+        is_symmetric = np.allclose(heuristics, heuristics.T)
+        print(f"Matrix symmetric: {is_symmetric}")
+        
+        # Sample scores
+        print("Sample edge scores (i, j, distance, heuristic):")
+        for i, j in [(0, 1), (0, 10), (5, 15), (10, 25)]:
+            if i < n and j < n:
+                print(f"({i:2d}, {j:2d}): dist={dist_matrix[i, j]:6.2f}, "
+                      f"score={heuristics[i, j]:.4f}")
+```

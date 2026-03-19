@@ -1,0 +1,199 @@
+```json
+{
+    "algorithm_features": ["Multiplicative Heuristic Fusion", "Adaptive Edge Sparsification", "Graph Diversity Preservation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import entropy
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic for TSP edge selection probability.
+    
+    Combines multiple factors with adaptive weighting and incorporates
+    entropy-based diversity preservation to prevent premature convergence.
+    
+    Args:
+        distance_matrix: Symmetric distance matrix where diagonal is zero.
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # Trivial case
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # 1. Base: inverse distance (normalized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize to [0, 1]
+    inv_max = np.max(inv_dist)
+    if inv_max > 0:
+        inv_dist = inv_dist / inv_max
+    
+    # 2. Minimum Spanning Tree connectivity
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 3. Adaptive nearest neighbor based on graph density
+    # Use logarithmic scaling for k
+    base_k = max(2, int(np.ceil(np.log2(n))))
+    # Adjust based on graph sparsity (average degree)
+    avg_degree = np.mean((distance_matrix > 0).sum(axis=1))
+    k = min(base_k * 2, n - 1) if avg_degree > n / 2 else base_k
+    
+    nn_weight = np.zeros_like(distance_matrix, dtype=float)
+    for i in range(n):
+        # Get k nearest neighbors (excluding self)
+        indices = np.argsort(distance_matrix[i])[1:k+1]
+        # Assign weights using exponential decay based on rank
+        ranks = np.arange(1, k+1)
+        decays = np.exp(-ranks / k)
+        for j, decay in zip(indices, decays):
+            nn_weight[i, j] = decay
+    
+    # Symmetrize NN weights
+    nn_weight = np.maximum(nn_weight, nn_weight.T)
+    
+    # 4. Edge centrality via degree correlation
+    # Use inverse of degree product to favor edges between lower-degree nodes
+    # (helps in balancing exploration)
+    degrees = np.sum(distance_matrix > 0, axis=1)
+    # Avoid division by zero
+    degree_prod = np.outer(degrees, degrees)
+    degree_prod[degree_prod == 0] = 1
+    centrality = 1.0 / np.sqrt(degree_prod)
+    np.fill_diagonal(centrality, 0)
+    
+    # Normalize centrality
+    cen_max = np.max(centrality)
+    if cen_max > 0:
+        centrality = centrality / cen_max
+    
+    # 5. Diversity preservation using entropy
+    # Compute edge distribution entropy for each node
+    node_entropy = np.zeros(n)
+    for i in range(n):
+        row = distance_matrix[i]
+        non_zero = row[row > 0]
+        if len(non_zero) > 1:
+            # Convert to probabilities
+            probs = 1.0 / non_zero
+            probs = probs / probs.sum()
+            node_entropy[i] = entropy(probs)
+    
+    # Normalize entropy values
+    ent_max = np.max(node_entropy)
+    if ent_max > 0:
+        node_entropy = node_entropy / ent_max
+    
+    # Entropy factor: prefer edges connecting nodes with diverse neighborhoods
+    entropy_factor = np.outer(node_entropy, node_entropy)
+    np.fill_diagonal(entropy_factor, 0)
+    
+    # 6. Adaptive combination with instance-aware weights
+    # Weights adjust based on problem size and graph properties
+    size_factor = min(1.0, n / 50)  # Scale with problem size
+    
+    weights = {
+        'distance': 0.4,
+        'mst': 0.2 * (1 + size_factor),  # MST importance increases with size
+        'neighbor': 0.25,
+        'centrality': 0.1,
+        'diversity': 0.05 * (1 + size_factor)  # Diversity more important for larger instances
+    }
+    
+    # Normalize weights to sum to 1
+    total = sum(weights.values())
+    for key in weights:
+        weights[key] /= total
+    
+    # Combine factors (multiplicative where appropriate)
+    heuristic = (
+        weights['distance'] * inv_dist +
+        weights['mst'] * mst_mask.astype(float) +
+        weights['neighbor'] * nn_weight +
+        weights['centrality'] * centrality +
+        weights['diversity'] * entropy_factor
+    )
+    
+    # Boost edges that appear in multiple factors
+    factor_count = (
+        (inv_dist > np.median(inv_dist[inv_dist > 0])).astype(int) +
+        mst_mask.astype(int) +
+        (nn_weight > np.median(nn_weight[nn_weight > 0])).astype(int) +
+        (centrality > np.median(centrality[centrality > 0])).astype(int)
+    )
+    boost = 1.0 + 0.2 * (factor_count - 2).clip(0, 2)
+    heuristic = heuristic * boost
+    
+    # 7. Two-stage adaptive sparsification
+    # Stage 1: Local sparsification per node
+    edges_per_node = max(2, int(np.ceil(np.log2(n))))
+    
+    for i in range(n):
+        row = heuristic[i].copy()
+        # Keep only top edges_per_node edges for each node
+        if np.count_nonzero(row) > edges_per_node:
+            threshold = np.partition(row, -edges_per_node)[-edges_per_node]
+            row[row < threshold] = 0
+            heuristic[i] = row
+    
+    # Stage 2: Global sparsification with adaptive threshold
+    non_zero = heuristic[heuristic > 0]
+    if len(non_zero) > 0:
+        # Adaptive threshold based on distribution shape
+        median_val = np.median(non_zero)
+        mean_val = np.mean(non_zero)
+        
+        if median_val < mean_val:  # Right-skewed distribution
+            # Be more selective
+            threshold = np.percentile(non_zero, 40)
+        else:  # Left-skewed or symmetric
+            threshold = np.percentile(non_zero, 25)
+        
+        heuristic[heuristic < threshold] = 0
+    
+    # Ensure connectivity: each node must have at least 2 edges
+    for i in range(n):
+        if np.count_nonzero(heuristic[i]) < 2:
+            # Add back the best missing edges
+            row = heuristic[i].copy()
+            mask = row == 0
+            mask[i] = False  # Exclude diagonal
+            if np.any(mask):
+                # Use original heuristic factors to select edges
+                candidate_scores = (
+                    inv_dist[i] * 0.5 +
+                    nn_weight[i] * 0.3 +
+                    centrality[i] * 0.2
+                )
+                candidate_scores[~mask] = -np.inf
+                # Add top edges to reach at least 2 connections
+                needed = 2 - np.count_nonzero(row)
+                if needed > 0:
+                    indices = np.argsort(candidate_scores)[-needed:]
+                    row[indices] = candidate_scores[indices]
+                    heuristic[i] = row
+    
+    # Ensure symmetry (TSP is undirected)
+    heuristic = np.maximum(heuristic, heuristic.T)
+    
+    # Final normalization
+    max_val = np.max(heuristic)
+    if max_val > 0:
+        heuristic = heuristic / max_val
+    
+    # Set diagonal to zero
+    np.fill_diagonal(heuristic, 0)
+    
+    return heuristic
+```

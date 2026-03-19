@@ -1,0 +1,221 @@
+```json
+{
+    "algorithm_features": ["Minimum Spanning Tree Bonus", "Three-hop Alternative Penalty", "Local Clustering Coefficient", "Centrality-Adjusted Density"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge prioritization heuristic incorporating global topological
+    features and three-hop lookahead analysis for enhanced edge quality assessment.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Enhanced Symmetric Sparsification ====================
+    k = max(3, int(np.log2(n)))
+    mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        mask[i, nn_indices] = True
+    
+    mask = mask | mask.T
+    np.fill_diagonal(mask, False)
+    
+    # ==================== 2. Global Topological Features ====================
+    # 2.1 Minimum Spanning Tree bonus
+    mst_bonus = np.ones_like(distance_matrix)
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = mst > 0
+    mst_bonus[mst_mask] = 1.3
+    
+    # 2.2 Clustering coefficient-based local density
+    cluster_coeff = np.zeros(n)
+    for i in range(n):
+        neighbors = np.where(mask[i])[0]
+        if len(neighbors) < 2:
+            cluster_coeff[i] = 0
+            continue
+        
+        # Count triangles among neighbors
+        triangles = 0
+        for idx, n1 in enumerate(neighbors):
+            for n2 in neighbors[idx+1:]:
+                if mask[n1, n2]:
+                    triangles += 1
+        
+        max_triangles = len(neighbors) * (len(neighbors) - 1) / 2
+        cluster_coeff[i] = triangles / max_triangles if max_triangles > 0 else 0
+    
+    # 2.3 Centrality measure (closeness-like)
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Modified closeness using only top neighbors for efficiency
+        valid_dists = distance_matrix[i, mask[i]]
+        if len(valid_dists) > 0:
+            centrality[i] = len(valid_dists) / (np.mean(valid_dists) + 1e-10)
+    
+    # Normalize centrality
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # ==================== 3. Enhanced Inverse Distance with Global Features ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Rank-based weights with exponential decay
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = np.exp(-0.4 * (ranks - 1))
+            weights = weights / np.sum(weights)
+            
+            # Base inverse distance
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            
+            # Density factor incorporating clustering and centrality
+            density_factor = 1.0 + 0.3 * cluster_coeff[i] + 0.2 * centrality[i]
+            
+            inv_dist[i, valid_mask] = inv_vals * weights * density_factor
+    
+    # Apply MST bonus and symmetrize
+    inv_dist = inv_dist * mst_bonus
+    inv_dist = np.maximum(inv_dist, inv_dist.T)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ==================== 4. Extended Lookahead Analysis (2-hop and 3-hop) ====================
+    penalty = np.ones_like(distance_matrix)
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    # Precompute top neighbors for all nodes
+    lookahead_depth = max(4, int(np.sqrt(n)))
+    top_neighbors = sorted_indices[:, 1:lookahead_depth+1]
+    
+    for i in range(n):
+        valid_indices = np.where(mask[i] & (i < np.arange(n)))[0]
+        if len(valid_indices) == 0:
+            continue
+            
+        i_neighbors = top_neighbors[i]
+        
+        for j in valid_indices:
+            j_neighbors = top_neighbors[j]
+            
+            # Two-hop alternatives
+            candidates_2hop = np.unique(np.concatenate([i_neighbors, j_neighbors]))
+            candidates_2hop = candidates_2hop[(candidates_2hop != i) & (candidates_2hop != j)]
+            
+            best_2hop = np.inf
+            if len(candidates_2hop) > 0:
+                two_hop_dists = distance_matrix[i, candidates_2hop] + distance_matrix[candidates_2hop, j]
+                best_2hop = np.min(two_hop_dists)
+            
+            # Three-hop alternatives (limited to top neighbors for efficiency)
+            best_3hop = np.inf
+            # Use top k neighbors as intermediate nodes for three-hop paths
+            k_intermediate = min(5, lookahead_depth // 2)
+            i_intermediate = top_neighbors[i, :k_intermediate]
+            j_intermediate = top_neighbors[j, :k_intermediate]
+            
+            for k in i_intermediate:
+                if k == i or k == j:
+                    continue
+                # Find best two-hop from k to j avoiding i
+                k_neighbors = top_neighbors[k]
+                valid_k_neighbors = k_neighbors[(k_neighbors != i) & (k_neighbors != j) & (k_neighbors != k)]
+                
+                if len(valid_k_neighbors) > 0:
+                    three_hop_dists = (distance_matrix[i, k] + 
+                                     distance_matrix[k, valid_k_neighbors] + 
+                                     distance_matrix[valid_k_neighbors, j])
+                    current_best = np.min(three_hop_dists) if len(three_hop_dists) > 0 else np.inf
+                    best_3hop = min(best_3hop, current_best)
+            
+            # Take the best alternative path
+            best_alternative = min(best_2hop, best_3hop)
+            direct_dist = distance_matrix[i, j]
+            
+            if direct_dist > 1e-10 and best_alternative < np.inf:
+                # Enhanced penalty considering both 2-hop and 3-hop alternatives
+                ratio = best_alternative / direct_dist
+                if ratio < 1.5:
+                    # Strong penalty when alternatives are nearly as good
+                    penalty_val = 0.2 + 0.8 * (ratio / 1.5) ** 2
+                elif ratio < 2.5:
+                    # Moderate penalty for somewhat competitive alternatives
+                    penalty_val = 0.7 + 0.3 * ((ratio - 1.5) / 1.0)
+                else:
+                    # Minimal penalty for poor alternatives
+                    penalty_val = 1.0
+                
+                # Adjust penalty based on node centrality (central nodes tolerate more alternatives)
+                centrality_factor = 0.5 + 0.5 * (centrality[i] + centrality[j]) / 2
+                penalty_val = penalty_val ** centrality_factor
+                
+                penalty[i, j] = penalty_val
+                penalty[j, i] = penalty_val
+    
+    # ==================== 5. Edge Connectivity Bonus ====================
+    # Reward edges that connect different clusters
+    connectivity_bonus = np.ones_like(distance_matrix)
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            if mask[i, j]:
+                # Bonus if nodes have different neighbor sets
+                i_neighbors = set(np.where(mask[i])[0])
+                j_neighbors = set(np.where(mask[j])[0])
+                overlap = len(i_neighbors.intersection(j_neighbors))
+                total = len(i_neighbors.union(j_neighbors))
+                
+                if total > 0:
+                    similarity = overlap / total
+                    # Higher bonus for connecting dissimilar neighborhoods
+                    connectivity_bonus[i, j] = connectivity_bonus[j, i] = 1.0 + 0.3 * (1 - similarity)
+    
+    # ==================== 6. Combine All Components ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Apply all bonuses and penalties only to edges in mask
+    base_scores = inv_dist.copy()
+    base_scores[~mask] = 0
+    heuristics = base_scores * penalty * connectivity_bonus
+    
+    # Row normalization with stability
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    non_zero_rows = row_sums.flatten() > 0
+    if np.any(non_zero_rows):
+        heuristics[non_zero_rows] = heuristics[non_zero_rows] / row_sums[non_zero_rows]
+    
+    # Add minimal noise to all edges in mask to break ties
+    heuristics[mask] += 1e-10
+    
+    # Final symmetrization and cleanup
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure all rows sum to approximately 1
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    return heuristics
+```

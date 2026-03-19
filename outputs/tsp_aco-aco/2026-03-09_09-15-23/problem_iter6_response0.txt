@@ -1,0 +1,179 @@
+```json
+{
+    "algorithm_features": ["Vectorized Cluster-Aware Scoring", "Adaptive Parameter Tuning", "Graph-Theoretic Two-Hop Analysis", "Sparsity-Aware Normalization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import cdist
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP heuristic function with global structural awareness,
+    fully vectorized computations, and adaptive parameter optimization.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. ADAPTIVE PARAMETER TUNING ====================
+    # Dynamically adjust parameters based on instance characteristics
+    log_n = np.log2(n)
+    
+    # Sparsity factor: logarithmic in n, but adjusted by instance density
+    avg_dist = np.mean(distance_matrix)
+    std_dist = np.std(distance_matrix)
+    density_factor = std_dist / (avg_dist + 1e-10)
+    k_sparse = int(np.clip(3 + log_n * (1.0 + 0.5 * density_factor), 5, 20))
+    
+    # Clustering parameters
+    n_clusters = max(2, int(np.sqrt(n)))
+    cluster_check_k = max(3, int(np.sqrt(k_sparse)))
+    
+    # ==================== 2. VECTORIZED SPARSIFICATION ====================
+    # Find k_sparse nearest neighbors for each node (fully vectorized)
+    np.fill_diagonal(distance_matrix, np.inf)  # Temporarily mask self
+    neighbor_indices = np.argpartition(distance_matrix, k_sparse, axis=1)[:, :k_sparse]
+    np.fill_diagonal(distance_matrix, 0)  # Restore diagonal
+    
+    # Build sparse adjacency mask with reciprocal enhancement
+    row_indices = np.repeat(np.arange(n), k_sparse)
+    col_indices = neighbor_indices.ravel()
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    adjacency_mask[row_indices, col_indices] = True
+    
+    # Enhance with reciprocity: edge exists if either endpoint considers the other in top neighbors
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 3. GLOBAL STRUCTURAL AWARENESS ====================
+    # Fast approximate clustering using farthest point sampling (deterministic)
+    centroids = [0]  # Start with first node
+    for _ in range(1, n_clusters):
+        # Find point farthest from all current centroids
+        dist_to_centroids = np.min(distance_matrix[np.array(centroids)], axis=0)
+        new_centroid = np.argmax(dist_to_centroids)
+        centroids.append(new_centroid)
+    centroids = np.array(centroids)
+    
+    # Assign nodes to nearest centroid (vectorized)
+    centroid_dists = distance_matrix[centroids]
+    cluster_assignments = np.argmin(centroid_dists, axis=0)
+    
+    # Compute cluster cohesion scores
+    intra_cluster_mask = cluster_assignments[:, None] == cluster_assignments[None, :]
+    cluster_bonus = np.where(intra_cluster_mask, 1.3, 0.9)  # Boost intra-cluster, penalize inter-cluster
+    
+    # Add centroid proximity bonus
+    centroid_proximity = 1.0 / (1.0 + cdist(centroids, centroids, 'euclidean'))
+    for i in range(n_clusters):
+        for j in range(n_clusters):
+            if i != j:
+                cluster_i_mask = cluster_assignments == i
+                cluster_j_mask = cluster_assignments == j
+                cluster_bonus[cluster_i_mask[:, None] & cluster_j_mask[None, :]] = 1.0 + 0.2 * centroid_proximity[i, j]
+    
+    np.fill_diagonal(cluster_bonus, 0)
+    
+    # ==================== 4. VECTORIZED RANK-AWARE SCORING ====================
+    # Compute rank-based weights using fully vectorized operations
+    masked_distances = np.where(adjacency_mask, distance_matrix, np.inf)
+    
+    # Get ranks for each node's neighbors
+    ranks = np.argsort(np.argsort(masked_distances, axis=1), axis=1).astype(float)
+    ranks[~adjacency_mask] = np.inf
+    
+    # Exponential decay weights adapt to neighborhood size
+    valid_counts = np.sum(adjacency_mask, axis=1, keepdims=True)
+    decay_bases = 0.6 + 0.4 * np.exp(-valid_counts / 10)
+    rank_weights = decay_bases ** ranks
+    rank_weights[~adjacency_mask] = 0
+    
+    # Normalize weights per row
+    row_sums = np.sum(rank_weights, axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    rank_weights = rank_weights / row_sums
+    
+    # Combine with inverse distance (vectorized)
+    inv_distances = np.where(adjacency_mask, 1.0 / (distance_matrix + 1e-10), 0)
+    base_scores = inv_distances * rank_weights
+    
+    # Symmetrize via geometric mean
+    base_scores = np.sqrt(np.maximum(base_scores, 1e-10) * np.maximum(base_scores.T, 1e-10))
+    
+    # ==================== 5. GRAPH-THEORETIC TWO-HOP ANALYSIS ====================
+    # Vectorized two-hop computation using matrix operations
+    min_two_hop = np.full((n, n), np.inf)
+    
+    # Compute (i,k) + (k,j) for all k, then take min over k
+    for k in range(n):
+        two_hop = distance_matrix[:, k][:, None] + distance_matrix[k, :][None, :]
+        np.fill_diagonal(two_hop, np.inf)  # Avoid self-loops
+        min_two_hop = np.minimum(min_two_hop, two_hop)
+    
+    # Compute direct-to-two-hop ratio (vectorized)
+    ratio = np.where(adjacency_mask, min_two_hop / (distance_matrix + 1e-10), 1.0)
+    
+    # Dynamic penalty/bonus based on ratio
+    two_hop_factor = np.ones_like(distance_matrix)
+    two_hop_factor = np.where(ratio < 0.8, 0.3 + 0.7 * (ratio / 0.8), two_hop_factor)
+    two_hop_factor = np.where((0.8 <= ratio) & (ratio < 1.0), 
+                              0.7 + 0.3 * (ratio - 0.8) / 0.2, two_hop_factor)
+    two_hop_factor = np.where(ratio >= 1.0, 
+                              1.0 + 0.5 * (1 - np.exp(-(ratio - 1.0))), two_hop_factor)
+    two_hop_factor = np.clip(two_hop_factor, 0.2, 2.0)
+    
+    # Only apply to sparse edges
+    two_hop_factor = np.where(adjacency_mask, two_hop_factor, 1.0)
+    
+    # ==================== 6. COMBINE WITH EFFICIENT NORMALIZATION ====================
+    # Combine all components (fully vectorized)
+    heuristics = np.zeros_like(distance_matrix)
+    heuristics[adjacency_mask] = (
+        base_scores[adjacency_mask] * 
+        cluster_bonus[adjacency_mask] * 
+        two_hop_factor[adjacency_mask]
+    )
+    
+    # Ensure connectivity via MST boost (sparse implementation)
+    mst = minimum_spanning_tree(csr_matrix(distance_matrix)).toarray()
+    mst_mask = mst > 0
+    mst_edges = np.argwhere(mst_mask & adjacency_mask)
+    
+    if len(mst_edges) > 0:
+        mst_values = heuristics[mst_edges[:, 0], mst_edges[:, 1]]
+        if len(mst_values) > 0:
+            mst_median = np.median(mst_values)
+            # Boost weak MST edges
+            weak_mst = mst_values < mst_median
+            boost_indices = mst_edges[weak_mst]
+            heuristics[boost_indices[:, 0], boost_indices[:, 1]] = mst_median
+    
+    # Sparsity-aware normalization
+    np.fill_diagonal(heuristics, 0)
+    row_max = np.max(heuristics, axis=1, keepdims=True)
+    row_max[row_max == 0] = 1
+    heuristics = heuristics / row_max  # Scale to [0,1] per row
+    
+    # Final symmetric harmonic mean
+    non_zero_mask = adjacency_mask & (heuristics > 0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        harmonic = np.where(non_zero_mask,
+                            2 * heuristics * heuristics.T / (heuristics + heuristics.T + 1e-10),
+                            0)
+    heuristics = np.where(adjacency_mask, harmonic, 0)
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

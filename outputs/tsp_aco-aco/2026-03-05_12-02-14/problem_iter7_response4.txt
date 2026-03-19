@@ -1,0 +1,204 @@
+```json
+{
+    "algorithm_features": ["Stochastic Edge Sparsification", "Enhanced Centrality Combination", "Exploration-Exploitation Balance"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse import csgraph
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic matrix generator with:
+    1. Stochastic edge sparsification with adaptive k selection based on coefficient of variation
+    2. Enhanced centrality combination using geometric mean of closeness and Floyd-Warshall centrality
+    3. Improved exploration-exploitation balance through entropy-based probability adjustment
+    
+    Returns: Non-negative matrix of same shape as input, normalized by row for stochastic sampling
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / np.maximum(distance_matrix, 1e-10)
+        np.fill_diagonal(result, 0)
+        row_sums = result.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return result / row_sums
+    
+    # ===== 1. BASE COMPONENTS =====
+    # 1.1 Inverse distance (proximity heuristic)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / np.maximum(distance_matrix, 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 1.2 MST connectivity
+    mst_mask = np.zeros((n, n), dtype=bool)
+    try:
+        mst = csgraph.minimum_spanning_tree(distance_matrix).toarray()
+        mst_mask = mst > 0
+    except Exception:
+        pass  # Keep zero mask if MST fails
+    
+    # ===== 2. ENHANCED CENTRALITY COMBINATION =====
+    # 2.1 Closeness centrality from row sums
+    closeness = 1 / (distance_matrix.sum(axis=1) + 1e-10)
+    
+    # 2.2 Shortest-path centrality via Floyd-Warshall
+    # Compute all-pairs shortest paths efficiently
+    shortest_paths = distance_matrix.copy()
+    for k in range(n):
+        # Vectorized update for Floyd-Warshall
+        through_k = shortest_paths[:, k:k+1] + shortest_paths[k:k+1, :]
+        shortest_paths = np.minimum(shortest_paths, through_k)
+    
+    # Centrality based on shortest paths (inverse of sum of distances)
+    sp_centrality = 1 / (shortest_paths.sum(axis=1) + 1e-10)
+    
+    # 2.3 Geometric mean of centrality measures (enhanced combination)
+    # Use epsilon to avoid zeros and ensure stability
+    epsilon = 1e-10
+    geo_mean_centrality = np.sqrt(
+        (closeness + epsilon) * (sp_centrality + epsilon)
+    )
+    
+    # Normalize centrality scores
+    if geo_mean_centrality.max() > 0:
+        geo_mean_centrality = geo_mean_centrality / geo_mean_centrality.max()
+    
+    # Create centrality matrix using outer product (edges between central nodes get higher scores)
+    centrality_matrix = np.outer(geo_mean_centrality, geo_mean_centrality)
+    
+    # ===== 3. ADAPTIVE COMBINATION =====
+    # Analyze graph characteristics for adaptive weighting
+    # Use inverse distance variance as heuristic for graph structure
+    inv_dist_variance = np.var(inv_dist[inv_dist > 0]) if np.any(inv_dist > 0) else 1.0
+    
+    # Adaptive weights based on graph structure
+    w_inv = 0.4 + 0.2 * np.tanh(1.0 - inv_dist_variance)  # More weight when distances are uniform
+    w_mst = 0.3
+    w_cent = 0.3 + 0.2 * np.tanh(inv_dist_variance - 1.0)  # More weight when distances vary
+    
+    # Normalize weights
+    total_weight = w_inv + w_mst + w_cent
+    w_inv /= total_weight
+    w_mst /= total_weight
+    w_cent /= total_weight
+    
+    # Combine components with MST boost
+    mst_boost = 1.5  # Fixed boost for MST edges
+    combined = (
+        w_inv * inv_dist + 
+        w_mst * mst_boost * mst_mask.astype(float) + 
+        w_cent * centrality_matrix
+    )
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    # ===== 4. STOCHASTIC EDGE SPARSIFICATION =====
+    sparsified = np.zeros_like(combined)
+    
+    # Base k scaling with sqrt(n) and adaptive adjustment
+    base_k = max(3, min(15, int(np.sqrt(n))))
+    
+    for i in range(n):
+        row = combined[i].copy()
+        row[i] = -np.inf  # Exclude self
+        
+        # Calculate coefficient of variation for adaptive k
+        positive_vals = row[row > 0]
+        if len(positive_vals) > 1:
+            cv = np.std(positive_vals) / (np.mean(positive_vals) + 1e-10)
+            # Adjust k based on CV: more edges when values are similar
+            k = int(base_k * (1.5 - 0.5 * np.tanh(cv - 1.0)))
+            k = min(max(k, 3), n - 1)
+        else:
+            k = base_k
+        
+        # Get candidate indices with positive values
+        candidates = np.where(row > 0)[0]
+        
+        if len(candidates) == 0:
+            # Fallback to nearest neighbors
+            sorted_idx = np.argsort(distance_matrix[i])[1:k+1]
+            sparsified[i, sorted_idx] = 1.0
+            continue
+        
+        if len(candidates) <= k:
+            # Keep all candidates
+            sparsified[i, candidates] = row[candidates]
+            continue
+        
+        # ===== 4.1 EXPLORATION-EXPLOITATION BALANCE =====
+        candidate_values = row[candidates]
+        
+        # Calculate entropy for temperature adjustment
+        normalized_vals = candidate_values / (candidate_values.sum() + 1e-10)
+        entropy = -np.sum(normalized_vals * np.log(normalized_vals + 1e-10))
+        max_entropy = np.log(len(candidates))
+        
+        # Adaptive temperature: higher entropy -> higher temperature -> more exploration
+        if max_entropy > 0:
+            normalized_entropy = entropy / max_entropy
+            temperature = 1.0 + 2.0 * normalized_entropy  # Range: 1.0 to 3.0
+        else:
+            temperature = 1.0
+        
+        # Softmax probabilities with adaptive temperature
+        exp_values = np.exp(candidate_values / temperature)
+        probs = exp_values / exp_values.sum()
+        
+        # ===== 4.2 STOCHASTIC SELECTION WITH CONTROLLED NOISE =====
+        # Add adaptive noise proportional to value and temperature
+        noise_scale = 0.1 * temperature
+        noisy_scores = candidate_values * (1.0 + noise_scale * np.random.randn(len(candidates)))
+        
+        # Ensure scores remain positive
+        noisy_scores = np.maximum(noisy_scores, 0)
+        
+        # Select top k edges based on noisy scores
+        top_k_idx = np.argsort(noisy_scores)[-k:]
+        selected = candidates[top_k_idx]
+        selected_values = candidate_values[top_k_idx]
+        
+        # ===== 4.3 EXPONENTIAL DECAY WITH RANK =====
+        # Sort selected edges by original value (not noisy score)
+        value_order = np.argsort(selected_values)[::-1]
+        sorted_selected = selected[value_order]
+        sorted_values = selected_values[value_order]
+        
+        # Apply exponential decay
+        for rank, (j, value) in enumerate(zip(sorted_selected, sorted_values)):
+            decay = np.exp(-rank / 2.0)  # Exponential decay factor
+            sparsified[i, j] = value * decay
+    
+    # ===== 5. FINAL PROCESSING =====
+    # Ensure symmetry
+    result = (sparsified + sparsified.T) / 2
+    
+    # Add minimal exploration noise
+    exploration_noise = 0.01 * np.random.rand(n, n)
+    np.fill_diagonal(exploration_noise, 0)
+    result = np.maximum(result + exploration_noise, 0)
+    
+    # Ensure zero diagonal
+    np.fill_diagonal(result, 0)
+    
+    # Row normalization for stochastic sampling
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # For rows with no connections, use inverse distance as fallback
+        fallback_weights = inv_dist[zero_rows]
+        row_sums[zero_rows] = fallback_weights.sum(axis=1, keepdims=True)
+        result[zero_rows] = fallback_weights
+    
+    row_sums[row_sums == 0] = 1
+    result = result / row_sums
+    
+    return result
+```

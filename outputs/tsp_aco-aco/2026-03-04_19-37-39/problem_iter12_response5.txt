@@ -1,0 +1,397 @@
+```json
+{
+    "algorithm_features": ["Adaptive Local Search", "Statistical Weight Learning", "Symmetry-Aware Sampling", "Progressive Refinement"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with adaptive local search, learned parameter tuning,
+    symmetry-aware sampling, and progressive refinement.
+    
+    Key improvements over previous versions:
+    1. Adaptive local search intensities based on solution quality and instance structure
+    2. Statistical learning of component weights through iterative refinement
+    3. Symmetry-aware edge betweenness sampling for Euclidean-like instances
+    4. Progressive refinement with multiple aggregation stages
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Symmetric matrix of pairwise distances between nodes (n x n)
+    
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix where higher values indicate more promising edges
+    """
+    n = distance_matrix.shape[0]
+    
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    
+    # === 1. INSTANCE CHARACTERIZATION & PARAMETER INITIALIZATION ===
+    distances_flat = distance_matrix[np.triu_indices(n, k=1)]
+    dist_mean = np.mean(distances_flat)
+    dist_std = np.std(distances_flat)
+    cv = dist_std / (dist_mean + 1e-10)
+    
+    # Size-aware parameters
+    log_n = np.log(n + 1)
+    density_factor = min(1.0, n / 50.0)
+    
+    # Test for potential Euclidean structure (triangle inequality)
+    def test_euclidean_symmetry():
+        if n < 10:
+            return 0.0
+        # Sample random triangles to check triangle inequality
+        violations = 0
+        for _ in range(min(100, n**2)):
+            i, j, k = np.random.choice(n, 3, replace=False)
+            if distance_matrix[i, j] > distance_matrix[i, k] + distance_matrix[k, j] + 1e-6:
+                violations += 1
+        return 1.0 - min(1.0, violations / 100.0)
+    
+    euclidean_score = test_euclidean_symmetry()
+    
+    # === 2. ADAPTIVE LOCAL SEARCH WITH PROGRESSIVE INTENSITY ===
+    def generate_initial_tour(method: str) -> np.ndarray:
+        """Generate initial tour using specified method."""
+        if method == 'nn':
+            start = np.random.randint(0, n)
+            tour = [start]
+            unvisited = set(range(n)) - {start}
+            while unvisited:
+                current = tour[-1]
+                nearest = min(unvisited, key=lambda x: distance_matrix[current, x])
+                tour.append(nearest)
+                unvisited.remove(nearest)
+            return np.array(tour)
+        
+        elif method == 'farthest_insertion':
+            if n <= 3:
+                return np.random.permutation(n)
+            # Start with farthest pair
+            i, j = np.unravel_index(np.argmax(distance_matrix), distance_matrix.shape)
+            tour = [i, j]
+            remaining = set(range(n)) - set(tour)
+            
+            while remaining:
+                # Find farthest node from tour
+                farthest = max(remaining, 
+                             key=lambda x: min(distance_matrix[x, y] for y in tour))
+                # Best insertion
+                best_cost = float('inf')
+                best_pos = 1
+                for pos in range(len(tour)):
+                    next_pos = (pos + 1) % len(tour)
+                    inc = (distance_matrix[tour[pos], farthest] + 
+                          distance_matrix[farthest, tour[next_pos]] - 
+                          distance_matrix[tour[pos], tour[next_pos]])
+                    if inc < best_cost:
+                        best_cost = inc
+                        best_pos = pos + 1
+                tour.insert(best_pos, farthest)
+                remaining.remove(farthest)
+            return np.array(tour)
+        
+        else:  # Random
+            return np.random.permutation(n)
+    
+    def adaptive_local_search(tour: np.ndarray, base_quality: float) -> np.ndarray:
+        """
+        Apply adaptive local search with intensity based on instance characteristics
+        and solution quality.
+        """
+        current = tour.copy()
+        current_length = sum(distance_matrix[current[i], current[(i+1)%n]] for i in range(n))
+        
+        # Determine search intensity
+        # Higher for worse solutions and larger instances
+        quality_ratio = base_quality / (current_length + 1e-10)
+        intensity = min(1.0, 0.3 + 0.7 * density_factor * (2.0 - quality_ratio))
+        
+        max_iter = int(10 + 40 * intensity)
+        improved = True
+        iter_count = 0
+        
+        while improved and iter_count < max_iter:
+            improved = False
+            
+            # Random 2-opt moves with neighborhood size based on intensity
+            neighborhood_size = int(n * (0.1 + 0.3 * intensity))
+            for _ in range(neighborhood_size):
+                i, j = np.random.choice(n, 2, replace=False)
+                if abs(i - j) < 2 or (i == 0 and j == n-1):
+                    continue
+                
+                i, j = sorted([i, j])
+                a, b = current[i], current[(i+1)%n]
+                c, d = current[j], current[(j+1)%n]
+                
+                old_len = distance_matrix[a, b] + distance_matrix[c, d]
+                new_len = distance_matrix[a, c] + distance_matrix[b, d]
+                
+                if new_len < old_len - 1e-10:
+                    current = np.concatenate([
+                        current[:i+1],
+                        current[i+1:j+1][::-1],
+                        current[j+1:]
+                    ])
+                    improved = True
+                    break
+            
+            iter_count += 1
+        
+        return current
+    
+    # Generate diverse initial tours
+    num_initial = min(15, max(5, n // 3))
+    tours = []
+    tour_lengths = []
+    
+    # Method distribution based on instance characteristics
+    if cv > 0.4:
+        methods = ['farthest_insertion'] * (num_initial//2) + ['nn'] * (num_initial//2)
+    else:
+        methods = ['nn'] * (num_initial//3) + ['farthest_insertion'] * (num_initial//3) + ['random'] * (num_initial - 2*(num_initial//3))
+    
+    # Generate initial tours and compute base quality
+    base_tour_quality = float('inf')
+    for method in methods:
+        tour = generate_initial_tour(method)
+        length = sum(distance_matrix[tour[i], tour[(i+1)%n]] for i in range(n))
+        if length < base_tour_quality:
+            base_tour_quality = length
+    
+    # Apply adaptive local search
+    for method in methods:
+        tour = generate_initial_tour(method)
+        improved_tour = adaptive_local_search(tour, base_tour_quality)
+        tours.append(improved_tour)
+        tour_lengths.append(sum(distance_matrix[improved_tour[i], improved_tour[(i+1)%n]] for i in range(n)))
+    
+    # === 3. EDGE FREQUENCY WITH QUALITY-BASED WEIGHTING ===
+    edge_freq = np.zeros_like(distance_matrix)
+    min_length = min(tour_lengths)
+    
+    for tour, length in zip(tours, tour_lengths):
+        # Weight inversely proportional to tour length
+        weight = min_length / (length + 1e-10)
+        weight = min(1.0, weight)  # Cap at 1.0
+        
+        for i in range(n):
+            j = (i + 1) % n
+            u, v = tour[i], tour[j]
+            edge_freq[u, v] += weight
+            edge_freq[v, u] += weight
+    
+    if edge_freq.max() > 0:
+        edge_freq = edge_freq / edge_freq.max()
+    
+    # === 4. SYMMETRY-AWARE EDGE BETWEENNESS SAMPLING ===
+    edge_betweenness = np.zeros_like(distance_matrix)
+    
+    # Adaptive sampling parameters
+    num_paths = min(250, max(50, n * 3))
+    avg_path_length = min(n, max(5, n // 2))
+    
+    # Use symmetry information to guide sampling
+    symmetry_factor = 0.5 + 0.5 * euclidean_score
+    
+    for _ in range(num_paths):
+        # Choose source and target
+        if np.random.random() < symmetry_factor and euclidean_score > 0.7:
+            # For Euclidean-like instances, sample distant pairs
+            s = np.random.randint(0, n)
+            # Find a distant target
+            farthest = np.argmax(distance_matrix[s])
+            t = farthest if farthest != s else np.random.randint(0, n)
+        else:
+            s, t = np.random.choice(n, 2, replace=False)
+        
+        # Progress-aware random walk
+        current = s
+        for step in range(avg_path_length):
+            if current == t:
+                break
+            
+            # Compute transition probabilities
+            with np.errstate(divide='ignore', invalid='ignore'):
+                # Base: prefer shorter edges
+                probs = 1.0 / (distance_matrix[current] + 1e-10)
+            
+            probs[current] = 0
+            
+            # Add progress toward target (more important for symmetric instances)
+            if euclidean_score > 0.5:
+                progress = 1.0 / (distance_matrix[:, t] + 1e-10)
+                progress[current] = 0
+                probs = probs * (1 - 0.3 * symmetry_factor) + progress * (0.3 * symmetry_factor)
+            
+            # Normalize
+            if probs.sum() > 0:
+                probs = probs / probs.sum()
+                next_node = np.random.choice(n, p=probs)
+            else:
+                next_node = np.random.choice([x for x in range(n) if x != current])
+            
+            # Update betweenness
+            edge_betweenness[current, next_node] += 1
+            edge_betweenness[next_node, current] += 1
+            
+            # Move with occasional teleportation
+            if np.random.random() < 0.15:
+                current = np.random.randint(0, n)
+            else:
+                current = next_node
+    
+    if edge_betweenness.max() > 0:
+        edge_betweenness = edge_betweenness / edge_betweenness.max()
+    
+    # === 5. STATISTICAL LEARNING OF COMPONENT WEIGHTS ===
+    # Compute component statistics
+    freq_vals = edge_freq[np.triu_indices(n, k=1)]
+    bet_vals = edge_betweenness[np.triu_indices(n, k=1)]
+    
+    # Compute correlation and agreement
+    if len(freq_vals) > 1 and np.std(freq_vals) > 1e-10 and np.std(bet_vals) > 1e-10:
+        corr = np.abs(np.corrcoef(freq_vals, bet_vals)[0, 1])
+    else:
+        corr = 0.5
+    
+    # Agreement measure: how often components agree on top edges
+    top_k = min(100, len(freq_vals) // 10)
+    if top_k > 0:
+        freq_top = set(np.argsort(freq_vals)[-top_k:])
+        bet_top = set(np.argsort(bet_vals)[-top_k:])
+        agreement = len(freq_top & bet_top) / top_k
+    else:
+        agreement = 0.5
+    
+    # Learn weights based on instance characteristics and component agreement
+    # Base weights from instance statistics
+    w_freq_base = 0.35 + 0.15 * (1 - corr) * (1 + cv)
+    w_bet_base = 0.25 + 0.15 * corr * (1 + 0.5 * (1 - cv))
+    
+    # Adjust based on agreement
+    if agreement > 0.7:
+        # High agreement: trust both components less, rely more on distance and MST
+        w_freq = w_freq_base * 0.8
+        w_bet = w_bet_base * 0.8
+        w_dist = 0.25 + 0.1 * (1 - cv)
+        w_mst = 0.15 + 0.05 * density_factor
+    else:
+        # Low agreement: components provide complementary information
+        w_freq = w_freq_base * 1.2
+        w_bet = w_bet_base * 1.2
+        w_dist = 0.15 + 0.1 * (1 - cv)
+        w_mst = 0.1 + 0.05 * density_factor
+    
+    # Normalize
+    total = w_freq + w_bet + w_dist + w_mst
+    w_freq /= total
+    w_bet /= total
+    w_dist /= total
+    w_mst /= total
+    
+    # === 6. COMPONENT COMPUTATION ===
+    # Distance component
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-10)
+    np.fill_diagonal(inv_dist, 0)
+    if inv_dist.max() > inv_dist.min():
+        inv_dist = (inv_dist - inv_dist.min()) / (inv_dist.max() - inv_dist.min())
+    
+    # MST component with distance weighting
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_mask = (mst > 0) | (mst.T > 0)
+    mst_scores = np.zeros_like(distance_matrix)
+    mst_scores[mst_mask] = 1.0 / (distance_matrix[mst_mask] + 1e-10)
+    if mst_scores.max() > mst_scores.min():
+        mst_scores = (mst_scores - mst_scores.min()) / (mst_scores.max() - mst_scores.min())
+    
+    # === 7. PROGRESSIVE REFINEMENT WITH MULTIPLE AGGREGATION ===
+    # First stage: combine components
+    heuristics_matrix = (
+        w_freq * edge_freq +
+        w_bet * edge_betweenness +
+        w_dist * inv_dist +
+        w_mst * mst_scores
+    )
+    
+    # Ensure symmetry
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Second stage: reinforce edges that appear in multiple good tours
+    if len(tours) > 3:
+        # Identify top tours
+        sorted_indices = np.argsort(tour_lengths)
+        top_tours = [tours[i] for i in sorted_indices[:len(tours)//2]]
+        
+        # Create reinforcement matrix
+        reinforcement = np.zeros_like(distance_matrix)
+        for tour in top_tours:
+            for i in range(n):
+                j = (i + 1) % n
+                u, v = tour[i], tour[j]
+                reinforcement[u, v] += 1
+                reinforcement[v, u] += 1
+        
+        if reinforcement.max() > 0:
+            reinforcement = reinforcement / reinforcement.max()
+            # Blend with existing heuristics
+            heuristics_matrix = 0.7 * heuristics_matrix + 0.3 * reinforcement
+    
+    # === 8. ADAPTIVE SPARSIFICATION ===
+    # Determine edges to keep per node
+    sparsity_mask = np.zeros_like(heuristics_matrix, dtype=bool)
+    
+    # Base connectivity
+    base_edges = max(2, int(1.2 * log_n))
+    max_edges = min(n-1, base_edges * 5)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        # Adaptive edge retention
+        # More edges for structured instances, fewer for uniform
+        if cv > 0.3:
+            n_edges = min(max_edges, int(base_edges * (1.5 + 0.5 * density_factor)))
+        else:
+            n_edges = min(max_edges, int(base_edges * (1.0 + 0.3 * density_factor)))
+        
+        # Keep top edges
+        threshold = np.partition(scores, -n_edges)[-n_edges]
+        sparsity_mask[i, scores >= threshold] = True
+    
+    # Ensure MST edges and symmetry
+    sparsity_mask = sparsity_mask | mst_mask
+    sparsity_mask = sparsity_mask | sparsity_mask.T
+    
+    # Apply sparsification
+    heuristics_matrix = heuristics_matrix * sparsity_mask
+    
+    # === 9. FINAL PROCESSING ===
+    # Final symmetry enforcement
+    heuristics_matrix = 0.5 * (heuristics_matrix + heuristics_matrix.T)
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    # Normalize non-zero elements
+    non_zero = heuristics_matrix[heuristics_matrix > 0]
+    if len(non_zero) > 0:
+        if non_zero.max() > non_zero.min():
+            heuristics_matrix[heuristics_matrix > 0] = (
+                (non_zero - non_zero.min()) / (non_zero.max() - non_zero.min())
+            )
+        else:
+            heuristics_matrix[heuristics_matrix > 0] = 1.0
+    
+    return heuristics_matrix
+```

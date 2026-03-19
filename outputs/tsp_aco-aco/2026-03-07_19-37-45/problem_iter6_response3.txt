@@ -1,0 +1,448 @@
+```json
+{
+    "algorithm_features": ["Distribution-Based Regret", "Greedy Local Search Lookahead", "Adaptive Structural Weighting", "Two-Phase Edge Pruning"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristics with distribution-based regret metrics,
+    greedy local search lookahead, and adaptive structural weighting.
+    
+    Key improvements over v1:
+    1. Distribution-based regret using percentiles and skewness analysis
+    2. Greedy local search (2-opt) in lookahead simulations
+    3. Structural analysis for adaptive parameter selection
+    4. Two-phase edge pruning with connectivity guarantees
+    """
+    
+    def _analyze_instance(distance_matrix: np.ndarray) -> dict:
+        """Analyze TSP instance characteristics for adaptive parameter tuning."""
+        n = distance_matrix.shape[0]
+        mask = ~np.eye(n, dtype=bool)
+        dist_values = distance_matrix[mask]
+        
+        stats = {
+            'n': n,
+            'mean_dist': np.mean(dist_values),
+            'std_dist': np.std(dist_values),
+            'cv_dist': np.std(dist_values) / (np.mean(dist_values) + 1e-12),
+            'min_dist': np.min(dist_values),
+            'max_dist': np.max(dist_values),
+            'skewness': 0.0,
+            'percentiles': {},
+            'density': _estimate_density(distance_matrix),
+            'structure_type': 'mixed'
+        }
+        
+        if len(dist_values) > 0:
+            # Compute distribution characteristics
+            stats['skewness'] = np.mean((dist_values - stats['mean_dist']) ** 3) / (stats['std_dist'] ** 3 + 1e-12)
+            stats['percentiles'] = {
+                'p25': np.percentile(dist_values, 25),
+                'p50': np.percentile(dist_values, 50),
+                'p75': np.percentile(dist_values, 75),
+                'p90': np.percentile(dist_values, 90)
+            }
+            
+            # Classify structure type
+            if stats['cv_dist'] < 0.3:
+                stats['structure_type'] = 'uniform'
+            elif stats['density'] > 3.0:
+                stats['structure_type'] = 'clustered'
+        
+        return stats
+    
+    def _estimate_density(distance_matrix: np.ndarray) -> float:
+        """Estimate point density based on nearest neighbor distances."""
+        n = distance_matrix.shape[0]
+        nn_dists = []
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            nn_dists.append(np.min(dists))
+        
+        avg_nn_dist = np.mean(nn_dists)
+        overall_avg = np.mean(distance_matrix[~np.eye(n, dtype=bool)])
+        density = overall_avg / (avg_nn_dist + 1e-8)
+        return min(max(density, 0.1), 10.0)
+    
+    def _compute_base_scores(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+        """Compute base edge scores including MST contribution and distance normalization."""
+        n = stats['n']
+        
+        # Inverse distance with adaptive power scaling
+        # Use steeper power for uniform instances to emphasize near neighbors
+        if stats['structure_type'] == 'uniform':
+            power = 1.8
+        elif stats['structure_type'] == 'clustered':
+            power = 1.2
+        else:
+            power = 1.5
+        
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(inv_dist, 0)
+        inv_dist_pow = inv_dist ** power
+        
+        # MST contribution
+        mst_scores = np.ones((n, n))
+        if n > 2:
+            try:
+                mst = minimum_spanning_tree(distance_matrix).toarray()
+                mst_present = (mst + mst.T) > 0
+                # Boost edges in MST based on instance characteristics
+                boost_factor = 1.3 if stats['structure_type'] == 'clustered' else 1.5
+                mst_scores[mst_present] = boost_factor
+            except:
+                pass
+        
+        # Combine factors
+        base_scores = inv_dist_pow * mst_scores
+        
+        # Row normalization
+        row_sums = base_scores.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        base_scores = base_scores / row_sums
+        
+        return base_scores
+    
+    def _compute_regret_scores(distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+        """Compute distribution-based regret scores using percentile analysis."""
+        n = stats['n']
+        regret_scores = np.ones((n, n))
+        
+        # Adaptive parameters based on instance characteristics
+        if stats['structure_type'] == 'uniform':
+            # For uniform instances, use multiple percentiles
+            percentiles = [25, 50, 75]
+        elif stats['structure_type'] == 'clustered':
+            # For clustered instances, focus on lower percentiles
+            percentiles = [25, 40, 60]
+        else:
+            percentiles = [30, 50, 70]
+        
+        for i in range(n):
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            
+            # Compute percentile values
+            p_vals = np.percentile(dists, percentiles)
+            
+            # Compute regret for each edge
+            for j in range(n):
+                if i != j:
+                    dist_ij = distance_matrix[i, j]
+                    
+                    # Multi-level regret calculation
+                    regret_components = []
+                    for p_val in p_vals:
+                        if dist_ij > p_val:
+                            regret = (dist_ij - p_val) / (p_val + 1e-12)
+                            penalty = np.exp(-regret)
+                        else:
+                            penalty = 1.0
+                        regret_components.append(penalty)
+                    
+                    # Weight components (more weight to lower percentiles)
+                    weights = [0.5, 0.3, 0.2]
+                    weighted_penalty = sum(w * c for w, c in zip(weights, regret_components))
+                    
+                    # Additional penalty based on distance percentile rank
+                    rank = np.sum(dists < dist_ij) / (n - 1)
+                    rank_penalty = 1.0 - 0.3 * rank  # Penalize edges with high rank
+                    
+                    regret_scores[i, j] = weighted_penalty * rank_penalty
+        
+        # Symmetrize via geometric mean
+        symmetric_regret = np.sqrt(regret_scores * regret_scores.T)
+        np.fill_diagonal(symmetric_regret, 0)
+        
+        # Adjust based on instance skewness
+        if abs(stats['skewness']) > 0.5:
+            # For skewed distributions, emphasize regret more
+            symmetric_regret = symmetric_regret ** 0.8
+        
+        return symmetric_regret
+    
+    def _greedy_tour_construction(start_i: int, start_j: int, distance_matrix: np.ndarray, 
+                                steps: int) -> list:
+        """Construct a greedy tour starting from edge (i,j)."""
+        n = distance_matrix.shape[0]
+        visited = np.zeros(n, dtype=bool)
+        visited[start_i] = visited[start_j] = True
+        
+        tour = [start_i, start_j]
+        current = start_j
+        
+        for _ in range(steps - 2):
+            unvisited = np.where(~visited)[0]
+            if len(unvisited) == 0:
+                break
+            
+            # Greedy: choose nearest unvisited node
+            dists = distance_matrix[current, unvisited]
+            nearest_idx = np.argmin(dists)
+            next_node = unvisited[nearest_idx]
+            
+            tour.append(next_node)
+            visited[next_node] = True
+            current = next_node
+        
+        return tour
+    
+    def _two_opt_improvement(tour: list, distance_matrix: np.ndarray) -> tuple:
+        """Apply 2-opt local search to improve tour."""
+        n_nodes = len(tour)
+        best_tour = tour[:]
+        best_length = sum(distance_matrix[best_tour[i], best_tour[(i+1) % n_nodes]] 
+                         for i in range(n_nodes))
+        
+        improved = True
+        while improved:
+            improved = False
+            for i in range(1, n_nodes - 2):
+                for j in range(i + 2, n_nodes):
+                    if j - i == 1:
+                        continue
+                    
+                    # Calculate gain from 2-opt swap
+                    a1, a2 = best_tour[i-1], best_tour[i]
+                    b1, b2 = best_tour[j-1], best_tour[j]
+                    
+                    old_cost = distance_matrix[a1, a2] + distance_matrix[b1, b2]
+                    new_cost = distance_matrix[a1, b1] + distance_matrix[a2, b2]
+                    
+                    if new_cost < old_cost:
+                        # Perform swap
+                        best_tour[i:j] = best_tour[i:j][::-1]
+                        best_length = best_length - old_cost + new_cost
+                        improved = True
+        
+        return best_tour, best_length
+    
+    def _compute_lookahead_scores(distance_matrix: np.ndarray, stats: dict, 
+                                base_scores: np.ndarray) -> np.ndarray:
+        """Compute lookahead scores with greedy construction and local search."""
+        n = stats['n']
+        lookahead_scores = np.ones((n, n))
+        
+        if n < 4:
+            return lookahead_scores
+        
+        # Determine lookahead depth based on instance size
+        lookahead_depth = min(8, max(4, n // 2))
+        
+        # Select candidate edges for lookahead (top per node)
+        candidate_edges = set()
+        edges_per_node = min(4, n // 2)
+        
+        for i in range(n):
+            scores = base_scores[i].copy()
+            scores[i] = -np.inf
+            top_indices = np.argpartition(-scores, edges_per_node)[:edges_per_node]
+            for j in top_indices:
+                if i < j:
+                    candidate_edges.add((i, j))
+        
+        # Evaluate candidate edges
+        for i, j in candidate_edges:
+            # Construct greedy tour starting from edge (i,j)
+            tour = _greedy_tour_construction(i, j, distance_matrix, lookahead_depth)
+            
+            if len(tour) >= 4:
+                # Apply 2-opt local search
+                improved_tour, tour_length = _two_opt_improvement(tour, distance_matrix)
+                
+                # Calculate expected length (based on average distance)
+                n_edges = len(improved_tour) - 1
+                expected_length = n_edges * stats['mean_dist']
+                
+                # Score = expected / actual (higher is better)
+                score = expected_length / (tour_length + 1e-12)
+                lookahead_scores[i, j] = lookahead_scores[j, i] = min(score, 2.5)
+            else:
+                # Simple scoring for short tours
+                actual_length = sum(distance_matrix[tour[k], tour[k+1]] 
+                                   for k in range(len(tour)-1))
+                expected_length = (len(tour)-1) * stats['mean_dist']
+                score = expected_length / (actual_length + 1e-12)
+                lookahead_scores[i, j] = lookahead_scores[j, i] = min(score, 2.0)
+        
+        return lookahead_scores
+    
+    def _compute_adaptive_weights(stats: dict) -> dict:
+        """Dynamically compute factor weights based on instance characteristics."""
+        n = stats['n']
+        cv = stats['cv_dist']
+        structure_type = stats['structure_type']
+        
+        # Base weights by structure type
+        if structure_type == 'uniform':
+            weights = {'base': 0.5, 'regret': 0.35, 'lookahead': 0.15}
+        elif structure_type == 'clustered':
+            weights = {'base': 0.4, 'regret': 0.4, 'lookahead': 0.2}
+        else:
+            weights = {'base': 0.45, 'regret': 0.4, 'lookahead': 0.15}
+        
+        # Adjust based on instance size
+        if n < 10:
+            weights['lookahead'] *= 1.2
+        elif n > 30:
+            weights['lookahead'] *= 0.7
+        
+        # Adjust based on distance variation
+        if cv > 0.5:
+            weights['regret'] *= 1.2
+            weights['base'] *= 0.9
+        
+        # Normalize
+        total = sum(weights.values())
+        for key in weights:
+            weights[key] /= total
+        
+        return weights
+    
+    def _build_candidate_mask(distance_matrix: np.ndarray, base_scores: np.ndarray, 
+                            stats: dict) -> np.ndarray:
+        """Build mask of candidate edges with two-phase pruning."""
+        n = stats['n']
+        
+        # Phase 1: Distance-based pruning
+        if stats['structure_type'] == 'uniform':
+            threshold = 2.0 * stats['mean_dist']
+        elif stats['structure_type'] == 'clustered':
+            threshold = 1.8 * stats['mean_dist']
+        else:
+            threshold = 2.2 * stats['mean_dist']
+        
+        dist_mask = distance_matrix <= threshold
+        np.fill_diagonal(dist_mask, False)
+        
+        # Phase 2: Top-k pruning per node
+        k = min(10, max(3, n // 2))
+        topk_mask = np.zeros((n, n), dtype=bool)
+        
+        for i in range(n):
+            scores = base_scores[i].copy()
+            scores[i] = -np.inf
+            top_indices = np.argpartition(-scores, k)[:k]
+            topk_mask[i, top_indices] = True
+        
+        # Ensure symmetry
+        topk_mask = topk_mask | topk_mask.T
+        
+        # Combine masks
+        candidate_mask = dist_mask & topk_mask
+        np.fill_diagonal(candidate_mask, False)
+        
+        return candidate_mask
+    
+    def _post_process(H: np.ndarray, distance_matrix: np.ndarray, stats: dict) -> np.ndarray:
+        """Post-process heuristic matrix with connectivity guarantees."""
+        n = stats['n']
+        
+        # Ensure minimum connectivity
+        min_degree = min(4, n - 1)
+        for i in range(n):
+            non_zero = np.where(H[i] > 0)[0]
+            if len(non_zero) < min_degree:
+                # Add nearest neighbors
+                dists = distance_matrix[i].copy()
+                dists[i] = np.inf
+                nearest = np.argsort(dists)[:min_degree]
+                
+                for j in nearest:
+                    if H[i, j] == 0 and i != j:
+                        # Assign score based on inverse distance
+                        H[i, j] = H[j, i] = 1 / (distance_matrix[i, j] + 1e-12)
+        
+        # Final sparsification: keep only significant values
+        if n > 10:
+            non_zero_vals = H[H > 0]
+            if len(non_zero_vals) > 0:
+                # Keep edges in top percentiles
+                if stats['structure_type'] == 'clustered':
+                    threshold = np.percentile(non_zero_vals, 30)  # Keep top 70%
+                else:
+                    threshold = np.percentile(non_zero_vals, 40)  # Keep top 60%
+                H[H < threshold] = 0
+        
+        # Row normalization
+        row_max = H.max(axis=1, keepdims=True)
+        row_max[row_max == 0] = 1
+        H = H / row_max
+        
+        # Ensure symmetry and zero diagonal
+        H = (H + H.T) / 2
+        np.fill_diagonal(H, 0)
+        
+        return H
+    
+    # Main function logic
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.zeros_like(distance_matrix)  # No meaningful heuristics for tiny instances
+    
+    # Step 1: Analyze instance
+    stats = _analyze_instance(distance_matrix)
+    
+    # Step 2: Compute component scores
+    base_scores = _compute_base_scores(distance_matrix, stats)
+    regret_scores = _compute_regret_scores(distance_matrix, stats)
+    lookahead_scores = _compute_lookahead_scores(distance_matrix, stats, base_scores)
+    
+    # Step 3: Determine adaptive weights
+    weights = _compute_adaptive_weights(stats)
+    
+    # Step 4: Build candidate mask
+    candidate_mask = _build_candidate_mask(distance_matrix, base_scores, stats)
+    
+    # Step 5: Combine scores multiplicatively
+    H = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            if candidate_mask[i, j]:
+                combined = (
+                    (base_scores[i, j] ** weights['base']) *
+                    (regret_scores[i, j] ** weights['regret']) *
+                    (lookahead_scores[i, j] ** weights['lookahead'])
+                )
+                H[i, j] = H[j, i] = combined
+    
+    # Step 6: Post-processing
+    H = _post_process(H, distance_matrix, stats)
+    
+    return H
+
+# Example usage and validation
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with different instance sizes
+    for n_cities in [10, 20, 30]:
+        print(f"\n{'='*50}")
+        print(f"Testing with {n_cities} cities")
+        print('='*50)
+        
+        coords = np.random.rand(n_cities, 2) * 100
+        distances = squareform(pdist(coords, 'euclidean'))
+        
+        h_matrix = heuristics_v2(distances)
+        
+        non_zero_edges = np.sum(h_matrix > 0)
+        total_edges = n_cities * (n_cities - 1) / 2
+        avg_degree = 2 * non_zero_edges / n_cities
+        
+        print(f"Non-zero edges: {non_zero_edges:.0f} / {total_edges:.0f} ({non_zero_edges/total_edges:.1%})")
+        print(f"Average degree: {avg_degree:.1f}")
+        print(f"Heuristics range: [{h_matrix[h_matrix>0].min():.3f}, {h_matrix.max():.3f}]")
+        
+        # Check symmetry
+        symmetry_error = np.max(np.abs(h_matrix - h_matrix.T))
+        print(f"Symmetry error: {symmetry_error:.2e}")
+```

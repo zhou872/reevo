@@ -1,0 +1,376 @@
+```json
+{
+    "algorithm_features": ["Distance-Aware Triangle Boosting", "Adaptive Spatial Clustering", "Stochastic Edge Sampling", "Multi-Factor Aggregation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from sklearn.manifold import MDS
+from sklearn.neighbors import KDTree
+import warnings
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic for TSP edge selection with distance-aware triangle boosting,
+    adaptive spatial clustering, and stochastic edge sampling.
+    
+    Returns a matrix of edge promises with the same shape as distance_matrix,
+    where higher values indicate more promising edges.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 3:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = 1 / (distance_matrix + np.eye(n) * 1e-12)
+            np.fill_diagonal(result, 0)
+            return result
+    
+    # Base heuristic: reciprocal of distances (inverse relationship)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        reciprocal_weights = 1 / (distance_matrix + np.eye(n) * 1e-12)
+        np.fill_diagonal(reciprocal_weights, 0)
+    
+    # Factor 1: Spatial clustering with adaptive method selection
+    spatial_promising = _compute_adaptive_spatial_clustering(distance_matrix, n)
+    
+    # Factor 2: Minimum Spanning Tree edges
+    mst_promising = _compute_mst_promises(distance_matrix)
+    
+    # Factor 3: Distance-aware triangle boosting
+    triangle_boost = _compute_distance_aware_triangle_boosting(distance_matrix, n)
+    
+    # Factor 4: Local connectivity statistics
+    local_factors = _compute_local_factors_v2(distance_matrix, n)
+    
+    # Combine factors with adaptive weights
+    heuristics_matrix = _adaptive_factor_combination(
+        reciprocal_weights, spatial_promising, mst_promising,
+        triangle_boost, local_factors, distance_matrix, n
+    )
+    
+    # Stochastic edge sampling with distance-based probability
+    sampled_edges = _stochastic_edge_sampling(heuristics_matrix, distance_matrix, n)
+    
+    # Final normalization and zero diagonal
+    final_heuristics = _final_normalization(sampled_edges, n)
+    
+    return final_heuristics
+
+def _compute_adaptive_spatial_clustering(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute spatial clustering factor with method adaptation based on graph size."""
+    spatial_promising = np.zeros_like(distance_matrix)
+    
+    if n <= 500:  # Adjusted threshold as per long-term suggestion
+        # Use MDS for accurate coordinates when n is manageable
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mds = MDS(
+                n_components=min(3, n-1),
+                dissimilarity='precomputed',
+                random_state=42,
+                n_init=1,
+                max_iter=100
+            )
+            coords = mds.fit_transform(distance_matrix)
+    else:
+        # Use distance-based approximation for large graphs (more efficient)
+        # Select landmarks using farthest point sampling
+        landmarks = min(50, max(5, n // 20))
+        landmark_indices = _farthest_point_sampling(distance_matrix, landmarks)
+        landmark_dists = distance_matrix[landmark_indices]
+        
+        # Approximate coordinates using distance to landmarks
+        coords = np.zeros((n, landmarks))
+        for i in range(n):
+            coords[i] = np.array([distance_matrix[i, idx] for idx in landmark_indices])
+    
+    # Adaptive neighbor selection based on local density
+    for i in range(n):
+        if n <= 500 and 'tree' in locals():
+            # Use KD-tree for accurate nearest neighbors
+            k = max(3, min(int(np.log2(n)) + 2, n - 1))
+            distances, indices = tree.query(coords[i].reshape(1, -1), k=k+1)
+            indices = indices[0][1:] if distances[0][0] == 0 else indices[0][:k]
+        else:
+            # Distance-based approximation for large graphs
+            dists = distance_matrix[i].copy()
+            dists[i] = np.inf
+            
+            # Adaptive k based on local statistics
+            local_mean = np.mean(dists[dists < np.percentile(dists, 20)])
+            threshold = local_mean * 1.5 if local_mean > 0 else np.median(dists)
+            indices = np.where(dists <= threshold)[0]
+            if len(indices) < 3:
+                indices = np.argsort(dists)[:max(3, min(10, n//10))]
+        
+        # Assign promising values based on distance ranking
+        for rank, j in enumerate(indices):
+            spatial_promising[i, j] = 1.0 / (rank + 1)  # Higher rank = higher promise
+    
+    return spatial_promising
+
+def _farthest_point_sampling(distance_matrix: np.ndarray, k: int) -> np.ndarray:
+    """Select k landmarks using farthest point sampling."""
+    n = distance_matrix.shape[0]
+    selected = np.zeros(k, dtype=int)
+    
+    # Start with a random point
+    selected[0] = np.random.randint(0, n)
+    
+    for i in range(1, k):
+        # Compute minimum distance to already selected points
+        min_dists = np.min(distance_matrix[:, selected[:i]], axis=1)
+        # Select the point farthest from all selected points
+        selected[i] = np.argmax(min_dists)
+    
+    return selected
+
+def _compute_mst_promises(distance_matrix: np.ndarray) -> np.ndarray:
+    """Compute promises based on Minimum Spanning Tree edges with enhancements."""
+    n = distance_matrix.shape[0]
+    
+    # Compute MST
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0).astype(float)
+    
+    # Make symmetric
+    mst_promising = mst_edges + mst_edges.T
+    
+    # Add promising edges based on 2-opt neighborhood
+    for i in range(n):
+        # Get distances to all other nodes
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        
+        # Consider k closest neighbors (adaptive k)
+        k = min(5, n - 1)
+        closest_indices = np.argsort(dists)[:k]
+        
+        for j in closest_indices:
+            if mst_promising[i, j] == 0:
+                # Additional promise based on edge length relative to MST edges
+                mst_length = np.sum(distance_matrix[mst_edges > 0]) / np.sum(mst_edges > 0) if np.sum(mst_edges) > 0 else dists[j]
+                edge_ratio = dists[j] / (mst_length + 1e-12)
+                mst_promising[i, j] = np.exp(-edge_ratio) * 0.7
+    
+    return mst_promising
+
+def _compute_distance_aware_triangle_boosting(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Boost edges forming triangles with boost factor inversely proportional to triangle distances."""
+    triangle_boost = np.ones_like(distance_matrix)
+    
+    if n < 1000:  # Compute exact for manageable sizes
+        for i in range(n):
+            for j in range(i+1, n):
+                # Find common neighbors
+                common_neighbors = []
+                triangle_distances = []
+                
+                for k in range(n):
+                    if k != i and k != j:
+                        # Check if triangle exists
+                        if distance_matrix[i, k] < np.inf and distance_matrix[j, k] < np.inf:
+                            common_neighbors.append(k)
+                            triangle_dist = distance_matrix[i, j] + distance_matrix[i, k] + distance_matrix[j, k]
+                            triangle_distances.append(triangle_dist)
+                
+                if common_neighbors:
+                    # Compute boost factor inversely proportional to average triangle distance
+                    avg_triangle_dist = np.mean(triangle_distances)
+                    num_common = len(common_neighbors)
+                    
+                    # Capped boost factor as per long-term suggestion
+                    base_boost = 1.0 / (avg_triangle_dist + 1e-12)
+                    common_boost = 0.2 * min(num_common, 5)
+                    boost = 1.0 + min(base_boost, common_boost)
+                    
+                    triangle_boost[i, j] = triangle_boost[j, i] = boost
+    else:
+        # Approximate for large graphs using sampling
+        sample_size = min(200, n)
+        sampled_nodes = np.random.choice(n, sample_size, replace=False)
+        
+        for i in sampled_nodes:
+            # Find nearest neighbors for node i
+            k = min(20, n-1)
+            i_neighbors = np.argsort(distance_matrix[i])[1:k+1]
+            
+            for j in i_neighbors:
+                if j <= i:
+                    continue
+                    
+                # Sample common neighbors
+                sample_k = min(10, n-2)
+                k_samples = np.random.choice([x for x in range(n) if x != i and x != j], sample_k, replace=False)
+                
+                triangle_distances = []
+                for k in k_samples:
+                    triangle_dist = distance_matrix[i, j] + distance_matrix[i, k] + distance_matrix[j, k]
+                    triangle_distances.append(triangle_dist)
+                
+                if triangle_distances:
+                    avg_triangle_dist = np.mean(triangle_distances)
+                    boost = 1.0 + min(1.0 / (avg_triangle_dist + 1e-12), 0.3)
+                    triangle_boost[i, j] = triangle_boost[j, i] = boost
+    
+    return triangle_boost
+
+def _compute_local_factors_v2(distance_matrix: np.ndarray, n: int) -> np.ndarray:
+    """Compute local connectivity factors with improved statistics."""
+    # Adaptive neighborhood size
+    m = min(10, max(3, n // 20))
+    
+    # Precompute local statistics
+    local_means = np.zeros(n)
+    local_stds = np.zeros(n)
+    
+    for i in range(n):
+        dists = distance_matrix[i].copy()
+        dists[i] = np.inf
+        sorted_dists = np.sort(dists)[:m]
+        local_means[i] = np.mean(sorted_dists)
+        local_stds[i] = np.std(sorted_dists) + 1e-12
+    
+    # Compute local factor matrix using vectorized operations
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Compute statistics for all pairs at once
+    mean_pairs = (local_means[i_idx] + local_means[j_idx]) / 2
+    std_pairs = local_stds[i_idx] + local_stds[j_idx]
+    
+    # Statistic similarity
+    stat_diff = np.abs(local_means[i_idx] - local_means[j_idx])
+    stat_similarity = np.exp(-stat_diff / std_pairs)
+    
+    # Distance ratio
+    dist_vals = distance_matrix[i_idx, j_idx]
+    dist_ratio = dist_vals / (mean_pairs + 1e-12)
+    
+    # Combined factor
+    local_factors_flat = stat_similarity * np.exp(-0.3 * dist_ratio**2)
+    
+    # Create symmetric matrix
+    local_factors = np.ones_like(distance_matrix)
+    local_factors[i_idx, j_idx] = local_factors_flat
+    local_factors[j_idx, i_idx] = local_factors_flat
+    
+    return local_factors
+
+def _adaptive_factor_combination(reciprocal_weights, spatial_promising, mst_promising,
+                                triangle_boost, local_factors, distance_matrix, n):
+    """Combine heuristic factors with adaptive weights based on graph properties."""
+    
+    # Compute graph statistics for weight adaptation
+    avg_distance = np.mean(distance_matrix[np.triu_indices(n, k=1)])
+    distance_variance = np.var(distance_matrix[np.triu_indices(n, k=1)])
+    
+    # Adaptive weights based on graph characteristics
+    if n < 100:
+        # For small graphs, emphasize spatial and MST factors
+        spatial_weight = 1.5
+        mst_weight = 2.0
+        triangle_weight = 1.2
+        local_weight = 1.0
+    elif distance_variance > avg_distance * 0.5:
+        # For graphs with high variance, emphasize local factors and triangle boosting
+        spatial_weight = 1.2
+        mst_weight = 1.5
+        triangle_weight = 1.8
+        local_weight = 1.5
+    else:
+        # Balanced weights for regular graphs
+        spatial_weight = 1.3
+        mst_weight = 1.7
+        triangle_weight = 1.5
+        local_weight = 1.2
+    
+    # Apply weights to factors
+    weighted_spatial = np.where(spatial_promising > 0, 
+                               spatial_weight * spatial_promising, 
+                               0.5)
+    
+    weighted_mst = np.where(mst_promising > 0,
+                           mst_weight * mst_promising,
+                           0.8)
+    
+    # Combine all factors
+    combined = (reciprocal_weights * 
+                weighted_spatial * 
+                weighted_mst * 
+                triangle_boost * 
+                local_factors)
+    
+    # Additional distance-based adjustment
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dist_adjustment = 1 + 0.2 * np.log(1 + 1 / (reciprocal_weights + 1e-12))
+        dist_adjustment = np.nan_to_num(dist_adjustment, nan=1.0, posinf=1.0)
+    
+    combined *= dist_adjustment
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    
+    return combined
+
+def _stochastic_edge_sampling(heuristics_matrix, distance_matrix, n):
+    """Perform stochastic edge sampling based on heuristic values."""
+    if n <= 10:
+        return heuristics_matrix
+    
+    sampled = np.zeros_like(heuristics_matrix)
+    
+    # Determine sampling probability based on heuristic values
+    for i in range(n):
+        row = heuristics_matrix[i].copy()
+        row[i] = 0
+        
+        if np.sum(row) > 0:
+            # Convert heuristic values to probabilities
+            probabilities = row / np.sum(row)
+            
+            # Adaptive number of edges to sample per node
+            base_samples = max(3, int(np.log2(n)) + 2)
+            max_samples = min(n // 3, 20)
+            num_samples = min(base_samples, max_samples)
+            
+            # Stochastic sampling without replacement
+            try:
+                # Use weighted random choice
+                sampled_indices = np.random.choice(n, size=num_samples, 
+                                                   replace=False, p=probabilities)
+            except ValueError:
+                # Fallback to deterministic top-k if probabilities don't sum to 1
+                sampled_indices = np.argsort(row)[-num_samples:]
+            
+            # Assign sampled edges their heuristic values
+            sampled[i, sampled_indices] = heuristics_matrix[i, sampled_indices]
+    
+    # Ensure symmetry by keeping edges sampled by at least one endpoint
+    sampled = np.maximum(sampled, sampled.T)
+    
+    # Add back some essential edges (MST edges)
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_edges = (mst.toarray() > 0)
+    sampled[mst_edges] = np.maximum(sampled[mst_edges], heuristics_matrix[mst_edges])
+    
+    return sampled
+
+def _final_normalization(heuristics_matrix, n):
+    """Apply final normalization and cleanup."""
+    # Zero out diagonal
+    result = heuristics_matrix.copy()
+    np.fill_diagonal(result, 0)
+    
+    # Normalize to [0, 1] range
+    max_val = np.max(result)
+    if max_val > 0:
+        result = result / max_val
+    
+    # Small epsilon to avoid exact zeros for sampled edges
+    result[result > 0] += 1e-8
+    
+    return result
+```

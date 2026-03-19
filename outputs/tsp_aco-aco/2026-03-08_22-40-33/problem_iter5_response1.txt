@@ -1,0 +1,217 @@
+```json
+{
+    "algorithm_features": ["Two-Hop Efficiency Scoring", "Mutual K-NN Prioritization", "Distance Inverse Weighting", "Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial.distance import squareform, pdist
+from typing import Optional
+
+def heuristics_v2(distance_matrix: np.ndarray, 
+                  k_neighbors: Optional[int] = None,
+                  sparsity_factor: float = 0.3) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization using mutual K-NN
+    and two-hop lookahead efficiency.
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        k_neighbors: Number of nearest neighbors to consider (default: sqrt(n))
+        sparsity_factor: Fraction of weakest edges to zero out (0.0 to 1.0)
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values indicating
+        more promising edges. Diagonal is zero.
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # Set default k_neighbors
+    if k_neighbors is None:
+        k_neighbors = max(2, min(8, int(np.sqrt(n))))
+    k_neighbors = min(k_neighbors, n - 1)
+    
+    # === 1. BASE INVERSE DISTANCE WEIGHTING ===
+    # Use soft inverse to avoid extreme values
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Add small epsilon to diagonal to avoid division by zero
+        eps = np.finfo(distance_matrix.dtype).eps * 10
+        inv_dist = 1.0 / (distance_matrix + eps * np.eye(n))
+    np.fill_diagonal(inv_dist, 0)
+    
+    # Normalize inverse distances to [0, 1] range
+    max_inv = inv_dist.max()
+    if max_inv > 0:
+        inv_dist = inv_dist / max_inv
+    
+    # === 2. MUTUAL K-NN PRIORITIZATION ===
+    # Get k-nearest neighbors for each node (excluding self)
+    nearest_indices = np.argsort(distance_matrix, axis=1)[:, 1:k_neighbors+1]
+    
+    # Create k-NN adjacency matrix
+    knn_adjacency = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        knn_adjacency[i, nearest_indices[i]] = True
+    
+    # Mutual K-NN: both nodes are in each other's k-nearest neighbors
+    mutual_knn = knn_adjacency & knn_adjacency.T
+    
+    # One-way K-NN: only one node is in the other's k-nearest neighbors
+    oneway_knn = knn_adjacency ^ mutual_knn  # XOR to get non-mutual edges
+    
+    # === 3. TWO-HOP LOOKAHEAD EFFICIENCY SCORING ===
+    efficiency_score = np.ones((n, n))
+    
+    for i in range(n):
+        # Get i's nearest neighbors (excluding i itself)
+        i_neighbors = nearest_indices[i]
+        
+        for j in range(i + 1, n):
+            direct_dist = distance_matrix[i, j]
+            
+            if direct_dist <= 0:
+                efficiency_score[i, j] = efficiency_score[j, i] = 1.0
+                continue
+            
+            # Get j's nearest neighbors (excluding j itself)
+            j_neighbors = nearest_indices[j]
+            
+            # Consider two-hop paths through common neighbors
+            common_neighbors = np.intersect1d(i_neighbors, j_neighbors)
+            # Also consider neighbors of neighbors
+            all_candidates = np.union1d(i_neighbors, j_neighbors)
+            all_candidates = all_candidates[all_candidates != i]
+            all_candidates = all_candidates[all_candidates != j]
+            
+            best_alternative = np.inf
+            
+            # Check two-hop paths through common neighbors
+            for k in common_neighbors:
+                alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                if alt_dist < best_alternative:
+                    best_alternative = alt_dist
+            
+            # Check two-hop paths through any candidate
+            for k in all_candidates:
+                alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                if alt_dist < best_alternative:
+                    best_alternative = alt_dist
+            
+            # If we found a viable alternative path
+            if best_alternative < np.inf:
+                # Calculate efficiency ratio: alternative / direct
+                efficiency_ratio = best_alternative / direct_dist
+                
+                # Convert to score: higher means direct edge is more efficient
+                # Clip to reasonable range and transform to favor efficient edges
+                if efficiency_ratio >= 1.0:
+                    # Direct edge is better than alternative
+                    score = min(2.0, efficiency_ratio)
+                else:
+                    # Direct edge is worse than alternative (unusual but possible)
+                    score = max(0.1, efficiency_ratio)
+                
+                efficiency_score[i, j] = efficiency_score[j, i] = score
+    
+    # === 4. COMBINE ALL FACTORS ===
+    heuristics = inv_dist.copy()
+    
+    # Apply efficiency scoring
+    heuristics *= efficiency_score
+    
+    # Boost mutual K-NN edges
+    heuristics[mutual_knn] *= 1.5
+    
+    # Slight boost for one-way K-NN edges
+    heuristics[oneway_knn] *= 1.2
+    
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # === 5. ADAPTIVE SPARSIFICATION ===
+    if sparsity_factor > 0 and n > 3:
+        # Calculate threshold based on sparsity_factor
+        # We'll zero out the weakest edges for each node
+        
+        for i in range(n):
+            # Get all candidate edges from node i (excluding self)
+            row_values = heuristics[i].copy()
+            row_values[i] = -np.inf  # Ignore diagonal
+            
+            # Calculate how many edges to keep
+            keep_count = max(k_neighbors, int((1 - sparsity_factor) * (n - 1)))
+            keep_count = min(keep_count, n - 1)
+            
+            if keep_count < n - 1:
+                # Find threshold for top keep_count edges
+                threshold = np.partition(row_values, -keep_count)[-keep_count]
+                
+                # Zero out edges below threshold
+                mask = row_values < threshold
+                heuristics[i, mask] = 0
+        
+        # Ensure symmetry after sparsification
+        # Use element-wise minimum to be conservative
+        symmetric_heuristics = np.minimum(heuristics, heuristics.T)
+        
+        # But keep edges that are strong in at least one direction
+        # (this prevents losing potentially good asymmetric edges)
+        strong_mask = (heuristics > 0) | (heuristics.T > 0)
+        heuristics = np.where(strong_mask, 
+                              np.maximum(heuristics, heuristics.T),
+                              symmetric_heuristics)
+    
+    # === 6. FINAL NORMALIZATION ===
+    # Normalize non-zero values to [0, 1] range
+    non_zero_mask = heuristics > 0
+    if np.any(non_zero_mask):
+        max_val = heuristics[non_zero_mask].max()
+        if max_val > 0:
+            heuristics[non_zero_mask] = heuristics[non_zero_mask] / max_val
+    
+    # Final zero diagonal
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+
+
+# Example usage and test
+if __name__ == "__main__":
+    # Generate a test instance
+    np.random.seed(42)
+    n_nodes = 20
+    coords = np.random.rand(n_nodes, 2) * 100
+    dist_matrix = squareform(pdist(coords))
+    
+    # Compute heuristics
+    heuristics = heuristics_v2(dist_matrix.copy(), k_neighbors=5, sparsity_factor=0.3)
+    
+    # Print statistics
+    print(f"Original distance matrix shape: {dist_matrix.shape}")
+    print(f"Heuristics matrix shape: {heuristics.shape}")
+    print(f"Sparsity: {(heuristics == 0).sum() / heuristics.size:.1%}")
+    
+    # Count edges per node
+    non_zero_edges = np.sum(heuristics > 0, axis=1)
+    print(f"Non-zero edges per node: min={non_zero_edges.min()}, max={non_zero_edges.max()}, mean={non_zero_edges.mean():.1f}")
+    
+    # Verify symmetry
+    is_symmetric = np.allclose(heuristics, heuristics.T)
+    print(f"\nMatrix is symmetric: {is_symmetric}")
+    
+    # Sample edge scores
+    print("\nSample edge scores (i, j, distance, heuristic):")
+    for i, j in [(0, 1), (0, 5), (2, 8), (3, 7), (10, 15)]:
+        if i < n_nodes and j < n_nodes:
+            print(f"({i}, {j}): dist={dist_matrix[i, j]:.2f}, heuristic={heuristics[i, j]:.4f}")
+```

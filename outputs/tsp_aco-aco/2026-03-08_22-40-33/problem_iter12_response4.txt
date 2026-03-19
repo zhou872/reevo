@@ -1,0 +1,402 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Regret Estimation", "Adaptive Density-Aware Parameterization", "Spatial Clustering with Connectivity Constraints", "Three-tier Edge Prioritization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+from sklearn.cluster import AgglomerativeClustering
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge heuristic with multi-hop regret estimation, adaptive instance-aware
+    parameterization, spatial clustering, and three-tier edge prioritization for stochastic
+    solution sampling.
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input, normalized to [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n < 2:
+        return np.zeros_like(distance_matrix)
+    if n == 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. ADVANCED INSTANCE CHARACTERIZATION ===
+    # Extract distance distribution features
+    distances_flat = distance_matrix[np.triu_indices(n, 1)]
+    if len(distances_flat) == 0:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # Compute comprehensive statistics
+    mean_dist = np.mean(distances_flat)
+    median_dist = np.median(distances_flat)
+    std_dist = np.std(distances_flat)
+    q10, q25, q75, q90 = np.percentile(distances_flat, [10, 25, 75, 90])
+    iqr = q75 - q25
+    
+    # Density and skewness measures
+    density_ratio = iqr / (median_dist + 1e-12)
+    skewness = (mean_dist - median_dist) / (std_dist + 1e-12)
+    
+    # === 2. ADAPTIVE PARAMETER OPTIMIZATION ===
+    # Base KNN size: increases with instance density and decreases with skewness
+    base_k = max(3, min(15, int(8 + 4 * (1 - min(density_ratio, 2.0)/2.0) - 2 * abs(skewness))))
+    k = min(base_k, n - 1)
+    
+    # Multi-hop regret depth: adaptive based on instance size and density
+    if n < 20:
+        regret_depth = 2
+        max_hops = 2
+    elif n < 50:
+        regret_depth = 3 if density_ratio > 0.8 else 2
+        max_hops = 3
+    else:
+        regret_depth = 3
+        max_hops = min(4, int(3 + (n - 50) / 100))
+    
+    # Clustering parameters
+    cluster_std_threshold = median_dist * (1.0 + 0.5 * density_ratio)
+    
+    # === 3. ENHANCED SPATIAL CLUSTERING ===
+    cluster_labels = np.zeros(n, dtype=int)
+    cluster_centers = {}
+    cluster_diameters = {}
+    
+    if n >= 10:
+        # Use hierarchical clustering for better spatial grouping
+        clustering = AgglomerativeClustering(
+            n_clusters=min(10, max(2, n // 10)),
+            metric='precomputed',
+            linkage='average'
+        )
+        cluster_labels = clustering.fit_predict(distance_matrix)
+        
+        # Compute cluster statistics
+        for cluster_id in np.unique(cluster_labels):
+            mask = cluster_labels == cluster_id
+            if np.sum(mask) > 1:
+                # Cluster center approximation (node closest to mean position)
+                cluster_dists = distance_matrix[mask][:, mask]
+                centrality = np.sum(cluster_dists, axis=1)
+                center_idx = np.where(mask)[0][np.argmin(centrality)]
+                cluster_centers[cluster_id] = center_idx
+                
+                # Cluster diameter (maximum intra-cluster distance)
+                cluster_diameters[cluster_id] = np.max(cluster_dists)
+            else:
+                cluster_centers[cluster_id] = np.where(mask)[0][0]
+                cluster_diameters[cluster_id] = 0
+    
+    # === 4. MULTI-HOP REGRET ESTIMATION ===
+    # Precompute sorted neighbors for efficient lookup
+    sorted_neighbors = np.argsort(distance_matrix, axis=1)
+    
+    # Initialize regret scores
+    regret_scores = np.ones((n, n))
+    
+    def compute_multi_hop_regret(i: int, j: int, max_depth: int) -> float:
+        """Compute minimum alternative path cost using up to max_depth hops."""
+        direct_cost = distance_matrix[i, j]
+        if direct_cost == 0:
+            return np.inf
+        
+        best_alternative = np.inf
+        visited = set([i, j])
+        
+        # Recursive depth-limited search
+        def dfs(current: int, remaining_hops: int, current_cost: float, path: list):
+            nonlocal best_alternative
+            
+            if current_cost >= best_alternative:
+                return
+            
+            if remaining_hops == 0:
+                if current == j and len(path) > 1:
+                    best_alternative = min(best_alternative, current_cost)
+                return
+            
+            # Explore promising neighbors
+            for neighbor in sorted_neighbors[current, :min(k*2, n)]:
+                if neighbor in visited:
+                    continue
+                
+                new_cost = current_cost + distance_matrix[current, neighbor]
+                if new_cost >= best_alternative:
+                    continue
+                
+                visited.add(neighbor)
+                dfs(neighbor, remaining_hops - 1, new_cost, path + [neighbor])
+                visited.remove(neighbor)
+        
+        # Try different path lengths
+        for start_neighbor in sorted_neighbors[i, 1:min(k, n)]:
+            if start_neighbor == j:
+                continue
+            
+            initial_cost = distance_matrix[i, start_neighbor]
+            if initial_cost >= direct_cost * 1.5:  # Early pruning
+                continue
+            
+            visited = set([i, j, start_neighbor])
+            dfs(start_neighbor, max_depth - 1, initial_cost, [start_neighbor])
+        
+        return best_alternative
+    
+    # Compute regret scores for each edge (efficient sampling for large instances)
+    edge_sample_size = min(n * (n - 1) // 2, 1000) if n > 30 else n * (n - 1) // 2
+    if n > 30:
+        # Sample edges for regret computation
+        rng = np.random.default_rng(42)
+        sampled_pairs = rng.choice(n * (n - 1) // 2, size=edge_sample_size, replace=False)
+        
+        # Convert flat indices to matrix indices
+        triu_indices = np.triu_indices(n, 1)
+        sampled_i = triu_indices[0][sampled_pairs]
+        sampled_j = triu_indices[1][sampled_pairs]
+    else:
+        # Compute for all edges
+        sampled_i, sampled_j = np.triu_indices(n, 1)
+    
+    # Parallel regret computation (vectorized where possible)
+    for idx in range(len(sampled_i)):
+        i, j = sampled_i[idx], sampled_j[idx]
+        best_alternative = compute_multi_hop_regret(i, j, regret_depth)
+        
+        if best_alternative < np.inf:
+            ratio = best_alternative / distance_matrix[i, j]
+            # Non-linear transformation emphasizing good alternatives
+            if ratio > 2.0:
+                score = 0.3
+            elif ratio > 1.5:
+                score = 0.5 + 0.2 * (2.0 - ratio) / 0.5
+            elif ratio > 1.0:
+                score = 0.7 + 0.3 * (1.5 - ratio) / 0.5
+            else:
+                score = 1.0 + 0.5 * (1.0 - ratio)
+            
+            regret_scores[i, j] = regret_scores[j, i] = np.clip(score, 0.1, 1.5)
+    
+    # === 5. THREE-TIER EDGE PRIORITIZATION ===
+    # Tier 1: Intra-cluster connectivity
+    cluster_scores = np.ones((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cluster_labels[i] == cluster_labels[j]:
+                # Same cluster: boost short edges, penalize long ones
+                cluster_diameter = cluster_diameters.get(cluster_labels[i], median_dist)
+                rel_dist = distance_matrix[i, j] / (cluster_diameter + 1e-12)
+                if rel_dist < 0.5:
+                    cluster_scores[i, j] = cluster_scores[j, i] = 1.4
+                elif rel_dist < 1.0:
+                    cluster_scores[i, j] = cluster_scores[j, i] = 1.1
+                else:
+                    cluster_scores[i, j] = cluster_scores[j, i] = 0.8
+            else:
+                # Different clusters: assess inter-cluster connectivity
+                center_i = cluster_centers.get(cluster_labels[i], i)
+                center_j = cluster_centers.get(cluster_labels[j], j)
+                cluster_dist = distance_matrix[center_i, center_j]
+                
+                if distance_matrix[i, j] < cluster_dist * 1.2:
+                    # Good inter-cluster connection
+                    cluster_scores[i, j] = cluster_scores[j, i] = 1.2
+                else:
+                    cluster_scores[i, j] = cluster_scores[j, i] = 0.9
+    
+    # Tier 2: Reciprocal proximity with distance-weighted ranking
+    ranks = np.argsort(np.argsort(distance_matrix, axis=1), axis=1)
+    
+    # Adaptive rank penalty based on instance density
+    rank_penalty = 0.3 + 0.4 * min(density_ratio, 1.5)
+    rank_weight = 1.0 / (1.0 + rank_penalty * ranks)
+    
+    # Mutual neighborhood detection with distance validation
+    mutual_topk = (ranks < k) & (ranks.T < k)
+    proximity_scores = np.sqrt(rank_weight * rank_weight.T)
+    proximity_scores[mutual_topk] *= 1.5
+    
+    # Tier 3: Minimum Spanning Tree preservation
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    
+    # === 6. INTEGRATED SCORING WITH ADAPTIVE WEIGHTS ===
+    # Dynamic weighting based on instance characteristics
+    if density_ratio > 1.2:  # Clustered instance
+        cluster_weight = 1.3
+        regret_weight = 0.9
+        proximity_weight = 1.1
+    elif density_ratio < 0.8:  # Uniform instance
+        cluster_weight = 0.8
+        regret_weight = 1.2
+        proximity_weight = 1.2
+    else:  # Mixed instance
+        cluster_weight = 1.0
+        regret_weight = 1.0
+        proximity_weight = 1.0
+    
+    # Combine scores with adaptive weights
+    heuristic_matrix = (
+        proximity_scores ** proximity_weight *
+        regret_scores ** regret_weight *
+        cluster_scores ** cluster_weight
+    )
+    
+    # Boost MST edges
+    heuristic_matrix[mst_mask] *= 1.4
+    
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    # === 7. CONNECTIVITY-AWARE SPARSIFICATION ===
+    # Preserve critical edges
+    preserve_mask = mst_mask | mutual_topk
+    
+    # Identify bridge edges between clusters
+    if len(cluster_centers) > 1:
+        for cluster_i in cluster_centers.values():
+            for cluster_j in cluster_centers.values():
+                if cluster_i < cluster_j:
+                    # Find best connection between clusters
+                    mask_i = cluster_labels == cluster_labels[cluster_i]
+                    mask_j = cluster_labels == cluster_labels[cluster_j]
+                    inter_distances = distance_matrix[mask_i][:, mask_j]
+                    if inter_distances.size > 0:
+                        min_idx = np.unravel_index(np.argmin(inter_distances), inter_distances.shape)
+                        node_i = np.where(mask_i)[0][min_idx[0]]
+                        node_j = np.where(mask_j)[0][min_idx[1]]
+                        preserve_mask[node_i, node_j] = preserve_mask[node_j, node_i] = True
+    
+    # Adaptive per-node edge retention
+    for i in range(n):
+        row_scores = heuristic_matrix[i].copy()
+        row_scores[i] = -np.inf
+        
+        # Compute target edges based on node's role
+        is_cluster_center = i in cluster_centers.values()
+        target_edges = k + 2 if is_cluster_center else k
+        
+        # Count already preserved edges
+        preserved_count = np.sum(preserve_mask[i])
+        
+        if preserved_count < target_edges:
+            # Add top non-preserved edges
+            non_preserved = ~preserve_mask[i]
+            non_preserved[i] = False
+            available_scores = row_scores[non_preserved]
+            
+            if len(available_scores) > 0:
+                needed = target_edges - preserved_count
+                if needed > 0:
+                    threshold = np.partition(available_scores, -needed)[-needed]
+                    add_mask = (row_scores >= threshold) & non_preserved
+                    preserve_mask[i] = preserve_mask[i] | add_mask
+                    preserve_mask[:, i] = preserve_mask[:, i] | add_mask
+        
+        # Zero out non-preserved edges
+        non_preserved = ~preserve_mask[i]
+        non_preserved[i] = False  # Keep diagonal zero
+        heuristic_matrix[i, non_preserved] = 0
+    
+    # Ensure symmetry
+    heuristic_matrix = np.maximum(heuristic_matrix, heuristic_matrix.T)
+    
+    # === 8. FINAL REFINEMENT AND NORMALIZATION ===
+    # Smooth extreme values
+    non_zero = heuristic_matrix > 0
+    if np.any(non_zero):
+        median_val = np.median(heuristic_matrix[non_zero])
+        heuristic_matrix[non_zero] = np.minimum(
+            heuristic_matrix[non_zero],
+            median_val * 3.0
+        )
+        
+        # Normalize to [0, 1]
+        min_val = np.min(heuristic_matrix[non_zero])
+        max_val = np.max(heuristic_matrix[non_zero])
+        if max_val > min_val:
+            heuristic_matrix[non_zero] = (
+                (heuristic_matrix[non_zero] - min_val) / (max_val - min_val)
+            )
+    
+    np.fill_diagonal(heuristic_matrix, 0)
+    
+    return heuristic_matrix
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    # Test with various instance types
+    for instance_type in ["uniform", "clustered", "mixed", "line"]:
+        if instance_type == "uniform":
+            n = 50
+            coords = np.random.rand(n, 2) * 100
+        elif instance_type == "clustered":
+            n = 50
+            coords = np.zeros((n, 2))
+            cluster_sizes = [15, 15, 10, 10]
+            cluster_centers = [[20, 20], [70, 70], [30, 70], [70, 30]]
+            idx = 0
+            for size, center in zip(cluster_sizes, cluster_centers):
+                coords[idx:idx+size] = np.random.randn(size, 2) * 5 + center
+                idx += size
+        elif instance_type == "mixed":
+            n = 50
+            coords = np.zeros((n, 2))
+            # Dense cluster
+            coords[:20] = np.random.randn(20, 2) * 3 + [30, 30]
+            # Sparse cluster
+            coords[20:35] = np.random.randn(15, 2) * 10 + [60, 60]
+            # Uniform background
+            coords[35:] = np.random.rand(15, 2) * 100
+        else:  # line (structured)
+            n = 50
+            t = np.linspace(0, 100, n)
+            coords = np.column_stack([t, 10 * np.sin(t / 10)])
+            coords += np.random.randn(n, 2) * 2  # Add slight noise
+        
+        dist_matrix = squareform(pdist(coords))
+        heuristics = heuristics_v2(dist_matrix)
+        
+        print(f"\n=== {instance_type.upper()} Instance (n={n}) ===")
+        print(f"Non-zero entries: {np.sum(heuristics > 0)} / {n*n} ({np.sum(heuristics > 0)/(n*n):.1%})")
+        
+        edges_per_node = np.sum(heuristics > 0, axis=1)
+        print(f"Edges per node: min={edges_per_node.min()}, max={edges_per_node.max()}, mean={edges_per_node.mean():.1f}")
+        
+        # Check connectivity
+        component_count = 0
+        visited = set()
+        for i in range(n):
+            if i not in visited:
+                component_count += 1
+                # BFS to find connected component
+                stack = [i]
+                while stack:
+                    node = stack.pop()
+                    if node not in visited:
+                        visited.add(node)
+                        neighbors = np.where(heuristics[node] > 0)[0]
+                        stack.extend([n for n in neighbors if n not in visited])
+        
+        print(f"Connected components: {component_count}")
+        
+        # Sample edge scores
+        print("Sample edge scores (i, j, distance, heuristic):")
+        sample_pairs = [(0, 1), (0, 20), (10, 30), (25, 45)]
+        for i, j in sample_pairs:
+            if i < n and j < n:
+                print(f"  ({i:2d}, {j:2d}): dist={dist_matrix[i, j]:7.2f}, score={heuristics[i, j]:.4f}")
+```

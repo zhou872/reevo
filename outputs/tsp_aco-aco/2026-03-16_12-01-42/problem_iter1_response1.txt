@@ -1,0 +1,135 @@
+```json
+{
+    "algorithm_features": ["Distance Inverse Weighting", "Nearest Neighbor Sparsification", "Edge Density Penalty", "Two-Hop Connectivity Bonus"]
+}
+```
+
+```python
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.ndimage import convolve
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristics for TSP edge prioritization combining multiple factors:
+    1. Inverse distance weighting (baseline)
+    2. Nearest neighbor sparsification
+    3. Edge density penalty to avoid cluster formation
+    4. Two-hop connectivity bonus for promising paths
+    
+    Returns a matrix of the same shape as input where higher values indicate
+    more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        # Simple case: use inverse distance directly
+        heuristics = 1 / (distance_matrix + np.eye(n) * 1e-10)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # 1. Base inverse distance weighting
+    safe_dist = distance_matrix + np.eye(n) * 1e-10  # Avoid division by zero
+    base_heuristics = 1 / safe_dist
+    
+    # 2. Nearest neighbor sparsification
+    # Keep only top k connections per node based on inverse distance
+    k = min(10, max(3, int(np.log2(n)) * 2))  # Adaptive k based on problem size
+    top_k_mask = np.zeros_like(base_heuristics, dtype=bool)
+    
+    for i in range(n):
+        # Get indices of top k inverse distances (excluding self)
+        row = base_heuristics[i].copy()
+        row[i] = -np.inf  # Exclude diagonal
+        top_indices = np.argpartition(row, -k)[-k:]
+        top_k_mask[i, top_indices] = True
+    
+    # Make mask symmetric (if i->j is in top k, j->i should also be considered)
+    symmetric_mask = top_k_mask | top_k_mask.T
+    
+    # 3. Edge density penalty
+    # Calculate local density around each node
+    density_penalty = np.zeros((n, n))
+    
+    # Use KDTree for efficient nearest neighbor search
+    if n > 10:
+        # Create approximate coordinates from distance matrix using MDS
+        from sklearn.manifold import MDS
+        mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+        try:
+            coords = mds.fit_transform(distance_matrix)
+            tree = KDTree(coords)
+            
+            # For each node, find its m nearest neighbors
+            m = min(8, n - 1)
+            for i in range(n):
+                # Get distances to m nearest neighbors
+                dists, indices = tree.query(coords[i].reshape(1, -1), k=m+1)
+                dists = dists[0][1:]  # Exclude self
+                indices = indices[0][1:]
+                
+                # Penalize edges between nodes with many close neighbors
+                for idx in indices:
+                    if i != idx:
+                        # Higher penalty if both nodes have many close neighbors
+                        local_density_i = np.mean(dists[:min(3, len(dists))])
+                        local_density_j = np.mean(
+                            [np.linalg.norm(coords[idx] - coords[nbr]) 
+                             for nbr in indices[:min(3, len(indices))] if nbr != idx]
+                        )
+                        density_penalty[i, idx] = (local_density_i + local_density_j) / 2
+        except:
+            # Fallback if MDS fails
+            density_penalty = np.ones((n, n))
+    
+    # Normalize density penalty
+    if np.max(density_penalty) > 0:
+        density_penalty = density_penalty / np.max(density_penalty)
+    
+    # 4. Two-hop connectivity bonus
+    two_hop_bonus = np.zeros((n, n))
+    
+    # Compute potential savings from two-hop paths
+    for i in range(n):
+        for j in range(i + 1, n):
+            if symmetric_mask[i, j]:
+                # Find best intermediate node k that creates triangle i-k-j
+                potential_savings = []
+                for k in range(n):
+                    if k != i and k != j:
+                        # Savings if we go i-k-j instead of direct i-j
+                        detour_cost = distance_matrix[i, k] + distance_matrix[k, j]
+                        direct_cost = distance_matrix[i, j]
+                        if detour_cost < direct_cost:
+                            savings = direct_cost - detour_cost
+                            potential_savings.append(savings)
+                
+                if potential_savings:
+                    two_hop_bonus[i, j] = np.max(potential_savings)
+                    two_hop_bonus[j, i] = two_hop_bonus[i, j]
+    
+    # Normalize two-hop bonus
+    if np.max(two_hop_bonus) > 0:
+        two_hop_bonus = two_hop_bonus / np.max(two_hop_bonus)
+    
+    # Combine all factors
+    heuristics = base_heuristics.copy()
+    
+    # Apply sparsification mask
+    heuristics[~symmetric_mask] = 0
+    
+    # Apply density penalty (reduce score for dense regions)
+    heuristics *= (1 - density_penalty * 0.3)  # 30% max penalty
+    
+    # Add two-hop bonus (boost score for promising detours)
+    heuristics += two_hop_bonus * 0.5 * np.max(base_heuristics)
+    
+    # Normalize to have similar scale as v1
+    if np.max(heuristics) > 0:
+        scale_factor = np.median(base_heuristics[base_heuristics > 0]) / np.median(heuristics[heuristics > 0])
+        heuristics *= scale_factor
+    
+    # Ensure diagonal is zero
+    np.fill_diagonal(heuristics, 0)
+    
+    return heuristics
+```

@@ -1,0 +1,313 @@
+```json
+{
+    "algorithm_features": ["Rank-based Exponential Distance Weighting", "Local-Regret Normalized Penalty", "Kernel Density Spatial Scoring", "Centrality-Aware Edge Prioritization"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import pdist, squareform
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced TSP edge heuristics with refined regret modeling, geometric centrality 
+    scoring, adaptive kernel density estimation, and dynamic candidate selection.
+    
+    Core Innovations:
+    1. Centrality-Regret Integration: Combines graph centrality with local regret penalties
+    2. Adaptive Kernel Bandwidth: Automatically tunes spatial analysis based on instance geometry
+    3. Multi-Scale Rank Weighting: Hierarchical rank-based scoring with distance variance awareness
+    4. Geometric Connectivity Preservation: Ensures graph connectivity while maintaining sparsity
+    
+    Parameters:
+    -----------
+    distance_matrix : np.ndarray
+        Square symmetric matrix of pairwise distances between nodes
+        
+    Returns:
+    --------
+    np.ndarray
+        Heuristic matrix with edge priority scores in [0, 1] range
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        # Trivial cases
+        heuristics = np.ones_like(distance_matrix)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # Safe distance matrix
+    dmat = distance_matrix.copy()
+    np.fill_diagonal(dmat, np.inf)
+    eps = 1e-12
+    
+    # ========== INSTANCE CHARACTERIZATION ==========
+    flat_dist = dmat[np.isfinite(dmat)]
+    if len(flat_dist) == 0:
+        return np.zeros_like(distance_matrix)
+    
+    dist_mean = np.mean(flat_dist)
+    dist_std = np.std(flat_dist)
+    dist_q25, dist_q75 = np.percentile(flat_dist, [25, 75])
+    iqr = dist_q75 - dist_q25
+    
+    # Instance classification
+    uniformity = dist_std / (dist_mean + eps)
+    is_uniform = uniformity < 0.3
+    is_clustered = iqr / (dist_mean + eps) > 0.5
+    
+    # ========== ADAPTIVE PARAMETERS ==========
+    # Candidate list size: scales sublinearly with n
+    k_candidate = max(4, int(np.sqrt(n) * 2))
+    
+    # Bandwidth parameter for density estimation
+    k_bandwidth = min(8, n - 1)
+    
+    # ========== GEOMETRIC CENTRALITY SCORES ==========
+    # Modified closeness centrality: inverse of average distance to k-nearest neighbors
+    centrality = np.zeros(n)
+    for i in range(n):
+        # Get distances to all other nodes
+        dists = dmat[i]
+        # Sort and take k-nearest (excluding self)
+        sorted_dists = np.sort(dists[dists < np.inf])
+        if len(sorted_dists) > 0:
+            k = min(k_bandwidth, len(sorted_dists))
+            avg_near_dist = np.mean(sorted_dists[:k])
+            centrality[i] = 1.0 / (avg_near_dist + eps)
+    
+    # Normalize centrality scores
+    if np.max(centrality) > 0:
+        centrality = centrality / np.max(centrality)
+    
+    # ========== ADAPTIVE REGRET PENALTY ==========
+    regret_matrix = np.zeros_like(dmat)
+    
+    # Precompute sorted distances for efficiency
+    sorted_indices = np.argsort(dmat, axis=1)
+    sorted_dists = np.take_along_axis(dmat, sorted_indices, axis=1)
+    
+    for i in range(n):
+        # Get valid distances (excluding self)
+        valid_mask = sorted_dists[i] < np.inf
+        if not np.any(valid_mask):
+            continue
+            
+        valid_dists = sorted_dists[i, valid_mask]
+        
+        # Dynamic thresholds based on distance distribution
+        best_dist = valid_dists[0]
+        
+        # Use percentiles for robust alternative distance
+        if len(valid_dists) >= 5:
+            alt_idx = min(len(valid_dists) // 4, len(valid_dists) - 1)
+            alt_dist = valid_dists[alt_idx]
+        else:
+            alt_dist = valid_dists[-1] if len(valid_dists) > 1 else best_dist
+        
+        # For each potential edge from i
+        for rank, j in enumerate(sorted_indices[i]):
+            if i == j or dmat[i, j] >= np.inf:
+                continue
+            
+            edge_dist = dmat[i, j]
+            
+            # Compute normalized regret
+            if edge_dist <= alt_dist:
+                # Within competitive range: mild penalty
+                if alt_dist - best_dist > eps:
+                    regret = (edge_dist - best_dist) / (alt_dist - best_dist + eps)
+                else:
+                    regret = 0.0
+            else:
+                # Outside competitive range: stronger penalty
+                max_dist = np.max(valid_dists)
+                regret = 0.5 + 0.5 * (edge_dist - alt_dist) / (max_dist - alt_dist + eps)
+            
+            # Incorporate centrality: central nodes can tolerate more regret
+            centrality_factor = 0.5 + 0.5 * centrality[i]
+            regret_matrix[i, j] = regret * centrality_factor
+    
+    # Symmetrize regret
+    regret_matrix = np.maximum(regret_matrix, regret_matrix.T)
+    
+    # ========== MULTI-SCALE RANK WEIGHTING ==========
+    rank_weights = np.zeros_like(dmat)
+    
+    for i in range(n):
+        # Get all distances from i
+        dists = dmat[i]
+        valid_mask = dists < np.inf
+        if not np.any(valid_mask):
+            continue
+        
+        valid_dists = dists[valid_mask]
+        
+        # Adaptive decay rate based on distance variance
+        if len(valid_dists) >= 3:
+            # Measure dispersion of nearest distances
+            nearest_dists = np.sort(valid_dists)[:min(5, len(valid_dists))]
+            cv = np.std(nearest_dists) / (np.mean(nearest_dists) + eps)
+            decay_rate = 0.3 + 0.5 * np.clip(cv, 0, 1)
+        else:
+            decay_rate = 0.7
+        
+        # Get ranks for all neighbors
+        ranks = np.argsort(np.argsort(dists))
+        
+        # Apply exponential decay with rank
+        for j in range(n):
+            if i != j and dists[j] < np.inf:
+                rank = ranks[j]
+                rank_weights[i, j] = decay_rate ** rank
+    
+    # ========== KERNEL DENSITY SPATIAL SCORING ==========
+    density_scores = np.zeros_like(dmat)
+    
+    # Adaptive bandwidth estimation
+    bandwidths = np.zeros(n)
+    for i in range(n):
+        # Use median distance to k-nearest neighbors as bandwidth
+        dists = dmat[i]
+        valid_dists = dists[dists < np.inf]
+        if len(valid_dists) > 0:
+            k = min(k_bandwidth, len(valid_dists))
+            bandwidths[i] = np.median(np.partition(valid_dists, k)[:k])
+        else:
+            bandwidths[i] = dist_mean
+    
+    # Gaussian kernel density estimation
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dmat[i, j] >= np.inf:
+                continue
+            
+            # Adaptive bandwidth for this pair
+            sigma = np.sqrt(bandwidths[i] * bandwidths[j])
+            
+            # Compute how many nodes are in the joint neighborhood
+            # Using Gaussian kernel similarity
+            kernel_i = np.exp(-0.5 * (dmat[i] / sigma) ** 2)
+            kernel_j = np.exp(-0.5 * (dmat[j] / sigma) ** 2)
+            
+            # Joint density measure (excluding i and j themselves)
+            joint_density = np.sum(kernel_i * kernel_j) - kernel_i[i] * kernel_j[i] - kernel_i[j] * kernel_j[j]
+            
+            # Transform to score: positive for dense regions, negative for sparse
+            if joint_density > 0:
+                # Logarithmic scaling for better dynamic range
+                density_scores[i, j] = np.log1p(joint_density) * 0.2
+            else:
+                density_scores[i, j] = -0.1  # Mild penalty for isolated edges
+    
+    # Make symmetric
+    density_scores = np.maximum(density_scores, density_scores.T)
+    
+    # ========== STRUCTURAL BIAS ==========
+    # Minimum Spanning Tree (if feasible)
+    if n <= 2000:
+        try:
+            mst = minimum_spanning_tree(dmat).toarray()
+            mst_bias = (mst + mst.T) > 0
+            mst_bonus = mst_bias.astype(float) * 0.25
+        except:
+            mst_bonus = np.zeros_like(dmat)
+    else:
+        mst_bonus = np.zeros_like(dmat)
+    
+    # ========== BASE SCORE ==========
+    # Inverse distance with instance-aware scaling
+    scaling = dist_mean * 0.1
+    inv_dist = 1.0 / (dmat + scaling)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # ========== COMBINE COMPONENTS ==========
+    # Dynamic weighting based on instance type
+    if is_uniform:
+        regret_weight = 0.3
+        density_weight = 0.2
+        centrality_weight = 0.2
+    elif is_clustered:
+        regret_weight = 0.25
+        density_weight = 0.35
+        centrality_weight = 0.15
+    else:
+        regret_weight = 0.3
+        density_weight = 0.25
+        centrality_weight = 0.2
+    
+    # Regret penalty: exponential decay
+    regret_penalty = np.exp(-2.0 * regret_matrix)
+    
+    # Centrality bonus: edges between central nodes get bonus
+    centrality_bonus = np.outer(centrality, centrality)
+    
+    # Combine all factors
+    heuristics_matrix = (
+        inv_dist * 
+        rank_weights * 
+        regret_penalty * 
+        (1.0 + density_scores * density_weight) * 
+        (1.0 + centrality_bonus * centrality_weight) * 
+        (1.0 + mst_bonus)
+    )
+    
+    # ========== DYNAMIC CANDIDATE SELECTION ==========
+    # Build candidate list based on combined scores
+    edges_per_node = max(3, min(k_candidate, int(np.sqrt(n)) + 2))
+    candidate_mask = np.zeros_like(dmat, dtype=bool)
+    
+    for i in range(n):
+        scores = heuristics_matrix[i].copy()
+        scores[i] = -np.inf
+        
+        # Select top edges_per_node candidates
+        if np.any(scores > 0):
+            top_idx = np.argpartition(scores, -edges_per_node)[-edges_per_node:]
+            candidate_mask[i, top_idx] = True
+        else:
+            # Fallback: nearest neighbors
+            top_idx = np.argsort(dmat[i])[1:edges_per_node + 1]
+            candidate_mask[i, top_idx] = True
+    
+    # Ensure symmetry and connectivity
+    candidate_mask = np.maximum(candidate_mask, candidate_mask.T)
+    
+    # Force minimum degree of 2 for connectivity
+    for i in range(n):
+        degree = np.sum(candidate_mask[i])
+        if degree < 2:
+            # Add nearest neighbors
+            all_neighbors = np.argsort(dmat[i])[1:]
+            needed = 2 - degree
+            added = 0
+            for neighbor in all_neighbors:
+                if not candidate_mask[i, neighbor]:
+                    candidate_mask[i, neighbor] = True
+                    candidate_mask[neighbor, i] = True
+                    added += 1
+                    if added >= needed:
+                        break
+    
+    # Apply candidate mask
+    heuristics_matrix[~candidate_mask] = 0
+    
+    # ========== FINAL PROCESSING ==========
+    # Ensure symmetry
+    heuristics_matrix = np.maximum(heuristics_matrix, heuristics_matrix.T)
+    
+    # Row-wise normalization
+    row_sums = np.sum(heuristics_matrix, axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics_matrix = heuristics_matrix / row_sums
+    
+    # Global normalization to [0, 1]
+    max_val = np.max(heuristics_matrix)
+    if max_val > 0:
+        heuristics_matrix = heuristics_matrix / max_val
+    
+    np.fill_diagonal(heuristics_matrix, 0)
+    
+    return heuristics_matrix
+```

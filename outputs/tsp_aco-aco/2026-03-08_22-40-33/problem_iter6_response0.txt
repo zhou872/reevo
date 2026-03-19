@@ -1,0 +1,185 @@
+```json
+{
+    "algorithm_features": ["Dynamic k-NN Scaling", "Efficient Two-Hop Efficiency Scoring", "Mutual k-NN Sparsification", "Instance-Adaptive Weighting"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge prioritization using adaptive
+    instance analysis and efficient combinatorial scoring.
+    
+    Key improvements over v1:
+    1. Lightweight instance analysis for parameter tuning
+    2. More efficient two-hop scoring using precomputed neighbor matrices
+    3. Dynamic combination weights based on instance characteristics
+    4. Improved sparsification with connectivity preservation
+    
+    Args:
+        distance_matrix: Symmetric matrix of pairwise distances (n x n)
+        
+    Returns:
+        Heuristic matrix of same shape as input with values in [0, 1]
+    """
+    n = distance_matrix.shape[0]
+    if n < 3:
+        return np.ones_like(distance_matrix) - np.eye(n)
+    
+    # === 1. LIGHTWEIGHT INSTANCE ANALYSIS ===
+    # Compute basic statistics for adaptive parameter tuning
+    upper_tri = distance_matrix[np.triu_indices(n, k=1)]
+    dist_median = np.median(upper_tri)
+    dist_iqr = np.percentile(upper_tri, 75) - np.percentile(upper_tri, 25)
+    dist_variability = dist_iqr / (dist_median + 1e-12)
+    
+    # Adaptive parameters
+    k = min(max(3, int(np.sqrt(n) * (1 + 0.5 * dist_variability))), n - 1)
+    efficiency_weight = 0.5 + 0.3 * np.tanh(2 * dist_variability)
+    sparsity_factor = 0.6 + 0.3 * (1 - np.exp(-n / 20))
+    
+    # === 2. BASE INVERSE DISTANCE WEIGHTING ===
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = dist_median / (distance_matrix + 0.1 * dist_median * np.eye(n))
+    inv_dist[np.isinf(inv_dist)] = 0
+    np.fill_diagonal(inv_dist, 0)
+    
+    # === 3. EFFICIENT K-NEAREST NEIGHBORS ===
+    # Add minimal noise for tie-breaking
+    noise = np.random.randn(n, n) * 1e-10 * np.max(distance_matrix)
+    noisy_dist = distance_matrix + noise + np.eye(n) * np.max(distance_matrix)
+    
+    # Get k nearest neighbors for all nodes
+    sorted_indices = np.argsort(noisy_dist, axis=1)[:, 1:k+1]
+    sorted_distances = np.take_along_axis(distance_matrix, sorted_indices, axis=1)
+    
+    # Create neighbor adjacency matrix for efficient lookups
+    neighbor_adj = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        neighbor_adj[i, sorted_indices[i]] = True
+    
+    # === 4. OPTIMIZED TWO-HOP EFFICIENCY SCORING ===
+    efficiency_score = np.ones((n, n))
+    
+    # Precompute second-best neighbors for each node
+    second_best = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        # For each node j, find the minimum distance through i's neighbors
+        for idx, neighbor in enumerate(sorted_indices[i]):
+            for j in range(n):
+                if j != i and j != neighbor:
+                    current = second_best[i, j]
+                    new_dist = sorted_distances[i, idx] + distance_matrix[neighbor, j]
+                    if current == 0 or new_dist < current:
+                        second_best[i, j] = new_dist
+    
+    # Calculate efficiency ratios
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Direct distance
+            direct = distance_matrix[i, j]
+            
+            # Best two-hop alternative
+            alt_through_i = second_best[i, j] if second_best[i, j] > 0 else np.inf
+            alt_through_j = second_best[j, i] if second_best[j, i] > 0 else np.inf
+            best_alternative = min(alt_through_i, alt_through_j)
+            
+            if best_alternative < np.inf and direct > 0:
+                ratio = best_alternative / direct
+                # Convert to score: lower ratio means edge is more efficient
+                if ratio > 1.0:
+                    score = 1.0 / np.sqrt(ratio)  # Penalize inefficient edges
+                else:
+                    score = 2.0 - ratio  # Reward efficient edges
+                efficiency_score[i, j] = efficiency_score[j, i] = np.clip(score, 0.3, 1.7)
+    
+    # === 5. MUTUAL NEAREST NEIGHBOR BOOSTING ===
+    mutual_boost = np.ones((n, n))
+    
+    # Check mutual k/2-nearest neighbors for more meaningful relationships
+    mutual_k = max(2, k // 2)
+    for i in range(n):
+        i_top_neighbors = set(sorted_indices[i, :mutual_k])
+        for j in range(i + 1, n):
+            j_top_neighbors = set(sorted_indices[j, :mutual_k])
+            if i in j_top_neighbors and j in i_top_neighbors:
+                mutual_boost[i, j] = mutual_boost[j, i] = 1.4
+            elif i in j_top_neighbors or j in i_top_neighbors:
+                mutual_boost[i, j] = mutual_boost[j, i] = 1.2
+    
+    # === 6. DYNAMIC FACTOR COMBINATION ===
+    # Weight factors based on instance characteristics
+    base_weight = 1.0 - efficiency_weight
+    heuristics = (
+        (inv_dist ** base_weight) * 
+        (efficiency_score ** efficiency_weight) * 
+        mutual_boost
+    )
+    
+    # === 7. MST-BASED PRIORITIZATION ===
+    # Boost edges that appear in minimum spanning tree
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    heuristics[mst_mask] *= 1.3
+    
+    # === 8. ADAPTIVE SPARSIFICATION ===
+    # Create adjacency mask from mutual k-nearest neighbors
+    adjacency_mask = neighbor_adj | neighbor_adj.T
+    
+    # For non-adjacent edges, apply adaptive thresholding
+    non_adjacent = ~adjacency_mask
+    np.fill_diagonal(non_adjacent, False)
+    
+    if np.any(non_adjacent):
+        non_adj_vals = heuristics[non_adjacent]
+        if len(non_adj_vals) > 0:
+            # Dynamic threshold based on value distribution
+            q1 = np.percentile(non_adj_vals, 25)
+            threshold = q1 * sparsity_factor
+            
+            # Zero out low-scoring non-adjacent edges
+            low_value_mask = non_adjacent & (heuristics < threshold)
+            heuristics[low_value_mask] = 0
+    
+    # === 9. CONNECTIVITY PRESERVATION ===
+    # Ensure each node has at least 2 connections for small instances
+    if n <= 30:
+        row_counts = np.sum(heuristics > 0, axis=1)
+        min_connections = min(3, n - 1)
+        
+        for i in range(n):
+            if row_counts[i] < min_connections:
+                # Add connections to nearest neighbors not already connected
+                mask = np.arange(n) != i
+                potential = np.where(mask)[0]
+                # Sort by distance and select top missing connections
+                distances = distance_matrix[i, potential]
+                nearest = np.argsort(distances)[:min_connections - row_counts[i]]
+                nearest_idx = potential[nearest]
+                
+                # Set heuristic value based on distance rank
+                for rank, j in enumerate(nearest_idx):
+                    if heuristics[i, j] == 0:
+                        heuristics[i, j] = heuristics[j, i] = 0.5 * (1.0 - rank * 0.2)
+    
+    # === 10. FINAL PROCESSING ===
+    # Ensure symmetry
+    heuristics = (heuristics + heuristics.T) / 2
+    np.fill_diagonal(heuristics, 0)
+    
+    # Normalize to [0, 1] range
+    non_zero = heuristics > 0
+    if np.any(non_zero):
+        max_val = heuristics[non_zero].max()
+        min_val = heuristics[non_zero].min()
+        if max_val > min_val:
+            heuristics[non_zero] = (heuristics[non_zero] - min_val) / (max_val - min_val)
+    
+    # Apply soft threshold to emphasize promising edges
+    heuristics = heuristics ** 0.8
+    
+    return heuristics
+```

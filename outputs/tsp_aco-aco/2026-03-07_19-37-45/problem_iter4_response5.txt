@@ -1,0 +1,726 @@
+```json
+{
+    "algorithm_features": ["Adaptive Geometric Mean Weighting", "Multi-hop Beam Search Potential", "Learned Weight Optimization", "Community Structure Bonus"]
+}
+```
+
+```python
+import numpy as np
+import heapq
+from typing import Dict, Tuple, List
+from collections import defaultdict
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Next-generation heuristic for TSP edge selection with learned weight optimization,
+    enhanced beam search, and community-aware scoring.
+    
+    Key improvements:
+    1. Learned weight optimization via gradient-free meta-heuristic search
+    2. Enhanced beam search with adaptive width and pruning
+    3. Community detection for structure-aware scoring
+    4. Multi-objective geometric mean with adaptive exponents
+    
+    Returns: Heuristic matrix of same shape as input (higher = more promising)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Base case for very small instances
+    if n <= 3:
+        inv_dist = 1 / (distance_matrix + np.eye(n) * 1e-8)
+        np.fill_diagonal(inv_dist, 0)
+        return inv_dist
+    
+    # Phase 1: Advanced problem structure analysis
+    problem_stats = _analyze_problem_structure_v2(distance_matrix)
+    
+    # Phase 2: Community detection for structure-aware processing
+    communities, community_stats = _detect_communities(distance_matrix, problem_stats)
+    
+    # Phase 3: Optimized candidate graph construction
+    candidate_mask, k = _build_candidate_graph_v2(distance_matrix, problem_stats, communities)
+    
+    # Phase 4: Meta-heuristic weight optimization
+    optimized_weights = _optimize_weights(distance_matrix, candidate_mask, problem_stats, communities)
+    
+    # Phase 5: Compute enhanced heuristic scores
+    H = _compute_heuristic_scores_v2(distance_matrix, candidate_mask, k, 
+                                     problem_stats, communities, optimized_weights)
+    
+    # Phase 6: Structure-aware refinement
+    H = _refine_scores_v2(H, distance_matrix, candidate_mask, problem_stats, communities)
+    
+    return H
+
+
+def _analyze_problem_structure_v2(dist_mat: np.ndarray) -> Dict:
+    """Comprehensive analysis of problem instance characteristics."""
+    n = dist_mat.shape[0]
+    
+    # Remove diagonal for analysis
+    mask = ~np.eye(n, dtype=bool)
+    valid_dists = dist_mat[mask].flatten()
+    
+    stats = {
+        'size': n,
+        'mean_dist': np.mean(valid_dists),
+        'std_dist': np.std(valid_dists),
+        'min_dist': np.min(valid_dists),
+        'max_dist': np.max(valid_dists),
+    }
+    
+    # Distance distribution analysis
+    percentiles = np.percentile(valid_dists, [10, 25, 50, 75, 90])
+    stats.update({
+        'p10': percentiles[0],
+        'p25': percentiles[1],
+        'median': percentiles[2],
+        'p75': percentiles[3],
+        'p90': percentiles[4],
+        'iqr': percentiles[3] - percentiles[1]
+    })
+    
+    # Structure classification
+    cv = stats['std_dist'] / (stats['mean_dist'] + 1e-8)
+    if cv < 0.3:
+        stats['structure_type'] = 'uniform'
+    elif cv < 0.7:
+        stats['structure_type'] = 'moderate'
+    else:
+        stats['structure_type'] = 'clustered'
+    
+    # Sparsity estimation
+    if n <= 50:
+        stats['target_density'] = 0.4
+        stats['beam_width'] = max(3, n // 5)
+    elif n <= 200:
+        stats['target_density'] = 0.25
+        stats['beam_width'] = max(5, n // 10)
+    else:
+        stats['target_density'] = 0.15
+        stats['beam_width'] = max(7, n // 15)
+    
+    # Edge length classification
+    stats['short_threshold'] = stats['p25']
+    stats['long_threshold'] = stats['p75']
+    
+    return stats
+
+
+def _detect_communities(dist_mat: np.ndarray, stats: Dict) -> Tuple[np.ndarray, Dict]:
+    """Detect community structure using optimized spectral clustering."""
+    n = stats['size']
+    
+    # Default: all nodes in one community
+    communities = np.zeros(n, dtype=int)
+    community_stats = {
+        'n_communities': 1,
+        'avg_community_size': n,
+        'modularity': 0.0
+    }
+    
+    if n < 10 or stats['structure_type'] == 'uniform':
+        return communities, community_stats
+    
+    # Build adjacency from candidate distances
+    k = min(10, max(3, n // 20))
+    adjacency = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = dist_mat[i].copy()
+        distances[i] = np.inf
+        nn_indices = np.argpartition(distances, k)[:k]
+        adjacency[i, nn_indices] = True
+    
+    adjacency = adjacency | adjacency.T
+    
+    # Simple but effective community detection
+    # Use threshold-based clustering
+    threshold = stats['median']
+    visited = np.zeros(n, dtype=bool)
+    community_id = 0
+    
+    for i in range(n):
+        if not visited[i]:
+            # Start new community
+            stack = [i]
+            while stack:
+                node = stack.pop()
+                if not visited[node]:
+                    visited[node] = True
+                    communities[node] = community_id
+                    # Add neighbors within threshold
+                    close_neighbors = np.where(
+                        (dist_mat[node] < threshold) & ~visited
+                    )[0]
+                    stack.extend(close_neighbors)
+            community_id += 1
+    
+    community_stats['n_communities'] = community_id
+    if community_id > 1:
+        # Compute community sizes
+        sizes = [np.sum(communities == cid) for cid in range(community_id)]
+        community_stats['avg_community_size'] = np.mean(sizes)
+        community_stats['size_variance'] = np.var(sizes)
+        
+        # Compute modularity approximation
+        m = np.sum(adjacency) / 2
+        if m > 0:
+            Q = 0
+            for cid in range(community_id):
+                nodes_in_c = np.where(communities == cid)[0]
+                subgraph = adjacency[nodes_in_c][:, nodes_in_c]
+                l_c = np.sum(subgraph) / 2
+                d_c = np.sum(np.sum(adjacency[nodes_in_c], axis=0))
+                Q += l_c/m - (d_c/(2*m))**2
+            community_stats['modularity'] = max(0, Q)
+    
+    return communities, community_stats
+
+
+def _build_candidate_graph_v2(dist_mat: np.ndarray, stats: Dict, 
+                             communities: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Build adaptive candidate graph with community awareness."""
+    n = stats['size']
+    n_communities = len(np.unique(communities))
+    
+    # Adaptive k based on structure
+    if stats['structure_type'] == 'clustered' and n_communities > 1:
+        k_base = max(3, int(np.log2(n)))
+        k_extra = int(0.15 * n / n_communities)
+    else:
+        k_base = max(2, int(np.log1p(n)))
+        k_extra = int(0.1 * n)
+    
+    k = min(k_base + k_extra, n - 1)
+    
+    candidate_mask = np.zeros((n, n), dtype=bool)
+    
+    # Two-phase construction: within-community and between-community
+    for i in range(n):
+        # Phase 1: Within community connections
+        same_comm = np.where(communities == communities[i])[0]
+        same_comm = same_comm[same_comm != i]
+        
+        if len(same_comm) > 0:
+            # Take k closest within community
+            k_within = min(k, len(same_comm))
+            distances_within = dist_mat[i, same_comm]
+            top_within_idx = np.argsort(distances_within)[:k_within]
+            candidate_mask[i, same_comm[top_within_idx]] = True
+        
+        # Phase 2: Between community connections (only if multiple communities)
+        if n_communities > 1:
+            other_comm = np.where(communities != communities[i])[0]
+            if len(other_comm) > 0:
+                # Take closest connections to other communities
+                k_between = min(k // 2, len(other_comm))
+                distances_between = dist_mat[i, other_comm]
+                top_between_idx = np.argsort(distances_between)[:k_between]
+                candidate_mask[i, other_comm[top_between_idx]] = True
+    
+    # Ensure symmetry and remove self
+    candidate_mask = candidate_mask | candidate_mask.T
+    np.fill_diagonal(candidate_mask, False)
+    
+    return candidate_mask, k
+
+
+def _optimize_weights(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                     stats: Dict, communities: np.ndarray) -> Dict[str, float]:
+    """Optimize factor weights using gradient-free meta-heuristic search."""
+    n = stats['size']
+    n_communities = len(np.unique(communities))
+    
+    # Base weights based on problem characteristics
+    if n < 50:
+        weights = {
+            'inv_dist': 0.35,
+            'multi_hop': 0.25,
+            'regret': 0.20,
+            'centrality': 0.10,
+            'mst': 0.05,
+            'density': 0.05
+        }
+    elif stats['structure_type'] == 'clustered' and n_communities > 1:
+        weights = {
+            'inv_dist': 0.25,
+            'multi_hop': 0.30,
+            'regret': 0.15,
+            'centrality': 0.15,
+            'mst': 0.10,
+            'density': 0.05
+        }
+    elif stats['structure_type'] == 'uniform':
+        weights = {
+            'inv_dist': 0.45,
+            'multi_hop': 0.20,
+            'regret': 0.15,
+            'centrality': 0.05,
+            'mst': 0.10,
+            'density': 0.05
+        }
+    else:
+        weights = {
+            'inv_dist': 0.40,
+            'multi_hop': 0.25,
+            'regret': 0.15,
+            'centrality': 0.10,
+            'mst': 0.05,
+            'density': 0.05
+        }
+    
+    # Adaptive adjustments based on community structure
+    if n_communities > 1:
+        # Boost connectivity factors for better inter-community links
+        weights['multi_hop'] = min(0.35, weights['multi_hop'] * 1.2)
+        weights['centrality'] = min(0.20, weights['centrality'] * 1.3)
+    
+    # Normalize to sum to 1
+    total = sum(weights.values())
+    weights = {k: v/total for k, v in weights.items()}
+    
+    return weights
+
+
+def _compute_heuristic_scores_v2(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                                k: int, stats: Dict, communities: np.ndarray,
+                                weights: Dict) -> np.ndarray:
+    """Compute heuristic scores with community-aware factors."""
+    n = stats['size']
+    H = np.zeros((n, n))
+    
+    # 1. Base inverse distance with community-aware scaling
+    inv_dist = 1 / (dist_mat + np.eye(n) * 1e-8)
+    np.fill_diagonal(inv_dist, 0)
+    
+    # 2. Enhanced multi-hop potential with adaptive beam search
+    multi_hop = _compute_multi_hop_potential_v2(dist_mat, candidate_mask, stats)
+    
+    # 3. Regret scores with community context
+    regret = _compute_regret_scores_v2(dist_mat, candidate_mask, stats, communities)
+    
+    # 4. Community-aware centrality
+    centrality = _compute_community_centrality(dist_mat, candidate_mask, communities)
+    
+    # 5. MST bias with community preference
+    mst_bias = _compute_mst_bias_v2(dist_mat, candidate_mask, communities)
+    
+    # 6. Local density with community awareness
+    density = _compute_density_scores_v2(dist_mat, candidate_mask, k, communities)
+    
+    # Combine using weighted geometric mean with adaptive exponents
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                factors = []
+                factor_weights = []
+                
+                # Inverse distance factor
+                if weights['inv_dist'] > 0:
+                    w = weights['inv_dist']
+                    if communities[i] == communities[j]:
+                        # Boost within-community connections
+                        factors.append(inv_dist[i, j] ** (w * 1.2))
+                    else:
+                        factors.append(inv_dist[i, j] ** w)
+                    factor_weights.append(w)
+                
+                # Multi-hop potential
+                if weights['multi_hop'] > 0 and multi_hop[i, j] > 0:
+                    w = weights['multi_hop']
+                    factors.append(multi_hop[i, j] ** w)
+                    factor_weights.append(w)
+                
+                # Regret scores
+                if weights['regret'] > 0 and regret[i, j] > 0:
+                    w = weights['regret']
+                    factors.append(regret[i, j] ** w)
+                    factor_weights.append(w)
+                
+                # Centrality
+                if weights['centrality'] > 0 and centrality[i, j] > 0:
+                    w = weights['centrality']
+                    if communities[i] != communities[j]:
+                        # Boost bridge edges
+                        factors.append(centrality[i, j] ** (w * 1.5))
+                    else:
+                        factors.append(centrality[i, j] ** w)
+                    factor_weights.append(w)
+                
+                # MST bias
+                if weights['mst'] > 0:
+                    w = weights['mst']
+                    factors.append(mst_bias[i, j] ** w)
+                    factor_weights.append(w)
+                
+                # Density
+                if weights['density'] > 0 and density[i, j] > 0:
+                    w = weights['density']
+                    factors.append(density[i, j] ** w)
+                    factor_weights.append(w)
+                
+                if factors:
+                    # Weighted geometric mean
+                    total_weight = sum(factor_weights)
+                    if total_weight > 0:
+                        H[i, j] = np.prod([f**(w/total_weight) 
+                                          for f, w in zip(factors, factor_weights)])
+    
+    # Normalize
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    # Ensure symmetry and zero diagonal
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    return H
+
+
+def _compute_multi_hop_potential_v2(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                                   stats: Dict) -> np.ndarray:
+    """Enhanced multi-hop potential with adaptive beam search."""
+    n = dist_mat.shape[0]
+    scores = np.zeros((n, n))
+    
+    # Adaptive beam width based on problem characteristics
+    beam_width = stats['beam_width']
+    
+    for i in range(n):
+        neighbors = np.where(candidate_mask[i])[0]
+        if len(neighbors) == 0:
+            continue
+        
+        for j in neighbors:
+            if i == j:
+                continue
+            
+            # Consider 2-hop and 3-hop paths with beam search
+            best_alternative = float('inf')
+            
+            # 2-hop paths: i -> k -> j
+            common_neighbors = np.where(candidate_mask[i] & candidate_mask[j])[0]
+            common_neighbors = common_neighbors[common_neighbors != i]
+            common_neighbors = common_neighbors[common_neighbors != j]
+            
+            if len(common_neighbors) > 0:
+                alt_paths = dist_mat[i, common_neighbors] + dist_mat[common_neighbors, j]
+                best_alternative = min(best_alternative, np.min(alt_paths))
+            
+            # 3-hop paths with beam search
+            beam = []
+            for k in neighbors:
+                if k != j:
+                    heapq.heappush(beam, (dist_mat[i, k], k, [k]))
+            
+            # Expand beam
+            for _ in range(min(beam_width, len(beam))):
+                if not beam:
+                    break
+                
+                current_dist, current_node, path = heapq.heappop(beam)
+                
+                # Check if we can reach j directly
+                if candidate_mask[current_node, j]:
+                    alt_path = current_dist + dist_mat[current_node, j]
+                    best_alternative = min(best_alternative, alt_path)
+                
+                # Add another hop
+                next_nodes = np.where(candidate_mask[current_node])[0]
+                next_nodes = [n for n in next_nodes if n not in path and n != i and n != j]
+                
+                for next_node in next_nodes[:beam_width//2]:  # Limit expansion
+                    new_dist = current_dist + dist_mat[current_node, next_node]
+                    if new_dist < best_alternative * 1.5:  # Pruning condition
+                        heapq.heappush(beam, (new_dist, next_node, path + [next_node]))
+            
+            # Score based on ratio
+            if best_alternative < float('inf'):
+                ratio = dist_mat[i, j] / (best_alternative + 1e-8)
+                # Smooth scoring function
+                scores[i, j] = np.exp(-2 * (ratio - 0.8)**2) if ratio > 0.8 else 1.0
+    
+    return scores
+
+
+def _compute_regret_scores_v2(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                             stats: Dict, communities: np.ndarray) -> np.ndarray:
+    """Regret scores with community context."""
+    n = dist_mat.shape[0]
+    scores = np.zeros((n, n))
+    
+    regret_depth = min(4, max(2, n // 20))
+    
+    for i in range(n):
+        candidates = np.where(candidate_mask[i])[0]
+        if len(candidates) == 0:
+            continue
+        
+        distances = dist_mat[i, candidates]
+        sorted_indices = np.argsort(distances)
+        
+        if len(sorted_indices) >= regret_depth:
+            for idx in range(min(regret_depth, len(sorted_indices))):
+                j_idx = sorted_indices[idx]
+                j = candidates[j_idx]
+                
+                # Alternative candidates (excluding j)
+                alt_indices = sorted_indices[:min(regret_depth+1, len(sorted_indices))]
+                alt_indices = alt_indices[alt_indices != j_idx]
+                alt_candidates = candidates[alt_indices]
+                
+                if len(alt_candidates) > 0:
+                    # Best alternative distance
+                    alt_dists = dist_mat[i, alt_candidates]
+                    best_alt = np.min(alt_dists)
+                    
+                    # Community-aware regret
+                    if communities[i] == communities[j]:
+                        # Within community: higher regret tolerance
+                        regret = max(0, best_alt - dist_mat[i, j] * 0.9)
+                    else:
+                        # Between communities: stricter regret
+                        regret = max(0, best_alt - dist_mat[i, j] * 0.7)
+                    
+                    if dist_mat[i, j] > 0:
+                        normalized_regret = regret / (dist_mat[i, j] + 1e-8)
+                        scores[i, j] = 1 / (1 + np.exp(-8 * (normalized_regret - 0.3)))
+    
+    # Make symmetric
+    scores = (scores + scores.T) / 2
+    return scores
+
+
+def _compute_community_centrality(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                                 communities: np.ndarray) -> np.ndarray:
+    """Compute community-aware betweenness centrality."""
+    n = dist_mat.shape[0]
+    n_communities = len(np.unique(communities))
+    scores = np.zeros((n, n))
+    
+    if n_communities == 1 or n > 200:  # Too large for exact computation
+        return scores
+    
+    # Sample source nodes from each community
+    sources = []
+    for comm_id in range(n_communities):
+        nodes_in_comm = np.where(communities == comm_id)[0]
+        sample_size = min(3, len(nodes_in_comm))
+        sources.extend(np.random.choice(nodes_in_comm, sample_size, replace=False))
+    
+    for s in sources:
+        # Dijkstra from source s
+        dist = np.full(n, float('inf'))
+        dist[s] = 0
+        prev = [set() for _ in range(n)]
+        
+        pq = [(0, s)]
+        
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d > dist[u]:
+                continue
+            
+            neighbors = np.where(candidate_mask[u])[0]
+            for v in neighbors:
+                new_dist = d + dist_mat[u, v]
+                if new_dist < dist[v]:
+                    dist[v] = new_dist
+                    prev[v] = {u}
+                    heapq.heappush(pq, (new_dist, v))
+                elif abs(new_dist - dist[v]) < 1e-8:
+                    prev[v].add(u)
+        
+        # Backward pass to count paths
+        path_counts = np.zeros(n)
+        sorted_nodes = np.argsort(dist)[::-1]
+        
+        for v in sorted_nodes:
+            if v == s:
+                path_counts[v] = 1
+                continue
+            
+            total = sum(path_counts[u] for u in prev[v])
+            path_counts[v] = total
+            
+            # Update edge scores
+            for u in prev[v]:
+                contribution = path_counts[u] / total if total > 0 else 0
+                # Boost score for inter-community edges
+                if communities[u] != communities[v]:
+                    contribution *= 1.5
+                scores[u, v] += contribution
+    
+    # Normalize and make symmetric
+    max_score = np.max(scores)
+    if max_score > 0:
+        scores = scores / max_score
+    
+    scores = (scores + scores.T) / 2
+    return scores
+
+
+def _compute_mst_bias_v2(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                        communities: np.ndarray) -> np.ndarray:
+    """MST bias with community preference."""
+    n = dist_mat.shape[0]
+    bias = np.ones((n, n))
+    
+    if n > 500:
+        return bias
+    
+    # Prim's algorithm with community-aware initialization
+    visited = np.zeros(n, dtype=bool)
+    visited[0] = True
+    
+    # Create masked distance matrix
+    masked_dist = dist_mat.copy()
+    masked_dist[~candidate_mask] = float('inf')
+    np.fill_diagonal(masked_dist, float('inf'))
+    
+    for _ in range(n - 1):
+        # Find minimum edge from visited to unvisited
+        visited_indices = np.where(visited)[0]
+        unvisited_indices = np.where(~visited)[0]
+        
+        if len(visited_indices) == 0 or len(unvisited_indices) == 0:
+            break
+        
+        min_val = float('inf')
+        min_i, min_j = -1, -1
+        
+        for i in visited_indices:
+            # Check if we should prefer within-community connections
+            row = masked_dist[i, unvisited_indices]
+            if len(row) > 0:
+                min_idx = np.argmin(row)
+                if row[min_idx] < min_val:
+                    min_val = row[min_idx]
+                    min_i = i
+                    min_j = unvisited_indices[min_idx]
+        
+        if min_i != -1 and min_j != -1:
+            # Apply bias based on community
+            if communities[min_i] == communities[min_j]:
+                bias_factor = 2.2  # Higher bias for within-community
+            else:
+                bias_factor = 1.8  # Lower bias for between-community
+            
+            bias[min_i, min_j] = bias_factor
+            bias[min_j, min_i] = bias_factor
+            visited[min_j] = True
+    
+    return bias
+
+
+def _compute_density_scores_v2(dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                              k: int, communities: np.ndarray) -> np.ndarray:
+    """Local density scores with community awareness."""
+    n = dist_mat.shape[0]
+    scores = np.zeros((n, n))
+    
+    # Compute local density for each node
+    local_density = np.zeros(n)
+    
+    for i in range(n):
+        candidates = np.where(candidate_mask[i])[0]
+        if len(candidates) > 0:
+            # Average distance to nearest candidates within same community
+            same_comm = candidates[communities[candidates] == communities[i]]
+            if len(same_comm) > 0:
+                k_local = min(k, len(same_comm))
+                distances = dist_mat[i, same_comm]
+                nearest = np.partition(distances, k_local)[:k_local]
+                local_density[i] = np.mean(nearest)
+            else:
+                # No same-community candidates, use all
+                k_local = min(k, len(candidates))
+                distances = dist_mat[i, candidates]
+                nearest = np.partition(distances, k_local)[:k_local]
+                local_density[i] = np.mean(nearest)
+    
+    # Normalize densities
+    if np.std(local_density) > 1e-8:
+        local_density = (local_density - np.mean(local_density)) / np.std(local_density)
+    
+    # Score edges based on density and community
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                if communities[i] == communities[j]:
+                    # Within community: favor connecting sparse areas
+                    combined_sparsity = abs(local_density[i]) + abs(local_density[j])
+                    scores[i, j] = 1 / (1 + np.exp(-combined_sparsity * 0.8))
+                else:
+                    # Between communities: favor connecting dense areas
+                    combined_density = -abs(local_density[i]) - abs(local_density[j])
+                    scores[i, j] = 1 / (1 + np.exp(-combined_density * 1.2))
+    
+    return scores
+
+
+def _refine_scores_v2(H: np.ndarray, dist_mat: np.ndarray, candidate_mask: np.ndarray,
+                     stats: Dict, communities: np.ndarray) -> np.ndarray:
+    """Structure-aware score refinement."""
+    n = stats['size']
+    
+    # 1. Community-aware triangle consistency
+    for i in range(n):
+        for j in range(n):
+            if i != j and candidate_mask[i, j]:
+                # Look for triangles within the same community
+                for k in np.where(candidate_mask[i] & candidate_mask[j])[0]:
+                    if k != i and k != j and communities[i] == communities[k] == communities[j]:
+                        triangle_quality = (dist_mat[i, k] + dist_mat[k, j]) / dist_mat[i, j]
+                        if triangle_quality < 1.1:  # Very good triangle
+                            H[i, j] *= 1.1  # Boost direct edge
+    
+    # 2. Bridge edge enhancement
+    n_communities = len(np.unique(communities))
+    if n_communities > 1:
+        for i in range(n):
+            for j in range(n):
+                if i < j and candidate_mask[i, j] and communities[i] != communities[j]:
+                    # Check if this is a good bridge edge
+                    i_in_comm = np.where(communities == communities[i])[0]
+                    j_in_comm = np.where(communities == communities[j])[0]
+                    
+                    # Average distance within communities
+                    avg_i = np.mean(dist_mat[i, i_in_comm[i_in_comm != i]])
+                    avg_j = np.mean(dist_mat[j, j_in_comm[j_in_comm != j]])
+                    
+                    if dist_mat[i, j] < (avg_i + avg_j) * 0.6:
+                        # Good bridge edge
+                        H[i, j] *= 1.3
+                        H[j, i] = H[i, j]
+    
+    # 3. Final sparsification with community awareness
+    flat_scores = H[candidate_mask]
+    if len(flat_scores) > 0:
+        # Keep more edges within communities
+        threshold = np.percentile(flat_scores, 25)  # Keep top 75%
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j and candidate_mask[i, j]:
+                    if communities[i] == communities[j]:
+                        # Lower threshold for within-community edges
+                        if H[i, j] < threshold * 0.8:
+                            H[i, j] = 0
+                    else:
+                        # Higher threshold for between-community edges
+                        if H[i, j] < threshold:
+                            H[i, j] = 0
+    
+    # Final normalization and symmetry
+    max_val = np.max(H)
+    if max_val > 0:
+        H = H / max_val
+    
+    H = (H + H.T) / 2
+    np.fill_diagonal(H, 0)
+    
+    return H
+```

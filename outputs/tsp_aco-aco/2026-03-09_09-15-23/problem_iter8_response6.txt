@@ -1,0 +1,235 @@
+```json
+{
+    "algorithm_features": ["Multi-step Lookahead Regret", "Minimum Spanning Tree Priority", "Rank-Weighted Inverse Distance", "Geometric Neighborhood Adaptation"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic function with multi-step regret analysis and
+    global path consistency via minimum spanning tree integration.
+    
+    Features:
+    1. Geometric neighborhood adaptation for sparsification
+    2. Multi-step (2-3 hop) lookahead regret analysis
+    3. Minimum spanning tree consistency bonus
+    4. Rank-weighted inverse distance with adaptive decay
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances between n nodes
+        
+    Returns:
+        Heuristic matrix of same shape, with higher values indicating more promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. GEOMETRIC NEIGHBORHOOD ADAPTATION ====================
+    # Dynamic neighborhood size based on geometric scaling
+    base_k = max(3, int(np.log2(n) * 1.5))
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    
+    # Build adjacency with geometric scaling
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        # Use more neighbors in sparse regions, fewer in dense regions
+        avg_first_5 = np.mean(distance_matrix[i, sorted_indices[i, 1:6]])
+        avg_scale = avg_first_5 / np.mean(distance_matrix)
+        k_i = int(base_k * (0.5 + 0.5 * avg_scale))
+        k_i = min(max(k_i, 3), n // 2)
+        
+        neighbors = sorted_indices[i, 1:k_i + 1]
+        adjacency_mask[i, neighbors] = True
+    
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. RANK-WEIGHTED INVERSE DISTANCE ====================
+    inv_dist = np.zeros_like(distance_matrix, dtype=float)
+    
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            valid_dists = distance_matrix[i, valid_mask]
+            
+            # Adaptive rank decay based on problem size
+            decay_rate = 0.7 * (1 + 1/np.log2(n + 10))
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = np.exp(-decay_rate * (ranks - 1))
+            weights = weights / np.sum(weights)
+            
+            # Inverse distance with smoothing
+            inv_vals = 1.0 / (valid_dists + np.mean(valid_dists) * 0.01)
+            inv_dist[i, valid_mask] = inv_vals * weights
+    
+    # Symmetrize with geometric mean
+    inv_dist_sym = np.sqrt(np.maximum(inv_dist * inv_dist.T, 1e-16))
+    
+    # ==================== 3. MULTI-STEP LOOKAHEAD REGRET ====================
+    regret_penalty = np.ones_like(distance_matrix)
+    avg_dist = np.mean(distance_matrix)
+    
+    # Prepare top neighbors for efficient multi-step analysis
+    top_m = min(max(10, int(np.sqrt(n))), n // 3)
+    top_neighbors = sorted_indices[:, 1:top_m + 1]
+    
+    # Precompute adjacency sets for faster lookups
+    adjacency_sets = [set(np.where(adjacency_mask[i])[0]) for i in range(n)]
+    
+    # Analyze edges in sparse adjacency
+    edge_indices = np.where(np.triu(adjacency_mask))
+    
+    for idx in range(len(edge_indices[0])):
+        i, j = edge_indices[0][idx], edge_indices[1][idx]
+        direct = distance_matrix[i, j]
+        if direct < 1e-10:
+            continue
+        
+        # Get candidate intermediate nodes (common neighbors and top neighbors)
+        i_neighbors = set(top_neighbors[i])
+        j_neighbors = set(top_neighbors[j])
+        candidates = list(i_neighbors.union(j_neighbors) - {i, j})
+        
+        if len(candidates) < 2:
+            continue
+        
+        # Two-step regret analysis
+        two_step_dists = []
+        for k in candidates:
+            if (k in adjacency_sets[i]) and (j in adjacency_sets[k]):
+                two_step_dists.append(distance_matrix[i, k] + distance_matrix[k, j])
+        
+        # Three-step regret analysis (limited to top candidates)
+        three_step_dists = []
+        if len(candidates) >= 3:
+            # Use top 5 candidates for three-step to limit computation
+            top_cands = candidates[:min(5, len(candidates))]
+            for k in top_cands:
+                if k not in adjacency_sets[i]:
+                    continue
+                for l in top_cands:
+                    if l == k:
+                        continue
+                    if (l in adjacency_sets[k]) and (j in adjacency_sets[l]):
+                        three_step_dists.append(
+                            distance_matrix[i, k] + distance_matrix[k, l] + distance_matrix[l, j]
+                        )
+        
+        # Compute combined regret score
+        if two_step_dists:
+            best_two_step = np.min(two_step_dists)
+            regret_two = (best_two_step - direct) / direct
+        else:
+            regret_two = 0.1  # Default optimistic value
+            
+        if three_step_dists:
+            best_three_step = np.min(three_step_dists)
+            regret_three = (best_three_step - direct) / (direct + avg_dist * 0.1)
+            # Weight three-step less than two-step
+            regret_three = regret_three * 0.7
+        else:
+            regret_three = 0.05
+            
+        # Combine regrets with weighted geometric mean
+        combined_regret = (max(0, regret_two) ** 0.6) * (max(0, regret_three) ** 0.4)
+        
+        # Convert regret to penalty factor
+        if combined_regret > 0.2:
+            # Excellent edge: two-step and three-step are much worse
+            penalty = 1.0 + min(1.0, np.log1p(combined_regret))
+        elif combined_regret > 0:
+            # Good edge
+            penalty = 1.0 + combined_regret * 0.5
+        else:
+            # Poor edge: multi-step paths are better
+            penalty = max(0.3, 1.0 + combined_regret * 2.0)
+        
+        # Scale by distance quality
+        dist_quality = 1.0 / (1.0 + direct / avg_dist)
+        penalty = penalty * (0.6 + 0.4 * dist_quality)
+        
+        regret_penalty[i, j] = regret_penalty[j, i] = penalty
+    
+    # ==================== 4. MINIMUM SPANNING TREE CONSISTENCY ====================
+    mst_bonus = np.ones_like(distance_matrix)
+    
+    # Compute minimum spanning tree
+    mst = minimum_spanning_tree(distance_matrix).toarray()
+    mst_edges = np.where(mst > 0)
+    
+    # Boost edges that are in MST
+    for idx in range(len(mst_edges[0])):
+        i, j = mst_edges[0][idx], mst_edges[1][idx]
+        # Adaptive bonus based on problem size
+        bonus_factor = 1.0 + 0.3 / np.log2(n + 5)
+        mst_bonus[i, j] = mst_bonus[j, i] = bonus_factor
+    
+    # ==================== 5. ADAPTIVE COMBINATION ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Adaptive weights based on problem size
+    w_inv = 0.4 + 0.2 / np.log2(n + 10)  # More weight to inverse distance for larger problems
+    w_regret = 0.35
+    w_mst = 0.25 - 0.1 / np.log2(n + 10)
+    
+    # Normalize weights
+    total = w_inv + w_regret + w_mst
+    w_inv, w_regret, w_mst = w_inv/total, w_regret/total, w_mst/total
+    
+    # Combine components with weighted geometric mean
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                inv_comp = max(inv_dist_sym[i, j], 1e-10)
+                regret_comp = max(regret_penalty[i, j], 1e-10)
+                mst_comp = max(mst_bonus[i, j], 1e-10)
+                
+                log_score = (
+                    w_inv * np.log(inv_comp) +
+                    w_regret * np.log(regret_comp) +
+                    w_mst * np.log(mst_comp)
+                )
+                
+                heuristics[i, j] = heuristics[j, i] = np.exp(log_score)
+    
+    # ==================== 6. FINAL PROCESSING ====================
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure connectivity by boosting weak MST edges
+    mst_scores = heuristics[mst_edges]
+    if len(mst_scores) > 0:
+        mst_median = np.median(mst_scores)
+        for idx in range(len(mst_edges[0])):
+            i, j = mst_edges[0][idx], mst_edges[1][idx]
+            if heuristics[i, j] < mst_median * 0.4:
+                heuristics[i, j] = heuristics[j, i] = mst_median * 0.6
+    
+    # Row-wise normalization
+    for i in range(n):
+        row = heuristics[i]
+        row_max = row.max()
+        if row_max > 0:
+            exp_row = np.exp(row / (row_max + 1e-10))
+            heuristics[i] = exp_row / exp_row.sum()
+    
+    # Symmetrize and final cleanup
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small baseline for all possible edges
+    min_val = heuristics[heuristics > 0].min() if np.any(heuristics > 0) else 1e-8
+    heuristics = heuristics + min_val * 0.01
+    
+    # Final row normalization
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    heuristics = heuristics / row_sums
+    
+    return heuristics
+```

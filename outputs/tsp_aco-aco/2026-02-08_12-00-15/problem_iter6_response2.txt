@@ -1,0 +1,146 @@
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP edge selection heuristics with optimized triangle inequality
+    penalties, improved sparsification, and logarithmic edge weighting.
+    
+    Features:
+    1. Efficient triangle inequality violation detection with early termination
+    2. Combined mask multiplication for MST and nearest neighbors
+    3. Logarithmic scaling for edge importance with adaptive parameters
+    4. Improved sparsification with distance-adaptive thresholds
+    
+    Args:
+        distance_matrix: Symmetric 2D array of pairwise distances.
+    
+    Returns:
+        Heuristic matrix of same shape where higher values indicate 
+        more promising edges for inclusion in TSP solutions.
+    """
+    n = distance_matrix.shape[0]
+    
+    if n <= 1:
+        return np.zeros_like(distance_matrix)
+    
+    # Create safe distance matrix with diagonal set to infinity
+    safe_dist = distance_matrix.copy().astype(float)
+    np.fill_diagonal(safe_dist, np.inf)
+    
+    # 1. Base heuristic: inverse distance (handle zeros)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        base_heuristic = 1.0 / safe_dist
+    np.fill_diagonal(base_heuristic, 0.0)
+    
+    # 2. Minimum Spanning Tree mask
+    mst = minimum_spanning_tree(safe_dist).toarray()
+    mst_mask = (mst + mst.T) > 0
+    
+    # 3. Adaptive nearest neighbor mask
+    k_nn = max(2, min(int(np.log2(n)) + 3, n // 3))
+    nn_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    # Efficient vectorized nearest neighbor computation
+    sorted_indices = np.argsort(safe_dist, axis=1)
+    row_indices = np.arange(n)[:, None]
+    
+    # Get k nearest neighbors for each row
+    neighbor_indices = sorted_indices[:, 1:k_nn+1]
+    nn_mask[row_indices, neighbor_indices] = True
+    
+    # Symmetrize nearest neighbor mask
+    nn_mask = nn_mask | nn_mask.T
+    
+    # 4. Efficient triangle inequality penalty
+    tri_penalty = np.ones_like(distance_matrix, dtype=float)
+    
+    if n > 2:
+        # Vectorized triangle inequality check
+        # For each k, compute detour distances and compare with direct distances
+        for k in range(n):
+            if k % 50 == 0 and k > 0:  # Check progress periodically
+                # Early termination if matrix is large and we have enough samples
+                if n > 200 and k >= 100:
+                    break
+            
+            # Compute detour distances via k
+            detour = safe_dist[:, k:k+1] + safe_dist[k:k+1, :]
+            
+            # Find violations where direct path is longer than detour
+            violations = safe_dist > detour
+            
+            # Apply penalty to violating edges (accumulate multiplicatively)
+            tri_penalty[violations] *= 0.7  # Stronger penalty for violations
+    
+    # 5. Combine masks multiplicatively
+    mask_multiplier = np.ones_like(distance_matrix)
+    mask_multiplier[mst_mask] *= 2.0  # MST edges get 2x boost
+    mask_multiplier[nn_mask] *= 1.5   # NN edges get 1.5x boost
+    
+    # 6. Initial combination with triangle penalty
+    heuristics = base_heuristic * mask_multiplier * tri_penalty
+    
+    # 7. Adaptive sparsification with distance-aware thresholds
+    keep_mask = np.zeros_like(distance_matrix, dtype=bool)
+    
+    for i in range(n):
+        row_vals = heuristics[i].copy()
+        row_vals[i] = 0  # Exclude self
+        
+        if np.any(row_vals > 0):
+            # Adaptive threshold based on node's distance distribution
+            valid_vals = row_vals[row_vals > 0]
+            
+            # Nodes with smaller distances should keep more connections
+            avg_dist = np.mean(safe_dist[i, safe_dist[i] < np.inf])
+            median_all = np.median(safe_dist[safe_dist < np.inf])
+            
+            if avg_dist < median_all:
+                keep_fraction = min(0.4 + 0.2 * np.log(n), 0.8)  # Keep more for central nodes
+            else:
+                keep_fraction = min(0.3 + 0.1 * np.log(n), 0.6)  # Keep fewer for peripheral nodes
+            
+            threshold = np.percentile(valid_vals, 100 * (1 - keep_fraction))
+            
+            # Always keep MST and nearest neighbor edges
+            keep_mask[i] = (row_vals >= threshold) | mst_mask[i] | nn_mask[i]
+    
+    # Symmetrize the keep mask
+    keep_mask = keep_mask | keep_mask.T
+    heuristics = heuristics * keep_mask
+    
+    # 8. Logarithmic importance scaling
+    # Apply log scaling to enhance contrast without overfitting
+    positive_mask = heuristics > 0
+    if np.any(positive_mask):
+        positive_vals = heuristics[positive_mask]
+        
+        # Normalize positive values
+        min_val, max_val = positive_vals.min(), positive_vals.max()
+        if max_val > min_val:
+            normalized_vals = (positive_vals - min_val) / (max_val - min_val)
+            
+            # Apply logarithmic scaling: log(1 + value) preserves order
+            # while compressing the range for better distribution
+            log_scaled = np.log1p(normalized_vals * 9)  # Scale to [0, ln(10)]
+            
+            # Map back to original scale
+            heuristics[positive_mask] = log_scaled * (max_val - min_val) + min_val
+    
+    # 9. Final processing
+    # Ensure symmetry
+    heuristics = np.maximum(heuristics, heuristics.T)
+    
+    # Normalize to [0, 1] range
+    max_val = heuristics.max()
+    if max_val > 0:
+        heuristics = heuristics / max_val
+    
+    # Sparsify: zero out very small values
+    heuristics[heuristics < 1e-6] = 0
+    
+    return heuristics
+```

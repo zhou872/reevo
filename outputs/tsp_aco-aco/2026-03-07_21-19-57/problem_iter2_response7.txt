@@ -1,0 +1,168 @@
+```json
+{
+    "algorithm_features": ["Regret-Based Penalty", "Lookahead Spatial Averaging", "Minimum Spanning Tree Inclusion", "Cluster Density Similarity"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic function for TSP edge selection with regret-based
+    penalization and lookahead spatial averaging.
+    
+    Core improvements over v1:
+    1. Regret-based penalty: Prioritizes edges where alternatives are poor
+    2. Lookahead spatial averaging: Estimates future connection costs
+    3. Maintains MST inclusion for structural importance
+    4. Uses cluster density similarity for intra-region connections
+    
+    Args:
+        distance_matrix: Square matrix of distances between nodes
+        
+    Returns:
+        Heuristic matrix of same shape where higher values indicate
+        more promising edges for TSP solutions
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        return np.ones((n, n)) - np.eye(n)
+    
+    # Base reciprocal distance with safe handling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_dist = 1.0 / distance_matrix
+        inv_dist[np.isinf(inv_dist)] = 0
+        inv_dist[np.diag_indices(n)] = 0
+    
+    # Adaptive parameter for neighborhood size
+    k = max(3, int(0.15 * n))
+    
+    # 1. REGRET-BASED PENALTY: Prioritize edges with poor alternatives
+    regret_matrix = np.ones((n, n))
+    for i in range(n):
+        # Get distances from node i to all others (excluding self)
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        
+        # Find two nearest neighbors
+        sorted_indices = np.argsort(distances)
+        nearest_idx = sorted_indices[0]
+        second_nearest_idx = sorted_indices[1]
+        
+        # Calculate regret for not taking the nearest edge
+        nearest_dist = distances[nearest_idx]
+        second_nearest_dist = distances[second_nearest_idx]
+        
+        if nearest_dist > 0:
+            regret = (second_nearest_dist - nearest_dist) / nearest_dist
+            
+            # Apply regret bonus to nearest edge
+            regret_matrix[i, nearest_idx] += regret
+            regret_matrix[nearest_idx, i] += regret
+    
+    # Normalize regret component
+    max_regret = np.max(regret_matrix)
+    if max_regret > 0:
+        regret_matrix = regret_matrix / max_regret
+    
+    # 2. LOOKAHEAD SPATIAL AVERAGING: Estimate future connection costs
+    lookahead_matrix = np.ones((n, n))
+    
+    # Precompute k-nearest neighbors for each node
+    k_neighbors = min(k, n-1)
+    nearest_masks = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i, :].copy()
+        distances[i] = np.inf
+        nearest_indices = np.argsort(distances)[:k_neighbors]
+        nearest_masks[i, nearest_indices] = True
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            # Calculate average distance from i to its other k-nearest neighbors
+            i_neighbors = np.where(nearest_masks[i, :])[0]
+            i_neighbors = i_neighbors[i_neighbors != j]
+            if len(i_neighbors) > 0:
+                avg_i = np.mean(distance_matrix[i, i_neighbors])
+            else:
+                avg_i = 0
+            
+            # Calculate average distance from j to its other k-nearest neighbors
+            j_neighbors = np.where(nearest_masks[j, :])[0]
+            j_neighbors = j_neighbors[j_neighbors != i]
+            if len(j_neighbors) > 0:
+                avg_j = np.mean(distance_matrix[j, j_neighbors])
+            else:
+                avg_j = 0
+            
+            # Lookahead score: inverse of average future connection cost
+            if avg_i + avg_j > 0:
+                lookahead_score = 1.0 / (1.0 + (avg_i + avg_j) / 2)
+            else:
+                lookahead_score = 1.0
+            
+            lookahead_matrix[i, j] = lookahead_matrix[j, i] = lookahead_score
+    
+    # 3. MST INCLUSION (from v1): Structural importance
+    mst = minimum_spanning_tree(distance_matrix)
+    mst_mask = (mst.toarray() > 0) | (mst.toarray().T > 0)
+    mst_bonus = np.where(mst_mask, 2.0, 1.0)
+    
+    # 4. CLUSTER DENSITY SIMILARITY (from v1): Intra-region connections
+    cluster_bonus = np.ones((n, n))
+    if n > 10:
+        # Compute local density for each node
+        local_density = np.zeros(n)
+        for i in range(n):
+            nearest_dists = np.sort(distance_matrix[i])[1:k+1]
+            local_density[i] = 1.0 / (np.mean(nearest_dists) + 1e-8)
+        
+        # Normalize densities
+        max_density = np.max(local_density)
+        if max_density > 0:
+            local_density = local_density / max_density
+        
+        # Bonus for edges connecting nodes with similar local densities
+        for i in range(n):
+            for j in range(i+1, n):
+                density_sim = 1.0 - abs(local_density[i] - local_density[j])
+                cluster_bonus[i, j] = cluster_bonus[j, i] = 1.0 + 0.5 * density_sim
+    
+    # COMBINE ALL FACTORS with non-linear compounding
+    combined = inv_dist * regret_matrix * lookahead_matrix * mst_bonus * cluster_bonus
+    
+    # Symmetrize
+    combined = np.maximum(combined, combined.T)
+    
+    # SPARSIFICATION: Keep promising edges
+    # Strategy 1: Keep top 30% of edges per node
+    threshold_per_node = np.percentile(combined, 70, axis=1, keepdims=True)
+    mask_top_edges = combined >= threshold_per_node
+    
+    # Strategy 2: Keep MST edges
+    final_mask = mask_top_edges | mst_mask
+    
+    # Strategy 3: Ensure at least 2 connections per node
+    min_connections = 2
+    for i in range(n):
+        num_connections = np.sum(final_mask[i, :])
+        if num_connections < min_connections:
+            # Add additional nearest neighbors
+            distances = distance_matrix[i, :].copy()
+            distances[i] = np.inf
+            additional_neighbors = np.argsort(distances)[:min_connections - num_connections]
+            final_mask[i, additional_neighbors] = True
+            final_mask[additional_neighbors, i] = True
+    
+    sparsified = combined * final_mask
+    
+    # NORMALIZATION for stability
+    max_val = np.max(sparsified)
+    if max_val > 0:
+        sparsified = sparsified / max_val
+    
+    return sparsified
+```

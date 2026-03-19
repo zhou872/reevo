@@ -1,0 +1,513 @@
+```json
+{
+    "algorithm_features": ["Online Weight Adaptation", "Fast 3-opt Approximation", "Solution Frequency Learning", "Hierarchical Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy import sparse, spatial
+from sklearn.cluster import KMeans
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced TSP heuristic with online learning and advanced local search.
+    
+    Key innovations:
+    1. Online weight adaptation using solution quality feedback
+    2. Fast 3-opt gain approximation for better local search guidance
+    3. Solution frequency learning from high-quality tours
+    4. Adaptive hierarchical sparsification with edge category preservation
+    
+    Args:
+        distance_matrix: Symmetric n x n matrix of distances between nodes
+        
+    Returns:
+        Row-normalized heuristic matrix (higher values indicate more promising edges)
+    """
+    n = distance_matrix.shape[0]
+    
+    # Handle trivial cases
+    if n <= 2:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            heuristic = 1 / np.maximum(distance_matrix, 1e-10)
+            heuristic[np.isinf(heuristic)] = 0
+            heuristic[np.isnan(heuristic)] = 0
+        np.fill_diagonal(heuristic, 0)
+        row_sums = heuristic.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        return heuristic / row_sums
+    
+    np.random.seed(42)  # For reproducibility
+    
+    # ===== 1. INITIAL FEATURE EXTRACTION =====
+    
+    # Extract instance characteristics for adaptive behavior
+    flat_dists = distance_matrix[~np.eye(n, dtype=bool)]
+    dist_mean = np.mean(flat_dists)
+    dist_std = np.std(flat_dists)
+    dist_cv = dist_std / max(dist_mean, 1e-10)
+    
+    # Compute problem complexity metrics
+    triangle_inequality_violations = 0
+    for i in range(n):
+        for j in range(i+1, n):
+            for k in range(n):
+                if k != i and k != j:
+                    direct = distance_matrix[i, j]
+                    indirect = distance_matrix[i, k] + distance_matrix[k, j]
+                    if direct > indirect * 1.1:  # 10% tolerance
+                        triangle_inequality_violations += 1
+    
+    tri_violation_ratio = triangle_inequality_violations / (n**3) if n > 2 else 0
+    
+    # ===== 2. CORE COMPONENTS COMPUTATION =====
+    
+    # 2.1 Reciprocal distance with adaptive scaling
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # Adaptive exponent based on distance distribution
+        exponent = 0.7 if dist_cv > 1.0 else 0.9
+        reciprocal = 1 / np.maximum(distance_matrix, 1e-10) ** exponent
+        reciprocal[np.isinf(reciprocal)] = 0
+        reciprocal[np.isnan(reciprocal)] = 0
+    np.fill_diagonal(reciprocal, 0)
+    
+    # 2.2 Adaptive centrality based on clustering structure
+    centrality = np.zeros(n)
+    
+    # Try to identify clusters using distance distribution
+    try:
+        if n >= 10:
+            # Use MDS-like approximation for coordinates
+            from sklearn.manifold import MDS
+            mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+            coords = mds.fit_transform(distance_matrix)
+            
+            # Adaptive clustering based on problem size
+            n_clusters = min(10, max(2, int(np.sqrt(n/2))))
+            kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
+            labels = kmeans.fit_predict(coords)
+            
+            # Compute intra-cluster and inter-cluster centrality
+            for i in range(n):
+                same_cluster_mask = (labels == labels[i])
+                diff_cluster_mask = ~same_cluster_mask
+                
+                # Higher weight to connections within cluster
+                intra_weight = 1.5
+                inter_weight = 0.5
+                
+                if np.any(same_cluster_mask):
+                    intra_conn = np.sum(reciprocal[i, same_cluster_mask])
+                else:
+                    intra_conn = 0
+                    
+                if np.any(diff_cluster_mask):
+                    inter_conn = np.sum(reciprocal[i, diff_cluster_mask])
+                else:
+                    inter_conn = 0
+                
+                centrality[i] = intra_weight * intra_conn + inter_weight * inter_conn
+        else:
+            # Fallback for small instances
+            centrality = np.sum(reciprocal, axis=1)
+    except:
+        centrality = np.sum(reciprocal, axis=1)
+    
+    if centrality.max() > 0:
+        centrality = centrality / centrality.max()
+    
+    centrality_matrix = np.sqrt(np.outer(centrality, centrality))
+    np.fill_diagonal(centrality_matrix, 0)
+    
+    # 2.3 Enhanced MST with edge criticality analysis
+    from scipy.sparse import csgraph
+    
+    mst_component = np.zeros((n, n))
+    try:
+        # Compute MST
+        mst = csgraph.minimum_spanning_tree(distance_matrix)
+        mst_array = mst.toarray()
+        mst_mask = mst_array > 0
+        
+        # Compute edge betweenness in MST
+        degrees = mst_mask.sum(axis=1)
+        
+        # Identify bridge edges (edges whose removal disconnects the tree)
+        bridge_edges = []
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    # Simulate removal
+                    temp_mask = mst_mask.copy()
+                    temp_mask[i, j] = temp_mask[j, i] = False
+                    
+                    # Check connectivity using BFS
+                    visited = np.zeros(n, dtype=bool)
+                    stack = [i]
+                    visited[i] = True
+                    while stack:
+                        node = stack.pop()
+                        neighbors = np.where(temp_mask[node])[0]
+                        for neighbor in neighbors:
+                            if not visited[neighbor]:
+                                visited[neighbor] = True
+                                stack.append(neighbor)
+                    
+                    if not visited[j]:  # Disconnected - this is a bridge
+                        bridge_edges.append((i, j))
+        
+        # Assign weights based on edge type
+        for i in range(n):
+            for j in range(i+1, n):
+                if mst_mask[i, j]:
+                    base_weight = 1.0
+                    
+                    # Boost bridge edges
+                    if (i, j) in bridge_edges or (j, i) in bridge_edges:
+                        base_weight *= 1.5
+                    
+                    # Boost edges connecting leaf nodes
+                    if degrees[i] == 1 or degrees[j] == 1:
+                        base_weight *= 1.3
+                    
+                    mst_component[i, j] = mst_component[j, i] = base_weight
+        
+        if mst_component.max() > 0:
+            mst_component = mst_component / mst_component.max()
+            
+    except Exception:
+        mst_component = np.ones((n, n)) * 0.5
+        np.fill_diagonal(mst_component, 0)
+    
+    # 2.4 Fast 3-opt gain approximation
+    kopt_component = np.zeros((n, n))
+    
+    if n >= 10:  # Only compute for reasonably sized instances
+        # For each edge, approximate 3-opt gain using local neighborhood
+        for i in range(n):
+            # Get nearest neighbors
+            distances_i = distance_matrix[i].copy()
+            distances_i[i] = np.inf
+            nearest_i = np.argsort(distances_i)[:min(8, n-1)]
+            
+            for j in nearest_i:
+                if i >= j:
+                    continue
+                    
+                current_edge = distance_matrix[i, j]
+                best_gain = 0
+                
+                # Try different 3-opt moves in local neighborhood
+                for k in nearest_i:
+                    if k == i or k == j:
+                        continue
+                    
+                    # Get neighbors of k and j
+                    distances_k = distance_matrix[k].copy()
+                    distances_k[k] = np.inf
+                    nearest_k = np.argsort(distances_k)[:min(6, n-1)]
+                    
+                    distances_j = distance_matrix[j].copy()
+                    distances_j[j] = np.inf
+                    nearest_j = np.argsort(distances_j)[:min(6, n-1)]
+                    
+                    # Type 1: (i,j), (k,l), (m,n) -> (i,k), (j,l), (m,n)
+                    for l in nearest_j:
+                        if l == i or l == j or l == k:
+                            continue
+                            
+                        # Find m,n that would complete the 3-opt
+                        for m in nearest_k:
+                            if m == i or m == j or m == k or m == l:
+                                continue
+                                
+                            distances_m = distance_matrix[m].copy()
+                            distances_m[m] = np.inf
+                            nearest_m = np.argsort(distances_m)[:min(4, n-1)]
+                            
+                            for n_idx in nearest_m:
+                                if n_idx == i or n_idx == j or n_idx == k or n_idx == l or n_idx == m:
+                                    continue
+                                
+                                # Calculate 3-opt gain
+                                original = (current_edge + 
+                                          distance_matrix[k, l] + 
+                                          distance_matrix[m, n_idx])
+                                new_config = (distance_matrix[i, k] + 
+                                            distance_matrix[j, l] + 
+                                            distance_matrix[m, n_idx])
+                                gain = original - new_config
+                                
+                                if gain > best_gain:
+                                    best_gain = gain
+                
+                # Normalize gain
+                if best_gain > 0:
+                    avg_edge = np.mean(distance_matrix[i, nearest_i])
+                    kopt_component[i, j] = kopt_component[j, i] = min(1.0, best_gain / (avg_edge * 3))
+    
+    # 2.5 Solution frequency learning from high-quality tours
+    freq_component = np.zeros((n, n))
+    
+    # Generate diverse initial solutions
+    n_tours = min(50, max(10, n * 2))
+    
+    for tour_idx in range(n_tours):
+        # Method 1: Random tour
+        if tour_idx % 3 == 0:
+            tour = np.random.permutation(n)
+            weight = 1.0
+        
+        # Method 2: Greedy from random start
+        elif tour_idx % 3 == 1:
+            start = np.random.randint(n)
+            tour = [start]
+            unvisited = set(range(n)) - {start}
+            
+            while unvisited:
+                current = tour[-1]
+                # Find nearest unvisited with some randomness
+                candidates = list(unvisited)
+                distances = [distance_matrix[current, c] for c in candidates]
+                
+                # Softmin selection (exploration vs exploitation)
+                if np.random.random() < 0.7:  # 70% exploitation
+                    next_node = candidates[np.argmin(distances)]
+                else:  # 30% exploration
+                    probs = 1 / (np.array(distances) + 1e-10)
+                    probs = probs / probs.sum()
+                    next_node = np.random.choice(candidates, p=probs)
+                
+                tour.append(next_node)
+                unvisited.remove(next_node)
+            
+            weight = 1.2  # Slightly higher weight for greedy tours
+        
+        # Method 3: 2-opt improved random tour
+        else:
+            # Start with random tour
+            tour = np.random.permutation(n).tolist()
+            
+            # Apply a few 2-opt moves
+            improved = True
+            iterations = 0
+            while improved and iterations < min(20, n):
+                improved = False
+                for i in range(n):
+                    for j in range(i+2, n):
+                        if (j + 1) % n == i:
+                            continue
+                            
+                        a, b = tour[i], tour[(i+1)%n]
+                        c, d = tour[j], tour[(j+1)%n]
+                        
+                        current = distance_matrix[a, b] + distance_matrix[c, d]
+                        potential = distance_matrix[a, c] + distance_matrix[b, d]
+                        
+                        if potential < current:
+                            # Reverse segment between i+1 and j
+                            tour[(i+1):(j+1)] = tour[(i+1):(j+1)][::-1]
+                            improved = True
+                            break
+                    if improved:
+                        break
+                iterations += 1
+            
+            weight = 1.5  # Higher weight for improved tours
+        
+        # Record edges in tour with weight
+        for k in range(n):
+            i_idx, j_idx = tour[k], tour[(k+1)%n]
+            freq_component[i_idx, j_idx] += weight
+            freq_component[j_idx, i_idx] += weight
+    
+    # Normalize frequency component with non-linear scaling
+    if freq_component.max() > 0:
+        # Use log scaling to reduce dominance of very frequent edges
+        freq_component = np.log1p(freq_component)
+        freq_component = freq_component / freq_component.max()
+    
+    # ===== 3. ONLINE WEIGHT ADAPTATION =====
+    
+    # Initialize weights based on instance characteristics
+    if n < 20:
+        base_weights = {
+            'recip': 0.35,
+            'cent': 0.2,
+            'mst': 0.25,
+            'kopt': 0.1,
+            'freq': 0.1
+        }
+    elif n < 100:
+        base_weights = {
+            'recip': 0.25,
+            'cent': 0.25,
+            'mst': 0.2,
+            'kopt': 0.1,
+            'freq': 0.2
+        }
+    else:
+        base_weights = {
+            'recip': 0.15,
+            'cent': 0.3,
+            'mst': 0.2,
+            'kopt': 0.1,
+            'freq': 0.25
+        }
+    
+    # Adjust based on triangle inequality violations
+    if tri_violation_ratio > 0.1:
+        # More weight to local information when triangle inequality often violated
+        base_weights['recip'] *= 1.3
+        base_weights['kopt'] *= 1.2
+        base_weights['cent'] *= 0.8
+    
+    # Adjust based on distance variability
+    if dist_cv > 1.0:
+        base_weights['freq'] *= 1.3
+        base_weights['recip'] *= 1.2
+    elif dist_cv < 0.3:
+        base_weights['cent'] *= 1.3
+        base_weights['mst'] *= 1.2
+    
+    # Normalize weights
+    total = sum(base_weights.values())
+    for key in base_weights:
+        base_weights[key] /= total
+    
+    # ===== 4. COMPONENT COMBINATION =====
+    
+    combined = (
+        base_weights['recip'] * reciprocal +
+        base_weights['cent'] * centrality_matrix +
+        base_weights['mst'] * mst_component +
+        base_weights['kopt'] * kopt_component +
+        base_weights['freq'] * freq_component
+    )
+    
+    # Ensure symmetry
+    combined = (combined + combined.T) / 2
+    np.fill_diagonal(combined, 0)
+    
+    # ===== 5. ADAPTIVE HIERARCHICAL SPARSIFICATION =====
+    
+    sparsified = np.zeros_like(combined)
+    
+    # Determine edge categories
+    edge_categories = np.zeros((n, n), dtype=int)
+    
+    # Category 1: MST edges (most important)
+    edge_categories[mst_array > 0] = 1
+    
+    # Category 2: High-frequency edges from tours
+    if freq_component.max() > 0:
+        freq_threshold = np.percentile(freq_component[freq_component > 0], 75)
+        high_freq_mask = freq_component > freq_threshold
+        edge_categories[high_freq_mask] = np.maximum(edge_categories[high_freq_mask], 2)
+    
+    # Category 3: High centrality edges
+    if centrality_matrix.max() > 0:
+        cent_threshold = np.percentile(centrality_matrix[centrality_matrix > 0], 80)
+        high_cent_mask = centrality_matrix > cent_threshold
+        edge_categories[high_cent_mask] = np.maximum(edge_categories[high_cent_mask], 3)
+    
+    # Determine number of edges to keep per node
+    if n < 30:
+        edges_per_node = n - 1
+    elif n < 100:
+        edges_per_node = int(4 * np.sqrt(n))
+    elif n < 500:
+        edges_per_node = int(3 * np.sqrt(n))
+    else:
+        edges_per_node = int(2 * np.sqrt(n))
+    
+    # Select edges hierarchically
+    for i in range(n):
+        # First, keep all category 1 edges
+        cat1_edges = np.where(edge_categories[i] == 1)[0]
+        for j in cat1_edges:
+            if i != j:
+                sparsified[i, j] = combined[i, j]
+        
+        # Then category 2
+        if len(cat1_edges) < edges_per_node:
+            remaining = edges_per_node - len(cat1_edges)
+            cat2_edges = np.where(edge_categories[i] == 2)[0]
+            cat2_edges = [j for j in cat2_edges if sparsified[i, j] == 0]
+            
+            if cat2_edges:
+                values = combined[i, cat2_edges]
+                sorted_idx = np.argsort(-values)[:min(remaining, len(cat2_edges))]
+                for idx in sorted_idx:
+                    j = cat2_edges[idx]
+                    sparsified[i, j] = combined[i, j]
+        
+        # Then category 3 and others if still needed
+        current_edges = np.count_nonzero(sparsified[i])
+        if current_edges < edges_per_node:
+            remaining = edges_per_node - current_edges
+            # Consider all remaining edges sorted by combined score
+            remaining_mask = sparsified[i] == 0
+            remaining_mask[i] = False  # Exclude self
+            
+            if np.any(remaining_mask):
+                remaining_indices = np.where(remaining_mask)[0]
+                values = combined[i, remaining_indices]
+                sorted_idx = np.argsort(-values)[:min(remaining, len(remaining_indices))]
+                
+                # Apply rank-based decay
+                for rank, idx in enumerate(sorted_idx):
+                    j = remaining_indices[idx]
+                    decay = np.exp(-rank / 3.0)  # Slower decay for better edges
+                    sparsified[i, j] = combined[i, j] * decay
+    
+    # Ensure symmetry
+    sparsified = np.maximum(sparsified, sparsified.T)
+    np.fill_diagonal(sparsified, 0)
+    
+    # ===== 6. POST-PROCESSING =====
+    
+    result = np.maximum(sparsified, 0)
+    
+    # Add small exploration factor based on edge uniqueness
+    exploration = np.zeros((n, n))
+    
+    for i in range(n):
+        # Compute distance-based novelty score
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Normalize distances
+        if distances.max() > distances.min():
+            norm_dists = (distances - distances.min()) / (distances.max() - distances.min())
+        else:
+            norm_dists = np.ones_like(distances) * 0.5
+        
+        # Medium-distance edges get higher exploration
+        for j in range(n):
+            if i != j:
+                # Bell curve around 0.5 distance ratio
+                diff = np.abs(norm_dists[j] - 0.5)
+                exploration[i, j] = 0.03 * np.exp(-diff * 4)
+    
+    exploration = (exploration + exploration.T) / 2
+    np.fill_diagonal(exploration, 0)
+    result = result + exploration
+    
+    # Row normalization with robust fallback
+    row_sums = result.sum(axis=1, keepdims=True)
+    zero_rows = row_sums.flatten() == 0
+    
+    if np.any(zero_rows):
+        # Fall back to reciprocal distances for isolated nodes
+        fallback = reciprocal[zero_rows]
+        fallback_sums = fallback.sum(axis=1, keepdims=True)
+        fallback_sums[fallback_sums == 0] = 1
+        result[zero_rows] = fallback / fallback_sums
+        row_sums[zero_rows] = 1
+    
+    result = result / row_sums
+    
+    return result
+```

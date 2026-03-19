@@ -1,0 +1,201 @@
+```json
+{
+    "algorithm_features": ["Dynamic Degree-Adjusted Mutual Regret", "MST-Based Community Clustering", "Local Alternative Regret Lookahead", "Hybrid Adaptive Sparsification"]
+}
+```
+
+```python
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.sparse import csr_matrix
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Advanced heuristic scoring for TSP edges with dynamic mutual regret,
+    community-aware clustering, and lightweight regret-based lookahead.
+    
+    Features:
+    1. Dynamic degree-adjusted mutual regret penalization
+    2. MST-based lightweight community detection with intra-cluster boosting
+    3. Local alternative regret lookahead (neighborhood-restricted)
+    4. Hybrid adaptive sparsification with connectivity guarantees
+    """
+    n = distance_matrix.shape[0]
+    if n <= 2:
+        result = np.ones_like(distance_matrix)
+        np.fill_diagonal(result, 0)
+        return result
+    
+    # === 1. Base inverse distance ===
+    dist = distance_matrix.copy()
+    np.fill_diagonal(dist, np.inf)
+    inv_dist = 1 / (dist + 1e-10)
+    
+    # === 2. MST for connectivity and clustering ===
+    mst = minimum_spanning_tree(dist)
+    mst_mask = (mst.toarray() > 0)
+    mst_bonus = mst_mask.astype(float) * 1.0 + 1.0  # 2.0 for MST edges
+    
+    # === 3. Lightweight community detection via MST clustering ===
+    # Remove longest edges in MST to form sqrt(n) clusters
+    num_clusters = max(2, int(np.sqrt(n)))
+    if n > 2 and mst.nnz > 0:
+        # Get MST edges sorted by distance
+        mst_edges = []
+        rows, cols = np.where(mst_mask)
+        for i, j in zip(rows, cols):
+            if i < j:
+                mst_edges.append((i, j, distance_matrix[i, j]))
+        mst_edges.sort(key=lambda x: x[2], reverse=True)
+        
+        # Remove (num_clusters-1) longest edges to form clusters
+        edges_to_remove = min(len(mst_edges), num_clusters - 1)
+        removed_edges = set()
+        for idx in range(edges_to_remove):
+            i, j, _ = mst_edges[idx]
+            removed_edges.add((i, j))
+        
+        # Assign cluster labels using DFS on MST with removed edges
+        visited = np.zeros(n, dtype=bool)
+        cluster_labels = np.zeros(n, dtype=int)
+        current_label = 0
+        
+        for node in range(n):
+            if not visited[node]:
+                stack = [node]
+                visited[node] = True
+                cluster_labels[node] = current_label
+                
+                while stack:
+                    current = stack.pop()
+                    # Find neighbors in MST that are not removed
+                    for neighbor in np.where(mst_mask[current])[0]:
+                        edge_tuple = (min(current, neighbor), max(current, neighbor))
+                        if edge_tuple in removed_edges:
+                            continue
+                        if not visited[neighbor]:
+                            visited[neighbor] = True
+                            cluster_labels[neighbor] = current_label
+                            stack.append(neighbor)
+                current_label += 1
+    else:
+        cluster_labels = np.zeros(n, dtype=int)
+    
+    # Community boost: edges within same cluster get boost
+    community_boost = np.ones_like(inv_dist)
+    for i in range(n):
+        for j in range(n):
+            if i != j and cluster_labels[i] == cluster_labels[j]:
+                # Boost inversely proportional to cluster size
+                cluster_size = np.sum(cluster_labels == cluster_labels[i])
+                boost = 1.0 + 1.0 / max(1, np.sqrt(cluster_size))
+                community_boost[i, j] = min(boost, 1.5)  # Cap at 1.5
+    
+    # === 4. Dynamic degree-adjusted mutual regret ===
+    # Compute node isolation based on average distance
+    avg_distances = np.mean(dist, axis=1)
+    global_avg_distance = np.mean(avg_distances)
+    
+    penalty = np.ones_like(inv_dist)
+    top_percentile_base = 0.3
+    
+    for i in range(n):
+        # Dynamic percentile based on isolation
+        isolation_factor = avg_distances[i] / (global_avg_distance + 1e-10)
+        dynamic_percentile = top_percentile_base * isolation_factor
+        dynamic_percentile = np.clip(dynamic_percentile, 0.15, 0.45)
+        
+        # Find top edges for this node
+        row = inv_dist[i].copy()
+        row[i] = -np.inf
+        k = max(1, int(dynamic_percentile * (n - 1)))
+        if k > 0:
+            threshold = np.partition(row, -k)[-k]
+            top_mask_i = row >= threshold
+            
+            # Apply penalty for edges not in top set for both endpoints
+            for j in range(n):
+                if i != j and not top_mask_i[j]:
+                    # Check if j also doesn't have this edge in its top set
+                    if j > i:  # Avoid double computation
+                        row_j = inv_dist[j].copy()
+                        row_j[j] = -np.inf
+                        k_j = max(1, int(dynamic_percentile * (n - 1)))
+                        if k_j > 0:
+                            threshold_j = np.partition(row_j, -k_j)[-k_j]
+                            if row_j[i] < threshold_j:
+                                penalty[i, j] = 0.1
+                                penalty[j, i] = 0.1
+    
+    # === 5. Local alternative regret lookahead ===
+    regret_factor = np.ones_like(inv_dist)
+    m = max(2, int(np.sqrt(n)))  # Neighborhood size for lookahead
+    
+    # Precompute top m neighbors for each node
+    top_neighbors = []
+    for i in range(n):
+        row = inv_dist[i].copy()
+        row[i] = -np.inf
+        neighbors = np.argpartition(row, -m)[-m:]
+        top_neighbors.append(neighbors)
+    
+    # Compute regret factor for each edge
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Find best alternative path i->k->j using i's top neighbors
+            best_alt = np.inf
+            for k in top_neighbors[i]:
+                if k != j:
+                    alt_dist = distance_matrix[i, k] + distance_matrix[k, j]
+                    best_alt = min(best_alt, alt_dist)
+            
+            if best_alt < np.inf:
+                ratio = distance_matrix[i, j] / best_alt
+                # Regret factor: penalize if good alternatives exist
+                if ratio > 1.1:  # Direct edge is significantly worse
+                    factor = 1.0 / ratio
+                elif ratio < 0.9:  # Direct edge is significantly better
+                    factor = 1.0 + (1.0 - ratio)
+                else:
+                    factor = 1.0
+                factor = np.clip(factor, 0.5, 1.5)
+                regret_factor[i, j] = regret_factor[j, i] = factor
+    
+    # === 6. Combine factors ===
+    scores = inv_dist * mst_bonus * community_boost * penalty * regret_factor
+    
+    # === 7. Hybrid adaptive sparsification ===
+    # 7a. Adaptive degree sparsification
+    k_degree = max(2, int(np.sqrt(n)))
+    degree_mask = np.zeros_like(scores, dtype=bool)
+    
+    for i in range(n):
+        row = scores[i].copy()
+        row[i] = -np.inf
+        top_k_idx = np.argpartition(row, -k_degree)[-k_degree:]
+        degree_mask[i, top_k_idx] = True
+    
+    degree_mask = degree_mask | degree_mask.T
+    
+    # 7b. Global elite preservation
+    upper_tri = np.triu_indices(n, k=1)
+    if len(upper_tri[0]) > 0:
+        elite_scores = scores[upper_tri]
+        elite_threshold = np.percentile(elite_scores, 90)
+        global_mask = scores >= elite_threshold
+    else:
+        global_mask = np.zeros_like(scores, dtype=bool)
+    
+    # 7c. Final mask: combine degree, global elite, and MST
+    final_mask = degree_mask | global_mask | mst_mask
+    scores = scores * final_mask
+    
+    # === 8. Normalize and finalize ===
+    max_score = scores.max()
+    if max_score > 0:
+        scores = scores / max_score
+    
+    np.fill_diagonal(scores, 0)
+    
+    return scores
+```

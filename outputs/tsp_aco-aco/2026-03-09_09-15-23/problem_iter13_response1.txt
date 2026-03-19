@@ -1,0 +1,220 @@
+```json
+{
+    "algorithm_features": ["Multi-hop Lookahead Penalty", "Degree-aware Adaptive Sparsification", "Cluster Density Bonus", "Two-stage Edge Scoring"]
+}
+```
+
+```python
+import numpy as np
+from typing import Tuple, List
+
+def heuristics_v2(distance_matrix: np.ndarray) -> np.ndarray:
+    """
+    Enhanced heuristic function for TSP edge selection with multi-hop analysis,
+    degree-aware sparsification, and cluster-aware edge scoring.
+    
+    Args:
+        distance_matrix: Square matrix of pairwise distances
+        
+    Returns:
+        Heuristic matrix of same shape as input, with higher values for promising edges
+    """
+    n = len(distance_matrix)
+    if n < 3:
+        # Handle trivial cases
+        heuristics = np.ones_like(distance_matrix, dtype=float)
+        np.fill_diagonal(heuristics, 0)
+        return heuristics
+    
+    # ==================== 1. Degree-aware Adaptive Sparsification ====================
+    # Determine edge retention per node based on local density
+    adjacency_mask = np.zeros((n, n), dtype=bool)
+    
+    for i in range(n):
+        distances = distance_matrix[i].copy()
+        distances[i] = np.inf
+        
+        # Count edges within 1.5x of minimum distance
+        min_dist = np.min(distances)
+        threshold = 1.5 * min_dist
+        degree_i = np.sum(distances <= threshold)
+        
+        # Logarithmic base plus degree adjustment
+        k = min(degree_i, max(3, int(np.log2(n)) + int(np.sqrt(degree_i))))
+        k = min(k, n - 1)  # Ensure valid k
+        
+        # Get k nearest neighbors
+        nn_indices = np.argpartition(distances, k)[:k]
+        adjacency_mask[i, nn_indices] = True
+    
+    # Ensure symmetry for connected graph
+    adjacency_mask = adjacency_mask | adjacency_mask.T
+    np.fill_diagonal(adjacency_mask, False)
+    
+    # ==================== 2. Multi-hop Lookahead Penalty ====================
+    # Compute penalties comparing direct edges to 2-hop and 3-hop alternatives
+    penalty_matrix = np.ones_like(distance_matrix, dtype=float)
+    
+    # Pre-compute sorted distances for efficient lookups
+    sorted_indices = np.argsort(distance_matrix, axis=1)
+    sorted_dists = np.sort(distance_matrix, axis=1)
+    
+    for i in range(n):
+        valid_indices = np.where(adjacency_mask[i])[0]
+        
+        for j in valid_indices:
+            if i >= j:
+                continue
+                
+            direct_dist = distance_matrix[i, j]
+            if direct_dist < 1e-10:
+                continue
+                
+            # Analyze top alternatives for efficient computation
+            check_limit = max(5, int(np.sqrt(n)))
+            
+            # Get candidate intermediate nodes from both endpoints
+            i_candidates = sorted_indices[i, 1:check_limit+1]
+            j_candidates = sorted_indices[j, 1:check_limit+1]
+            candidates = np.unique(np.concatenate([i_candidates, j_candidates]))
+            candidates = candidates[(candidates != i) & (candidates != j)]
+            
+            if len(candidates) == 0:
+                continue
+                
+            # Two-hop analysis
+            two_hop_dists = distance_matrix[i, candidates] + distance_matrix[candidates, j]
+            min_two_hop = np.min(two_hop_dists) if len(two_hop_dists) > 0 else np.inf
+            
+            # Three-hop analysis (limited to top candidates)
+            three_hop_min = np.inf
+            if len(candidates) >= 2:
+                # Consider limited number of 3-hop paths
+                for k_idx in range(min(5, len(candidates))):
+                    k = candidates[k_idx]
+                    # Find best l from remaining candidates
+                    remaining = candidates[candidates != k]
+                    if len(remaining) > 0:
+                        l_indices = remaining[:min(3, len(remaining))]
+                        three_hop_paths = (distance_matrix[i, k] + 
+                                          distance_matrix[k, l_indices] + 
+                                          distance_matrix[l_indices, j])
+                        local_min = np.min(three_hop_paths) if len(three_hop_paths) > 0 else np.inf
+                        three_hop_min = min(three_hop_min, local_min)
+            
+            # Apply piecewise penalty based on cost ratios
+            penalty = 1.0
+            
+            if min_two_hop < np.inf:
+                ratio_2hop = min_two_hop / direct_dist
+                if ratio_2hop < 1.0:
+                    # Two-hop is better than direct
+                    penalty *= 0.2
+                elif ratio_2hop < 1.2:
+                    # Competitive two-hop
+                    penalty *= 0.3 + 0.7 * (ratio_2hop - 1.0) / 0.2
+                elif ratio_2hop < 1.5:
+                    # Moderately competitive
+                    penalty *= 0.7 + 0.3 * (ratio_2hop - 1.2) / 0.3
+                # Else: penalty remains 1.0
+            
+            if three_hop_min < np.inf:
+                ratio_3hop = three_hop_min / direct_dist
+                if ratio_3hop < 1.3:
+                    # Very competitive three-hop
+                    penalty *= 0.5
+                elif ratio_3hop < 1.7:
+                    # Moderately competitive three-hop
+                    penalty *= 0.5 + 0.5 * (ratio_3hop - 1.3) / 0.4
+            
+            penalty_matrix[i, j] = penalty_matrix[j, i] = penalty
+    
+    # ==================== 3. Cluster Density Bonus ====================
+    # Detect locally dense regions to boost intra-cluster edges
+    density_bonus = np.ones_like(distance_matrix, dtype=float)
+    
+    # Estimate local density for each node
+    local_density = np.zeros(n)
+    for i in range(n):
+        valid_distances = distance_matrix[i][adjacency_mask[i]]
+        if len(valid_distances) > 0:
+            local_density[i] = 1.0 / (np.mean(valid_distances) + 1e-10)
+    
+    # Apply density-aware bonuses
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Nodes in dense regions get bonus for connecting
+                density_score = (local_density[i] + local_density[j]) / 2.0
+                # Normalize density score
+                if np.max(local_density) > 0:
+                    density_score = density_score / np.max(local_density)
+                
+                # Apply bonus: edges within dense regions get higher values
+                bonus = 0.5 + 0.5 * density_score
+                density_bonus[i, j] = density_bonus[j, i] = bonus
+    
+    # ==================== 4. Two-stage Edge Scoring ====================
+    heuristics = np.zeros_like(distance_matrix, dtype=float)
+    
+    # Stage 1: Base scores from inverse distances
+    inv_dist_base = np.zeros_like(distance_matrix, dtype=float)
+    for i in range(n):
+        valid_mask = adjacency_mask[i]
+        if np.any(valid_mask):
+            # Use normalized inverse distances
+            valid_dists = distance_matrix[i, valid_mask]
+            inv_vals = 1.0 / (valid_dists + 1e-10)
+            
+            # Apply rank-based weighting
+            ranks = np.argsort(np.argsort(valid_dists)) + 1
+            weights = 1.0 / np.sqrt(ranks)  # Square root weighting for smoother decay
+            weights = weights / np.sum(weights)
+            
+            inv_dist_base[i, valid_mask] = inv_vals * weights
+    
+    # Symmetrize base scores
+    inv_dist_base = np.maximum(inv_dist_base, inv_dist_base.T)
+    
+    # Stage 2: Combine all components
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adjacency_mask[i, j]:
+                # Start with base score
+                score = inv_dist_base[i, j]
+                
+                # Apply multi-hop penalty
+                score *= penalty_matrix[i, j]
+                
+                # Apply density bonus
+                score *= density_bonus[i, j]
+                
+                # Additional factor: edge between high-degree nodes
+                i_degree = np.sum(adjacency_mask[i])
+                j_degree = np.sum(adjacency_mask[j])
+                degree_factor = 1.0 + 0.2 * np.log1p(min(i_degree, j_degree))
+                score *= degree_factor
+                
+                heuristics[i, j] = heuristics[j, i] = score
+    
+    # ==================== 5. Final Processing ====================
+    # Ensure no self-loops
+    np.fill_diagonal(heuristics, 0)
+    
+    # Add small constant to avoid zeros in retained edges
+    heuristics[adjacency_mask] += 1e-10
+    
+    # Normalize by row and symmetrize
+    row_sums = heuristics.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    heuristics = heuristics / row_sums
+    
+    # Final symmetrization
+    heuristics = 0.5 * (heuristics + heuristics.T)
+    np.fill_diagonal(heuristics, 0)
+    
+    # Ensure all values are non-negative
+    heuristics = np.maximum(heuristics, 0)
+    
+    return heuristics
+```
